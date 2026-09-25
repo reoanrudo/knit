@@ -492,13 +492,15 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
             }
         }
         CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
-        // 復帰位置は「メイン(MacBook)画面の右端内側 100px」と「union 右端から 150px」の
-        // 小さい方へ置く。ウルトラワイド右端のすぐ内側に復帰すると、戻ってから少しでも
-        // 右へ動いた瞬間に再突入して「押し戻される」体験になるため、出口から
-        // 十分離れた MacBook 側へ戻す(Windows へ行くときだけ出口へ向かう)
+        // 復帰位置: ダブルタップ切替が有効な間は出た境界のすぐ内側(60px)へ戻す。
+        // 1回の到達では切替しなくなったため境界近くでも再突入せず、境界を
+        // 跨いで戻ってくる連続的な体験になる。
+        // 1回切替(SEAMLESS_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
+        // 誤再突入を防ぐ
         let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
         let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
-        let x = (main_w - 100.0).min(edge_x - 150.0);
+        let taps = EDGE_TAPS.get().copied().unwrap_or(2);
+        let x = if taps >= 2 { edge_x - 60.0 } else { (main_w - 100.0).min(edge_x - 150.0) };
         let y = match ny {
             Some(n) => {
                 let h = SCREEN_H.get().copied().unwrap_or(1000.0);
@@ -785,7 +787,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-175513-d513b89";
+const BUILD_ID: &str = "build-20260925-175859-2a0c056";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
