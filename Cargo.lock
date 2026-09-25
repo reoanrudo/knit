@@ -33,31 +33,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sd-common"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "sd-mac"
-version = "0.7.6"
-dependencies = [
- "sd-common",
- "serde_json",
-]
-
-[[package]]
-name = "sd-win"
-version = "0.7.6"
-dependencies = [
- "sd-common",
- "serde_json",
- "windows-sys",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,6 +84,31 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
+]
+
+[[package]]
+name = "tsunagu-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "tsunagu-mac"
+version = "0.8.0"
+dependencies = [
+ "serde_json",
+ "tsunagu-common",
+]
+
+[[package]]
+name = "tsunagu-win"
+version = "0.8.0"
+dependencies = [
+ "serde_json",
+ "tsunagu-common",
+ "windows-sys",
 ]
 
 [[package]]

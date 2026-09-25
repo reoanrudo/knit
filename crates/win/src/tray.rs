@@ -130,7 +130,7 @@ fn set_text(h: usize, s: &str) {
 
 fn tray_status_text() -> String {
     let conn = if crate::CONNECTED.load(Ordering::Relaxed) { "接続済" } else { "切断(再接続中)" };
-    format!("seamless-desk: {conn} / {}", crate::BUILD_ID)
+    format!("tsunagu: {conn} / {}", crate::BUILD_ID)
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -211,7 +211,7 @@ unsafe fn handle_command(id: u32) {
             update_tip();
         }
         MENU_OPENLOG => {
-            let mut log: Vec<u16> = r"C:\Users\<user>\seamless-desk\sd-win.log".encode_utf16().collect();
+            let mut log: Vec<u16> = r"C:\Users\<user>\tsunagu\tsunagu-win.log".encode_utf16().collect();
             log.push(0);
             let mut verb = wide("open");
             let mut np = wide("notepad.exe");
@@ -274,7 +274,7 @@ unsafe fn open_status_window() {
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("seamless-desk").as_ptr(),
+            wide("tsunagu").as_ptr(),
             WS_OVERLAPPEDWINDOW,
             60, 60, 396, 284,
             std::ptr::null_mut(),
@@ -402,7 +402,7 @@ unsafe fn tray_loop() {
         eprintln!("[tray] RegisterClassW 失敗(トレイなしで継続)");
         return;
     }
-    let mut title: Vec<u16> = "seamless-desk".encode_utf16().collect();
+    let mut title: Vec<u16> = "tsunagu".encode_utf16().collect();
     title.push(0);
     // 可視化しないメッセージウィンドウ(トレイのコールバック受け)
     let hwnd = CreateWindowExW(

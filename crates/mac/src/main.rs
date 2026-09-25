@@ -1,12 +1,12 @@
-// sd-mac: Mac 側クライアント。CGEventTap で入力を横流しし、Windows へ送信する。
+// tsunagu-mac: Mac 側クライアント。CGEventTap で入力を横流しし、Windows へ送信する。
 // 画面右端でカーソルが Mac→Windows 切替、Windows カーソル左端(または F13)で復帰。
 #![allow(non_camel_case_types)]
 
 mod audio;
 mod gui;
 
-use sd_common::envutil;
-use sd_common::proto::{decode, encode, Msg, PORT, VERSION};
+use tsunagu_common::envutil;
+use tsunagu_common::proto::{decode, encode, Msg, PORT, VERSION};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;
@@ -72,7 +72,7 @@ const FLAG_OPT: CGEventFlags = 0x0008_0000;
 const FLAG_CMD: CGEventFlags = 0x0010_0000;
 
 const KC_F13: i64 = 105;
-/// 切替ホットキー(Mac keycode)。SEAMLESS_HOTKEY_KC で変更可。
+/// 切替ホットキー(Mac keycode)。TSUNAGU_HOTKEY_KC で変更可。
 /// MacBook 内蔵キーボードには F13 が無いため、例えば右Cmd(54)等に変えられる
 static HOTKEY_KC: OnceLock<i64> = OnceLock::new();
 
@@ -421,7 +421,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
         if total == 0 || total > MAX_TOTAL {
             eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
             notify(
-                "seamless-desk",
+                "tsunagu",
                 &format!("ファイルを送信できません(合計 {}MB。上限 200MB)", total / 1024 / 1024),
             );
             FILE_TX_BUSY.store(false, Ordering::Relaxed);
@@ -429,7 +429,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
         }
         if !CONNECTED.load(Ordering::Relaxed) {
             eprintln!("[file] 未接続のため送信しません");
-            notify("seamless-desk", "Windows 未接続のためファイルを送信できません");
+            notify("tsunagu", "Windows 未接続のためファイルを送信できません");
             FILE_TX_BUSY.store(false, Ordering::Relaxed);
             return;
         }
@@ -460,7 +460,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
                 match f.read(&mut buf[..want]) {
                     Ok(0) => break,
                     Ok(n) => {
-                        send_msg(&Msg::FileChunk { data: sd_common::b64::encode(&buf[..n]) });
+                        send_msg(&Msg::FileChunk { data: tsunagu_common::b64::encode(&buf[..n]) });
                         remain -= n as u64;
                     }
                     Err(_) => break,
@@ -470,7 +470,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
             eprintln!("[file] 送信: {name} ({size} bytes)");
         }
         eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
-        notify("seamless-desk", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
+        notify("tsunagu", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
     });
 }
@@ -503,7 +503,7 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。トグル時に Windows へ Cfg で同期
 static CMD_ALT: AtomicBool = AtomicBool::new(false);
 /// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
-/// トグル時に Windows へ Cfg で同期(SEAMLESS_MUTE_SPK=0 で初期無効化)
+/// トグル時に Windows へ Cfg で同期(TSUNAGU_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE: AtomicBool = AtomicBool::new(true);
 /// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
 static SCROLL_FLIP: AtomicBool = AtomicBool::new(false);
@@ -533,7 +533,7 @@ static TAP_REARM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static LAST_EVENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 境界ダブルタップ切替(Deskflow switchDoubleTap 相当)。
-/// SEAMLESS_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
+/// TSUNAGU_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
 /// 切替しないため、境界付近での日常作業と Windows への移動が分離される。
 /// GUI から実行中に切り替え可能なため AtomicU32(初期値は起動時に store)
 static EDGE_TAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
@@ -561,10 +561,10 @@ static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
 static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((0.05, 0.5));
-/// 絶対位置送信モード(既定ON。SEAMLESS_MOUSE_MODE=rel で旧・相対移動に戻す)
+/// 絶対位置送信モード(既定ON。TSUNAGU_MOUSE_MODE=rel で旧・相対移動に戻す)
 static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 切替方式: false=境界+ホットキー(既定)/ true=ホットキー(F13)のみで切替、
-/// 切替後は境界を超えても戻らないロック状態になる(SEAMLESS_SWITCH_MODE=hotkey)
+/// 切替後は境界を超えても戻らないロック状態になる(TSUNAGU_SWITCH_MODE=hotkey)
 static HOTKEY_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -582,12 +582,12 @@ unsafe fn live_cursor() -> Option<CGPoint> {
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
 static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
-/// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。SEAMLESS_SCROLL_DIV で調整可。
+/// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。TSUNAGU_SCROLL_DIV で調整可。
 static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
 /// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
-/// SEAMLESS_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
+/// TSUNAGU_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
 static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
-/// 右端切替の判定閾値(px、画面右端からの距離)。SEAMLESS_EDGE_PX で調整可。
+/// 右端切替の判定閾値(px、画面右端からの距離)。TSUNAGU_EDGE_PX で調整可。
 static EDGE_PX: OnceLock<f64> = OnceLock::new();
 /// 全ディスプレイ領域(union)の右端。右にサブモニターがある環境では
 /// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
@@ -686,7 +686,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         // 復帰位置: ダブルタップ切替が有効な間は出た境界のすぐ内側(60px)へ戻す。
         // 1回の到達では切替しなくなったため境界近くでも再突入せず、境界を
         // 跨いで戻ってくる連続的な体験になる。
-        // 1回切替(SEAMLESS_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
+        // 1回切替(TSUNAGU_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
         // 誤再突入を防ぐ
         let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
         let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
@@ -768,7 +768,7 @@ unsafe extern "C" fn tap_callback(
     let win_mode = WIN_MODE.load(Ordering::Relaxed);
     let connected = CONNECTED.load(Ordering::Relaxed);
 
-    // ホットキー(F13 既定 / SEAMLESS_HOTKEY_KC)= 手動トグル(常に有効、握る)。
+    // ホットキー(F13 既定 / TSUNAGU_HOTKEY_KC)= 手動トグル(常に有効、握る)。
     // 修飾キー(右Cmd=54 等)は flagsChanged として届くため、flags の該当ビットで
     // 押下/解放を判別し、押下側でのみトグルする(up・解放側は握るだけ)。
     // 旧実装は KEY_DOWN しかトグルせず(=修飾キー指定が機能しない)、かつ up 把握の
@@ -1029,10 +1029,10 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-214610-8052a89";
+const BUILD_ID: &str = "build-20260925-220506-66f43a1";
 
 fn main() {
-    eprintln!("[info] sd-mac {BUILD_ID}");
+    eprintln!("[info] tsunagu-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
     let _host = args
         .iter()
@@ -1046,14 +1046,14 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(PORT);
-    // トークンは必須(旧既定値 "seamless-desk-dev" での脆弱な稼働を廃止。
-    // 環境変数 > exe同階層.env > ~/.config/seamless-desk/env の順で解決する)
-    let token = match envutil::get("SEAMLESS_DESK_TOKEN") {
+    // トークンは必須(旧既定値 "tsunagu-dev" での脆弱な稼働を廃止。
+    // 環境変数 > exe同階層.env > ~/.config/tsunagu/env の順で解決する)
+    let token = match envutil::get("TSUNAGU_TOKEN") {
         Some(t) if !t.is_empty() => t,
         _ => {
             eprintln!(
-                "[fatal] SEAMLESS_DESK_TOKEN が未設定です。`scripts/gen-token.sh` を実行するか、\
-                 ~/.config/seamless-desk/env に SEAMLESS_DESK_TOKEN=<ランダム値> を設定してください"
+                "[fatal] TSUNAGU_TOKEN が未設定です。`scripts/gen-token.sh` を実行するか、\
+                 ~/.config/tsunagu/env に TSUNAGU_TOKEN=<ランダム値> を設定してください"
             );
             std::process::exit(1);
         }
@@ -1093,49 +1093,49 @@ fn main() {
             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
     }
-    if let Some(d) = std::env::var("SEAMLESS_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(d) = std::env::var("TSUNAGU_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
             let _ = SCROLL_DIV.set(d);
         }
     }
-    if let Some(m) = std::env::var("SEAMLESS_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(m) = std::env::var("TSUNAGU_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
         if m > 0.0 {
             let _ = MOUSE_SCALE.set(m);
         }
     }
-    if let Some(e) = std::env::var("SEAMLESS_EDGE_PX").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(e) = std::env::var("TSUNAGU_EDGE_PX").ok().and_then(|v| v.parse::<f64>().ok()) {
         if e >= 0.0 && e < 100.0 {
             let _ = EDGE_PX.set(e);
         }
     }
-    if let Some(m) = std::env::var("SEAMLESS_MOUSE_MODE").ok() {
+    if let Some(m) = std::env::var("TSUNAGU_MOUSE_MODE").ok() {
         if m.eq_ignore_ascii_case("rel") {
             MOUSE_ABS_MODE.store(false, Ordering::Relaxed);
         }
     }
-    if let Some(m) = std::env::var("SEAMLESS_SWITCH_MODE").ok() {
+    if let Some(m) = std::env::var("TSUNAGU_SWITCH_MODE").ok() {
         if m.eq_ignore_ascii_case("hotkey") {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
     }
-    if let Some(t) = envutil::get("SEAMLESS_EDGE_TAPS").and_then(|v| v.parse::<u32>().ok()) {
+    if let Some(t) = envutil::get("TSUNAGU_EDGE_TAPS").and_then(|v| v.parse::<u32>().ok()) {
         if t >= 1 && t <= 3 {
             EDGE_TAPS.store(t, Ordering::Relaxed);
         }
     }
-    if let Some(k) = std::env::var("SEAMLESS_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
+    if let Some(k) = std::env::var("TSUNAGU_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
         if (1..=127).contains(&k) {
             let _ = HOTKEY_KC.set(k);
         }
     }
     // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
-    if envutil::get("SEAMLESS_SCROLL_FLIP").as_deref() == Some("1") {
+    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
         SCROLL_FLIP.store(true, Ordering::Relaxed);
     }
-    if envutil::get("SEAMLESS_CMD_ALT").as_deref() == Some("1") {
+    if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
     }
-    if envutil::get("SEAMLESS_MUTE_SPK").as_deref() == Some("0") {
+    if envutil::get("TSUNAGU_MUTE_SPK").as_deref() == Some("0") {
         SPK_MUTE.store(false, Ordering::Relaxed);
     }
     eprintln!(
@@ -1195,25 +1195,25 @@ fn main() {
         }
     });
 
-    // 音声受信・再生(Windows→Mac。独立ポート 24901。SEAMLESS_AUDIO=0 で無効)
-    if envutil::get("SEAMLESS_AUDIO").as_deref() != Some("0") {
+    // 音声受信・再生(Windows→Mac。独立ポート 24901。TSUNAGU_AUDIO=0 で無効)
+    if envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
         audio::start(token.clone());
     }
 
-    // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。SEAMLESS_ROLE=client +
-    // SEAMLESS_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
-    // その場合は Windows 側を SEAMLESS_ROLE=server で待ち受ける)
-    let client_role = envutil::get("SEAMLESS_ROLE").as_deref() == Some("client");
+    // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。TSUNAGU_ROLE=client +
+    // TSUNAGU_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
+    // その場合は Windows 側を TSUNAGU_ROLE=server で待ち受ける)
+    let client_role = envutil::get("TSUNAGU_ROLE").as_deref() == Some("client");
     if client_role {
         let host = args
             .iter()
             .position(|a| a == "--host")
             .and_then(|i| args.get(i + 1))
             .cloned()
-            .or_else(|| envutil::get("SEAMLESS_HOST"))
+            .or_else(|| envutil::get("TSUNAGU_HOST"))
             .unwrap_or_else(|| {
                 eprintln!(
-                    "[fatal] SEAMLESS_ROLE=client には SEAMLESS_HOST=<Windows側IP> \
+                    "[fatal] TSUNAGU_ROLE=client には TSUNAGU_HOST=<Windows側IP> \
                      (または --host <IP>)の指定が必要です"
                 );
                 std::process::exit(1);
@@ -1252,8 +1252,8 @@ fn main() {
                     std::thread::sleep(Duration::from_millis(25));
                 }
             };
-            // "seamless e2e ok" (Mac keycode)
-            let body: Vec<(u16, bool)> = "seamless e2e ok".chars().filter_map(|c| {
+            // "tsunagu e2e ok" (Mac keycode)
+            let body: Vec<(u16, bool)> = "tsunagu e2e ok".chars().filter_map(|c| {
                 let kc = match c {
                     'a' => 0, 'b' => 11, 'c' => 8, 'd' => 2, 'e' => 14, 'f' => 3, 'g' => 5,
                     'h' => 4, 'i' => 34, 'j' => 38, 'k' => 40, 'l' => 37, 'm' => 46, 'n' => 45,
@@ -1505,11 +1505,11 @@ fn main() {
         CGEventTapEnable(tap, true);
     }
     eprintln!("[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13・メニューでトグル");
-    // メニューバー GUI(既定ON。--no-gui / SEAMLESS_NO_GUI=1 で CUI のみ)。
+    // メニューバー GUI(既定ON。--no-gui / TSUNAGU_NO_GUI=1 で CUI のみ)。
     // AppKit が使えない環境(ssh 由来のセッション等)では start() が失敗し、
     // 従来どおり CFRunLoop で継続する(タップはメインRunLoop共通モードのため共存可)
     let no_gui = args.iter().any(|a| a == "--no-gui")
-        || envutil::get("SEAMLESS_NO_GUI").is_some_and(|v| v == "1");
+        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v| v == "1");
     if !no_gui && gui::start() {
         eprintln!("[gui] メニューバー常駐を開始しました");
         unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)
@@ -1561,7 +1561,7 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                                 continue;
                             }
                             if kind == "image/dib" {
-                                if let Some(bytes) = sd_common::b64::decode(&data) {
+                                if let Some(bytes) = tsunagu_common::b64::decode(&data) {
                                     let bmp = dib_to_bmp(&bytes);
                                     let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
                                     eprintln!(
@@ -1618,7 +1618,7 @@ fn on_disconnect() {
         leave_win_mode_cursor_unlock(None);
     }
     eprintln!("[conn] lost. waiting for reconnect...");
-    notify("seamless-desk", "切断しました(自動再接続中)");
+    notify("tsunagu", "切断しました(自動再接続中)");
 }
 
 /// 待受モード(既定): Windows からの接続を受け入れる
@@ -1626,9 +1626,9 @@ fn on_disconnect() {
 fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
     use std::io::{BufRead, Read};
     // 待受アドレス: 既定は Tailscale IF を想定した制限なし設定だが、
-    // restart-mac.sh が SEAMLESS_BIND=$(tailscale ip -4) を渡すため、
+    // restart-mac.sh が TSUNAGU_BIND=$(tailscale ip -4) を渡すため、
     // 通常運用では Tailscale インタフェース以外で listen しない
-    let bind_ip = envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_ip = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -1708,7 +1708,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         eprintln!("[conn] established");
-        notify("seamless-desk", "Windows に接続しました");
+        notify("tsunagu", "Windows に接続しました");
         session_receive_loop(&mut reader);
         on_disconnect();
     }
@@ -1769,13 +1769,13 @@ fn client_attempt(
             spk_mute: SPK_MUTE.load(Ordering::Relaxed),
         });
     eprintln!("[conn] established");
-    notify("seamless-desk", "Windows に接続しました");
+    notify("tsunagu", "Windows に接続しました");
     session_receive_loop(&mut reader);
     on_disconnect();
     Ok(())
 }
 
-/// 接続モード(SEAMLESS_ROLE=client): Windows(サーバ)へ接続し続ける
+/// 接続モード(TSUNAGU_ROLE=client): Windows(サーバ)へ接続し続ける
 fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h: f64) {
     use std::net::ToSocketAddrs;
     let Some(addr) = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next())

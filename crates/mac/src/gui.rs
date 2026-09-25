@@ -137,7 +137,7 @@ unsafe extern "C" fn imp_edge_taps(_s: ID, _c: SEL, _n: ID) {
 }
 unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
     let _ = std::process::Command::new("open")
-        .args(["-a", "Console", "/tmp/sd-mac-run.log"])
+        .args(["-a", "Console", "/tmp/tsunagu-mac.log"])
         .spawn();
 }
 unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
@@ -152,7 +152,7 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
         }
         None => {
             eprintln!("[gui] 再起動スクリプトが見つかりません(.app 配布時は終了後に LaunchAgent が再起動します)");
-            crate::notify("seamless-desk", "再起動スクリプトが見つかりません");
+            crate::notify("tsunagu", "再起動スクリプトが見つかりません");
         }
     }
 }
@@ -260,7 +260,7 @@ unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
     refresh_status();
 }
 
-/// 開発環境のリポジトリを探す(<repo>/target/release/sd-mac から3階層上)
+/// 開発環境のリポジトリを探す(<repo>/target/release/tsunagu-mac から3階層上)
 fn restart_script() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut p = exe.clone();
@@ -632,7 +632,7 @@ pub fn start() -> bool {
         }
 
         add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
-        let quit = menu_item("seamless-desk を終了", Some(c"sdQuit:"), "q");
+        let quit = menu_item("tsunagu を終了", Some(c"sdQuit:"), "q");
         if quit.is_null() {
             return false;
         }

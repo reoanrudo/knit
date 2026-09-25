@@ -1,10 +1,10 @@
 [package]
-name = "sd-win"
-version = "0.7.6"
+name = "tsunagu-win"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
-sd-common = { path = "../common" }
+tsunagu-common = { path = "../common" }
 serde_json = { workspace = true }
 
 windows-sys = { version = "0.59", features = [

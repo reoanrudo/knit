@@ -328,7 +328,7 @@ pub fn start(token: String) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read, Write};
         let port: u16 = 24901;
-        let bind_ip = crate::envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind_ip = crate::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
             Ok(l) => l,
             Err(e) => {

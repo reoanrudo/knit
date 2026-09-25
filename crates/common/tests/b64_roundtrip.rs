@@ -6,11 +6,11 @@ fn b64_roundtrip_all_cases() {
         (0u8..=64).collect(),
     ];
     for src in cases {
-        let got = sd_common::b64::encode(&src);
-        let dec = sd_common::b64::decode(&got).expect("decode failed");
+        let got = tsunagu_common::b64::encode(&src);
+        let dec = tsunagu_common::b64::decode(&got).expect("decode failed");
         assert_eq!(dec, src, "roundtrip mismatch for {:?}", src);
     }
     // 既知の標準ベクトル
-    assert_eq!(sd_common::b64::encode(b"foobar"), "Zm9vYmFy");
-    assert_eq!(sd_common::b64::encode(b"fo"), "Zm8=");
+    assert_eq!(tsunagu_common::b64::encode(b"foobar"), "Zm9vYmFy");
+    assert_eq!(tsunagu_common::b64::encode(b"fo"), "Zm8=");
 }

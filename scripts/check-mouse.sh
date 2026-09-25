@@ -1,6 +1,6 @@
 #!/bin/bash
 # カーソル凍結(抑制)の自動検証: 切替後に Mac カーソルが動かなければ PASS
-# 使い方: ./scripts/check-mouse.sh   (sd-mac 起動中に実行)
+# 使い方: ./scripts/check-mouse.sh   (tsunagu-mac 起動中に実行)
 cd "$(dirname "$0")/.."
 
 swift /dev/stdin <<'EOF'
@@ -37,5 +37,5 @@ if moved < 20 {
 }
 EOF
 
-echo "--- sd-mac log ---"
-tail -3 /tmp/sd-mac-run.log
+echo "--- tsunagu-mac log ---"
+tail -3 /tmp/tsunagu-mac.log

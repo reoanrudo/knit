@@ -1,4 +1,4 @@
-// sd-win: Windows 側サーバ。TCP で受けた入力イベントを SendInput で注入する。
+// tsunagu-win: Windows 側サーバ。TCP で受けた入力イベントを SendInput で注入する。
 // 必須: 対話セッション起動 + OpenInputDesktop(フル権限) + SetThreadDesktop
 // v0.5: GUI サブシステム化(コンソール非依存)+タスクトレイ常駐+待受モード追加
 #![allow(non_snake_case)]
@@ -8,10 +8,10 @@
 mod audio;
 mod tray;
 
-use sd_common::keymap::mac_kc_to_win_vk;
+use tsunagu_common::keymap::mac_kc_to_win_vk;
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-use sd_common::proto::{decode, encode, Msg, PORT, VERSION};
+use tsunagu_common::proto::{decode, encode, Msg, PORT, VERSION};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::exit;
@@ -136,7 +136,7 @@ static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。Mac から Cfg で同期される
 static CMD_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
-/// Mac から Cfg で同期される(SEAMLESS_MUTE_SPK=0 で初期無効化)
+/// Mac から Cfg で同期される(TSUNAGU_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// Mac が測定した RTT(ms)。Mac から Stat で届く(ステータス窓の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -457,7 +457,7 @@ fn ensure_stdout() {
 /// 二重起動防止(5分毎の自動復帰タスクが既存インスタンスと並走しないように)
 fn acquire_single_instance() -> bool {
     unsafe {
-        let mut name: Vec<u16> = "Local\\seamless-desk-sd-win".encode_utf16().collect();
+        let mut name: Vec<u16> = "Local\\Tsunagu-Instance".encode_utf16().collect();
         name.push(0);
         let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if windows_sys::Win32::Foundation::GetLastError() == 183 {
@@ -522,7 +522,7 @@ fn detach_if_console() {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-212725-7988c2a";
+const BUILD_ID: &str = "win-20260925-220318-66f43a1";
 
 fn main() {
     ensure_stdout();
@@ -531,16 +531,16 @@ fn main() {
     if !acquire_single_instance() {
         return; // 既に起動している(トレイの既存インスタンスが稼働中)
     }
-    println!("[info] sd-win {BUILD_ID}");
+    println!("[info] tsunagu-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
-    // トークンは必須(旧既定値 "seamless-desk-dev" での脆弱な稼働を廃止)。
-    // 環境変数 > exe同階層の .env > ~/.config/seamless-desk/env の順で解決する
-    let token = match sd_common::envutil::get("SEAMLESS_DESK_TOKEN") {
+    // トークンは必須(旧既定値 "tsunagu-dev" での脆弱な稼働を廃止)。
+    // 環境変数 > exe同階層の .env > ~/.config/tsunagu/env の順で解決する
+    let token = match tsunagu_common::envutil::get("TSUNAGU_TOKEN") {
         Some(t) if !t.is_empty() => t,
         _ => {
             eprintln!(
-                "[fatal] SEAMLESS_DESK_TOKEN が未設定です。sd-win.exe と同じフォルダの .env に\
-                 SEAMLESS_DESK_TOKEN=<Mac側と同じ値> を設定してください"
+                "[fatal] TSUNAGU_TOKEN が未設定です。tsunagu-win.exe と同じフォルダの .env に\
+                 TSUNAGU_TOKEN=<Mac側と同じ値> を設定してください"
             );
             exit(1);
         }
@@ -582,13 +582,13 @@ fn main() {
     println!("[info] desktop attached. screen {w}x{h}. connecting to {host}:{port}");
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
-    // SEAMLESS_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
+    // TSUNAGU_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
     // (通常ネットワークの配布先向け)
     let role_server = args.iter().any(|a| a == "--listen")
-        || sd_common::envutil::get("SEAMLESS_ROLE").as_deref() == Some("server");
+        || tsunagu_common::envutil::get("TSUNAGU_ROLE").as_deref() == Some("server");
 
     // 接続中スピーカーミュートの初期値(既定 ON=Mac のみ発音)
-    if sd_common::envutil::get("SEAMLESS_MUTE_SPK").as_deref() == Some("0") {
+    if tsunagu_common::envutil::get("TSUNAGU_MUTE_SPK").as_deref() == Some("0") {
         SPK_MUTE_MODE.store(false, Ordering::Relaxed);
     }
 
@@ -596,13 +596,13 @@ fn main() {
     tray::start();
 
     // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
-    // (サーバモードは SEAMLESS_AUDIO_HOST で明示指定した時のみ)
-    if sd_common::envutil::get("SEAMLESS_AUDIO").as_deref() != Some("0") {
-        let audio_host = sd_common::envutil::get("SEAMLESS_AUDIO_HOST")
+    // (サーバモードは TSUNAGU_AUDIO_HOST で明示指定した時のみ)
+    if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
+        let audio_host = tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST")
             .or_else(|| if role_server { None } else { Some(host.clone()) });
         match audio_host {
             Some(h) => audio::start(h, token.clone()),
-            None => println!("[audio] サーバモードで音声先未指定のため無効(SEAMLESS_AUDIO_HOST で指定可)"),
+            None => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
         }
     }
 
@@ -644,11 +644,11 @@ fn client_loop(addr: &std::net::SocketAddr, token: &str, w: i32, h: i32) {
     }
 }
 
-/// 待受モード(SEAMLESS_ROLE=server): 相手(Mac=クライアント)からの接続を受け入れる。
+/// 待受モード(TSUNAGU_ROLE=server): 相手(Mac=クライアント)からの接続を受け入れる。
 /// hello のトークン検証後に hello_ok(自画面 w/h 付き)を返す
 fn server_loop(token: &str, port: u16, w: i32, h: i32) {
     use std::io::Read;
-    let bind_ip = sd_common::envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_ip = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -718,13 +718,13 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         drop(wr);
         CONNECTED.store(true, Ordering::Relaxed);
         println!("[conn] established");
-        tray::notify("seamless-desk", "接続しました");
+        tray::notify("tsunagu", "接続しました");
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
         let _ = session(stream, w, h);
         CONNECTED.store(false, Ordering::Relaxed);
         audio::speaker_disconnect();
         println!("[conn] lost. waiting for reconnect...");
-        tray::notify("seamless-desk", "切断しました(待機中)");
+        tray::notify("tsunagu", "切断しました(待機中)");
     }
 }
 
@@ -763,12 +763,12 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hello_ok")),
     }
     CONNECTED.store(true, Ordering::Relaxed);
-    tray::notify("seamless-desk", "接続しました");
+    tray::notify("tsunagu", "接続しました");
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(stream, w, h);
     CONNECTED.store(false, Ordering::Relaxed);
     audio::speaker_disconnect();
-    tray::notify("seamless-desk", "切断しました(自動再接続中)");
+    tray::notify("tsunagu", "切断しました(自動再接続中)");
     r
 }
 
@@ -822,7 +822,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             let Some(text) = clipboard_read_text() else {
                 // テキストが無いときは画像(CF_DIB)の変化を送る(スクショ等)
                 if let Some(dib) = clipboard_read_dib() {
-                    let b64 = sd_common::b64::encode(&dib);
+                    let b64 = tsunagu_common::b64::encode(&dib);
                     if b64.len() <= 5 * 1024 * 1024 && last_img.as_deref() != Some(b64.as_str()) {
                         last_img = Some(b64.clone());
                         if cb_tx
@@ -919,7 +919,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     continue;
                 }
                 let mut ok = false;
-                if let Some(bytes) = sd_common::b64::decode(&data) {
+                if let Some(bytes) = tsunagu_common::b64::decode(&data) {
                     if !bytes.is_empty() && bytes.len() as u64 <= recv_remain {
                         use std::io::Write as _;
                         let written = recv_file
@@ -948,7 +948,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 if !files.is_empty() && clipboard_write_files(&files) {
                     let n = files.len();
                     println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                    tray::notify("seamless-desk", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+                    tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
                 }
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift } => {
@@ -956,7 +956,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     continue;
                 }
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
-                    let ch = sd_common::charmap::mac_kc_to_char(kc);
+                    let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
                 }
                 // Mac JIS の 英数(102)/かな(104)キーは Windows 側 IME の開閉に変換する
@@ -1120,7 +1120,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// ファイル受信の開始: Downloads\SeamlessDesk へ新規作成し書き込みハンドルを返す。
+/// ファイル受信の開始: Downloads\Tsunagu へ新規作成し書き込みハンドルを返す。
 /// サイズ上限 200MB。ファイル名はパス区切り・Windows 禁止文字・先頭 '.' を無害化
 fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> {
     const MAX_FILE: u64 = 200 * 1024 * 1024;
@@ -1143,7 +1143,7 @@ fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> 
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
         .join("Downloads")
-        .join("SeamlessDesk");
+        .join("Tsunagu");
     if std::fs::create_dir_all(&dir).is_err() {
         println!("[file] 保存先フォルダ作成失敗");
         return None;

@@ -1,4 +1,4 @@
-# seamless-desk 改善履歴
+# tsunagu 改善履歴
 
 本ドキュメントは **2026-09-25 時点の `git log`(HEAD=48f261e)** を基に生成した。
 最新の状況は `git log --oneline` で確認すること。
@@ -16,7 +16,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 | 3 | 5451038 | fix: カーソル非表示を安定化(DeskflowのCGSプロパティ再現) |
 | 4 | ccc8f4a | feat: WINモード中のカーソル固定監視スレッド |
 | 5 | 614c93c | fix: 左端復帰時にWindows側の押しっぱなし修飾キーを離す |
-| 6 | d72ef77 | feat: マウス移動倍率を環境変数で調整可能に(SEAMLESS_MOUSE_SCALE) |
+| 6 | d72ef77 | feat: マウス移動倍率を環境変数で調整可能に(TSUNAGU_MOUSE_SCALE) |
 | 7 | fc40107 | fix: スクロールを0.25ノッチ刻みに量子化して滑らかに |
 | 8 | d9e1eca | feat: pong 15秒無しを切断扱いにする接続監視 |
 | 9 | a393c2b | fix: 復帰直後300msの右端判定無効化でチャタリング防止 |
@@ -80,7 +80,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 - Warp 送信をログ化、restart-mac.sh が起動直後の異常終了を検知
 
 **48f261e(改善ループ39〜43)**
-- 右端切替閾値を SEAMLESS_EDGE_PX で調整可能に(既定2px)
+- 右端切替閾値を TSUNAGU_EDGE_PX で調整可能に(既定2px)
 - 起動ログに scroll_div/mouse_scale/edge_px/clip_max を集約表示
 - マウス・スクロール累積残高に異常巨大値ガード(暴発時にリセット)
 - diag にスクロール送信回数(scrolls)を追加
@@ -107,7 +107,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 - `scripts/verify.sh`: プロセス/接続/クリップボード双方向の自動検証
   (5fee237 で追加。以降、ssh 失敗時の WARN 分離、diag 集計、IME ログ検出へ拡張)
 - `scripts/restart-mac.sh` / `scripts/deploy-win.sh`: BUILD_ID(日時+git短縮sha)を
-  それぞれ sd-mac / sd-win に埋め込み、ログ先頭行で配布物の鮮度を確認できる
+  それぞれ tsunagu-mac / tsunagu-win に埋め込み、ログ先頭行で配布物の鮮度を確認できる
   (restart-mac.sh は起動直後の異常終了も WARN で検知)
 
 ## 追記(2026-09-25 第2セッション: 改善ループ11〜50)
@@ -128,7 +128,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 | 24〜33 | スクロール残量リセット/F13 up握り/左端判定緩和/1MB化/diag拡張/固定監視150ms |
 | 34〜37 | read_timeout整合/VERSION 2/hbスレッド削除/clipリトライ/起動異常検知 |
 | 38 | deploy-win.sh のBUILD_IDスタンプ修正 |
-| 39〜43 | SEAMLESS_EDGE_PX/起動ログ集約/累積ガード/JIS ¥ _ キー |
+| 39〜43 | TSUNAGU_EDGE_PX/起動ログ集約/累積ガード/JIS ¥ _ キー |
 | 44 | 両側デプロイ+verify.sh 6項目合格 |
 | 45〜47 | Cargoメタ情報/docs取り込み/BUILD_ID更新 |
 | 48 | 本追記 |
@@ -143,7 +143,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 | 51〜53 | Mac の cmd+Tab を Windows の Alt+Tab(ウィンドウ切替)へ変換。Alt は cmd 離下まで保持し Mac と同じ操作感で確定 |
 | 54〜56 | Windows への再突入は前回出た位置へ戻す(Deskflow 標準体験)/MouseAbs 毎イベント送信で低速のステップ感除去/左端復帰を Mac 内完結化し RTT 分を削減 |
 | 57〜58 | 復帰時に Windows 画面内の現在地を記憶(次回切替の戻り先) |
-| 59〜63 | 書き込みタイムアウト/クリップボード監視 200ms/カーソル同期 16 イベント毎/run_sd.bat ログローテーション |
+| 59〜63 | 書き込みタイムアウト/クリップボード監視 200ms/カーソル同期 16 イベント毎/run_tsunagu.bat ログローテーション |
 | 64〜67 | 復帰ガード 200ms/diag に abs 送信回数/クランプ余白/Win 側 abs デバッグログ |
 | 68〜70 | 両側デプロイ+verify 7項目合格。実機ログで WM_IME_CONTROL による IME 開閉が正方向で動作することを確認 |
 | 71〜75 | ドキュメント反映(本表・usage・design)と Cargo 0.3.0 |
@@ -179,7 +179,7 @@ Phase 1 の動作確認後、「変更 → 検証 → コミット」の1サイ�
 |---|---|
 | 201〜208 | 境界チャタリング対策の試行錯誤: 距離アーム→回帰修正→アーム廃止+復帰位置の再設計/隠れカーソル固定位置の union 化 |
 | 209 | 復帰位置を MacBook 側(メイン右端内側)へ置き「戻された後に右へ動くと即再突入」を解消 |
-| 210〜214 | ホットキーロックモード(SEAMLESS_SWITCH_MODE=hotkey): F13 のみで切替、切替後は境界を超えても戻らないロック状態 |
+| 210〜214 | ホットキーロックモード(TSUNAGU_SWITCH_MODE=hotkey): F13 のみで切替、切替後は境界を超えても戻らないロック状態 |
 | 215〜219 | verify.sh に切替モード表示/両モード起動検証 |
 | 220〜226 | 実機観察サイクルと docs 反映 |
 
@@ -203,7 +203,7 @@ Deskflow 標準機能の搭載と、ユーザー体験重視の議論に基づ�
 
 | ループ | 内容 |
 |---|---|
-| 239〜243 | 【既定ON】境界ダブルタップ切替(Deskflow switchDoubleTap 相当): 境界に2回連続で当てた時だけ切替し、境界付近の日常作業と Windows 移動を分離。SEAMLESS_EDGE_TAPS=1 で従来へ戻せる |
+| 239〜243 | 【既定ON】境界ダブルタップ切替(Deskflow switchDoubleTap 相当): 境界に2回連続で当てた時だけ切替し、境界付近の日常作業と Windows 移動を分離。TSUNAGU_EDGE_TAPS=1 で従来へ戻せる |
 | 244〜246 | 【既定ON】接続/切断を macOS 通知センターに表示(切断に気づけない問題の解消) |
 | 247〜256 | 【既定ON】画像クリップボード共有(Windows→Mac): CF_DIB→base64→DIB→BMP→NSBitmapImageRep→TIFF。base64 は自前実装+ラウンドトリップ単体テスト |
 | 257〜260 | E2E 検証と修正(DIB ヘッダの biSize 読み取りオフセット修正、.NET SetData のシリアライズ形式の切り分け)。SetImage による実画像で Mac クリップボードに TIFF が載ることを確認 |

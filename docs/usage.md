@@ -1,4 +1,4 @@
-# seamless-desk 操作ガイド
+# tsunagu 操作ガイド
 
 Mac のキーボード/トラックパッドで Windows デスクトップを操作するツール。
 Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し続ける逆転構成)。
@@ -13,7 +13,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 
 切替まわりの細部の挙動:
 
-- 右端判定は Mac 画面右端から `SEAMLESS_EDGE_PX`(既定 2px)の内側。
+- 右端判定は Mac 画面右端から `TSUNAGU_EDGE_PX`(既定 2px)の内側。
   Windows 側の復帰判定は左端(x ≤ 1)で、実際にカーソルが動いたときだけ判定する
 - 切替時にドラッグしていた場合は Windows 側へ左ボタンを離すイベントを送り、
   誤ドラッグを持ち込まない
@@ -44,11 +44,11 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
   積算して自前のカーソル位置を追跡し、32 イベントに 1 回だけ実カーソル位置へ同期
   する(毎イベントの位置取得は負荷が高くカクつくため)。切替の瞬間だけ実位置を
   取って正確な高さを Windows 側へ引き継ぐ
-- 移動倍率は `SEAMLESS_MOUSE_SCALE` で調整(既定 1.0)
+- 移動倍率は `TSUNAGU_MOUSE_SCALE` で調整(既定 1.0)
 
 ## スクロール
 
-- Mac のスクロールのピクセル delta を `SEAMLESS_SCROLL_DIV`(既定 120)で除算して
+- Mac のスクロールのピクセル delta を `TSUNAGU_SCROLL_DIV`(既定 120)で除算して
   ノッチ単位へ変換し、**0.25 ノッチ刻み**で Windows へ送信する(端数は持ち越し)
 - Windows 側はノッチ × 120 ホイールユニットで注入
 - 除数を大きくすると遅くなる(40〜200 程度で調整)
@@ -70,14 +70,14 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 - Windows 側は切断後 0.5 秒から最大 3 秒のバックオフで自動再接続
 - Windows モード中に切断したら即 Mac モードへ復帰(入力の閉じ込め防止)
 
-## 調整用環境変数(sd-mac 起動時)
+## 調整用環境変数(tsunagu-mac 起動時)
 
 | 変数 | 既定 | 説明 |
 |------|------|------|
-| `SEAMLESS_SCROLL_DIV` | 120 | スクロール速度の除数。大きくすると遅い(40〜200で調整) |
-| `SEAMLESS_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
-| `SEAMLESS_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
-| `SEAMLESS_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
+| `TSUNAGU_SCROLL_DIV` | 120 | スクロール速度の除数。大きくすると遅い(40〜200で調整) |
+| `TSUNAGU_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
+| `TSUNAGU_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
+| `TSUNAGU_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
 ## ホットキーロックモード(オプション)
 
 `./scripts/restart-mac.sh --hotkey` で起動すると、画面境界での自動切替をやめ、
@@ -86,21 +86,21 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 (Windows 側で左端に行っても戻りません)。`--edge` で従来モードに戻ります。
 
 - 既定のホットキーは **F13**(Mac keycode 105)。MacBook 内蔵キーボードに F13 が
-  無い場合は `SEAMLESS_HOTKEY_KC` で変更できます(例: 右 Cmd=54、F6=97)
-  - 起動例: `SEAMLESS_HOTKEY_KC=54 ./scripts/restart-mac.sh --diag --hotkey`
+  無い場合は `TSUNAGU_HOTKEY_KC` で変更できます(例: 右 Cmd=54、F6=97)
+  - 起動例: `TSUNAGU_HOTKEY_KC=54 ./scripts/restart-mac.sh --diag --hotkey`
 - 起動ログに `switch_mode=hotkey(ロック) hotkey_kc=105` の形式で反映状況が出ます
 
 | 変数 | 既定 | 説明 |
-| `SEAMLESS_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
-| `SEAMLESS_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
-| `SEAMLESS_DESK_TOKEN` | seamless-desk-dev | 両側共通の認証トークン |
+| `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
+| `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
+| `TSUNAGU_TOKEN` | tsunagu-dev | 両側共通の認証トークン |
 
 ## 改善ループ(開発者用)
 
 変更→検証の 1 サイクルを回す手順:
 
 ```bash
-# Mac 側: ビルド鮮度保証付きで再起動(引数はそのまま sd-mac へ)
+# Mac 側: ビルド鮮度保証付きで再起動(引数はそのまま tsunagu-mac へ)
 # 起動直後に異常終了した場合はログ末尾とともに WARN を表示する
 ./scripts/restart-mac.sh --diag
 
@@ -112,8 +112,8 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 ```
 
 - `restart-mac.sh` / `deploy-win.sh` は起動のたび BUILD_ID(日時+git短縮sha)を
-  埋め込み、`/tmp/sd-mac-run.log`・`C:\Users\<user>\seamless-desk\sd-win.log` の
-  先頭行(`[info] sd-mac ...` / `[info] sd-win ...`)で配布物の鮮度を確認できる
+  埋め込み、`/tmp/tsunagu-mac.log`・`C:\Users\<user>\tsunagu\tsunagu-win.log` の
+  先頭行(`[info] tsunagu-mac ...` / `[info] tsunagu-win ...`)で配布物の鮮度を確認できる
 - `--diag` は毎秒
   `mode/moves/keys/sent/scrolls/warp_fixed/switches/cursor/moving` をログ出力。
   境界問題の切り分けは `warp_fixed`(カーソル巻き戻し回数)と
@@ -124,7 +124,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 - `verify.sh` は Windows へ ssh できない場合、該当項目を NG にせず WARN 扱いにして
   続行する(検証不能と失敗を区別)
 - `check-mouse.sh` は切替後に Mac 側カーソルが凍結(抑制)されているかを検証する
-- ログ: Mac=`/tmp/sd-mac-run.log`、Windows=`C:\Users\<user>\seamless-desk\sd-win.log`
+- ログ: Mac=`/tmp/tsunagu-mac.log`、Windows=`C:\Users\<user>\tsunagu\tsunagu-win.log`
   (ssh home で type)
 
 ## 既知の制限

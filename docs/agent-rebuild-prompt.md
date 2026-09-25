@@ -1,4 +1,4 @@
-# seamless-desk 第三者再構築エージェント プロンプト集
+# tsunagu 第三者再構築エージェント プロンプト集
 
 作成日: 2026-09-25
 目的: 開発者本人(および開発に関与したLLM)のバイアスを排除するため、**本プロジェクトに一度も関与していない第三者エージェント**に
@@ -11,7 +11,7 @@
 (※ 以下を各エージェントの prompt の先頭に連結して使用すること)
 
 ```
-あなたは seamless-desk プロジェクトに一度も関与していない第三者のシニアエンジニアです。
+あなたは tsunagu プロジェクトに一度も関与していない第三者のシニアエンジニアです。
 開発者の希望的観測を排し、本質から疑う辛口のレビューを求めます。顔は立てなくてよい。
 「動いているから正しい」は証明になりません。「たまたま動いているだけ」の箇所を特定してください。
 
@@ -21,12 +21,12 @@ Mac のキーボード/トラックパッドで、同一ネットワーク上の
 Deskflow(Synergy後継)と同じ感覚(画面端で切替)で操作する Rust 製入力共有ツール。
 CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質の再構築」と「GUI付きアプリへの昇格」。
 
-- リポジトリ: ~/ZCodeProject/seamless-desk
-- crates/mac/src/main.rs   (1347行) Mac側サーバ sd-mac
-- crates/win/src/main.rs   ( 725行) Windows側クライアント sd-win
+- リポジトリ: ~/ZCodeProject/tsunagu
+- crates/mac/src/main.rs   (1347行) Mac側サーバ tsunagu-mac
+- crates/win/src/main.rs   ( 725行) Windows側クライアント tsunagu-win
 - crates/common/src/lib.rs ( 262行) プロトコル・キーマップ・base64
 - scripts/{restart-mac.sh, deploy-win.sh, verify.sh} 検証・デプロイ
-- win-dist/{run_sd.vbs, install.bat, run_sd.bat} Windows常駐起動
+- win-dist/{run_tsunagu.vbs, install.bat, run_tsunagu.bat} Windows常駐起動
 - docs/{design.md, usage.md, improvement-log.md}
 
 ## 環境(実測で確定済み・変更不可の前提)
@@ -36,7 +36,7 @@ CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質
 - 通信: Tailscale (100.84.0.2, RTT 約6ms)。WiFi AP隔離のため Mac→Win 接続は最初の1パケットで落ちる
   → **Mac=サーバ(TCP:24900待受)、Windows=クライアント(接続し続ける)の逆転構成は環境制約で確定**
 - ビルド: Mac は aarch64-apple-darwin ネイティブ、Windows は Mac から x86_64-pc-windows-gnu クロスビルド+scp 配布
-  (Windows側での cargo 実行は不可。ssh ホスト名は `home`、Windows側パスは C:\Users\<user>\seamless-desk)
+  (Windows側での cargo 実行は不可。ssh ホスト名は `home`、Windows側パスは C:\Users\<user>\tsunagu)
 - 認証: 事前共有トークン(環境変数/.env から供給、コミットしない)
 - 通信は生TCP+JSON Lines(serde)。TLSは Tailscale が WireGuard 暗号化を持つため省略(設計判断)
 
@@ -45,8 +45,8 @@ CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質
 | # | 機能 | 実装方式 | レビュー観点 |
 |---|------|---------|------------|
 | 1 | 画面端切替(edge) | delta積算のCUR_POS+16イベント毎同期、二段階判定(積算超過かつライブ位置が境界付近)。CGGetActiveDisplayListで全ディスプレイ和集合右端UNION_MAX_X、出口ディスプレイy範囲EDGE_DISP_Yを記録 | 積算とライブの乖離、3画面レイアウト変更への追従 |
-| 2 | ダブルタップ切替(既定ON) | 「下から閾値を跨いだ瞬間」のみヒット計数、700ms窓2回。1回目は境界-15pxへ跳ね返し(CGWarpMouseCursorPosition)。SEAMLESS_EDGE_TAPS=1で1回切替に戻せる | 跳ね返し体感、窓長さ、誤カウント |
-| 3 | ホットキーロックモード | --hotkey / SEAMLESS_SWITCH_MODE=hotkey。F13(変更可)でトグル、切替後は境界を超えても戻らないロック | hotkeyモード中の復帰経路整合 |
+| 2 | ダブルタップ切替(既定ON) | 「下から閾値を跨いだ瞬間」のみヒット計数、700ms窓2回。1回目は境界-15pxへ跳ね返し(CGWarpMouseCursorPosition)。TSUNAGU_EDGE_TAPS=1で1回切替に戻せる | 跳ね返し体感、窓長さ、誤カウント |
+| 3 | ホットキーロックモード | --hotkey / TSUNAGU_SWITCH_MODE=hotkey。F13(変更可)でトグル、切替後は境界を超えても戻らないロック | hotkeyモード中の復帰経路整合 |
 | 4 | 絶対位置送信モード(既定ON) | Mac が Windows 仮想カーソル WIN_CUR(f64)を管理し MouseAbs(0..1正規化)を毎イベント送信→Win は MOUSEEVENTF_MOVE\|MOUSEEVENTF_ABSOLUTE で注入。方向別スケール。二重加速(Windows加速曲線)を回避 | 高速移動時の精度、毎イベント送信の帯域 |
 | 5 | 相対移動モード(fallback) | MouseMove + Windows側サブピクセル累積(f64累積し整数部のみ注入) | 絶対モードとの挙動一致度 |
 | 6 | スクロール変換 | Mac のピクセルdeltaを SCROLL_DIV(120)で除算→0.25ノッチ量子化→Win はノッチ×120で注入 | 慣性スクロールの再現性、除数の妥当性 |
@@ -61,8 +61,8 @@ CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質
 | 15 | 復帰経路6本 | ①abs-left(Win仮想カーソル左端) ②Windows側Return通知(左端x<=1+700msクールダウン) ③F13 ④自己修復(WIN外なのに非表示を150msで検知し復元) ⑤タップ定期再有効化(約1秒毎・冪等) ⑥ウォッチドッグ(WIN中、タップ受信<2s なのに abs送信5秒停止で強制復帰) | 6本もの保険が必要な構造的脆弱性の根本原因 |
 | 16 | ドラッグ持ち込み防止 | 切替時 Windows 側へ左ボタン解放送信、復帰時 mods.release_all | 抜け穴(他ボタン、修飾キー) |
 | 17 | チャタリング防止 | EDGE_GUARD_UNTIL_MS(復帰後400ms判定無効)+Win側クールダウン0.7s | 二重防御の整合 |
-| 18 | Windows非表示常駐 | run_sd.vbs(wscript が cmd /c をリダイレクト付きで非表示起動)+schtasks。MainWindowHandle=0を確認済み | ログローテーション、自動起動の堅牢さ |
-| 19 | 自動検証 | verify.sh 7項目(両プロセス/ssh/established/sd-winプロセス/クリップ双方向/IMEログ/diag集計) | 実操作(E2E)を検証できない箇所 |
+| 18 | Windows非表示常駐 | run_tsunagu.vbs(wscript が cmd /c をリダイレクト付きで非表示起動)+schtasks。MainWindowHandle=0を確認済み | ログローテーション、自動起動の堅牢さ |
+| 19 | 自動検証 | verify.sh 7項目(両プロセス/ssh/established/tsunagu-winプロセス/クリップ双方向/IMEログ/diag集計) | 実操作(E2E)を検証できない箇所 |
 
 ## 実装上の重要パターン(ここを崩すと実績のあるバグが再発する)
 
@@ -88,7 +88,7 @@ CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質
 - IME(かな/英数)、cmd+Tab→Alt+Tab、クリップボード(テキスト双方向+画像Win→Mac)
 - 6本の復帰経路(削減は可、ただし削減理由を明示し検証すること)
 - Windows非表示常駐(VBS+タスク)と verify.sh 7項目合格
-- 環境変数による既存チューニング(SEAMLESS_* 系)の互換(設定ファイル導入時は環境変数をフォールバックに)
+- 環境変数による既存チューニング(TSUNAGU_* 系)の互換(設定ファイル導入時は環境変数をフォールバックに)
 
 ## 既知の棚上げ・未解決(第三者視点で再評価してよい)
 
@@ -106,7 +106,7 @@ CLI の2バイナリ構成で現在本番稼働中。今回の目標は「品質
 3. Mac 再起動: `scripts/restart-mac.sh`(BUILD_ID スタンプ+起動確認)
 4. Windows 配布: `scripts/deploy-win.sh`(scp + schtasks 再実行、/End→taskkill→/Run)
 5. `scripts/verify.sh` 7項目合格を確認
-6. 実機ログ: Mac /tmp/sd-mac-run.log、Win C:\Users\<user>\seamless-desk\sd-win.log
+6. 実機ログ: Mac /tmp/tsunagu-mac.log、Win C:\Users\<user>\tsunagu\tsunagu-win.log
    (ssh home で Get-Content。`[edge]`/`[return]`/diag 行が切替挙動の証拠)
 ```
 
@@ -245,7 +245,7 @@ Logitech Flow である。
 ```
 ## あなたのミッション(GUIアプリ化の設計と実装)
 
-seamless-desk を「アプリ」に昇格させる。CLI は従来どおり daemon 的中核として残し、
+tsunagu を「アプリ」に昇格させる。CLI は従来どおり daemon 的中核として残し、
 macOS 側に GUI を持たせる。Windows 側は現状のトレイなし常駐のままでよい(優先度低)。
 
 ### 要件
@@ -258,7 +258,7 @@ macOS 側に GUI を持たせる。Windows 側は現状のトレイなし常駐�
    - 切替モード(境界/ダブルタップ回数/タップ窓ms/ホットキーモード+キー)
    - マウス(絶対/相対、倍率)、スクロール除数
    - ネットワーク(ポート、トークンは参照のみで編集不可でもよい)
-   - 変更は設定ファイルに永続化。既存 SEAMLESS_* 環境変数は「設定ファイル<環境変数」の
+   - 変更は設定ファイルに永続化。既存 TSUNAGU_* 環境変数は「設定ファイル<環境変数」の
      優先順で互換維持(未設定項目のみ環境変数フォールバック)
 3. 実装方式の選定(以下を比較し、理由を示して1つ選べ):
    a) 現行方式の延長: objc_msgSend 固定シグネチャで NSStatusItem/NSMenu/NSWindow を直叩き

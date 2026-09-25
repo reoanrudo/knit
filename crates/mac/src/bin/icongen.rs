@@ -1,5 +1,5 @@
 // icongen: アプリケーションアイコン素材を生成する開発ツール(手動実行)。
-//   cargo run -p sd-mac --bin icongen
+//   cargo run -p tsunagu-mac --bin icongen
 // 出力:
 //   assets/AppIcon.iconset/*.png  (icns化は scripts/gen-icons.sh の iconutil が行う)
 //   win-dist/app.ico              (Windows exe 埋込 + トレイ用)

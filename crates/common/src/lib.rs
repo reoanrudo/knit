@@ -1,10 +1,24 @@
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
-    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/seamless-desk/env。
+    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env。
     //! 配布形態(.app バンドル埋め込み / exe 同梱 .env / ホーム設定)のどれでも
     //! 同一コードで動かすための仕組み。KEY=VALUE 形式(1行1エントリ、# はコメント)。
+    //! 旧名称(v0.7 以前の seamless-desk)の環境変数・設定パスもフォールバックで
+    //! 読むため、既存環境を書き換えずにそのまま移行できる。
 
     use std::sync::OnceLock;
+
+    /// 旧名称(v0.7 以前)へのキー変換。
+    /// TSUNAGU_TOKEN ← SEAMLESS_DESK_TOKEN、TSUNAGU_X ← SEAMLESS_X
+    fn legacy_key(key: &str) -> String {
+        if key == "TSUNAGU_TOKEN" {
+            return "SEAMLESS_DESK_TOKEN".to_string();
+        }
+        match key.strip_prefix("TSUNAGU_") {
+            Some(rest) => format!("SEAMLESS_{rest}"),
+            None => String::new(),
+        }
+    }
 
     fn entries() -> &'static Vec<(String, String)> {
         static E: OnceLock<Vec<(String, String)>> = OnceLock::new();
@@ -23,7 +37,10 @@ pub mod envutil {
             }
             for key in ["HOME", "USERPROFILE"] {
                 if let Some(home) = std::env::var_os(key) {
-                    paths.push(std::path::Path::new(&home).join(".config/seamless-desk/env"));
+                    let cfg = std::path::Path::new(&home).join(".config");
+                    paths.push(cfg.join("tsunagu/env"));
+                    // 旧名称時代の設定パス(v0.7 からの移行措置)
+                    paths.push(cfg.join("seamless-desk/env"));
                 }
             }
             for p in paths {
@@ -45,14 +62,35 @@ pub mod envutil {
         })
     }
 
-    /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する
+    /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する。
+    /// 旧名称のキー(SEAMLESS_*)も最後に確認する(v0.7 設定からの移行)
     pub fn get(key: &str) -> Option<String> {
         if let Ok(v) = std::env::var(key) {
             if !v.is_empty() {
                 return Some(v);
             }
         }
-        entries().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        let legacy = legacy_key(key);
+        let hit = entries()
+            .iter()
+            .find(|(k, _)| k == key)
+            .or_else(|| {
+                if legacy.is_empty() {
+                    None
+                } else {
+                    entries().iter().find(|(k, _)| *k == legacy)
+                }
+            })
+            .map(|(_, v)| v.clone());
+        // 旧名称の環境変数も受け入れる(スクリプト側の書き換え漏れ保険)
+        if hit.is_none() && !legacy.is_empty() {
+            if let Ok(v) = std::env::var(&legacy) {
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        hit
     }
 }
 
@@ -60,7 +98,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 3; // 3: ファイル送信・設定同期・RTT・音量制御追加(旧バイナリ混在の早期検知用)
+    pub const VERSION: u32 = 4; // 4: Tsunagu へ改名(旧 seamless-desk v0.7 との混在早期検知)
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -143,7 +181,7 @@ pub mod proto {
         #[serde(rename = "stat")]
         Stat { rtt: u64 },
         /// ファイル送信(Mac→Win)。begin → chunk(base64, 生3MB以下) → end の順。
-        /// Windows 側は Downloads\SeamlessDesk へ保存し CF_HDROP をクリップボードへ
+        /// Windows 側は Downloads\Tsunagu へ保存し CF_HDROP をクリップボードへ
         #[serde(rename = "file_begin")]
         FileBegin { name: String, size: u64 },
         #[serde(rename = "file_chunk")]

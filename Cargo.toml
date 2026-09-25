@@ -4,9 +4,9 @@ default-members = ["crates/common", "crates/mac"]
 members = ["crates/common", "crates/mac", "crates/win"]
 
 [workspace.package]
-version = "0.7.6"
+version = "0.8.0"
 edition = "2021"
-description = "Mac⇄Windows 入力共有ツール(seamless-desk): CGEventTap→TCP→SendInput"
+description = "Mac⇄Windows 入力共有ツール(tsunagu): CGEventTap→TCP→SendInput"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
