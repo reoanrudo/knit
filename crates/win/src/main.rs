@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
     VK_SHIFT, VK_LWIN,
@@ -58,6 +59,28 @@ unsafe extern "system" {
     fn GlobalUnlock(hMem: *mut core::ffi::c_void) -> i32;
     fn GlobalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn GlobalSize(hMem: *mut core::ffi::c_void) -> usize;
+}
+
+// ---------- Win32 直宣言(コンソール離脱) ----------
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetConsoleWindow() -> *mut core::ffi::c_void;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// windows-sys 0.59 の Threading モジュールに無いため直宣言(ABI は安定)
+    fn CreateProcessW(
+        application_name: *const u16,
+        command_line: *mut u16,
+        process_attributes: *const core::ffi::c_void,
+        thread_attributes: *const core::ffi::c_void,
+        inherit_handles: i32,
+        creation_flags: u32,
+        environment: *const core::ffi::c_void,
+        current_directory: *const u16,
+        startup_info: *mut STARTUPINFOW,
+        process_information: *mut PROCESS_INFORMATION,
+    ) -> i32;
 }
 
 // ---------- Win32 直宣言(IME 制御) ----------
@@ -102,6 +125,7 @@ fn ime_set_open(open: bool) {
 
 const CF_UNICODETEXT: u32 = 13;
 const CF_DIB: u32 = 8;
+const CF_HDROP: u32 = 15;
 const GMEM_MOVEABLE: u32 = 0x0002;
 /// 最後に Mac から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -109,7 +133,15 @@ static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(
 static ALT_TAB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// トレイ/バルーン表示用の接続状態(セッション確立で true)
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。Mac から Cfg で同期される
+static CMD_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Mac が測定した RTT(ms)。Mac から Stat で届く(ステータス窓の表示用)
+static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
+static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
+/// ファイル送信 1 チャンクの生バイト上限(b64 後 4MB = プロトコル行上限 8MB 未満)
+const FILE_CHUNK_RAW: usize = 3 * 1024 * 1024;
 
 fn clipboard_read_text() -> Option<String> {
     unsafe {
@@ -190,6 +222,52 @@ fn clipboard_write_text(s: &str) -> bool {
         GlobalUnlock(h);
         if SetClipboardData(CF_UNICODETEXT, h).is_null() {
             GlobalFree(h); // 設定失敗時は呼び出し側の解放責任
+            CloseClipboard();
+            return false;
+        }
+        CloseClipboard();
+        true
+    }
+}
+
+/// ファイルパス群をクリップボードへ(CF_HDROP)。Mac からのファイル受信完了時に
+/// 呼ぶ。受け取ったファイルは Windows 側でそのまま Ctrl+V で貼り付けられる
+fn clipboard_write_files(paths: &[String]) -> bool {
+    // DROPFILES ヘッダ(20byte): pFiles=20, pt=(0,0), fNC=0, fWide=1 の後ろに
+    // UTF16 パス群(\0 区切り、リスト終端に追加の \0)が続く。pack(1) レイアウトを
+    // 手動で書く(アライン未定義の packed 参照を避けるため)
+    const HEAD: usize = 20;
+    let mut w: Vec<u16> = Vec::new();
+    for p in paths {
+        w.extend(p.encode_utf16());
+        w.push(0);
+    }
+    w.push(0); // リスト終端
+    let total = HEAD + w.len() * 2;
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, total);
+        if h.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let p = GlobalLock(h) as *mut u8;
+        if p.is_null() {
+            GlobalFree(h);
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::write_bytes(p, 0, total);
+        let buf = std::slice::from_raw_parts_mut(p, total);
+        buf[0..4].copy_from_slice(&(HEAD as u32).to_le_bytes()); // pFiles
+        buf[16..20].copy_from_slice(&1i32.to_le_bytes()); // fWide = UTF16
+        std::ptr::copy_nonoverlapping(w.as_ptr(), p.add(HEAD) as *mut u16, w.len());
+        GlobalUnlock(h);
+        if SetClipboardData(CF_HDROP, h).is_null() {
+            GlobalFree(h);
             CloseClipboard();
             return false;
         }
@@ -311,24 +389,26 @@ impl ModState {
         Self { ctrl: false, alt: false, win: false, shift: false }
     }
     fn apply(&mut self, ctrl: bool, opt: bool, cmd: bool, shift: bool) {
-        // Mac: cmd→Win Ctrl, option→Alt, ctrl→Winキー, shift→Shift
-        let want = [(VK_CONTROL, cmd), (VK_MENU, opt), (VK_LWIN, ctrl), (VK_SHIFT, shift)];
-        let have = [
-            (VK_CONTROL, self.ctrl),
-            (VK_MENU, self.alt),
-            (VK_LWIN, self.win),
-            (VK_SHIFT, self.shift),
+        // Mac: cmd→Win Ctrl(既定)/ Alt(Cfg で切替可), option→もう一方, ctrl→Winキー, shift→Shift
+        let (cmd_vk, opt_vk) = if CMD_ALT.load(Ordering::Relaxed) {
+            (VK_MENU, VK_CONTROL)
+        } else {
+            (VK_CONTROL, VK_MENU)
+        };
+        let want = [(cmd_vk, cmd), (opt_vk, opt), (VK_LWIN, ctrl), (VK_SHIFT, shift)];
+        let mut state = [
+            (VK_CONTROL, &mut self.ctrl),
+            (VK_MENU, &mut self.alt),
+            (VK_LWIN, &mut self.win),
+            (VK_SHIFT, &mut self.shift),
         ];
-        for (vk, pressed_now) in have {
-            let target = want.iter().find(|(v, _)| *v == vk).map(|(_, t)| *t).unwrap_or(false);
-            if pressed_now != target {
-                inject_key(vk, !target);
+        for (vk, cur) in &mut state {
+            let target = want.iter().find(|(v, _)| *v == *vk).map(|(_, t)| *t).unwrap_or(false);
+            if **cur != target {
+                inject_key(*vk, !target);
             }
+            **cur = target;
         }
-        self.ctrl = cmd;
-        self.alt = opt;
-        self.win = ctrl;
-        self.shift = shift;
     }
     fn release_all(&mut self) {
         self.apply(false, false, false, false);
@@ -386,10 +466,65 @@ fn acquire_single_instance() -> bool {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-201307-d661fa3";
+/// コンソール付き起動(手動実行/SSH/ターミナル)を検出したら、DETACHED_PROCESS
+/// な自分を再起動して即終了する。GUI サブシステムでもコンソールから起動すると
+/// そのコンソールに所属し、「ターミナルを閉じたら接続が切れる」原因になる。
+/// 起動経路がどうであれコンソールの生死に左右されない本体へ置き換える
+/// (ミューテックス取得の前に行うため、再起動先との二重起動競合も起きない)
+fn detach_if_console() {
+    unsafe {
+        if GetConsoleWindow().is_null() {
+            return; // コンソール無し起動(schtasks/vbs)= そのまま本体として続行
+        }
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // コマンドラインを "exeパス" 引数… の形で組み立てる
+        let mut cmd = String::new();
+        cmd.push('"');
+        cmd.push_str(&exe.to_string_lossy());
+        cmd.push('"');
+        for a in std::env::args().skip(1) {
+            cmd.push(' ');
+            cmd.push_str(&a);
+        }
+        let mut cmdw: Vec<u16> = cmd.encode_utf16().collect();
+        cmdw.push(0);
+        let mut si: STARTUPINFOW = std::mem::zeroed();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        let ok = CreateProcessW(
+            std::ptr::null(),
+            cmdw.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            DETACHED_PROCESS,
+            std::ptr::null(),
+            std::ptr::null(),
+            &mut si,
+            &mut pi,
+        );
+        if ok != 0 {
+            // 子プロセスは自分のミューテックスを取得して常駐を引き継ぐ
+            windows_sys::Win32::Foundation::CloseHandle(pi.hProcess);
+            windows_sys::Win32::Foundation::CloseHandle(pi.hThread);
+            println!("[info] コンソールから独立したプロセスへ引き継ぎました");
+            exit(0);
+        }
+        // CreateProcess 失敗時はそのまま続行(コンソール依存は受容するが機能は継続)
+        eprintln!("[warn] デタッチ再起動に失敗。コンソール付きで継続します");
+    }
+}
+
+const BUILD_ID: &str = "win-20260925-203943-52a8f6c";
 
 fn main() {
     ensure_stdout();
+    // コンソール付き起動なら DETACHED な自分へ置き換わって終了(常駐性の根保証)
+    detach_if_console();
     if !acquire_single_instance() {
         return; // 既に起動している(トレイの既存インスタンスが稼働中)
     }
@@ -646,6 +781,10 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     });
     let reader = BufReader::new(stream);
     let mut mods = ModState::new();
+    // ファイル受信の途中状態(FileBegin → FileChunk… → FileEnd)。受信ループは
+    // シングルスレッドなのでローカル変数で持つ(チャンク順序もここで保証される)
+    let mut recv_file: Option<std::fs::File> = None;
+    let mut recv_remain: u64 = 0;
     // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
     // 端数は次イベントへ持ち越す。
@@ -721,8 +860,80 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             Msg::HelloOk { name, w: mw, h: mh } => {
                 println!("[hello] (重複) ok from {name} (mac screen {mw}x{mh})");
             }
-            Msg::Ping => {
-                let _ = wtx.send(encode(&Msg::Pong));
+            Msg::Ping { ts } => {
+                let _ = wtx.send(encode(&Msg::Pong { ts }));
+            }
+            Msg::Cfg { cmd_alt } => {
+                CMD_ALT.store(cmd_alt, Ordering::Relaxed);
+                println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
+            }
+            Msg::Vol { op } => {
+                // VK_VOLUME_UP(0xAF)/DOWN(0xAE)/MUTE(0xAD)。up/down は2回送って調整幅を稼ぐ
+                const VK_VOL_UP: u16 = 0xAF;
+                const VK_VOL_DOWN: u16 = 0xAE;
+                const VK_VOL_MUTE: u16 = 0xAD;
+                match op {
+                    0 => {
+                        for _ in 0..2 {
+                            inject_key(VK_VOL_UP, false);
+                            inject_key(VK_VOL_UP, true);
+                        }
+                    }
+                    1 => {
+                        for _ in 0..2 {
+                            inject_key(VK_VOL_DOWN, false);
+                            inject_key(VK_VOL_DOWN, true);
+                        }
+                    }
+                    _ => {
+                        inject_key(VK_VOL_MUTE, false);
+                        inject_key(VK_VOL_MUTE, true);
+                    }
+                }
+                println!("[vol] op={op}");
+            }
+            Msg::Stat { rtt } => {
+                RTT_MS.store(rtt, Ordering::Relaxed);
+            }
+            Msg::FileBegin { name, size } => {
+                recv_file = file_begin(&name, size, &mut recv_remain);
+            }
+            Msg::FileChunk { data } => {
+                if recv_file.is_none() {
+                    continue;
+                }
+                let mut ok = false;
+                if let Some(bytes) = sd_common::b64::decode(&data) {
+                    if !bytes.is_empty() && bytes.len() as u64 <= recv_remain {
+                        use std::io::Write as _;
+                        let written = recv_file
+                            .as_mut()
+                            .map(|f| f.write_all(&bytes).is_ok())
+                            .unwrap_or(false);
+                        if written {
+                            recv_remain -= bytes.len() as u64;
+                            ok = true;
+                        }
+                    }
+                }
+                if !ok {
+                    println!("[file] chunk 失敗。受信を破棄します");
+                    recv_file = None;
+                    recv_remain = 0;
+                }
+            }
+            Msg::FileEnd => {
+                recv_file = None; // File の drop で閉じる
+                recv_remain = 0;
+                let files = PENDING_FILES
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                if !files.is_empty() && clipboard_write_files(&files) {
+                    let n = files.len();
+                    println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
+                    tray::notify("seamless-desk", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+                }
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift } => {
                 if !hello_done {
@@ -891,6 +1102,60 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     mods.release_all();
     running_w.store(false, Ordering::Relaxed);
     Ok(())
+}
+
+/// ファイル受信の開始: Downloads\SeamlessDesk へ新規作成し書き込みハンドルを返す。
+/// サイズ上限 200MB。ファイル名はパス区切り・Windows 禁止文字・先頭 '.' を無害化
+fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> {
+    const MAX_FILE: u64 = 200 * 1024 * 1024;
+    if size == 0 || size > MAX_FILE {
+        println!("[file] 拒否: {name} ({size} bytes)");
+        return None;
+    }
+    let safe: String = name
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect();
+    let safe = safe.trim_matches('.').trim().to_string();
+    if safe.is_empty() {
+        return None;
+    }
+    let dir = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Downloads")
+        .join("SeamlessDesk");
+    if std::fs::create_dir_all(&dir).is_err() {
+        println!("[file] 保存先フォルダ作成失敗");
+        return None;
+    }
+    let path = dir.join(&safe);
+    match std::fs::File::create(&path) {
+        Ok(f) => {
+            *remain = size;
+            let full = path.to_string_lossy().into_owned();
+            println!("[file] begin: {safe} ({size} bytes)");
+            PENDING_FILES
+                .lock()
+                .map(|mut g| {
+                    g.push(full);
+                    // クリップボードに載せるのは直近 16 件まで(無制限増加を防ぐ)
+                    if g.len() > 16 {
+                        let excess = g.len() - 16;
+                        g.drain(..excess);
+                    }
+                })
+                .ok();
+            Some(f)
+        }
+        Err(_) => {
+            println!("[file] 作成失敗: {safe}");
+            None
+        }
+    }
 }
 
 /// カーソルが画面左端に達したら Mac へ復帰通知(連打防止 1 秒クールダウン)。

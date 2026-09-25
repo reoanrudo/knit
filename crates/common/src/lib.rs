@@ -60,7 +60,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 2; // 2: Clip同期・Return ny 追加(旧バイナリ混在の早期検知用)
+    pub const VERSION: u32 = 3; // 3: ファイル送信・設定同期・RTT・音量制御追加(旧バイナリ混在の早期検知用)
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -117,9 +117,34 @@ pub mod proto {
         #[serde(rename = "warp")]
         Warp { nx: f64, ny: f64 },
         #[serde(rename = "ping")]
-        Ping,
+        Ping {
+            /// 送信時刻(unix ms)。Pong にエコーバックされ RTT 測定に使う
+            #[serde(default)]
+            ts: u64,
+        },
         #[serde(rename = "pong")]
-        Pong,
+        Pong {
+            #[serde(default)]
+            ts: u64,
+        },
+        /// 設定同期: ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。
+        /// 接続確立時とメニュー切替時に Mac→Windows へ送る
+        #[serde(rename = "cfg")]
+        Cfg { cmd_alt: bool },
+        /// Windows の音量制御(0=up / 1=down / 2=ミュート)。Mac メニューから送る
+        #[serde(rename = "vol")]
+        Vol { op: u8 },
+        /// 接続品質通知: Mac が測定した RTT(ms)を Windows 側の表示へ回す
+        #[serde(rename = "stat")]
+        Stat { rtt: u64 },
+        /// ファイル送信(Mac→Win)。begin → chunk(base64, 生3MB以下) → end の順。
+        /// Windows 側は Downloads\SeamlessDesk へ保存し CF_HDROP をクリップボードへ
+        #[serde(rename = "file_begin")]
+        FileBegin { name: String, size: u64 },
+        #[serde(rename = "file_chunk")]
+        FileChunk { data: String },
+        #[serde(rename = "file_end")]
+        FileEnd,
         #[serde(rename = "bye")]
         Bye,
     }

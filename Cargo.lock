@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "sd-mac"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "sd-common",
  "serde_json",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "sd-win"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "sd-common",
  "serde_json",

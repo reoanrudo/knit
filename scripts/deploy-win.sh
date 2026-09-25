@@ -24,8 +24,10 @@ if [ ! -f "$TOKEN_SRC" ]; then
 fi
 
 echo "[deploy-win] deploying (stop -> copy -> start)..."
-# コンソール窓が出ないよう VBS 起動へタスクを更新(冪等)
-ssh -o BatchMode=yes home "schtasks /Create /TN seamless_desk_run /TR "wscript.exe \"C:\\Users\\<user>\\seamless-desk\\run_sd.vbs\"" /SC ONCE /ST 23:59 /F" >/dev/null 2>&1 || true
+# コンソール窓が出ないよう VBS 起動へタスクを更新(冪等)。
+# 注意: クォートは外側をシングルにしないとリモート側で割れてタスク作成が
+# 黙って失敗する(実績バグ: watch タスクが消えて自動復帰が無効化されていた)
+ssh -o BatchMode=yes home 'schtasks /Create /TN seamless_desk_run /TR "wscript.exe C:\Users\<user>\seamless-desk\run_sd.vbs" /SC ONCE /ST 23:59 /F' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /End /TN seamless_desk_run" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "taskkill /IM sd-win.exe /F" >/dev/null 2>&1 || true
 sleep 2
@@ -34,8 +36,8 @@ scp -o BatchMode=yes target/x86_64-pc-windows-gnu/release/sd-win.exe home:C:/Use
 scp -o BatchMode=yes win-dist/run_sd.vbs win-dist/run_sd.bat home:C:/Users/<user>/seamless-desk/ >/dev/null
 scp -o BatchMode=yes win-dist/app.ico home:C:/Users/<user>/seamless-desk/ >/dev/null
 scp -o BatchMode=yes "$TOKEN_SRC" home:C:/Users/<user>/seamless-desk/.env >/dev/null
-# 自動復帰ウォッチ(5分毎。二重起動は exe 側のミューテックスで即終了)
-ssh -o BatchMode=yes home "schtasks /Create /TN seamless_desk_watch /TR "wscript.exe \"C:\\Users\\<user>\\seamless-desk\\run_sd.vbs\"" /SC MINUTE /MO 5 /F" >/dev/null 2>&1 || true
+# 自動復帰ウォッチ(毎分。二重起動は exe 側のミューテックスで即終了)
+ssh -o BatchMode=yes home 'schtasks /Create /TN seamless_desk_watch /TR "wscript.exe C:\Users\<user>\seamless-desk\run_sd.vbs" /SC MINUTE /MO 1 /F' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /Run /TN seamless_desk_run" >/dev/null 2>&1
 sleep 3
 

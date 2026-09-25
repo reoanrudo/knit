@@ -113,6 +113,8 @@ static GUI_TOGGLE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_MODE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_TAPS_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_AUDIO_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_CMD_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_SCROLL_ITEM: AtomicUsize = AtomicUsize::new(0);
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
 
@@ -159,6 +161,83 @@ unsafe extern "C" fn imp_audio_toggle(_s: ID, _c: SEL, _n: ID) {
     eprintln!("[audio] mute -> {next}");
     refresh_status();
 }
+unsafe extern "C" fn imp_cmd_map(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::CMD_ALT.load(Ordering::Relaxed);
+    crate::CMD_ALT.store(next, Ordering::Relaxed);
+    eprintln!("[cfg] ⌘キー -> {}", if next { "Alt" } else { "Ctrl" });
+    crate::send_msg(&crate::Msg::Cfg { cmd_alt: next });
+    refresh_status();
+}
+unsafe extern "C" fn imp_scroll_flip(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::SCROLL_FLIP.load(Ordering::Relaxed);
+    crate::SCROLL_FLIP.store(next, Ordering::Relaxed);
+    eprintln!("[cfg] スクロール方向 -> {}", if next { "反転(Mac準拠)" } else { "標準(Windows準拠)" });
+    refresh_status();
+}
+unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
+    // 3 つのメニュー項目(▲/▼/ミュート)から送信元 tag で判別する
+    let tag: isize = {
+        let f: unsafe extern "C" fn(ID, SEL) -> isize =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        f(sender, sel(c"tag"))
+    };
+    let op = match tag {
+        1 => 0u8, // up
+        2 => 1,   // down
+        _ => 2,   // mute
+    };
+    crate::send_msg(&crate::Msg::Vol { op });
+}
+unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
+    // accessory アプリでも明示アクティベートすればモーダルパネルは出せる
+    let app = msg0(crate::objc_getClass(c"NSApplication".as_ptr()), sel(c"sharedApplication"));
+    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    let panel = msg0(crate::objc_getClass(c"NSOpenPanel".as_ptr()), sel(c"openPanel"));
+    if panel.is_null() {
+        eprintln!("[gui] NSOpenPanel を生成できません");
+        return;
+    }
+    msg1_void_u8(panel, sel(c"setCanChooseFiles:"), 1);
+    msg1_void_u8(panel, sel(c"setCanChooseDirectories:"), 0);
+    msg1_void_u8(panel, sel(c"setAllowsMultipleSelection:"), 1);
+    msg1_void_id(panel, sel(c"setMessage:"), crate::nsstring("Windows へ送信します(合計 200MB まで)"));
+    // runModal は選択が確定するまで戻らない(メイン RunLoop を内回りする)
+    let resp = crate::msg0_isize(panel, sel(c"runModal"));
+    if resp != 1 {
+        return; // NSModalResponseOK 以外 = キャンセル
+    }
+    let urls = msg0(panel, sel(c"URLs"));
+    if urls.is_null() {
+        return;
+    }
+    let n = crate::msg0_isize(urls, sel(c"count")).max(0);
+    let at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
+        std::mem::transmute(crate::objc_msgSend as usize);
+    let mut paths = Vec::new();
+    for i in 0..n.min(64) {
+        let url = at(urls, sel(c"objectAtIndex:"), i as usize);
+        if url.is_null() {
+            continue;
+        }
+        let path = msg0(url, sel(c"path")); // NSURL.path -> NSString
+        if path.is_null() {
+            continue;
+        }
+        let utf8 = crate::msg0_cstr(path, sel(c"UTF8String"));
+        if utf8.is_null() {
+            continue;
+        }
+        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        if !s.is_empty() {
+            paths.push(s);
+        }
+    }
+    if !paths.is_empty() {
+        let pb: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+        eprintln!("[gui] ファイル送信: {} 件", pb.len());
+        crate::send_files_to_win(pb);
+    }
+}
 unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     eprintln!("[gui] メニューから終了しました");
     std::process::exit(0);
@@ -201,7 +280,13 @@ fn refresh_status() {
         if !state.is_null() {
             let conn = if connected { "接続済" } else { "切断(再接続待機中)" };
             let mode = if win { "Windows 操作中" } else { "Mac" };
-            let text = format!("状態: {conn} ・ {mode} ・ {BUILD}", BUILD = crate::BUILD_ID);
+            let rtt = crate::RTT_MS.load(Ordering::Relaxed);
+            let rtt_s = if connected && rtt > 0 {
+                format!("・遅延 {rtt}ms")
+            } else {
+                String::new()
+            };
+            let text = format!("状態: {conn} ・ {mode}{rtt_s} ・ {BUILD}", BUILD = crate::BUILD_ID);
             msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
         }
         let toggle = GUI_TOGGLE_ITEM.load(Ordering::Relaxed) as ID;
@@ -232,6 +317,24 @@ fn refresh_status() {
                 "音声転送: ON"
             };
             msg1_void_id(audio_item, sel(c"setTitle:"), nsstring(t));
+        }
+        let cmd_item = GUI_CMD_ITEM.load(Ordering::Relaxed) as ID;
+        if !cmd_item.is_null() {
+            let t = if crate::CMD_ALT.load(Ordering::Relaxed) {
+                "⌘キー: Alt"
+            } else {
+                "⌘キー: Ctrl"
+            };
+            msg1_void_id(cmd_item, sel(c"setTitle:"), nsstring(t));
+        }
+        let scroll_item = GUI_SCROLL_ITEM.load(Ordering::Relaxed) as ID;
+        if !scroll_item.is_null() {
+            let t = if crate::SCROLL_FLIP.load(Ordering::Relaxed) {
+                "スクロール方向: 反転(Mac準拠)"
+            } else {
+                "スクロール方向: 標準(Windows準拠)"
+            };
+            msg1_void_id(scroll_item, sel(c"setTitle:"), nsstring(t));
         }
     }
 }
@@ -333,6 +436,10 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdOpenLog:", imp_open_log as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
+        (c"sdCmdMap:", imp_cmd_map as *const () as usize),
+        (c"sdScroll:", imp_scroll_flip as *const () as usize),
+        (c"sdVol:", imp_vol as *const () as usize),
+        (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];
@@ -434,6 +541,47 @@ pub fn start() -> bool {
         msg1_void_sel(audio_item, sel(c"setAction:"), sel(c"sdAudio:"));
         let _ = GUI_AUDIO_ITEM.store(audio_item as usize, Ordering::Relaxed);
         add_item(menu, audio_item);
+
+        let cmd_item = menu_item("⌘キー: Ctrl", Some(c"sdCmdMap:"), "");
+        if cmd_item.is_null() {
+            return false;
+        }
+        msg1_void_id(cmd_item, sel(c"setTarget:"), target);
+        msg1_void_sel(cmd_item, sel(c"setAction:"), sel(c"sdCmdMap:"));
+        let _ = GUI_CMD_ITEM.store(cmd_item as usize, Ordering::Relaxed);
+        add_item(menu, cmd_item);
+
+        let scroll_item = menu_item("スクロール方向: 標準(Windows準拠)", Some(c"sdScroll:"), "");
+        if scroll_item.is_null() {
+            return false;
+        }
+        msg1_void_id(scroll_item, sel(c"setTarget:"), target);
+        msg1_void_sel(scroll_item, sel(c"setAction:"), sel(c"sdScroll:"));
+        let _ = GUI_SCROLL_ITEM.store(scroll_item as usize, Ordering::Relaxed);
+        add_item(menu, scroll_item);
+
+        add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
+
+        // Windows への操作(ファイル送信・音量)
+        let send_item = menu_item("Windows へファイルを送る…", Some(c"sdSendFile:"), "");
+        if send_item.is_null() {
+            return false;
+        }
+        msg1_void_id(send_item, sel(c"setTarget:"), target);
+        msg1_void_sel(send_item, sel(c"setAction:"), sel(c"sdSendFile:"));
+        add_item(menu, send_item);
+
+        // 音量3項目は tag で▲/▼/ミュートを判別(IMP は1つで受ける)
+        for (title, tag) in [("Windows の音量 ▲", 1isize), ("Windows の音量 ▼", 2), ("Windows をミュート", 3)] {
+            let item = menu_item(title, Some(c"sdVol:"), "");
+            if item.is_null() {
+                return false;
+            }
+            msg1_void_id(item, sel(c"setTarget:"), target);
+            msg1_void_sel(item, sel(c"setAction:"), sel(c"sdVol:"));
+            msg1_void_i64(item, sel(c"setTag:"), tag as i64);
+            add_item(menu, item);
+        }
 
         add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
 

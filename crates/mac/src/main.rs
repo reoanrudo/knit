@@ -133,6 +133,8 @@ unsafe extern "C" {
         sel: *mut core::ffi::c_void,
         ...
     ) -> *mut core::ffi::c_void;
+    /// ファイル URL のみを読む指定キー(readObjectsForClasses:options: 用)
+    static NSPasteboardURLReadingFileURLsOnlyKey: *mut core::ffi::c_void;
 }
 
 /// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
@@ -161,6 +163,12 @@ unsafe fn msg2_bool(target: ID, sel: SEL, a: ID, b: ID) -> u8 {
     let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 =
         std::mem::transmute(objc_msgSend as usize);
     f(target, sel, a, b)
+}
+/// (ID, SEL, ID) -> BOOL(NSArray containsObject: 等の1引数真偽値メソッド用)
+unsafe fn msg1_bool_id(target: ID, cmd: SEL, a: ID) -> u8 {
+    let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 =
+        std::mem::transmute(objc_msgSend as usize);
+    f(target, cmd, a)
 }
 unsafe fn msg0_isize(target: ID, sel: SEL) -> isize {
     let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as usize);
@@ -311,6 +319,162 @@ fn clipboard_change_count() -> isize {
     unsafe { msg0_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
 }
 
+/// NSPasteboard にファイル参照(Finder の ⌘C 等)があるか調べ、パス群を返す。
+/// readObjectsForClasses:options:(NSURL + FileURLsOnly=YES)で読むことで
+/// NSFilenamesPboardType / public.file-url / alias のどの載せ方でも拾う
+unsafe fn mac_clipboard_files() -> Option<Vec<std::path::PathBuf>> {
+    let pb = general_pasteboard();
+    if pb.is_null() {
+        return None;
+    }
+    let url_cls = objc_getClass(c"NSURL".as_ptr());
+    if url_cls.is_null() {
+        return None;
+    }
+    let classes = {
+        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+            std::mem::transmute(objc_msgSend as usize);
+        f(
+            objc_getClass(c"NSArray".as_ptr()),
+            sel_registerName(c"arrayWithObject:".as_ptr()),
+            url_cls,
+        )
+    };
+    let options = {
+        let yes = {
+            let f: unsafe extern "C" fn(ID, SEL, u8) -> ID =
+                std::mem::transmute(objc_msgSend as usize);
+            f(
+                objc_getClass(c"NSNumber".as_ptr()),
+                sel_registerName(c"numberWithBool:".as_ptr()),
+                1,
+            )
+        };
+        let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
+            std::mem::transmute(objc_msgSend as usize);
+        f(
+            objc_getClass(c"NSDictionary".as_ptr()),
+            sel_registerName(c"dictionaryWithObject:forKey:".as_ptr()),
+            yes,
+            NSPasteboardURLReadingFileURLsOnlyKey,
+        )
+    };
+    let urls = {
+        let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
+            std::mem::transmute(objc_msgSend as usize);
+        f(
+            pb,
+            sel_registerName(c"readObjectsForClasses:options:".as_ptr()),
+            classes,
+            options,
+        )
+    };
+    if urls.is_null() {
+        return None;
+    }
+    let n = msg0_isize(urls, sel_registerName(c"count".as_ptr()));
+    if n <= 0 {
+        return None;
+    }
+    let at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
+        std::mem::transmute(objc_msgSend as usize);
+    let mut out = Vec::new();
+    for i in 0..n.min(64) {
+        let url = at(urls, sel_registerName(c"objectAtIndex:".as_ptr()), i as usize);
+        if url.is_null() {
+            continue;
+        }
+        let path = msg0(url, sel_registerName(c"path".as_ptr()));
+        if path.is_null() {
+            continue;
+        }
+        let utf8 = msg0_cstr(path, sel_registerName(c"UTF8String".as_ptr()));
+        if utf8.is_null() {
+            continue;
+        }
+        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        if !s.is_empty() {
+            out.push(std::path::PathBuf::from(s));
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
+/// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行
+pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
+    if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
+        eprintln!("[file] 送信中のため要求を無視しました");
+        return;
+    }
+    std::thread::spawn(move || {
+        const MAX_TOTAL: u64 = 200 * 1024 * 1024; // Windows 側の受信上限と同じ
+        const CHUNK: usize = 3 * 1024 * 1024;
+        let mut total = 0u64;
+        for p in &paths {
+            if let Ok(m) = std::fs::metadata(p) {
+                if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+        if total == 0 || total > MAX_TOTAL {
+            eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
+            notify(
+                "seamless-desk",
+                &format!("ファイルを送信できません(合計 {}MB。上限 200MB)", total / 1024 / 1024),
+            );
+            FILE_TX_BUSY.store(false, Ordering::Relaxed);
+            return;
+        }
+        if !CONNECTED.load(Ordering::Relaxed) {
+            eprintln!("[file] 未接続のため送信しません");
+            notify("seamless-desk", "Windows 未接続のためファイルを送信できません");
+            FILE_TX_BUSY.store(false, Ordering::Relaxed);
+            return;
+        }
+        eprintln!("[file] 送信開始: {} 件 / 合計 {}KB", paths.len(), total / 1024);
+        use std::io::Read;
+        let mut buf = vec![0u8; CHUNK];
+        for p in &paths {
+            let Ok(meta) = std::fs::metadata(p) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let size = meta.len();
+            let Ok(mut f) = std::fs::File::open(p) else {
+                eprintln!("[file] open 失敗: {}", p.display());
+                continue;
+            };
+            send_msg(&Msg::FileBegin { name: name.clone(), size });
+            let mut remain = size;
+            while remain > 0 {
+                let want = remain.min(CHUNK as u64) as usize;
+                match f.read(&mut buf[..want]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        send_msg(&Msg::FileChunk { data: sd_common::b64::encode(&buf[..n]) });
+                        remain -= n as u64;
+                    }
+                    Err(_) => break,
+                }
+            }
+            send_msg(&Msg::FileEnd);
+            eprintln!("[file] 送信: {name} ({size} bytes)");
+        }
+        eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
+        notify("seamless-desk", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
+        FILE_TX_BUSY.store(false, Ordering::Relaxed);
+    });
+}
+
 /// macOS の通知センターへ表示(接続/切断のユーザー可視化)。
 /// osascript 経由で追加権限なしで出せる。失敗しても本体には影響しない。
 /// osascript 起動に数百msかかるため別スレッドで発火し、accept/受信スレッドを
@@ -336,6 +500,16 @@ fn notify(title: &str, body: &str) {
 // ---------- 共有状態 ----------
 static WIN_MODE: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+/// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。トグル時に Windows へ Cfg で同期
+static CMD_ALT: AtomicBool = AtomicBool::new(false);
+/// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
+static SCROLL_FLIP: AtomicBool = AtomicBool::new(false);
+/// Windows との RTT(ms)。ping/pong 往復で測定(メニュー状態行の表示用)
+static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ファイル送信中(多重送信の抑制)
+static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
+/// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
+static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
 static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
 static SCREEN_W: OnceLock<f64> = OnceLock::new();
@@ -829,9 +1003,11 @@ unsafe extern "C" fn tap_callback(
                 // 除数を大きくすると遅くなる(従来40は速すぎたので既定120)。端数は持ち越し。
                 const Q: f64 = 0.25; // 量子化幅(ノッチ)= Windows 側は 30 wheel units 刻み
                 let div = SCROLL_DIV.get().copied().unwrap_or(120.0);
+                // 方向トグル(メニュー): 既定は Windows 標準の指の動きに合わせる(反転)
+                let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) { 1.0 } else { -1.0 };
                 let mut acc = SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner());
-                acc.0 += -dx / div;
-                acc.1 += -dy / div;
+                acc.0 += sgn * dx / div;
+                acc.1 += sgn * dy / div;
                 // 異常な残高(1e6超)は何かの暴発なので捨てる
                 if acc.0.abs() > 1.0e6 || acc.1.abs() > 1.0e6 {
                     *acc = (0.0, 0.0);
@@ -850,7 +1026,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-201749-d661fa3";
+const BUILD_ID: &str = "build-20260925-204725-52a8f6c";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -949,6 +1125,13 @@ fn main() {
             let _ = HOTKEY_KC.set(k);
         }
     }
+    // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
+    if envutil::get("SEAMLESS_SCROLL_FLIP").as_deref() == Some("1") {
+        SCROLL_FLIP.store(true, Ordering::Relaxed);
+    }
+    if envutil::get("SEAMLESS_CMD_ALT").as_deref() == Some("1") {
+        CMD_ALT.store(true, Ordering::Relaxed);
+    }
     eprintln!(
         "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
@@ -998,7 +1181,7 @@ fn main() {
                 }
                 let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = guard.as_mut() {
-                    if s.write_all(encode(&Msg::Ping).as_bytes()).and_then(|_| s.flush()).is_err() {
+                    if s.write_all(encode(&Msg::Ping { ts: now_ms() }).as_bytes()).and_then(|_| s.flush()).is_err() {
                         *guard = None;
                     }
                 }
@@ -1180,10 +1363,34 @@ fn main() {
                 continue;
             }
             last_count = cnt;
-            let Some(text) = (unsafe { mac_get_clipboard() }) else { continue };
-            if text.is_empty() || text.len() > CLIP_MAX_BYTES {
+            // テキストが無い/空のときは Finder の ⌘C(ファイル参照)を試す:
+            // Mac で ⌘C → 画面端で切替 → Windows で Ctrl+V のファイル渡し
+            let text = unsafe { mac_get_clipboard() }
+                .filter(|t| !t.is_empty() && t.len() <= CLIP_MAX_BYTES);
+            let Some(text) = text else {
+                if let Some(files) = (unsafe { mac_clipboard_files() }) {
+                    // 同じ選択の再 ⌘C で何度も流れないよう指紋で抜く
+                    let sizes: u64 = files
+                        .iter()
+                        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+                        .sum();
+                    let key = format!(
+                        "{}|{sizes}",
+                        files
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect::<Vec<_>>()
+                            .join("\u{1}")
+                    );
+                    let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
+                    if !dup {
+                        *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                        eprintln!("[file] クリップボードのファイル {} 件を検出", files.len());
+                        send_files_to_win(files);
+                    }
+                }
                 continue;
-            }
+            };
             // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
             if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
                 continue;
@@ -1373,8 +1580,14 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                                 eprintln!("[clip] win->mac {} bytes", text.len());
                             }
                         }
-                        Msg::Pong => {
-                            LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+                        Msg::Pong { ts } => {
+                            let now = now_ms();
+                            LAST_PONG_MS.store(now, Ordering::Relaxed);
+                            // ping/pong の往復時間を RTT として保持し、Windows 側の
+                            // ステータス窓表示にも回す(接続品質の見える化)
+                            let rtt = now.saturating_sub(ts).min(60_000);
+                            RTT_MS.store(rtt, Ordering::Relaxed);
+                            send_msg(&Msg::Stat { rtt });
                         }
                         Msg::Bye => break,
                         _ => {}
@@ -1481,6 +1694,8 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         }
         // hello_ok 送信は送信スレッド経由で確実に
         send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
+        // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
+        send_msg(&Msg::Cfg { cmd_alt: CMD_ALT.load(Ordering::Relaxed) });
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         eprintln!("[conn] established");
@@ -1539,6 +1754,8 @@ fn client_attempt(
     }
     CONNECTED.store(true, Ordering::Relaxed);
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+    // 現在の ⌘キー設定を同期(クライアントモードの確立時)
+    send_msg(&Msg::Cfg { cmd_alt: CMD_ALT.load(Ordering::Relaxed) });
     eprintln!("[conn] established");
     notify("seamless-desk", "Windows に接続しました");
     session_receive_loop(&mut reader);

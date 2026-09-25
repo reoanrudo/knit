@@ -75,6 +75,7 @@ static STATUS_HWND: AtomicUsize = AtomicUsize::new(0);
 static LABEL_STATE: AtomicUsize = AtomicUsize::new(0);
 static LABEL_BUILD: AtomicUsize = AtomicUsize::new(0);
 static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
+static LABEL_RTT: AtomicUsize = AtomicUsize::new(0);
 
 fn wide_into(buf: &mut [u16], s: &str) {
     for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
@@ -90,6 +91,18 @@ fn audio_line() -> String {
         "音声転送: ON(Windows の音を Mac で再生)".to_string()
     } else {
         "音声転送: OFF".to_string()
+    }
+}
+/// Mac が測定した RTT(接続品質)。未測定/切断時は --
+fn rtt_line() -> String {
+    if !crate::CONNECTED.load(Ordering::Relaxed) {
+        return "遅延: --".to_string();
+    }
+    let ms = crate::RTT_MS.load(Ordering::Relaxed);
+    if ms == 0 {
+        "遅延: 計測中…".to_string()
+    } else {
+        format!("遅延: {ms}ms")
     }
 }
 fn set_text(h: usize, s: &str) {
@@ -281,9 +294,10 @@ unsafe fn open_status_window() {
         let _ = LABEL_STATE.store(make_child("STATIC", "状態: …", 0, 14, 14, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 14, 42, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 14, 70, 350, 22, 0), Ordering::Relaxed);
-        make_child("BUTTON", "ログを開く", 0, 14, 120, 112, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 136, 120, 112, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "終了", 0, 258, 120, 112, 36, MENU_QUIT as usize);
+        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 14, 98, 350, 22, 0), Ordering::Relaxed);
+        make_child("BUTTON", "ログを開く", 0, 14, 130, 112, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 136, 130, 112, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "終了", 0, 258, 130, 112, 36, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
@@ -295,6 +309,7 @@ unsafe fn update_labels() {
     set_text(LABEL_STATE.load(Ordering::Relaxed), &tray_status_text());
     set_text(LABEL_BUILD.load(Ordering::Relaxed), &build_line());
     set_text(LABEL_AUDIO.load(Ordering::Relaxed), &audio_line());
+    set_text(LABEL_RTT.load(Ordering::Relaxed), &rtt_line());
 }
 
 unsafe fn open_menu(hwnd: HWND) {
