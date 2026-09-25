@@ -251,6 +251,8 @@ static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
 static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// 前回送信した絶対位置(量子化変化検出用)
 static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
+/// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
+static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((0.05, 0.5));
 /// 絶対位置送信モード(既定ON。SEAMLESS_MOUSE_MODE=rel で旧・相対移動に戻す)
 static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
