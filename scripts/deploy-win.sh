@@ -14,6 +14,8 @@ cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | grep -E "^
 cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | tail -1
 
 echo "[deploy-win] deploying (stop -> copy -> start)..."
+# コンソール窓が出ないよう VBS 起動へタスクを更新(冪等)
+ssh -o BatchMode=yes home "schtasks /Create /TN seamless_desk_run /TR "wscript.exe \"C:\\Users\\<user>\\seamless-desk\\run_sd.vbs\"" /SC ONCE /ST 23:59 /F" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /End /TN seamless_desk_run" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "taskkill /IM sd-win.exe /F" >/dev/null 2>&1 || true
 sleep 2
