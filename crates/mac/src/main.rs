@@ -235,6 +235,10 @@ static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 static DIAG_ABS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SELF_HEAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_REARM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ウォッチドッグ用: 最終タップ受信時刻と最終 abs 送信時刻(ms)。
+/// 「ユーザーが操作中なのに Windows へ届いていない」状態を検知する
+static LAST_EVENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -457,6 +461,7 @@ unsafe extern "C" fn tap_callback(
 
     if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED) {
         DIAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
     }
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         DIAG_KEY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -598,6 +603,7 @@ unsafe extern "C" fn tap_callback(
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
                     *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
+                    LAST_ABS_MS.store(now_ms(), Ordering::Relaxed);
                     DIAG_ABS_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::MouseAbs { nx, ny });
                     // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
@@ -649,7 +655,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-173925-4581cf5";
+const BUILD_ID: &str = "build-20260925-174029-91ca47f";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -1076,6 +1082,20 @@ fn main() {
                 if TAP_REARM_N.fetch_add(1, Ordering::Relaxed) % 7 == 0 {
                     // 150ms×7 ≒ 1秒毎
                     unsafe { CGEventTapEnable(tap as CFMachPortRef, true) };
+                }
+            }
+            // ウォッチドッグ: WIN モード中にユーザーがマウスを動かしているのに
+            // (直近2秒以内にタップ受信) Windows への転送が5秒止まっている状態は
+            // 異常。強制的に Mac へ復帰させ、操作不能な状態に陥らないようにする
+            if WIN_MODE.load(Ordering::Relaxed) {
+                let now = now_ms();
+                let last_ev = LAST_EVENT_MS.load(Ordering::Relaxed);
+                let last_abs = LAST_ABS_MS.load(Ordering::Relaxed);
+                if last_ev > 0 && now.saturating_sub(last_ev) < 2_000 && now.saturating_sub(last_abs) > 5_000 {
+                    WIN_MODE.store(false, Ordering::Relaxed);
+                    eprintln!("[watchdog] WIN中に転送停止を検知。強制復帰します");
+                    leave_win_mode_cursor_unlock(None);
+                    continue;
                 }
             }
             if !WIN_MODE.load(Ordering::Relaxed) {
