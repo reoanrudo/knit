@@ -231,6 +231,7 @@ static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_ABS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -335,7 +336,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                     ((wc.0 / ww).clamp(0.05, 0.95), (wc.1 / wh).clamp(0.05, 0.95));
             }
         }
-        EDGE_GUARD_UNTIL_MS.store(now_ms() + 250, Ordering::Relaxed);
+        EDGE_GUARD_UNTIL_MS.store(now_ms() + 200, Ordering::Relaxed);
         if let Some(loc) = live_cursor() {
             *CUR_POS.lock().unwrap() = (loc.x, loc.y);
         }
@@ -523,11 +524,12 @@ unsafe extern "C" fn tap_callback(
                     );
                     let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
                     let mut wc = WIN_CUR.lock().unwrap();
-                    wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 1.0);
-                    wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 1.0);
+                    wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
+                    wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
                     let (nx, ny) = (wc.0 / ww, wc.1 / wh);
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
                     *LAST_ABS_SENT.lock().unwrap() = (nx, ny);
+                    DIAG_ABS_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::MouseAbs { nx, ny });
                     // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
                     if wc.0 <= 1.0 {
@@ -899,7 +901,7 @@ fn main() {
             let mut last_cursor = (0.0f64, 0.0f64);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd, wp, mc, sc) = (
+                let (mode, mv, kd, sd, wp, mc, sc, ab) = (
                     WIN_MODE.load(Ordering::Relaxed),
                     DIAG_MOVE_COUNT.load(Ordering::Relaxed),
                     DIAG_KEY_COUNT.load(Ordering::Relaxed),
@@ -907,13 +909,14 @@ fn main() {
                     DIAG_WARP_COUNT.load(Ordering::Relaxed),
                     DIAG_MODE_COUNT.load(Ordering::Relaxed),
                     DIAG_SCROLL_COUNT.load(Ordering::Relaxed),
+                    DIAG_ABS_COUNT.load(Ordering::Relaxed),
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
                     let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
-                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
+                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
                         if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
                     );
                     last_cursor = (p.x, p.y);

@@ -553,6 +553,9 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 let x = (nx.clamp(0.0, 1.0) * 65535.0).round() as i32;
                 let y = (ny.clamp(0.0, 1.0) * 65535.0).round() as i32;
                 inject_mouse_move_abs(x, y);
+                if DEBUG_KEYS.load(Ordering::Relaxed) {
+                    println!("[abs] -> ({x},{y})");
+                }
                 maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
