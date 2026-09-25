@@ -470,7 +470,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     continue;
                 }
                 inject_mouse_move_rel(dx.round() as i32, dy.round() as i32);
-                maybe_notify_return(&writer, &mut last_return_notify, h);
+                maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
@@ -545,13 +545,20 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
 
 /// カーソルが画面左端に達したら Mac へ復帰通知(連打防止 1 秒クールダウン)。
 /// カーソル高さも正規化して送り、Mac 側の復帰位置に反映させる(境界の連続性)。
-fn maybe_notify_return(mut writer: &TcpStream, last: &mut Instant, h: i32) {
+fn maybe_notify_return(
+    mut writer: &TcpStream,
+    last: &mut Instant,
+    h: i32,
+    mods: &mut ModState,
+) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
     if p.x <= 0 && last.elapsed() >= Duration::from_secs(1) {
         let ny = if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 };
         let _ = writeln!(writer, "{}", encode(&Msg::Return { ny }));
         *last = Instant::now();
+        // Mac へ制御を返すため、押しっぱなしの修飾キーを離して後片付けする
+        mods.release_all();
     }
 }
 
