@@ -98,7 +98,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 5; // 5: 双方向ファイル送信(FileBatchEnd 追加)
+    pub const VERSION: u32 = 6; // 6: 画面位置(side)・切替オプションの同期(Deskflow標準パリティ)
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -173,6 +173,9 @@ pub mod proto {
             cmd_alt: bool,
             #[serde(default)]
             spk_mute: bool,
+            /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下。Deskflow の links 相当)
+            #[serde(default)]
+            side: u8,
         },
         /// Windows の音量制御(0=up / 1=down / 2=ミュート)。Mac メニューから送る
         #[serde(rename = "vol")]

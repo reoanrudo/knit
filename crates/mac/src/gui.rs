@@ -127,6 +127,13 @@ static PREFS_CHK_SCROLL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
 static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_SIDE_POP: AtomicUsize = AtomicUsize::new(0);
+static PREFS_DELAY_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_DELAY_LBL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_DBL_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_DBL_LBL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
+static GUI_SIDE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
 /// 起動直後に設定ウィンドウを開く(--show-prefs。1 秒タイマーの初回で処理)
 pub static SHOW_AT_START: AtomicBool = AtomicBool::new(false);
@@ -242,6 +249,7 @@ unsafe extern "C" fn imp_cmd_map(_s: ID, _c: SEL, _n: ID) {
     crate::send_msg(&crate::Msg::Cfg {
         cmd_alt: next,
         spk_mute: crate::SPK_MUTE.load(Ordering::Relaxed),
+        side: crate::SIDE.load(Ordering::Relaxed),
     });
     refresh_status();
 }
@@ -252,9 +260,63 @@ unsafe extern "C" fn imp_spk_mute(_s: ID, _c: SEL, _n: ID) {
     crate::send_msg(&crate::Msg::Cfg {
         cmd_alt: crate::CMD_ALT.load(Ordering::Relaxed),
         spk_mute: next,
+        side: crate::SIDE.load(Ordering::Relaxed),
     });
     refresh_status();
 }
+/// 「Windows の位置」ポップアップ(0=右/1=左/2=上/3=下)。Deskflow links 相当
+unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> isize =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let idx = get(sender, sel(c"indexOfSelectedItem"));
+        crate::set_side(idx.clamp(0, 3) as u8);
+    }
+}
+
+/// switchDelay スライダ(0=無効。端に N ms 滞ってから切替)
+unsafe extern "C" fn imp_switch_delay(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let v = get(sender, sel(c"doubleValue"));
+        crate::SWITCH_DELAY_MS.store(v as u64, Ordering::Relaxed);
+        let lbl = PREFS_DELAY_LBL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            let t = if v < 1.0 { "無効(即時/ダブルタップ)" } else { &format!("{v:.0}ms 滞って切替") };
+            msg1_void_id(lbl, sel(c"setStringValue:"), nsstring(t));
+        }
+    }
+}
+
+/// switchDoubleTap スライダ(ダブルタップ判定窓 ms)
+unsafe extern "C" fn imp_dbl_tap(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let v = get(sender, sel(c"doubleValue"));
+        crate::DOUBLE_TAP_MS.store(v.max(100.0) as u64, Ordering::Relaxed);
+        let lbl = PREFS_DBL_LBL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            msg1_void_id(lbl, sel(c"setStringValue:"), nsstring(&format!("{v:.0}ms 以内の2回")));
+        }
+    }
+}
+
+/// clipboardSharing トグル(Deskflow 標準オプション)
+unsafe extern "C" fn imp_clip_share(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::CLIP_SHARE.load(Ordering::Relaxed);
+    crate::CLIP_SHARE.store(next, Ordering::Relaxed);
+    eprintln!("[cfg] クリップボード共有 -> {next}");
+}
+
+/// メニュー「Windows の位置」: 右→左→上→下→右 のローテート
+unsafe extern "C" fn imp_rotate_side(_s: ID, _c: SEL, _n: ID) {
+    let next = (crate::SIDE.load(Ordering::Relaxed) + 1) % 4;
+    crate::set_side(next);
+    refresh_status();
+}
+
 unsafe extern "C" fn imp_scroll_flip(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::SCROLL_FLIP.load(Ordering::Relaxed);
     crate::SCROLL_FLIP.store(next, Ordering::Relaxed);
@@ -415,6 +477,7 @@ fn sync_prefs_state() {
         set(&PREFS_CHK_CMD, crate::CMD_ALT.load(Ordering::Relaxed));
         set(&PREFS_CHK_SCROLL, !crate::SCROLL_FLIP.load(Ordering::Relaxed));
         set(&PREFS_CHK_SPK, crate::SPK_MUTE.load(Ordering::Relaxed));
+        set(&PREFS_CHK_CLIP, crate::CLIP_SHARE.load(Ordering::Relaxed));
     }
 }
 
@@ -486,7 +549,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 640.0 },
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 820.0 },
             1 | 2 | 8 | 0x8000, // +FullSizeContentView
             2,
             0,
@@ -504,7 +567,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         // NSSize(f64×2)のため f64 2 引数の transmute で渡す(NSRect 32byte と混同注意)
         let set_min: unsafe extern "C" fn(ID, SEL, f64, f64) =
             std::mem::transmute(crate::objc_msgSend as usize);
-        set_min(win, sel(c"setContentMinSize:"), 400.0, 640.0);
+        set_min(win, sel(c"setContentMinSize:"), 400.0, 820.0);
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
@@ -539,7 +602,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 640.0 - 56.0, w: 360.0, h: 24.0 });
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 820.0 - 56.0, w: 360.0, h: 24.0 });
             let font_cls = objc_getClass(c"NSFont".as_ptr());
             if !font_cls.is_null() {
                 let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
@@ -554,7 +617,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
 
         // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
-        let mut y = 640.0 - 84.0;
+        let mut y = 820.0 - 84.0;
         let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
@@ -575,6 +638,76 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         y -= 38.0;
         place_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS, y);
         y -= 38.0;
+        // Windows の位置(Deskflow links 相当)。NSPopUpButton で4択
+        let pop_cls = objc_getClass(c"NSPopUpButton".as_ptr());
+        if !pop_cls.is_null() {
+            let alloc_p = msg0(pop_cls, sel(c"alloc"));
+            let init_frame: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            let pop = init_frame(alloc_p, sel(c"initWithFrame:"), NSRect { x: 20.0, y: y - 30.0, w: 180.0, h: 26.0 });
+            if !pop.is_null() {
+                for t in ["Windows は右", "Windows は左", "Windows は上", "Windows は下"] {
+                    msg1_void_id(pop, sel(c"addItemWithTitle:"), nsstring(t));
+                }
+                msg1_void_id(pop, sel(c"setTarget:"), target);
+                msg1_void_sel(pop, sel(c"setAction:"), sel(c"sdSide:"));
+                let select: unsafe extern "C" fn(ID, SEL, isize) =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                select(pop, sel(c"selectItemAtIndex:"), crate::SIDE.load(Ordering::Relaxed) as isize);
+                msg1_void_id(cv, sel(c"addSubview:"), pop);
+                PREFS_SIDE_POP.store(pop as usize, Ordering::Relaxed);
+            }
+        }
+        y -= 40.0;
+        // switchDelay スライダ(0..1000ms)
+        let slider_cls2 = objc_getClass(c"NSSlider".as_ptr());
+        let mk_slider: unsafe extern "C" fn(ID, SEL, f64, f64, f64, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        if !slider_cls2.is_null() {
+            let sl = mk_slider(
+                slider_cls2, sel(c"sliderWithValue:minValue:maxValue:target:action:"),
+                crate::SWITCH_DELAY_MS.load(Ordering::Relaxed) as f64, 0.0, 1000.0,
+                target, sel(c"sdDelay:"),
+            );
+            if !sl.is_null() {
+                set_frame(sl, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 28.0, w: 180.0, h: 22.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), sl);
+                PREFS_DELAY_SLIDER.store(sl as usize, Ordering::Relaxed);
+            }
+        }
+        let dl = label(
+            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+            nsstring("切替までの滞在(0=無効)"),
+        );
+        if !dl.is_null() {
+            set_frame(dl, sel(c"setFrame:"), NSRect { x: 212.0, y: y - 26.0, w: 170.0, h: 18.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), dl);
+            PREFS_DELAY_LBL.store(dl as usize, Ordering::Relaxed);
+        }
+        y -= 40.0;
+        // switchDoubleTap スライダ(200..1200ms)
+        if !slider_cls2.is_null() {
+            let sl = mk_slider(
+                slider_cls2, sel(c"sliderWithValue:minValue:maxValue:target:action:"),
+                crate::DOUBLE_TAP_MS.load(Ordering::Relaxed) as f64, 200.0, 1200.0,
+                target, sel(c"sdDblTap:"),
+            );
+            if !sl.is_null() {
+                set_frame(sl, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 28.0, w: 180.0, h: 22.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), sl);
+                PREFS_DBL_SLIDER.store(sl as usize, Ordering::Relaxed);
+            }
+        }
+        let dbl = label(
+            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+            nsstring("ダブルタップ判定"),
+        );
+        if !dbl.is_null() {
+            set_frame(dbl, sel(c"setFrame:"), NSRect { x: 212.0, y: y - 26.0, w: 170.0, h: 18.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), dbl);
+            PREFS_DBL_LBL.store(dbl as usize, Ordering::Relaxed);
+        }
+        y -= 40.0;
 
         // ---- スクロール ----
         section_heading(cv, "スクロール", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
@@ -622,6 +755,12 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         place_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD, y);
         y -= 38.0;
         place_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK, y);
+        y -= 38.0;
+
+        // ---- クリップボード ----
+        section_heading(cv, "クリップボード", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 26.0;
+        place_check("クリップボードを共有(テキスト/画像)", c"sdClipShare:", &PREFS_CHK_CLIP, y);
         y -= 38.0;
 
         // ---- 操作ボタン(切替 + ファイル送信) ----
@@ -774,6 +913,14 @@ fn refresh_status() {
             };
             msg1_void_id(taps_item, sel(c"setTitle:"), nsstring(t));
         }
+        let side_item = GUI_SIDE_ITEM.load(Ordering::Relaxed) as ID;
+        if !side_item.is_null() {
+            msg1_void_id(
+                side_item,
+                sel(c"setTitle:"),
+                nsstring(&format!("Windows の位置: {}", crate::side_name())),
+            );
+        }
         let audio_item = GUI_AUDIO_ITEM.load(Ordering::Relaxed) as ID;
         if !audio_item.is_null() {
             let t = if crate::audio::MUTED.load(Ordering::Relaxed) {
@@ -919,6 +1066,11 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdScrollGain:", imp_scroll_gain as *const () as usize),
+        (c"sdSide:", imp_side as *const () as usize),
+        (c"sdDelay:", imp_switch_delay as *const () as usize),
+        (c"sdDblTap:", imp_dbl_tap as *const () as usize),
+        (c"sdClipShare:", imp_clip_share as *const () as usize),
+        (c"sdRotateSide:", imp_rotate_side as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];
@@ -1011,6 +1163,15 @@ pub fn start() -> bool {
         msg1_void_sel(taps_item, sel(c"setAction:"), sel(c"sdEdgeTaps:"));
         let _ = GUI_TAPS_ITEM.store(taps_item as usize, Ordering::Relaxed);
         add_item(menu, taps_item);
+
+        let side_item = menu_item("Windows の位置: 右", Some(c"sdRotateSide:"), "");
+        if side_item.is_null() {
+            return false;
+        }
+        msg1_void_id(side_item, sel(c"setTarget:"), target);
+        msg1_void_sel(side_item, sel(c"setAction:"), sel(c"sdRotateSide:"));
+        let _ = GUI_SIDE_ITEM.store(side_item as usize, Ordering::Relaxed);
+        add_item(menu, side_item);
 
         let audio_item = menu_item("音声転送: ON", Some(c"sdAudio:"), "");
         if audio_item.is_null() {

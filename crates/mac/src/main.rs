@@ -7,7 +7,7 @@ mod gui;
 
 use tsunagu_common::envutil;
 use tsunagu_common::proto::{decode, encode, Msg, PORT, VERSION};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -645,6 +645,41 @@ static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static EDGE_TAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
 static EDGE_AT_EDGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EDGE_LAST_HIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+// ---- Deskflow 標準オプション(画面位置 links / switchDelay / switchDoubleTap /
+// ---- switchCorners / clipboardSharing)----
+/// Windows 画面の位置(0=右/1=左/2=上/3=下)。Deskflow links 相当
+pub static SIDE: AtomicU8 = AtomicU8::new(0);
+/// 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時判定)
+pub static SWITCH_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+/// ダブルタップの判定窓 ms(switchDoubleTap)
+pub static DOUBLE_TAP_MS: AtomicU64 = AtomicU64::new(700);
+/// 四隅の切替禁止サイズ px(switchCornerSize。0=無効)
+pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
+/// クリップボード共有(clipboardSharing)
+pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
+/// 端到達の開始時刻(switchDelay の滞在計測用)
+static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 現在の SIDE(0=右/1=左/2=上/3=下)を文字列表現で
+pub fn side_name() -> &'static str {
+    match SIDE.load(Ordering::Relaxed) {
+        1 => "左",
+        2 => "上",
+        3 => "下",
+        _ => "右",
+    }
+}
+
+/// SIDE を設定し、Windows へ Cfg で同期する
+pub fn set_side(v: u8) {
+    SIDE.store(v.min(3), Ordering::Relaxed);
+    send_msg(&Msg::Cfg {
+        cmd_alt: CMD_ALT.load(Ordering::Relaxed),
+        spk_mute: SPK_MUTE.load(Ordering::Relaxed),
+        side: v.min(3),
+    });
+    eprintln!("[cfg] Windows の位置 -> {}", side_name());
+}
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -757,12 +792,28 @@ fn enter_win_mode_cursor_lock() {
             lock_y = loc.y;
             CFRelease(ev);
         }
-        // union 右端に固定(SCREEN_W はメイン画面幅なので、右サブモニターがある
-        // 環境で固定すると隠れカーソルが MacBook 側へ飛んでしまう)
-        let lock_x = UNION_MAX_X.get().copied().unwrap_or_else(|| {
+        // SIDE の境界端に固定(SCREEN_W はメイン画面幅なので、右サブモニターが
+        // ある環境で右端固定すると隠れカーソルが MacBook 側へ飛んでしまう)
+        let side = SIDE.load(Ordering::Relaxed);
+        let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
+        let edge_x = UNION_MAX_X.get().copied().unwrap_or_else(|| {
             SCREEN_W.get().copied().unwrap_or(2056.0)
-        }) - 2.0;
-        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
+        });
+        let ev2 = CGEventCreate(std::ptr::null_mut());
+        let mut lock_x2 = 0.0f64;
+        if !ev2.is_null() {
+            let loc2 = CGEventGetLocation(ev2);
+            lock_x2 = loc2.x;
+            CFRelease(ev2);
+        }
+        let (lock_x, use_y) = match side {
+            1 => (2.0, lock_y),                     // 左端
+            2 => (lock_x2, 2.0),                    // 上端
+            3 => (lock_x2, main_h - 2.0),           // 下端
+            _ => (edge_x - 2.0, lock_y),            // 右端(既定)
+        };
+        let _ = use_y;
+        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: use_y });
         // タップが握った位置を CUR_POS にも反映(積算の起点を正しくする)
         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (lock_x, lock_y);
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
@@ -806,26 +857,42 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         // 跨いで戻ってくる連続的な体験になる。
         // 1回切替(TSUNAGU_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
         // 誤再突入を防ぐ
+        // SIDE(Windows の位置)に応じた復帰座標: 出てきた境界のすぐ内側へ。
+        // ny は Windows 側カーソルの「境界に沿った比率」(side 0/1=縦、2/3=横)
         let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
+        let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
         let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
         let taps = EDGE_TAPS.load(Ordering::Relaxed);
-        let x = if taps >= 2 { edge_x - 60.0 } else { (main_w - 100.0).min(edge_x - 150.0) };
-        // 高さは出口ディスプレイの y 範囲へ対応付ける(Windows 側の高さ比を
-        // そのまま出口モニターの範囲へ写像。MacBook 基準だと位置がずれる)
-        let y = match ny {
-            Some(n) => {
-                let (ymin, ymax) = EDGE_DISP_Y
-                    .get()
-                    .copied()
-                    .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
-                (ymin + n.clamp(0.0, 1.0) * (ymax - ymin)).clamp(ymin + 20.0, (ymax - 20.0).max(ymin + 20.0))
+        let side = SIDE.load(Ordering::Relaxed);
+        let inset: f64 = if taps >= 2 { 60.0 } else { 150.0 };
+        let (ymin, ymax) = EDGE_DISP_Y
+            .get()
+            .copied()
+            .unwrap_or((0.0, main_h));
+        let along_y = |r: Option<f64>| -> f64 {
+            match r {
+                Some(n) => (ymin + n.clamp(0.0, 1.0) * (ymax - ymin)).clamp(ymin + 20.0, (ymax - 20.0).max(ymin + 20.0)),
+                None => (ymin + ymax) / 2.0,
             }
-            None => {
-                let (ymin, ymax) = EDGE_DISP_Y
-                    .get()
-                    .copied()
-                    .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
-                (ymin + ymax) / 2.0
+        };
+        let along_x = |r: Option<f64>| -> f64 {
+            match r {
+                Some(n) => (n.clamp(0.0, 1.0) * main_w).clamp(20.0, main_w - 20.0),
+                None => main_w / 2.0,
+            }
+        };
+        let (x, y) = match side {
+            1 => (inset.max(20.0), along_y(ny)), // 左端から戻る
+            2 => (along_x(ny), inset.max(20.0)), // 上端から戻る
+            3 => (along_x(ny), (main_h - inset).min(main_h - 20.0)), // 下端から戻る
+            _ => {
+                // 右端(既定): 1回切替時は MacBook 側へ十分退ける
+                let x = if taps >= 2 {
+                    edge_x - inset
+                } else {
+                    (main_w - 100.0).min(edge_x - inset)
+                };
+                (x, along_y(ny))
             }
         };
         CGWarpMouseCursorPosition(CGPoint { x, y });
@@ -946,43 +1013,82 @@ unsafe extern "C" fn tap_callback(
                         *pos = (loc.x, loc.y);
                     }
                 }
-                let (px, _py) = *pos;
+                let (px, py) = *pos;
                 drop(pos);
                 let edge = EDGE_PX.get().copied().unwrap_or(2.0);
                 // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
+                let main_w = w;
+                let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
                 let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
+                let side = SIDE.load(Ordering::Relaxed);
+                // SIDE に応じた「切替境界までの距離」(小さいほど端に近い)。
+                // Deskflow の links(left/right/up/down)相当。左/上は主画面原点(0)基点
+                let gap = |x: f64, y: f64| -> f64 {
+                    match side {
+                        1 => x,            // 左端
+                        2 => y,            // 上端
+                        3 => main_h - y,   // 下端
+                        _ => edge_x - x,   // 右端(既定)
+                    }
+                };
                 // 境界から十分内側へ戻ったらヒット状態をリセット(次の到達を1回目として数える)
-                if px < edge_x - edge - 8.0 {
+                if gap(px, py) > edge + 8.0 {
                     EDGE_AT_EDGE.store(false, Ordering::Relaxed);
+                    EDGE_STAY_SINCE_MS.store(0, Ordering::Relaxed);
                 }
-                // 距離アームは廃止: 復帰後に右方向へ動くユーザーの自然な操作が
-                // 「内側へ離れる」条件を満たせず Windows へ行けなくなるため。
-                // チャタリング防止は復帰位置 150px 内側 + 時間ガードで担保する
-                if px >= edge_x - edge {
+                if gap(px, py) <= edge {
+                    // switchCorners(+cornerSize): 四隅 N px 内では切替しない(誤爆防止)
+                    let corner = CORNER_PX.load(Ordering::Relaxed) as f64;
+                    if corner > 0.0
+                        && (px < corner || px > main_w - corner)
+                        && (py < corner || py > main_h - corner)
+                    {
+                        return event;
+                    }
                     // 二段階判定: 積算値が閾値を超えても、実カーソル(ライブ位置)が
                     // 境界付近でなければ発火しない。ドリフトが残っていても
                     // MacBook 中央などでの誤発火を構造的に防ぐ
                     let Some(loc) = live_cursor() else { return event };
-                    if loc.x < edge_x - edge - 40.0 {
+                    if gap(loc.x, loc.y) > edge + 40.0 {
                         // 積算ドリフト検出: 実位置で CUR_POS を補正して通過
                         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
                         return event;
                     }
-                    // ダブルタップ判定: 閾値を「下から跨いだ瞬間」だけをヒットと数え、
-                    // 500ms 以内の 2回目のヒットでのみ切替する(1回目は素通し)。
-                    // カーソルが境界に張り付いたまま出す delta は継続扱いで数えない
-                    if !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
+                    // switchDelay: 端に N ms 滞ってから切替(0=無効)。
+                    // 滞在判定は「端に到達し続けている」間のみ継続する
+                    let delay = SWITCH_DELAY_MS.load(Ordering::Relaxed);
+                    if delay > 0 {
+                        let now = now_ms();
+                        let since = EDGE_STAY_SINCE_MS.load(Ordering::Relaxed);
+                        if since == 0 {
+                            EDGE_STAY_SINCE_MS.store(now, Ordering::Relaxed);
+                            return event; // 滞在計測を開始(まだ切替ない)
+                        }
+                        if now.saturating_sub(since) < delay {
+                            return event; // まだ規定時間に達していない
+                        }
+                        EDGE_STAY_SINCE_MS.store(0, Ordering::Relaxed);
+                    } else if !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
+                        // switchDoubleTap: 閾値を「下から跨いだ瞬間」だけをヒットと数え、
+                        // 判定窓(DOUBLE_TAP_MS)以内の 2回目のヒットでのみ切替する。
+                        // カーソルが境界に張り付いたまま出す delta は継続扱いで数えない
                         let taps = EDGE_TAPS.load(Ordering::Relaxed);
                         let now = now_ms();
+                        let win_ms = DOUBLE_TAP_MS.load(Ordering::Relaxed).max(100);
                         let prev = EDGE_LAST_HIT_MS.swap(now, Ordering::Relaxed);
-                        let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= 700);
+                        let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= win_ms);
                         if !fire {
                             // 1回目: 境界から少し内側へ弾き返す。壁に当たった感触で
                             // 「もう一度押すと通る」ことを体感させる(本質の可視化)
                             eprintln!("[edge] 1回目の到達(跳ね返し)");
-                            let bx = edge_x - 15.0;
-                            CGWarpMouseCursorPosition(CGPoint { x: bx, y: loc.y });
-                            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (bx, loc.y);
+                            let (bx, by) = match side {
+                                1 => (15.0, loc.y),
+                                2 => (loc.x, 15.0),
+                                3 => (loc.x, main_h - 15.0),
+                                _ => (edge_x - 15.0, loc.y),
+                            };
+                            CGWarpMouseCursorPosition(CGPoint { x: bx, y: by });
+                            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (bx, by);
                             EDGE_AT_EDGE.store(false, Ordering::Relaxed);
                             return event;
                         }
@@ -1153,7 +1259,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260925-233958-967d8a8";
+const BUILD_ID: &str = "build-20260926-000040-0ea02c1";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1265,6 +1371,25 @@ fn main() {
     );
     if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
         SCROLL_FLIP.store(true, Ordering::Relaxed);
+    }
+    // Deskflow 標準オプション(画面位置/切替/隅/クリップボード)
+    match envutil::get("TSUNAGU_SIDE").as_deref() {
+        Some("left") => SIDE.store(1, Ordering::Relaxed),
+        Some("up") => SIDE.store(2, Ordering::Relaxed),
+        Some("down") => SIDE.store(3, Ordering::Relaxed),
+        _ => {}
+    }
+    if let Some(v) = envutil::get("TSUNAGU_SWITCH_DELAY").and_then(|v| v.parse::<u64>().ok()) {
+        SWITCH_DELAY_MS.store(v.min(5000), Ordering::Relaxed);
+    }
+    if let Some(v) = envutil::get("TSUNAGU_DOUBLE_TAP_MS").and_then(|v| v.parse::<u64>().ok()) {
+        DOUBLE_TAP_MS.store(v.clamp(100, 3000), Ordering::Relaxed);
+    }
+    if let Some(v) = envutil::get("TSUNAGU_CORNER_PX").and_then(|v| v.parse::<u64>().ok()) {
+        CORNER_PX.store(v.min(500), Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_CLIP").as_deref() == Some("0") {
+        CLIP_SHARE.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
@@ -1521,6 +1646,10 @@ fn main() {
                 continue;
             }
             last_count = cnt;
+            // clipboardSharing=false の間は Mac→Win 方向へ送らない
+            if !CLIP_SHARE.load(Ordering::Relaxed) {
+                continue;
+            }
             // テキストが無い/空のときは Finder の ⌘C(ファイル参照)を試す:
             // Mac で ⌘C → 画面端で切替 → Windows で Ctrl+V のファイル渡し
             let text = unsafe { mac_get_clipboard() }
@@ -1708,6 +1837,9 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             leave_win_mode_cursor_unlock(Some(ny));
                         }
                         Msg::ClipData { kind, data } => {
+                            if !CLIP_SHARE.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             // 受信側にも上限を課す(送信側制限のみに依存しない)
                             if data.len() > 8 * 1024 * 1024 {
                                 eprintln!("[clip] win->mac image too large. skipped");
@@ -1726,6 +1858,9 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             }
                         }
                         Msg::Clip { text } => {
+                            if !CLIP_SHARE.load(Ordering::Relaxed) {
+                                continue;
+                            }
                             if text.len() <= CLIP_MAX_BYTES {
                                 // Windows の CRLF は Mac 向けに LF へ正規化
                                 let text = if text.contains("\r\n") {
@@ -1914,6 +2049,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         send_msg(&Msg::Cfg {
             cmd_alt: CMD_ALT.load(Ordering::Relaxed),
             spk_mute: SPK_MUTE.load(Ordering::Relaxed),
+            side: SIDE.load(Ordering::Relaxed),
         });
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
@@ -1975,9 +2111,10 @@ fn client_attempt(
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     // 現在の ⌘キー設定を同期(クライアントモードの確立時)
     send_msg(&Msg::Cfg {
-            cmd_alt: CMD_ALT.load(Ordering::Relaxed),
-            spk_mute: SPK_MUTE.load(Ordering::Relaxed),
-        });
+        cmd_alt: CMD_ALT.load(Ordering::Relaxed),
+        spk_mute: SPK_MUTE.load(Ordering::Relaxed),
+        side: SIDE.load(Ordering::Relaxed),
+    });
     eprintln!("[conn] established");
     notify("tsunagu", "Windows に接続しました");
     session_receive_loop(&mut reader);

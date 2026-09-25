@@ -2,6 +2,19 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
+## [0.11.0] - 2026-09-25
+
+### 追加(Deskflow 標準機能パリティ)
+- **モニター位置関係(links)**: Windows 画面が Mac の 右/左/上/下 のどこにあるかを
+  選択(設定ウィンドウのポップアップ/メニュー/`TSUNAGU_SIDE`)。切替境界・復帰端・
+  カーソル固定/復帰位置・戻り通知の端が全て連動(`Cfg.side` で Win へ同期、VERSION 6)
+- **switchDelay**: 端に N ms 滞ってから切替(0=無効)。設定窓スライダ(0..1000ms)
+- **switchDoubleTap**: ダブルタップ判定窓を設定可(既定700ms、200..1200ms)
+- **switchCorners(+cornerSize)**: 四隅 N px では切替しない(`TSUNAGU_CORNER_PX`)
+- **clipboardSharing**: クリップボード共有の ON/OFF(設定窓/`TSUNAGU_CLIP=0`)
+- **サーバー設定 GUI(Win)**: ステータス窓にサーバー(Mac)アドレス編集+
+  「保存して再接続」ボタン(.env の TSUNAGU_HOST を更新して再起動)
+
 ## [0.10.2] - 2026-09-25
 
 ### 修正

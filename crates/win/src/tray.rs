@@ -114,6 +114,7 @@ const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
 const MENU_OPENLOG: u32 = 1004;
 const MENU_RESTART: u32 = 1005;
+const MENU_SAVEHOST: u32 = 1006;
 // ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
 const ID_LBL_STATE: u32 = 210;
 const ID_HEAD_CONN: u32 = 211;
@@ -170,6 +171,9 @@ static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static LABEL_RTT: AtomicUsize = AtomicUsize::new(0);
 static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FILES: AtomicUsize = AtomicUsize::new(0);
+static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
+/// 現在接続先としているホスト(サーバー編集欄の初期値)
+pub static HOST_NOW: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 fn wide_into(buf: &mut [u16], s: &str) {
     for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
@@ -199,6 +203,21 @@ fn rtt_line() -> String {
         format!("遅延: {ms}ms")
     }
 }
+/// exe と同じフォルダの .env の TSUNAGU_HOST 行を書き換える(無ければ追記)
+fn save_host_to_env(host: &str) {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let path = dir.join(".env");
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("TSUNAGU_HOST"))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("TSUNAGU_HOST={host}"));
+    let _ = std::fs::write(&path, lines.join("\r\n") + "\r\n");
+}
+
 /// ファイル受信の累計(ステータス窓の表示)
 fn files_line() -> String {
     let n = crate::FILES_RX.load(Ordering::Relaxed);
@@ -320,6 +339,26 @@ unsafe fn handle_command(id: u32) {
             let mut np = wide("notepad.exe");
             ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
         }
+        MENU_SAVEHOST => {
+            // サーバー(Mac)アドレスを .env へ保存して再起動(自動復帰が起こす)
+            let hwnd = EDIT_HOST.load(Ordering::Relaxed) as HWND;
+            if !hwnd.is_null() {
+                extern "system" {
+                    fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
+                    fn GetWindowTextLengthW(hwnd: HWND) -> i32;
+                }
+                let len = GetWindowTextLengthW(hwnd);
+                let mut buf = vec![0u16; len as usize + 1];
+                GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+                let text = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+                let host = text.trim().to_string();
+                if !host.is_empty() {
+                    save_host_to_env(&host);
+                    eprintln!("[tray] サーバーを {host} へ変更し再起動します");
+                    std::process::exit(0);
+                }
+            }
+        }
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
             eprintln!("[tray] 再起動します(自動復帰タスクが起こします)");
@@ -337,6 +376,7 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     const WM_PAINT2: u32 = 0x000F;
     const WM_ERASEBKGND2: u32 = 0x0014;
     const WM_CTLCOLORSTATIC2: u32 = 0x0138;
+    const WM_CTLCOLOREDIT2: u32 = 0x0133;
     const WM_DRAWITEM2: u32 = 0x002B;
     match msg {
         WM_COMMAND => {
@@ -352,6 +392,17 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         WM_PAINT2 => {
             unsafe { paint_status(hwnd) };
             0
+        }
+        WM_CTLCOLOREDIT2 => {
+            // サーバー編集欄のダーク対応(濃い背景+白文字)
+            unsafe {
+                let hdc = wparam as *mut core::ffi::c_void;
+                SetTextColor(hdc, 0xEDEDF2);
+                SetBkColor(hdc, rgb(CLR_CARD));
+                static EDIT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let b = *EDIT_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_CARD)) as usize);
+                b as LRESULT
+            }
         }
         WM_CTLCOLORSTATIC2 => {
             // ラベルの文字色をテーマへ(見出し/状態=白、本文=グレー、補助=暗グレー)。
@@ -524,7 +575,7 @@ unsafe fn open_status_window() {
             class.as_ptr(),
             wide("tsunagu").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 460, 300,
+            60, 60, 460, 372,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -567,15 +618,33 @@ unsafe fn open_status_window() {
         let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 38, 124, 390, 20, ID_LBL_AUDIO as usize), Ordering::Relaxed);
         let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 38, 146, 390, 20, ID_LBL_SPK as usize), Ordering::Relaxed);
         let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 38, 168, 390, 20, ID_LBL_FILES as usize), Ordering::Relaxed);
+        // 見出し「サーバー」(太字)+ 接続先(Mac)編集 + 保存して再接続
+        let head_srv = make_child("STATIC", "サーバー(Mac)", 0, 18, 212, 420, 18, 1000 as usize);
+        PostMessageW(head_srv as _, WM_SETFONT, font_bold as usize, 1);
+        let host_init = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let edit = make_child(
+            "EDIT",
+            &host_init,
+            0x0080 /*ES_AUTOHSCROLL*/ | 1 /*WS_BORDER*/,
+            18,
+            236,
+            250,
+            26,
+            0,
+        );
+        PostMessageW(edit as _, WM_SETFONT, font as usize, 1);
+        let _ = EDIT_HOST.store(edit, Ordering::Relaxed);
+        const BS_OWNERDRAW2: u32 = 0x000B;
+        make_child("BUTTON", "保存して再接続", BS_OWNERDRAW2, 276, 234, 144, 30, MENU_SAVEHOST as usize);
         // 見出し「操作」(太字)
-        let head_act = make_child("STATIC", "操作", 0, 18, 212, 420, 18, ID_HEAD_ACT as usize);
+        let head_act = make_child("STATIC", "操作", 0, 18, 278, 420, 18, ID_HEAD_ACT as usize);
         PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
         // ボタンはオーナードロー(角丸フラット・WM_DRAWITEM で描画)
         const BS_OWNERDRAW: u32 = 0x000B;
-        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 236, 100, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 124, 236, 108, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "再起動", BS_OWNERDRAW, 238, 236, 88, 36, MENU_RESTART as usize);
-        make_child("BUTTON", "終了", BS_OWNERDRAW, 332, 236, 88, 36, MENU_QUIT as usize);
+        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 302, 100, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 124, 302, 108, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "再起動", BS_OWNERDRAW, 238, 302, 88, 36, MENU_RESTART as usize);
+        make_child("BUTTON", "終了", BS_OWNERDRAW, 332, 302, 88, 36, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();

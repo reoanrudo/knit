@@ -152,6 +152,8 @@ static CMD_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// Mac が測定した RTT(ms)。Mac から Stat で届く(ステータス窓の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Windows 画面の位置(0=Macの右/1=左/2=上/3=下)。Mac から Cfg で同期
+pub static SIDE_W: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 /// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
 static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
@@ -645,7 +647,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260925-230026-967d8a8";
+const BUILD_ID: &str = "win-20260925-235925-0ea02c1";
 
 fn main() {
     ensure_stdout();
@@ -706,6 +708,7 @@ fn main() {
         .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"))
         .unwrap_or_else(|| "100.100.10.9".to_string());
     println!("[info] desktop attached. screen {w}x{h}. connecting to {host}:{port}");
+    *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = host.clone();
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
     // TSUNAGU_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
@@ -1019,8 +1022,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             Msg::Ping { ts } => {
                 let _ = wtx.send(encode(&Msg::Pong { ts }));
             }
-            Msg::Cfg { cmd_alt, spk_mute } => {
+            Msg::Cfg { cmd_alt, spk_mute, side } => {
                 CMD_ALT.store(cmd_alt, Ordering::Relaxed);
+                SIDE_W.store(side.min(3), Ordering::Relaxed);
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
                 if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
                     println!("[cfg] 接続中スピーカーミュート -> {}", if spk_mute { "ON" } else { "OFF" });
@@ -1182,7 +1186,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     accum.1 -= iy;
                     inject_mouse_move_rel(ix as i32, iy as i32);
                     // 実際にカーソルが動いたときだけ左端到達を判定する
-                    maybe_notify_return(&wtx, &mut last_return_notify, h, &mut mods);
+                    maybe_notify_return(&wtx, &mut last_return_notify, w, h, &mut mods);
                 }
             }
             Msg::MouseAbs { nx, ny } => {
@@ -1195,7 +1199,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 if DEBUG_KEYS.load(Ordering::Relaxed) {
                     println!("[abs] -> ({x},{y})");
                 }
-                maybe_notify_return(&wtx, &mut last_return_notify, h, &mut mods);
+                maybe_notify_return(&wtx, &mut last_return_notify, w, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
@@ -1324,18 +1328,34 @@ fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> 
     }
 }
 
-/// カーソルが画面左端に達したら Mac へ復帰通知(連打防止 1 秒クールダウン)。
-/// カーソル高さも正規化して送り、Mac 側の復帰位置に反映させる(境界の連続性)。
+/// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
+/// (連打防止 0.7 秒クールダウン)。境界に沿った比率も送り、Mac 側の復帰位置に
+/// 反映させる(境界の連続性)。side 0/1=縦比率、2/3=横比率を ny へ載せる
 fn maybe_notify_return(
     wtx: &std::sync::mpsc::Sender<String>,
     last: &mut Instant,
+    w: i32,
     h: i32,
     mods: &mut ModState,
 ) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
-    if p.x <= 1 && last.elapsed() >= Duration::from_millis(700) {
-        let ny = if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 };
+    let side = SIDE_W.load(Ordering::Relaxed);
+    let hit = match side {
+        1 => p.x >= w - 1,   // Mac は左にある → Win の右端で戻る
+        2 => p.y >= h - 1,   // Mac は上にある → Win の下端で戻る
+        3 => p.y <= 1,       // Mac は下にある → Win の上端で戻る
+        _ => p.x <= 1,       // 既定: Mac は右にある → Win の左端で戻る
+    };
+    if hit && last.elapsed() >= Duration::from_millis(700) {
+        let ny = match side {
+            2 | 3 => {
+                if w > 0 { (p.x as f64 / w as f64).clamp(0.0, 1.0) } else { 0.5 }
+            }
+            _ => {
+                if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 }
+            }
+        };
         let _ = wtx.send(encode(&Msg::Return { ny }));
         *last = Instant::now();
         // Mac へ制御を返すため、押しっぱなしの修飾キーを離して後片付けする
