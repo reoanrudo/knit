@@ -499,16 +499,15 @@ fn sync_prefs_state() {
             };
             let mode = if win { "Windows 操作中" } else { "Mac 操作中" };
             msg1_void_id(st, sel(c"setStringValue:"), nsstring(&format!("状態: {conn} ・ {mode}")));
-            // 近未来: 接続中=シアン発光/切断=赤
+            // 切断時は赤で強調(接続時は標準ラベル色)
             let color_cls = objc_getClass(c"NSColor".as_ptr());
             if !color_cls.is_null() {
-                let color = if connected {
-                    accent_color()
-                } else {
-                    let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
-                        std::mem::transmute(crate::objc_msgSend as usize);
-                    get_color(color_cls, sel(c"systemRedColor"))
-                };
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let color = get_color(
+                    color_cls,
+                    sel(if connected { c"labelColor" } else { c"systemRedColor" }),
+                );
                 if !color.is_null() {
                     msg1_void_id(st, sel(c"setTextColor:"), color);
                 }
@@ -584,17 +583,18 @@ unsafe fn section_heading(cv: ID, text: &str, frame: NSRect) {
         let set_frame: unsafe extern "C" fn(ID, SEL, NSRect) =
             std::mem::transmute(crate::objc_msgSend as usize);
         set_frame(lbl, sel(c"setFrame:"), frame);
-        // 近未来: 見出しはシアン発光+直下に細いネオン罫線
-        let acc = accent_color();
-        if !acc.is_null() {
-            let setc: unsafe extern "C" fn(ID, SEL, ID) =
+        // 見出しは標準の補足色(Apple 純正設定画面と同じ扱い)
+        let color_cls = objc_getClass(c"NSColor".as_ptr());
+        if !color_cls.is_null() {
+            let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
                 std::mem::transmute(crate::objc_msgSend as usize);
-            setc(lbl, sel(c"setTextColor:"), acc);
+            let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+            if !color.is_null() {
+                let setc: unsafe extern "C" fn(ID, SEL, ID) =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                setc(lbl, sel(c"setTextColor:"), color);
+            }
         }
-        neon_rule(
-            cv,
-            NSRect { x: frame.x, y: frame.y - 2.0, w: frame.w, h: 1.0 },
-        );
         // boldSystemFontOfSize: は NSFont のクラスメソッド(インスタンスへは送れない)
         let font_cls = objc_getClass(c"NSFont".as_ptr());
         if !font_cls.is_null() {
@@ -674,8 +674,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             let ve = init_frame(alloc_v, sel(c"initWithFrame:"), b);
             if !ve.is_null() {
                 // 近未来パネル: HUDWindow(13)=黒系の濃いすりガラス+背後ブレンド
-                msg1_void_i64(ve, sel(c"setMaterial:"), 13);
-            eprintln!("[prefs] ve material ok"); // HUDWindow
+                msg1_void_i64(ve, sel(c"setMaterial:"), 2); // Sidebar(標準)
                 msg1_void_i64(ve, sel(c"setBlendingMode:"), 0); // behind window
                 msg1_void_i64(ve, sel(c"setState:"), 1); // active
                 // 窓リサイズに追従(width|height sizable)
@@ -683,68 +682,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 msg1_void_id(cv, sel(c"addSubview:"), ve);
             }
         }
-        // 深みを出す半透明黒オーバーレイ(コントロールより下=effect view の上)
-        {
-            let ov_cls = objc_getClass(c"NSView".as_ptr());
-            if !ov_cls.is_null() {
-                let init_frame: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
-                    std::mem::transmute(crate::objc_msgSend as usize);
-                let bounds: unsafe extern "C" fn(ID, SEL) -> NSRect =
-                    std::mem::transmute(crate::objc_msgSend as usize);
-                let b = bounds(cv, sel(c"bounds"));
-                let ov = init_frame(msg0(ov_cls, sel(c"alloc")), sel(c"initWithFrame:"), b);
-                if !ov.is_null() {
-                    msg1_void_i64(ov, sel(c"setWantsLayer:"), 1);
-                    let color_cls = objc_getClass(c"NSColor".as_ptr());
-                    let mk: unsafe extern "C" fn(ID, SEL, f64, f64, f64, f64) -> ID =
-                        std::mem::transmute(crate::objc_msgSend as usize);
-                    // 90% 黒: ガラス感を残しつつ深いダークパネルへ
-                    let dark = mk(
-                        color_cls,
-                        sel(c"colorWithCalibratedRed:green:blue:alpha:"),
-                        0.02, 0.03, 0.06, 0.9,
-                    );
-                    if !dark.is_null() {
-                        let setbg: unsafe extern "C" fn(ID, SEL, ID) =
-                            std::mem::transmute(crate::objc_msgSend as usize);
-                        setbg(ov, sel(c"setBackgroundColor:"), dark);
-                    }
-                    let auto: unsafe extern "C" fn(ID, SEL, i64) =
-                        std::mem::transmute(crate::objc_msgSend as usize);
-                    auto(ov, sel(c"setAutoresizingMask:"), 2 | 16);
-                    msg1_void_id(cv, sel(c"addSubview:"), ov);
-                }
-            }
-        }
         let btn_cls = objc_getClass(c"NSButton".as_ptr());
-
-        // ---- ヘッダー: ロゴ(等幅・シアン=端末風) ----
-        let logo = label(
-            objc_getClass(c"NSTextField".as_ptr()),
-            sel(c"labelWithString:"),
-            nsstring("TSUNAGU"),
-        );
-        if !logo.is_null() {
-            set_frame(logo, sel(c"setFrame:"), NSRect { x: 300.0, y: 710.0 - 42.0, w: 96.0, h: 20.0 });
-            if std::env::var_os("TSUNAGU_NO_LOGO_STYLE").is_none() {
-                let font_cls = objc_getClass(c"NSFont".as_ptr());
-                if !font_cls.is_null() {
-                    // 等幅は monospacedSystemFontOfSize:weight: のみ実在
-                    // (weight: 0.0=通常, 0.4=太字)
-                    let mono: unsafe extern "C" fn(ID, SEL, f64, f64) -> ID =
-                        std::mem::transmute(crate::objc_msgSend as usize);
-                    let mf = mono(font_cls, sel(c"monospacedSystemFontOfSize:weight:"), 11.0, 0.4);
-                    if !mf.is_null() {
-                        msg1_void_id(logo, sel(c"setFont:"), mf);
-                    }
-                }
-                let acc = accent_color();
-                if !acc.is_null() {
-                    msg1_void_id(logo, sel(c"setTextColor:"), acc);
-                }
-            }
-            msg1_void_id(cv, sel(c"addSubview:"), logo);
-        }
 
         // ---- 状態行(最上部・太字。1 秒タイマーで更新・接続状態で色が変わる) ----
         let state_lbl = label(
@@ -1064,27 +1002,13 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring(&format!("Tsunagu {} ・ {}", crate::VERSION_STR, crate::BUILD_ID)),
         );
         if !info.is_null() {
-            // 近未来: 情報行は等幅+薄シアン(端末のステータス行風)
-            let font_cls2 = objc_getClass(c"NSFont".as_ptr());
-            if !font_cls2.is_null() {
-                let mono: unsafe extern "C" fn(ID, SEL, f64, f64) -> ID =
-                    std::mem::transmute(crate::objc_msgSend as usize);
-                let mf = mono(font_cls2, sel(c"monospacedSystemFontOfSize:weight:"), 11.0, 0.0);
-                if !mf.is_null() {
-                    msg1_void_id(info, sel(c"setFont:"), mf);
-                }
-            }
             let color_cls = objc_getClass(c"NSColor".as_ptr());
             if !color_cls.is_null() {
-                let mk: unsafe extern "C" fn(ID, SEL, f64, f64, f64, f64) -> ID =
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
                     std::mem::transmute(crate::objc_msgSend as usize);
-                let dim_cyan = mk(
-                    color_cls,
-                    sel(c"colorWithCalibratedRed:green:blue:alpha:"),
-                    0.4, 0.8, 0.9, 0.85,
-                );
-                if !dim_cyan.is_null() {
-                    msg1_void_id(info, sel(c"setTextColor:"), dim_cyan);
+                let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+                if !color.is_null() {
+                    msg1_void_id(info, sel(c"setTextColor:"), color);
                 }
             }
             set_frame(info, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 320.0, h: 22.0 });

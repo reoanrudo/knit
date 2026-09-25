@@ -29,12 +29,12 @@ unsafe extern "system" {
 const WM_TRAY: u32 = WM_APP + 1;
 
 // ---------- ダークテーマ(モダンUI)の色定義(0xRRGGBB) ----------
-const CLR_BG: u32 = 0x0A0E14; // 窓背景(深い黒+青み=近未来)
-const CLR_CARD: u32 = 0x10161F; // カード面(黒+青)
-const CLR_HEAD: u32 = 0xE8FBFF; // 見出し・状態行(白シアン)
-const CLR_TEXT: u32 = 0x9FB6C6; // 本文(青みグレー)
-const CLR_SUB: u32 = 0x5E7A8A; // 補足(くすんだ青グレー)
-const CLR_ACCENT: u32 = 0x22D3EE; // ボタン・ネオン(シアン)
+const CLR_BG: u32 = 0xF0F0F0; // 窓背景(Windows 標準ライト)
+const CLR_CARD: u32 = 0xFFFFFF; // カード面(白)
+const CLR_HEAD: u32 = 0x1A1A1A; // 見出し・状態行(黒)
+const CLR_TEXT: u32 = 0x444444; // 本文
+const CLR_SUB: u32 = 0x888888; // 補足
+const CLR_ACCENT: u32 = 0x0067C0; // 標準アクセント(Windows 11 青)
 const CLR_DANGER: u32 = 0xC2504B; // 終了ボタン(赤系)
 /// 0xRRGGBB → COLORREF(0x00BBGGRR)
 fn rgb(c: u32) -> u32 {
@@ -475,8 +475,6 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 let id = GetDlgCtrlID(child);
                 // RTT は値で色分け(緑=快適/黄=やや遅延/赤=遅延)
                 let color = match id as u32 {
-                    1003 => rgb(CLR_ACCENT), // TSUNAGU ロゴ=シアン
-                    ID_LBL_STATE if crate::CONNECTED.load(Ordering::Relaxed) => rgb(CLR_ACCENT),
                     ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT => rgb(CLR_HEAD),
                     ID_LBL_BUILD | 1002 => rgb(CLR_SUB),
                     ID_LBL_RTT => {
@@ -580,7 +578,7 @@ unsafe fn paint_status(hwnd: HWND) {
         // 接続カード(RTT/スピーカー/ファイル を囲む角丸面)
         let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 216 };
         let card_brush = CreateSolidBrush(rgb(CLR_CARD));
-        let card_pen = CreatePen(0, 1, rgb(0x1B2735));
+        let card_pen = CreatePen(0, 1, rgb(0xE0E0E0));
         let ob = SelectObject(hdc, card_brush);
         let op = SelectObject(hdc, card_pen);
         RoundRect(hdc, card.left, card.top, card.right, card.bottom, 10, 10);
@@ -588,12 +586,6 @@ unsafe fn paint_status(hwnd: HWND) {
         SelectObject(hdc, op);
         DeleteObject(card_brush);
         DeleteObject(card_pen);
-        // ネオン罫線: 各見出し(接続/サーバー/操作)の下にシアンの細線(Mac と同一意匠)
-        let neon = CreateSolidBrush(rgb(CLR_ACCENT));
-        for y in [96i32, 246, 312] {
-            FillRect(hdc, &Rect { left: 18, top: y, right: rc.right - 18, bottom: y + 1 }, neon);
-        }
-        DeleteObject(neon);
         EndPaint(hwnd, &ps);
     }
 }
@@ -691,7 +683,7 @@ unsafe fn open_status_window() {
             eprintln!("[tray] ステータスウィンドウ生成失敗");
             return;
         }
-        apply_dark_titlebar(hwnd);
+
         let _ = STATUS_HWND.store(hwnd as usize, Ordering::Relaxed);
         let font = segoe_font(false, 17);
         let font_bold = segoe_font(true, 19);
@@ -712,10 +704,6 @@ unsafe fn open_status_window() {
             }
             child as usize
         };
-        // 右上に TSUNAGU ロゴ(Consolas 等幅・シアン=Mac 設定窓と同一意匠)
-        let logo = make_child("STATIC", "TSUNAGU", 0, 330, 14, 108, 20, 1003 as usize);
-        PostMessageW(logo as _, WM_SETFONT, segoe_mono(11) as usize, 1);
-        let _ = LABEL_LOGO.store(logo, Ordering::Relaxed);
         // ヘッダー左にアプリアイコン(SS_ICON スタティック)
         let icon32 = load_tray_icon_size(32);
         if !icon32.is_null() {
@@ -752,18 +740,18 @@ unsafe fn open_status_window() {
         PostMessageW(edit as _, WM_SETFONT, font as usize, 1);
         let _ = EDIT_HOST.store(edit, Ordering::Relaxed);
         const BS_OWNERDRAW2: u32 = 0x000B;
-        make_child("BUTTON", "保存して再接続", BS_OWNERDRAW2, 276, 250, 144, 30, MENU_SAVEHOST as usize);
+        make_child("BUTTON", "保存して再接続", 0, 276, 250, 144, 30, MENU_SAVEHOST as usize);
         // 見出し「操作」(太字)
         let head_act = make_child("STATIC", "操作", 0, 18, 294, 420, 18, ID_HEAD_ACT as usize);
         PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
         // ボタンはオーナードロー(角丸フラット・WM_DRAWITEM で描画)
         const BS_OWNERDRAW: u32 = 0x000B;
-        make_child("BUTTON", "Mac へ戻る", BS_OWNERDRAW, 18, 316, 128, 36, MENU_BACKMAC as usize);
-        make_child("BUTTON", "受信フォルダ", BS_OWNERDRAW, 152, 316, 124, 36, MENU_OPENFOLDER as usize);
-        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 284, 316, 80, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "終了", BS_OWNERDRAW, 370, 316, 50, 36, MENU_QUIT as usize);
-        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 358, 128, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "再起動", BS_OWNERDRAW, 152, 358, 124, 36, MENU_RESTART as usize);
+        make_child("BUTTON", "Mac へ戻る", 0, 18, 316, 128, 36, MENU_BACKMAC as usize);
+        make_child("BUTTON", "受信フォルダ", 0, 152, 316, 124, 36, MENU_OPENFOLDER as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 284, 316, 80, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "終了", 0, 370, 316, 50, 36, MENU_QUIT as usize);
+        make_child("BUTTON", "ログを開く", 0, 18, 358, 128, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "再起動", 0, 152, 358, 124, 36, MENU_RESTART as usize);
         // フッター(接続先と稼働時間)
         let _ = LABEL_FOOTER.store(make_child("STATIC", &footer_line(), 0, 18, 406, 420, 20, 1002 as usize), Ordering::Relaxed);
         ShowWindow(hwnd, SW_SHOW);
