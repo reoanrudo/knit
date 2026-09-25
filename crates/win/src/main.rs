@@ -437,20 +437,21 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     let ch = sd_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
                 }
-                // Mac JIS の かな(102)/英数(104)キーは Windows 側 IME の開閉に変換する
+                // Mac JIS の 英数(102)/かな(104)キーは Windows 側 IME の開閉に変換する
+                // (HIToolbox 実測: kVK_JIS_Eisu=102, kVK_JIS_Kana=104)
                 if down {
                     match kc {
-                        102 => {
+                        104 => {
                             ime_set_open(true);
                             if DEBUG_KEYS.load(Ordering::Relaxed) {
-                                println!("[ime] kana -> IME on");
+                                println!("[ime] kana(kc=104) -> IME on");
                             }
                             continue;
                         }
-                        104 => {
+                        102 => {
                             ime_set_open(false);
                             if DEBUG_KEYS.load(Ordering::Relaxed) {
-                                println!("[ime] eisu -> IME off");
+                                println!("[ime] eisu(kc=102) -> IME off");
                             }
                             continue;
                         }
