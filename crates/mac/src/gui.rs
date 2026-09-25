@@ -359,7 +359,8 @@ unsafe extern "C" fn imp_rotate_side(_s: ID, _c: SEL, _n: ID) {
 }
 
 /// 配置エディタ(独立ウィンドウ)を開く
-unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
+/// 配置エディタ(独立ウィンドウ)を開く(メニュー IMP と起動直後の両方から呼ぶ)
+pub fn show_layout() {
     unsafe {
         let app = msg0(objc_getClass(c"NSApplication".as_ptr()), sel(c"sharedApplication"));
         if !app.is_null() {
@@ -382,6 +383,10 @@ unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
     }
 }
 
+unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
+    show_layout();
+}
+
 /// 配置エディタ専用の小ウィンドウ(設定窓に収まらないため分離)
 unsafe fn make_layout_window() -> ID {
     unsafe {
@@ -393,7 +398,7 @@ unsafe fn make_layout_window() -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 604.0, h: 300.0 },
+            NSRect { x: 0.0, y: 0.0, w: 604.0, h: 400.0 },
             1 | 2, // titled | closable
             2,
             0,
@@ -417,13 +422,13 @@ unsafe fn make_layout_window() -> ID {
             nsstring("Windows(青)をドラッグして実際の配置へ。離すと確定"),
         );
         if !top.is_null() {
-            set_frame(top, sel(c"setFrame:"), NSRect { x: 20.0, y: 258.0, w: 560.0, h: 18.0 });
+            set_frame(top, sel(c"setFrame:"), NSRect { x: 20.0, y: 372.0, w: 560.0, h: 18.0 });
             msg1_void_id(cv, sel(c"addSubview:"), top);
         }
         // 配置ビュー(中央)
         let lay = make_layout_view(cv);
         if !lay.is_null() {
-            set_frame(lay, sel(c"setFrame:"), NSRect { x: 22.0, y: 42.0, w: LAY_VW, h: LAY_VH });
+            set_frame(lay, sel(c"setFrame:"), NSRect { x: 22.0, y: 44.0, w: LAY_VW, h: LAY_VH });
             msg1_void_id(cv, sel(c"addSubview:"), lay);
         }
         // 凡例(下)
@@ -664,7 +669,7 @@ unsafe fn neon_rule(cv: ID, frame: NSRect) {
 // 灰色=Mac、青=Windows の矩形を描き、Windows 側をドラッグして物理配置を再現する。
 // ドロップ時に「接する辺+辺に沿った接続範囲」を算出して SIDE/LAY_RANGE へ反映
 const LAY_VW: f64 = 560.0;
-const LAY_VH: f64 = 230.0;
+const LAY_VH: f64 = 320.0;
 
 /// Mac/Win 両画面の実ピクセルサイズ(hello 受信値。未接続時は一般値)
 fn lay_px() -> ((f64, f64), (f64, f64)) {
@@ -750,14 +755,21 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
         extern "C" {
             fn CGContextSetRGBFillColor(c: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
             fn CGContextFillRect(c: *mut core::ffi::c_void, r: NSRect);
+            fn CGContextSetRGBStrokeColor(c: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+            fn CGContextSetLineWidth(c: *mut core::ffi::c_void, w: f64);
+            fn CGContextStrokeRect(c: *mut core::ffi::c_void, r: NSRect);
         }
         let ctx = port as *mut core::ffi::c_void;
         // 背景
         CGContextSetRGBFillColor(ctx, 0.13, 0.14, 0.16, 1.0);
         CGContextFillRect(ctx, NSRect { x: 0.0, y: 0.0, w: LAY_VW, h: LAY_VH });
-        // Mac(灰)
+        // Mac(灰+白枠: 青が重なっても輪郭が見える)
+        let mr = lay_mac_rect();
         CGContextSetRGBFillColor(ctx, 0.42, 0.45, 0.50, 1.0);
-        CGContextFillRect(ctx, lay_mac_rect());
+        CGContextFillRect(ctx, mr);
+        CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, 0.9);
+        CGContextSetLineWidth(ctx, 1.5);
+        CGContextStrokeRect(ctx, mr);
         // Windows(青=標準アクセント)
         let wc = lay_win_center();
         let (ww, wh) = lay_win_size();
@@ -832,23 +844,10 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         crate::set_side(side);
         // 細かい範囲で上書き(set_side は半分単位で設定するため)
         *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = (f0, f1.max(f0 + 0.05));
-        // 見た目を辺にスナップ
-        let (lo, hi) = *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
-        let mid = (lo + hi) / 2.0;
-        let snapped = match edge {
-            0 => (m.x + m.w + 8.0 + ww / 2.0, m.y + mid * m.h),
-            1 => (m.x - 8.0 - ww / 2.0, m.y + mid * m.h),
-            2 => (m.x + mid * m.w, m.y + m.h + 8.0 + wh / 2.0),
-            _ => (m.x + mid * m.w, m.y - 8.0 - wh / 2.0),
-        };
-        *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (
-            snapped.0.clamp(ww / 2.0 + 2.0, LAY_VW - ww / 2.0 - 2.0),
-            snapped.1.clamp(wh / 2.0 + 2.0, LAY_VH - wh / 2.0 - 2.0),
-        );
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
             std::mem::transmute(crate::objc_msgSend as usize);
         snd(_self, sel(c"setNeedsDisplay:"), 1);
-        eprintln!("[lay] 配置を更新: {}(範囲 {:.2}〜{:.2})", crate::side_name(), lo, hi);
+        eprintln!("[lay] 配置を更新: {}(範囲 {:.2}〜{:.2})", crate::side_name(), f0, f1);
     }
 }
 
@@ -1386,6 +1385,10 @@ unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
     // (run 前のウィンドウ操作は NSException で abort するため遅延させる)
     if SHOW_AT_START.swap(false, Ordering::Relaxed) {
         show_prefs();
+        // 検証用: TSUNAGU_SHOW_LAYOUT=1 で配置ウィンドウも同時オープン
+        if crate::envutil::get("TSUNAGU_SHOW_LAYOUT").as_deref() == Some("1") {
+            show_layout();
+        }
     }
     refresh_status();
 }
