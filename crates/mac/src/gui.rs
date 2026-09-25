@@ -112,6 +112,7 @@ static GUI_STATE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_TOGGLE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_MODE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_TAPS_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_AUDIO_ITEM: AtomicUsize = AtomicUsize::new(0);
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
 
@@ -151,6 +152,12 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
             crate::notify("seamless-desk", "再起動スクリプトが見つかりません");
         }
     }
+}
+unsafe extern "C" fn imp_audio_toggle(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::audio::MUTED.load(Ordering::Relaxed);
+    crate::audio::MUTED.store(next, Ordering::Relaxed);
+    eprintln!("[audio] mute -> {next}");
+    refresh_status();
 }
 unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     eprintln!("[gui] メニューから終了しました");
@@ -216,6 +223,15 @@ fn refresh_status() {
                 "境界到達: 1回"
             };
             msg1_void_id(taps_item, sel(c"setTitle:"), nsstring(t));
+        }
+        let audio_item = GUI_AUDIO_ITEM.load(Ordering::Relaxed) as ID;
+        if !audio_item.is_null() {
+            let t = if crate::audio::MUTED.load(Ordering::Relaxed) {
+                "音声転送: OFF(ミュート)"
+            } else {
+                "音声転送: ON"
+            };
+            msg1_void_id(audio_item, sel(c"setTitle:"), nsstring(t));
         }
     }
 }
@@ -316,6 +332,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdEdgeTaps:", imp_edge_taps as *const () as usize),
         (c"sdOpenLog:", imp_open_log as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
+        (c"sdAudio:", imp_audio_toggle as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];
@@ -408,6 +425,15 @@ pub fn start() -> bool {
         msg1_void_sel(taps_item, sel(c"setAction:"), sel(c"sdEdgeTaps:"));
         let _ = GUI_TAPS_ITEM.store(taps_item as usize, Ordering::Relaxed);
         add_item(menu, taps_item);
+
+        let audio_item = menu_item("音声転送: ON", Some(c"sdAudio:"), "");
+        if audio_item.is_null() {
+            return false;
+        }
+        msg1_void_id(audio_item, sel(c"setTarget:"), target);
+        msg1_void_sel(audio_item, sel(c"setAction:"), sel(c"sdAudio:"));
+        let _ = GUI_AUDIO_ITEM.store(audio_item as usize, Ordering::Relaxed);
+        add_item(menu, audio_item);
 
         add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
 

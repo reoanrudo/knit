@@ -7,17 +7,30 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
-    RegisterClassW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-    HMENU, WNDCLASSW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
-    WM_NULL, WM_RBUTTONUP, WM_TIMER,
+    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu,
+    TranslateMessage, HMENU, MSG, WNDCLASSW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_TIMER,
 };
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: HWND, verb: *const u16, file: *const u16, params: *const u16,
+        dir: *const u16, show: i32,
+    ) -> isize;
+}
 
 const WM_TRAY: u32 = WM_APP + 1;
 const MENU_QUIT: u32 = 1001;
+const MENU_STATUS: u32 = 1002;
+const MENU_AUDIO: u32 = 1003;
+const MENU_OPENLOG: u32 = 1004;
 
 #[link(name = "shell32")]
 #[link(name = "user32")]
@@ -57,11 +70,35 @@ const NIIF_INFO: u32 = 0x01;
 
 static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
 static TRAY_HICON: AtomicUsize = AtomicUsize::new(0);
+static TRAY_HINST: AtomicUsize = AtomicUsize::new(0);
+static STATUS_HWND: AtomicUsize = AtomicUsize::new(0);
+static LABEL_STATE: AtomicUsize = AtomicUsize::new(0);
+static LABEL_BUILD: AtomicUsize = AtomicUsize::new(0);
+static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
 
 fn wide_into(buf: &mut [u16], s: &str) {
     for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
         *dst = src;
     }
+}
+
+fn build_line() -> String {
+    format!("ビルド: {}", crate::BUILD_ID)
+}
+fn audio_line() -> String {
+    if crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed) {
+        "音声転送: ON(Windows の音を Mac で再生)".to_string()
+    } else {
+        "音声転送: OFF".to_string()
+    }
+}
+fn set_text(h: usize, s: &str) {
+    if h == 0 {
+        return;
+    }
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    w.push(0);
+    unsafe { SetWindowTextW(h as _, w.as_ptr()) };
 }
 
 fn tray_status_text() -> String {
@@ -106,18 +143,21 @@ unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
     match msg {
         WM_TRAY => {
             let mouse = (lparam & 0xFFFF) as u32;
-            if mouse == WM_LBUTTONUP || mouse == WM_RBUTTONUP {
+            if mouse == WM_LBUTTONUP {
+                open_status_window(); // 左クリック=アプリ画面(Windows 標準操作)
+            } else if mouse == WM_RBUTTONUP {
                 open_menu(hwnd);
             }
             0
         }
         WM_TIMER => {
             update_tip();
+            update_labels();
             0
         }
-        WM_COMMAND if (wparam & 0xFFFF) as u32 == MENU_QUIT => {
-            eprintln!("[tray] メニューから終了しました");
-            std::process::exit(0);
+        WM_COMMAND => {
+            handle_command((wparam & 0xFFFF) as u32);
+            0
         }
         WM_DESTROY => {
             let mut nid = std::mem::zeroed::<NotifyIconData>();
@@ -132,6 +172,131 @@ unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
     }
 }
 
+/// メニュー/ボタン共通のコマンド処理
+unsafe fn handle_command(id: u32) {
+    match id {
+        MENU_STATUS => open_status_window(),
+        MENU_AUDIO => {
+            let next = !crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed);
+            crate::audio::AUDIO_ENABLED.store(next, Ordering::Relaxed);
+            println!("[tray] 音声転送 -> {next}");
+            update_labels();
+            update_tip();
+        }
+        MENU_OPENLOG => {
+            let mut log: Vec<u16> = r"C:\Users\<user>\seamless-desk\sd-win.log".encode_utf16().collect();
+            log.push(0);
+            let mut verb = wide("open");
+            let mut np = wide("notepad.exe");
+            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
+        }
+        MENU_QUIT => {
+            eprintln!("[tray] メニューから終了しました");
+            std::process::exit(0);
+        }
+        _ => {}
+    }
+}
+
+unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        WM_COMMAND => {
+            handle_command((wparam & 0xFFFF) as u32);
+            0
+        }
+        WM_CLOSE => {
+            // 閉じても破棄せず隠すだけ(常駐アプリの標準動作)
+            ShowWindow(hwnd, SW_HIDE);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+fn wide(s: &str) -> Vec<u16> {
+    let mut w: Vec<u16> = s.encode_utf16().collect();
+    w.push(0);
+    w
+}
+
+/// ステータスウィンドウ(アプリ本体の画面)を開く。トレイ左クリック/メニューから
+unsafe fn open_status_window() {
+    unsafe {
+        let existing = STATUS_HWND.load(Ordering::Relaxed) as HWND;
+        if !existing.is_null() {
+            ShowWindow(existing, SW_SHOW);
+            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(existing);
+            return;
+        }
+        let hinst = TRAY_HINST.load(Ordering::Relaxed) as *mut core::ffi::c_void;
+        let mut class = wide("SDWinStatusWnd");
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(status_wndproc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: TRAY_HICON.load(Ordering::Relaxed) as *mut core::ffi::c_void,
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class.as_ptr(),
+        };
+        RegisterClassW(&wc);
+        // タイトルバー+枠で 380x220 のクライアント領域になるよう補正は省略(十分実用)
+        let hwnd = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            wide("seamless-desk").as_ptr(),
+            WS_OVERLAPPEDWINDOW,
+            60, 60, 396, 250,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            hinst,
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            eprintln!("[tray] ステータスウィンドウ生成失敗");
+            return;
+        }
+        let _ = STATUS_HWND.store(hwnd as usize, Ordering::Relaxed);
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let make_child = |class_name: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| -> usize {
+            let child = CreateWindowExW(
+                0,
+                wide(class_name).as_ptr(),
+                wide(text).as_ptr(),
+                WS_CHILD | WS_VISIBLE | style,
+                x, y, w, h,
+                hwnd,
+                id as *mut core::ffi::c_void,
+                hinst,
+                std::ptr::null(),
+            );
+            if !child.is_null() {
+                PostMessageW(child, WM_SETFONT, font as usize, 1);
+            }
+            child as usize
+        };
+        let _ = LABEL_STATE.store(make_child("STATIC", "状態: …", 0, 14, 14, 350, 22, 0), Ordering::Relaxed);
+        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 14, 42, 350, 22, 0), Ordering::Relaxed);
+        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 14, 70, 350, 22, 0), Ordering::Relaxed);
+        make_child("BUTTON", "ログを開く", 0, 14, 120, 112, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 136, 120, 112, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "終了", 0, 258, 120, 112, 36, MENU_QUIT as usize);
+        ShowWindow(hwnd, SW_SHOW);
+        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
+        update_labels();
+    }
+}
+
+/// ラベル類の定期更新(WM_TIMER から)
+unsafe fn update_labels() {
+    set_text(LABEL_STATE.load(Ordering::Relaxed), &tray_status_text());
+    set_text(LABEL_BUILD.load(Ordering::Relaxed), &build_line());
+    set_text(LABEL_AUDIO.load(Ordering::Relaxed), &audio_line());
+}
+
 unsafe fn open_menu(hwnd: HWND) {
     let menu: HMENU = CreatePopupMenu();
     if menu.is_null() {
@@ -143,8 +308,14 @@ unsafe fn open_menu(hwnd: HWND) {
     w.push(0);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    let mut quit: Vec<u16> = "終了".encode_utf16().collect();
-    quit.push(0);
+    let mut open_w = wide("ステータスを開く");
+    AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
+    let mut audio_w = wide(&audio_line());
+    AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
+    let mut log_w = wide("ログを開く");
+    AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
+    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+    let mut quit = wide("終了");
     AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
@@ -181,13 +352,16 @@ unsafe fn tray_loop() {
     let mut class: Vec<u16> = "SDWinTray".encode_utf16().collect();
     class.push(0);
     let hinst = GetModuleHandleW(std::ptr::null());
+    let _ = TRAY_HINST.store(hinst as usize, Ordering::Relaxed);
+    let icon = load_tray_icon();
+    let _ = TRAY_HICON.store(icon as usize, Ordering::Relaxed);
     let wc = WNDCLASSW {
         style: 0,
         lpfnWndProc: Some(tray_wndproc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinst,
-        hIcon: std::ptr::null_mut(),
+        hIcon: icon,
         hCursor: std::ptr::null_mut(),
         hbrBackground: std::ptr::null_mut(),
         lpszMenuName: std::ptr::null(),
@@ -216,8 +390,6 @@ unsafe fn tray_loop() {
         return;
     }
     let _ = TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
-    let icon = load_tray_icon();
-    let _ = TRAY_HICON.store(icon as usize, Ordering::Relaxed);
 
     let mut nid = std::mem::zeroed::<NotifyIconData>();
     nid.cb_size = std::mem::size_of::<NotifyIconData>() as u32;

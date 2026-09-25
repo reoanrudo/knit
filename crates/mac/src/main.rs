@@ -2,6 +2,7 @@
 // 画面右端でカーソルが Mac→Windows 切替、Windows カーソル左端(または F13)で復帰。
 #![allow(non_camel_case_types)]
 
+mod audio;
 mod gui;
 
 use sd_common::envutil;
@@ -849,7 +850,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-195722-4669e01";
+const BUILD_ID: &str = "build-20260925-201749-d661fa3";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -1004,6 +1005,11 @@ fn main() {
             }
         }
     });
+
+    // 音声受信・再生(Windows→Mac。独立ポート 24901。SEAMLESS_AUDIO=0 で無効)
+    if envutil::get("SEAMLESS_AUDIO").as_deref() != Some("0") {
+        audio::start(token.clone());
+    }
 
     // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。SEAMLESS_ROLE=client +
     // SEAMLESS_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。

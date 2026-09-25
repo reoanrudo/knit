@@ -5,6 +5,7 @@
 #![allow(non_upper_case_globals)]
 #![windows_subsystem = "windows"]
 
+mod audio;
 mod tray;
 
 use sd_common::keymap::mac_kc_to_win_vk;
@@ -385,7 +386,7 @@ fn acquire_single_instance() -> bool {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-195622-4669e01";
+const BUILD_ID: &str = "win-20260925-201307-d661fa3";
 
 fn main() {
     ensure_stdout();
@@ -450,6 +451,17 @@ fn main() {
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
+
+    // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
+    // (サーバモードは SEAMLESS_AUDIO_HOST で明示指定した時のみ)
+    if sd_common::envutil::get("SEAMLESS_AUDIO").as_deref() != Some("0") {
+        let audio_host = sd_common::envutil::get("SEAMLESS_AUDIO_HOST")
+            .or_else(|| if role_server { None } else { Some(host.clone()) });
+        match audio_host {
+            Some(h) => audio::start(h, token.clone()),
+            None => println!("[audio] サーバモードで音声先未指定のため無効(SEAMLESS_AUDIO_HOST で指定可)"),
+        }
+    }
 
     if role_server {
         println!("[info] server mode. screen {w}x{h}");

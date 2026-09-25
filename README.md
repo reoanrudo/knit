@@ -1,7 +1,7 @@
 # seamless-desk
 
 Deskflow 快適版。MacBook のキーボード/トラックパッドで Windows デスクトップを操作する。
-**v0.5: アイコン同梱・Windows タスクトレイ常駐(コンソール不要+自動復帰)・接続方向の選択**
+**v0.6: 音声転送(Windows→Mac)・Windows ステータスウィンドウ・タスクトレイ常駐・接続方向の選択**
 
 設計: [docs/design.md](docs/design.md) / 配布手順: [docs/distribution.md](docs/distribution.md)
 
@@ -10,7 +10,8 @@ Deskflow 快適版。MacBook のキーボード/トラックパッドで Windows
 - **Mac = サーバ**(`sd-mac`): CGEventTap で入力をフックし TCP で転送。画面右端で切替。
   **メニューバー常駐 GUI**(アイコン+状態表示・手動切替・切替方式トグル・ログ/再起動/終了)付き
 - **Windows = クライアント**(`sd-win`): 受信イベントを SendInput で注入。カーソル左端で復帰通知。
-  **タスクトレイ常駐**(状態表示・バルーン通知・終了)+5分毎の自動復帰ウォッチ付き
+  **タスクトレイ常駐+ステータスウィンドウ**(左クリックで状態/音声/ログ/終了)+
+  5分毎の自動復帰ウォッチ付き。**Windowsの音をMacで再生**(WASAPIループバック→24901→AudioQueue)
 - 経路: Tailscale(Mac: 100.100.10.9 / Win: 100.84.0.2)、TCP 24900、**共有トークン認証(必須)**
 - 接続方向は .env で選択可(既定: Mac=サーバ/Win=クライアント。逆方向も実機検証済み)
 
