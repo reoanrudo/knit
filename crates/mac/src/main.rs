@@ -369,19 +369,22 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
             }
         }
         CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
-        let edge_x = UNION_MAX_X.get().copied().or(SCREEN_W.get().copied());
-        if let Some(w) = edge_x {
-            let y = match ny {
-                Some(n) => {
-                    let h = SCREEN_H.get().copied().unwrap_or(1000.0);
-                    (n.clamp(0.0, 1.0) * h).clamp(20.0, (h - 20.0).max(20.0))
-                }
-                None => 400.0,
-            };
-            // 境界から 150px 内側へ置き、時間ガード(400ms)と合わせて
-            // 復帰直後のうっかり再突入を防ぐ(意図的な移動は妨げない)
-            CGWarpMouseCursorPosition(CGPoint { x: w - 150.0, y });
-        }
+        // 復帰位置は「メイン(MacBook)画面の右端内側 100px」と「union 右端から 150px」の
+        // 小さい方へ置く。ウルトラワイド右端のすぐ内側に復帰すると、戻ってから少しでも
+        // 右へ動いた瞬間に再突入して「押し戻される」体験になるため、出口から
+        // 十分離れた MacBook 側へ戻す(Windows へ行くときだけ出口へ向かう)
+        let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
+        let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
+        let x = (main_w - 100.0).min(edge_x - 150.0);
+        let y = match ny {
+            Some(n) => {
+                let h = SCREEN_H.get().copied().unwrap_or(1000.0);
+                (n.clamp(0.0, 1.0) * h).clamp(20.0, (h - 20.0).max(20.0))
+            }
+            None => 400.0,
+        };
+        CGWarpMouseCursorPosition(CGPoint { x, y });
+        eprintln!("[return] -> mac ({x:.0},{y:.0})");
     }
 }
 
@@ -616,7 +619,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-172806-88ecb13";
+const BUILD_ID: &str = "build-20260925-173134-fbc6b95";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
