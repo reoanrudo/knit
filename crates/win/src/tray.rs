@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
     RegisterClassW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, HMENU, MSG, WNDCLASSW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
+    TranslateMessage, HMENU, WNDCLASSW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
     MF_GRAYED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
     WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_TIMER,
@@ -335,8 +335,8 @@ unsafe fn handle_command(id: u32) {
         MENU_OPENLOG => {
             let mut log: Vec<u16> = r"C:\Users\<user>\tsunagu\tsunagu-win.log".encode_utf16().collect();
             log.push(0);
-            let mut verb = wide("open");
-            let mut np = wide("notepad.exe");
+            let verb = wide("open");
+            let np = wide("notepad.exe");
             ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
         }
         MENU_SAVEHOST => {
@@ -554,7 +554,7 @@ unsafe fn open_status_window() {
             return;
         }
         let hinst = TRAY_HINST.load(Ordering::Relaxed) as *mut core::ffi::c_void;
-        let mut class = wide("SDWinStatusWnd");
+        let class = wide("SDWinStatusWnd");
         let wc = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(status_wndproc),

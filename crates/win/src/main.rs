@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
+    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
     VK_SHIFT, VK_LWIN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -34,7 +34,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const INPUT_MOUSE: u32 = 0;
 const MOUSEEVENTF_MOVE: u32 = 0x0001;
 const VK_LBUTTON_SENTINEL: u16 = 0xFF; // 使用しない(ボタンは専用関数で)
-const VK_XBUTTON1: u16 = 0x05;
 const VK_XBUTTON2: u16 = 0x06;
 
 // ---------- Win32 直宣言(desktop 接続) ----------
@@ -647,7 +646,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260925-235925-0ea02c1";
+const BUILD_ID: &str = "win-20260926-001722-7d8c1ce";
 
 fn main() {
     ensure_stdout();

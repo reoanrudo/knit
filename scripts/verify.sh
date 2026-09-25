@@ -65,6 +65,9 @@ fi
 
 echo "[verify] Mac→Win クリップボード:"
 if [ "$WIN_OK" -eq 1 ]; then
+  # 検証用 bat を都度生成・配置(検証の自己完結化: 手動前提をなくす)
+  printf '@echo off\r\npowershell -NoProfile -Command "Get-Clipboard | Out-File -Encoding utf8 C:\\Users\\<user>\\tsunagu\\clip_get.txt"\r\n' > /tmp/clip_get.bat
+  $SCP /tmp/clip_get.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null
   printf 'verify-mw-%s' "$TS" | pbcopy
   sleep 3
   $SSH "schtasks /Run /TN tsunagu_clip_get" >/dev/null 2>&1

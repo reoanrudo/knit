@@ -164,12 +164,6 @@ unsafe fn msg2_bool(target: ID, sel: SEL, a: ID, b: ID) -> u8 {
         std::mem::transmute(objc_msgSend as usize);
     f(target, sel, a, b)
 }
-/// (ID, SEL, ID) -> BOOL(NSArray containsObject: 等の1引数真偽値メソッド用)
-unsafe fn msg1_bool_id(target: ID, cmd: SEL, a: ID) -> u8 {
-    let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 =
-        std::mem::transmute(objc_msgSend as usize);
-    f(target, cmd, a)
-}
 unsafe fn msg0_isize(target: ID, sel: SEL) -> isize {
     let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as usize);
     f(target, sel)
@@ -1259,7 +1253,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-000040-0ea02c1";
+const BUILD_ID: &str = "build-20260926-001940-7d8c1ce";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1808,7 +1802,6 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
     let mut recv_remain: u64 = 0;
     let mut recv_name = String::new();
     let mut recv_paths: Vec<std::path::PathBuf> = Vec::new();
-    let mut last_notified_key = String::new();
     let mut line = String::new();
     loop {
         line.clear();

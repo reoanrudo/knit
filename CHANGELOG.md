@@ -2,6 +2,17 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
+## [0.11.1] - 2026-09-26
+
+### 削除(本質化: 開発の残骸を除去)
+- 検証用バイナリ(wtest)/PoC 一式(poc/)/win-dist の検証スクリプト
+  (echo_client/focus_notepad/send_test×2)/再構築用プロンプト(docs)
+- 設定ウィンドウのデバッグトレースログ、未使用の関数・import・変数
+- 実機の検証残骸(clip 系 bat/検証ファイル/旧ログ)、dist の旧版 zip
+
+### 変更
+- README を本質(構成/日常の操作)中心に再構成。詳細は docs/usage.md へ集約
+
 ## [0.11.0] - 2026-09-25
 
 ### 追加(Deskflow 標準機能パリティ)
