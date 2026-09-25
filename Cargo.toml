@@ -4,7 +4,7 @@ default-members = ["crates/common", "crates/mac"]
 members = ["crates/common", "crates/mac", "crates/win"]
 
 [workspace.package]
-version = "0.15.0"
+version = "0.15.1"
 edition = "2021"
 description = "Mac⇄Windows 入力共有ツール(tsunagu): CGEventTap→TCP→SendInput"
 

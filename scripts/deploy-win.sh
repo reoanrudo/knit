@@ -49,8 +49,10 @@ echo "[deploy-win] deploying (stop -> copy -> start)..."
 # 配布中の自動復帰(watch)を一時停止し、配布完了後に再有効化する
 ssh -o BatchMode=yes home "schtasks /Change /TN tsunagu_watch /DISABLE" >/dev/null 2>&1 || true
 # 旧名称(v0.7)のタスクとプロセスを掃除する(二重常駐・混在を防ぐ移行処理)
+# 注意: リモート cmd.exe は「;」をコマンド区切りにしない(実績バグ: 旧タスクが
+# 消えず「run_sd.vbs が見つかりません」のダイアログが出続けた)。必ず「&」で区切る
 for t in seamless_desk seamless_desk_run seamless_desk_watch; do
-  ssh -o BatchMode=yes home "schtasks /End /TN $t; schtasks /Delete /TN $t /F" >/dev/null 2>&1 || true
+  ssh -o BatchMode=yes home "schtasks /End /TN $t & schtasks /Delete /TN $t /F" >/dev/null 2>&1 || true
 done
 ssh -o BatchMode=yes home "taskkill /IM sd-win.exe /F" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "if not exist C:\Users\<user>\tsunagu mkdir C:\Users\<user>\tsunagu" >/dev/null 2>&1 || true

@@ -8,6 +8,8 @@ for %%T in (tsunagu tsunagu_run tsunagu_watch seamless_desk seamless_desk_run se
   schtasks /End /TN %%T >nul 2>&1
   schtasks /Delete /TN %%T /F >nul 2>&1
 )
+REM パスに seamless-desk / run_sd / tsunagu を含む残存タスクも掃除
+powershell -NoProfile -Command "Get-ScheduledTask | Where-Object { ($_.Actions.Execute + ' ' + $_.Actions.Arguments) -match 'seamless-desk|run_sd|tsunagu' } | ForEach-Object { schtasks /End /TN $_.TaskName; schtasks /Delete /TN $_.TaskName /F }" >nul 2>&1
 taskkill /IM tsunagu-win.exe /F >nul 2>&1
 taskkill /IM sd-win.exe /F >nul 2>&1
 netsh advfirewall firewall delete rule name="tsunagu" >nul 2>&1

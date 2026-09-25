@@ -1217,7 +1217,9 @@ unsafe extern "C" fn tap_callback(
                         30 => { send(48, down, false, false, true, false); true }
                         33 => { send(48, down, false, false, true, true); true }
                         // ⌘⇧4 / ⌘⇧3 = スクリーンショット(Win+Shift+S の切取り)
-                        23 | 21 if shift => { send(1, down, true, false, false, true); true }
+                        21 | 18 if shift => { send(1, down, true, false, false, true); true }
+                        // ⌘⇧5 = 画面録画(Win+Alt+R)
+                        23 if shift => { send(15, down, false, true, false, false); true }
                         // ⌘Q = ウィンドウを閉じる(Alt+F4 = opt フラグ+F4)
                         12 => { send(118, down, false, true, false, false); true }
                         // ⌘Space = IME/言語切替(Win+Space = ctrl フラグ)
@@ -1370,7 +1372,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-005940-2dcc524";
+const BUILD_ID: &str = "build-20260926-010711-beb3d52";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");

@@ -13,6 +13,10 @@ for %%T in (seamless_desk seamless_desk_run seamless_desk_watch) do (
   schtasks /End /TN %%T >nul 2>&1
   schtasks /Delete /TN %%T /F >nul 2>&1
 )
+REM 名前不明の旧タスクも取りこぼさない: 実行パスに seamless-desk / run_sd を
+REM 含むタスクをすべて列挙して削除する(旧残骸が「vbs が見つかりません」の
+REM ダイアログを出し続ける事故の根治)
+powershell -NoProfile -Command "Get-ScheduledTask | Where-Object { ($_.Actions.Execute + ' ' + $_.Actions.Arguments) -match 'seamless-desk|run_sd' } | ForEach-Object { schtasks /End /TN $_.TaskName; schtasks /Delete /TN $_.TaskName /F }" >nul 2>&1
 netsh advfirewall firewall delete rule name="seamless-desk" >nul 2>&1
 netsh advfirewall firewall delete rule name="tsunagu" >nul 2>&1
 taskkill /IM sd-win.exe /F >nul 2>&1
