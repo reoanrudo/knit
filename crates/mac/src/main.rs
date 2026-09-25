@@ -88,6 +88,10 @@ unsafe extern "C" {
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGWarpMouseCursorPosition(new: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connect: bool) -> i32;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
+    fn CGEventCreate(allocator: CFAllocatorRef) -> CGEventRef;
     fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
@@ -102,18 +106,31 @@ static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
 static SCREEN_W: OnceLock<f64> = OnceLock::new();
 static SCREEN_H: OnceLock<f64> = OnceLock::new();
+static TAP_PORT: OnceLock<usize> = OnceLock::new();
+static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
 fn enter_win_mode_cursor_lock() {
-    // カーソル移動とマウス入力の関連を切断(カーソルは現在位置=右端に留まる)
-    unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
+    // Deskflow leave() 相当: hideCursor → suppression間隔最小化 → 関連切断
+    unsafe {
+        let d = CGMainDisplayID();
+        CGDisplayHideCursor(d);
+        CGSetLocalEventsSuppressionInterval(0.0001);
+        CGAssociateMouseAndMouseCursorPosition(false);
+    }
 }
 
 /// Windows チェモード終了: 関連を復元し、右端の内側へカーソルを戻す
 fn leave_win_mode_cursor_unlock() {
+    // Deskflow enter() 相当: 関連復元 → showCursor → 位置復帰
     unsafe {
         CGAssociateMouseAndMouseCursorPosition(true);
+        let d = CGMainDisplayID();
+        CGDisplayShowCursor(d);
         if let Some(w) = SCREEN_W.get() {
             CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y: 400.0 });
         }
@@ -121,6 +138,7 @@ fn leave_win_mode_cursor_unlock() {
 }
 
 fn send_msg(msg: &Msg) {
+    DIAG_SEND_COUNT.fetch_add(1, Ordering::Relaxed);
     if let Some(tx) = TX.get() {
         let line = encode(msg);
         let _ = tx.send(line);
@@ -134,6 +152,13 @@ unsafe extern "C" fn tap_callback(
     event: CGEventRef,
     _user_info: *mut core::ffi::c_void,
 ) -> CGEventRef {
+    // Deskflow 同様、タイムアウトで無効化されたら再び有効化する(でないと抑制が静かに止まる)
+    if event_type == 0xFFFFFFFE || event_type == 0xFFFFFFFD {
+        if let Some(&tap) = TAP_PORT.get() {
+            CGEventTapEnable(tap as CFMachPortRef, true);
+        }
+        return std::ptr::null_mut();
+    }
     let win_mode = WIN_MODE.load(Ordering::Relaxed);
     let connected = CONNECTED.load(Ordering::Relaxed);
 
@@ -153,6 +178,13 @@ unsafe extern "C" fn tap_callback(
             }
             return std::ptr::null_mut();
         }
+    }
+
+    if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED) {
+        DIAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
+        DIAG_KEY_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
     if !win_mode {
@@ -228,7 +260,10 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
+const BUILD_ID: &str = "build-20260925-155251-ded2553";
+
 fn main() {
+    eprintln!("[info] sd-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
     let _host = args
         .iter()
@@ -478,6 +513,33 @@ fn main() {
         });
     }
 
+    // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録
+    if args.iter().any(|a| a == "--diag") {
+        DIAG_ENABLED.store(true, Ordering::Relaxed);
+        std::thread::spawn(|| {
+            let mut last_cursor = (0.0f64, 0.0f64);
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let (mode, mv, kd, sd) = (
+                    WIN_MODE.load(Ordering::Relaxed),
+                    DIAG_MOVE_COUNT.load(Ordering::Relaxed),
+                    DIAG_KEY_COUNT.load(Ordering::Relaxed),
+                    DIAG_SEND_COUNT.load(Ordering::Relaxed),
+                );
+                unsafe {
+                    let ev = CGEventCreate(std::ptr::null_mut());
+                    let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
+                    let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
+                    eprintln!(
+                        "[diag] mode={} move_recv={mv} key_recv={kd} sent={sd} cursor=({:.0},{:.0}) cursor_moving={}",
+                        if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
+                    );
+                    last_cursor = (p.x, p.y);
+                }
+            }
+        });
+    }
+
     // イベントタップ(メインスレッドで RunLoop)
     let mask: CGEventMask = (1 << EVT_LEFT_DOWN)
         | (1 << EVT_LEFT_UP)
@@ -496,9 +558,9 @@ fn main() {
 
     let tap = unsafe {
         CGEventTapCreate(
-            0, // kCGSessionEventTap
+            0, // kCGHIDEventTap(ヘッダ実測: 0=HID, 1=Session, 2=Annotated。Deskflow は HID)
             0, // kCGHeadInsertEventTap
-            0, // kCGEventTapOptionDefault = 0(抑制可)。1はListenOnlyで抑制不可
+            0, // kCGEventTapOptionDefault = 0(抑制可/フィルタ)
             mask,
             tap_callback,
             std::ptr::null_mut(),
@@ -508,6 +570,7 @@ fn main() {
         eprintln!("[fatal] CGEventTapCreate failed(アクセシビリティ権限を確認)");
         std::process::exit(1);
     }
+    let _ = TAP_PORT.set(tap as usize);
     unsafe {
         let src = CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0);
         let rl = CFRunLoopGetMain();
