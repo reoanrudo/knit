@@ -6,7 +6,7 @@ source $HOME/.cargo/env 2>/dev/null || true
 
 echo "[deploy-win] stamping BUILD_ID..."
 NEW_ID="win-$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
-sed -i '' "s|const BUILD_ID: &str = [^;]*;|const BUILD_ID: \\\"$NEW_ID\\\";|" crates/win/src/main.rs
+sed -i '' "s|const BUILD_ID:[^;]*;|const BUILD_ID: \&str = \"$NEW_ID\";|" crates/win/src/main.rs
 
 echo "[deploy-win] building..."
 touch crates/win/src/main.rs
