@@ -49,6 +49,9 @@ pub mod proto {
         /// クリップボード同期(プレーンテキスト)
         #[serde(rename = "clip")]
         Clip { text: String },
+        /// クリップボード同期(バイナリ、base64)。kind 例: "image/dib"
+        #[serde(rename = "clip_data")]
+        ClipData { kind: String, data: String },
         #[serde(rename = "focus")]
         Focus { title: String },
         #[serde(rename = "minimize")]
@@ -72,6 +75,66 @@ pub mod proto {
 
     pub fn decode(line: &str) -> Option<Msg> {
         serde_json::from_str(line.trim()).ok()
+    }
+}
+
+pub mod b64 {
+    /// 小さな base64 実装(依存追加なし。クリップボード画像の運搬用)
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const R: [u8; 256] = {
+        let mut t = [255u8; 256];
+        let mut i = 0;
+        while i < 64 {
+            t[T[i] as usize] = i as u8;
+            i += 1;
+        }
+        t
+    };
+
+    pub fn encode(data: &[u8]) -> String {
+        let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+        for c in data.chunks(3) {
+            let b = [*c.first().unwrap_or(&0), *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(T[(n >> 18 & 63) as usize] as char);
+            out.push(T[(n >> 12 & 63) as usize] as char);
+            out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+            out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        }
+        out
+    }
+
+    pub fn decode(s: &str) -> Option<Vec<u8>> {
+        let b: Vec<u8> = s.bytes().filter(|c| *c != b'\n' && *c != b'\r').collect();
+        if b.len() % 4 != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(b.len() / 4 * 3);
+        for c in b.chunks(4) {
+            let mut n: u32 = 0;
+            let mut pad = 0;
+            for (i, ch) in c.iter().enumerate() {
+                if *ch == b'=' {
+                    n <<= 6;
+                    pad += 1;
+                } else {
+                    let v = R[*ch as usize];
+                    if v == 255 {
+                        return None;
+                    }
+                    n = (n << 6) | v as u32;
+                    let _ = i;
+                }
+            }
+            out.push((n >> 16) as u8);
+            if pad < 2 {
+                out.push((n >> 8) as u8);
+            }
+            if pad < 1 {
+                out.push(n as u8);
+            }
+        }
+        Some(out)
     }
 }
 

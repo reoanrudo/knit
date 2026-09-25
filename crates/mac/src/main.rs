@@ -202,6 +202,76 @@ unsafe fn mac_set_clipboard(text: &str) -> bool {
     ok != 0
 }
 
+/// DIB(Windows 画像)に BMP ファイルヘッダを付与して BMP データへ変換する。
+/// NSBitmapImageRep は BMP ファイル形式を受け付けるため
+fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
+    if dib.len() < 40 {
+        return Vec::new();
+    }
+    let header_size = u32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]) as usize;
+    let bpp = u16::from_le_bytes([dib[14], dib[15]]) as usize;
+    let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]) as usize;
+    let palette = if clr_used > 0 {
+        clr_used * 4
+    } else if bpp == 8 {
+        1024
+    } else {
+        0
+    };
+    let off = 14 + header_size + palette;
+    let mut out = Vec::with_capacity(14 + dib.len());
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(off as u32).to_le_bytes());
+    out.extend_from_slice(dib);
+    out
+}
+
+/// BMP 画像を Mac のクリップボードへ TIFF として書き込む(Windows→Mac 画像同期)
+unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
+    let pb = general_pasteboard();
+    if pb.is_null() || bmp.is_empty() {
+        return false;
+    }
+    // NSData dataWithBytes:length:
+    let data = {
+        let f: unsafe extern "C" fn(ID, SEL, *const u8, usize) -> ID =
+            std::mem::transmute(objc_msgSend as usize);
+        f(
+            objc_getClass(c"NSData".as_ptr()),
+            sel_registerName(c"dataWithBytes:length:".as_ptr()),
+            bmp.as_ptr(),
+            bmp.len(),
+        )
+    };
+    if data.is_null() {
+        return false;
+    }
+    // NSBitmapImageRep imageRepWithData:
+    let rep = {
+        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+        f(
+            objc_getClass(c"NSBitmapImageRep".as_ptr()),
+            sel_registerName(c"imageRepWithData:".as_ptr()),
+            data,
+        )
+    };
+    if rep.is_null() {
+        return false;
+    }
+    // [rep TIFFRepresentation]
+    let tiff = msg0(rep, sel_registerName(c"TIFFRepresentation".as_ptr()));
+    if tiff.is_null() {
+        return false;
+    }
+    msg0(pb, sel_registerName(c"clearContents".as_ptr()));
+    let uti = nsstring("public.tiff");
+    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 = std::mem::transmute(objc_msgSend as usize);
+    let ok = f(pb, sel_registerName(c"setData:forType:".as_ptr()), tiff, uti);
+    ok != 0
+}
+
 /// NSPasteboard からテキストを読む(Mac→Windows 送信時)
 unsafe fn mac_get_clipboard() -> Option<String> {
     let pb = general_pasteboard();
@@ -922,6 +992,19 @@ fn main() {
                                     WIN_MODE.store(false, Ordering::Relaxed);
                                     eprintln!("[mode] MAC (return)");
                                     leave_win_mode_cursor_unlock(Some(ny));
+                                }
+                                Msg::ClipData { kind, data } => {
+                                    if kind == "image/dib" {
+                                        if let Some(bytes) = sd_common::b64::decode(&data) {
+                                            let bmp = dib_to_bmp(&bytes);
+                                            let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
+                                            eprintln!(
+                                                "[clip] win->mac image {}KB {}",
+                                                bytes.len() / 1024,
+                                                if ok { "ok" } else { "FAILED" }
+                                            );
+                                        }
+                                    }
                                 }
                                 Msg::Clip { text } => {
                                     if text.len() <= CLIP_MAX_BYTES {

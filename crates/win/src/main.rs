@@ -52,6 +52,7 @@ unsafe extern "system" {
     fn GlobalLock(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn GlobalUnlock(hMem: *mut core::ffi::c_void) -> i32;
     fn GlobalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn GlobalSize(hMem: *mut core::ffi::c_void) -> usize;
 }
 
 // ---------- Win32 直宣言(IME 制御) ----------
@@ -95,6 +96,7 @@ fn ime_set_open(open: bool) {
 }
 
 const CF_UNICODETEXT: u32 = 13;
+const CF_DIB: u32 = 8;
 const GMEM_MOVEABLE: u32 = 0x0002;
 /// 最後に Mac から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -125,6 +127,32 @@ fn clipboard_read_text() -> Option<String> {
             }
         };
         if locked {
+            GlobalUnlock(h);
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+/// クリップボードから画像(CF_DIB)の生バイトを読む(Windows→Mac 画像同期用)
+fn clipboard_read_dib() -> Option<Vec<u8>> {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let h = GetClipboardData(CF_DIB);
+        let out = if h.is_null() {
+            None
+        } else {
+            let size = GlobalSize(h);
+            let p = GlobalLock(h) as *const u8;
+            if p.is_null() || size == 0 {
+                None
+            } else {
+                Some(std::slice::from_raw_parts(p, size).to_vec())
+            }
+        };
+        if !h.is_null() {
             GlobalUnlock(h);
         }
         CloseClipboard();
@@ -416,9 +444,25 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     let cb_running = running.clone();
     std::thread::spawn(move || {
         let mut last_sent = clipboard_read_text();
+        let mut last_img: Option<String> = None;
         while cb_running.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(200));
-            let Some(text) = clipboard_read_text() else { continue };
+            let Some(text) = clipboard_read_text() else {
+                // テキストが無いときは画像(CF_DIB)の変化を送る(スクショ等)
+                if let Some(dib) = clipboard_read_dib() {
+                    let b64 = sd_common::b64::encode(&dib);
+                    if b64.len() <= 5 * 1024 * 1024 && last_img.as_deref() != Some(b64.as_str()) {
+                        last_img = Some(b64.clone());
+                        if writeln!(cb_writer, "{}", encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }))
+                            .and_then(|_| cb_writer.flush())
+                            .is_ok()
+                        {
+                            println!("[clip] win->mac image");
+                        }
+                    }
+                }
+                continue;
+            };
             if text.len() > CLIP_MAX_CHARS || last_sent.as_deref() == Some(text.as_str()) {
                 continue;
             }
