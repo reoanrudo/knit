@@ -28,7 +28,10 @@ else
 fi
 
 echo "[verify] 接続状態(Macログ):"
-tail -20 /tmp/sd-mac-run.log 2>/dev/null | grep -q established && { echo "  OK  established"; pass=$((pass+1)); } || { echo "  NG  未接続"; fail=$((fail+1)); }
+# 直近の接続イベントが established なら接続中(diag行で押し出されないよう
+# ログ全体から最後の conn 行を見る)
+LAST_CONN=$(grep -E "established|\[conn\] lost" /tmp/sd-mac-run.log 2>/dev/null | tail -1)
+[ -n "$LAST_CONN" ] && echo "$LAST_CONN" | grep -q established && { echo "  OK  established"; pass=$((pass+1)); } || { echo "  NG  未接続"; fail=$((fail+1)); }
 
 echo "[verify] Windows プロセス:"
 if [ "$WIN_OK" -eq 1 ]; then
