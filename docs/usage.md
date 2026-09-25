@@ -137,6 +137,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 - 起動ログに `switch_mode=hotkey(ロック) hotkey_kc=105` の形式で反映状況が出ます
 
 | 変数 | 既定 | 説明 |
+| `TSUNAGU_SIDE` | right | Windows 画面の位置。right/left/up/down + upright/lowright(右下)/upleft/lowleft。設定窓の配置エディタ(ドラッグ)が同じ結果を視覚的に作れる |
 | `TSUNAGU_SIDE` | right | Windows 画面の位置(Deskflow links 相当)。right/left/up/down。切替境界と戻り端が連動 |
 | `TSUNAGU_SWITCH_DELAY` | 0 | 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時) |
 | `TSUNAGU_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |

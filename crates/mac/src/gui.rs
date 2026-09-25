@@ -567,6 +567,207 @@ unsafe fn neon_rule(cv: ID, frame: NSRect) {
     }
 }
 
+
+// ---------- モニター配置エディタ(Mac の「ディスプレイ配置」相当) ----------
+// 灰色=Mac、青=Windows の矩形を描き、Windows 側をドラッグして物理配置を再現する。
+// ドロップ時に「接する辺+辺に沿った接続範囲」を算出して SIDE/LAY_RANGE へ反映
+const LAY_VW: f64 = 344.0;
+const LAY_VH: f64 = 170.0;
+const LAY_MAC_W: f64 = 188.0;
+const LAY_MAC_H: f64 = LAY_MAC_W / 1.547; // Mac 画面アスペクト(2056x1329)
+const LAY_WIN_W: f64 = 94.0;
+const LAY_WIN_H: f64 = LAY_WIN_W / 1.778; // Windows 画面アスペクト(16:9)
+static LAY_WIN: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((292.0, 85.0)); // Win 矩形中心
+static LAY_GRAB: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
+static LAY_DRAG: AtomicBool = AtomicBool::new(false);
+
+fn lay_mac_rect() -> NSRect {
+    NSRect {
+        x: 26.0,
+        y: (LAY_VH - LAY_MAC_H) / 2.0,
+        w: LAY_MAC_W,
+        h: LAY_MAC_H,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint2 {
+    x: f64,
+    y: f64,
+}
+
+unsafe fn lay_point_in_view(_self: ID, ev: ID) -> CGPoint2 {
+    unsafe {
+        let loc: unsafe extern "C" fn(ID, SEL) -> CGPoint2 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let conv: unsafe extern "C" fn(ID, SEL, CGPoint2, ID) -> CGPoint2 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let p = loc(ev, sel(c"locationInWindow"));
+        conv(_self, sel(c"convertPoint:fromView:"), p, std::ptr::null_mut())
+    }
+}
+
+/// 描画: CoreGraphics で直接塗る(graphicsPort 経由)
+unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
+    unsafe {
+        let ctx_cls = objc_getClass(c"NSGraphicsContext".as_ptr());
+        let cur = msg0(ctx_cls, sel(c"currentContext"));
+        if cur.is_null() {
+            return;
+        }
+        let port = msg0(cur, sel(c"graphicsPort"));
+        if port.is_null() {
+            return;
+        }
+        extern "C" {
+            fn CGContextSetRGBFillColor(c: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+            fn CGContextFillRect(c: *mut core::ffi::c_void, r: NSRect);
+        }
+        let ctx = port as *mut core::ffi::c_void;
+        // 背景
+        CGContextSetRGBFillColor(ctx, 0.13, 0.14, 0.16, 1.0);
+        CGContextFillRect(ctx, NSRect { x: 0.0, y: 0.0, w: LAY_VW, h: LAY_VH });
+        // Mac(灰)
+        CGContextSetRGBFillColor(ctx, 0.42, 0.45, 0.50, 1.0);
+        CGContextFillRect(ctx, lay_mac_rect());
+        // Windows(青=標準アクセント)
+        let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        CGContextSetRGBFillColor(ctx, 0.16, 0.50, 0.98, 1.0);
+        CGContextFillRect(
+            ctx,
+            NSRect { x: wc.0 - LAY_WIN_W / 2.0, y: wc.1 - LAY_WIN_H / 2.0, w: LAY_WIN_W, h: LAY_WIN_H },
+        );
+    }
+}
+
+unsafe extern "C" fn lay_down(_self: ID, _cmd: SEL, ev: ID) {
+    unsafe {
+        let p = lay_point_in_view(_self, ev);
+        let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let inside = p.x >= wc.0 - LAY_WIN_W / 2.0 - 4.0
+            && p.x <= wc.0 + LAY_WIN_W / 2.0 + 4.0
+            && p.y >= wc.1 - LAY_WIN_H / 2.0 - 4.0
+            && p.y <= wc.1 + LAY_WIN_H / 2.0 + 4.0;
+        if inside {
+            LAY_DRAG.store(true, Ordering::Relaxed);
+            *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner()) = (p.x - wc.0, p.y - wc.1);
+        }
+    }
+}
+
+unsafe extern "C" fn lay_dragged(_self: ID, _cmd: SEL, ev: ID) {
+    unsafe {
+        if !LAY_DRAG.load(Ordering::Relaxed) {
+            return;
+        }
+        let p = lay_point_in_view(_self, ev);
+        let g = *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner());
+        let nx = (p.x - g.0).clamp(LAY_WIN_W / 2.0 + 2.0, LAY_VW - LAY_WIN_W / 2.0 - 2.0);
+        let ny = (p.y - g.1).clamp(LAY_WIN_H / 2.0 + 2.0, LAY_VH - LAY_WIN_H / 2.0 - 2.0);
+        *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
+        let snd: unsafe extern "C" fn(ID, SEL, u8) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        snd(_self, sel(c"setNeedsDisplay:"), 1);
+    }
+}
+
+/// ドロップ: 接する辺と接続範囲(LAY_RANGE)を算出して SIDE へ反映し、
+/// 矩形をきれいな位置(辺にスナップ)へ揃える
+unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
+    unsafe {
+        if !LAY_DRAG.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let m = lay_mac_rect();
+        let mc = (m.x + m.w / 2.0, m.y + m.h / 2.0);
+        let wc0 = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let (dx, dy) = (wc0.0 - mc.0, wc0.1 - mc.1);
+        let (edge, f0, f1) = if dx.abs() >= dy.abs() {
+            // 左右いずれかの辺に接続。Win の縦範囲が Mac の縦範囲のどこに来るか
+            let f0 = ((wc0.1 - LAY_WIN_H / 2.0) - m.y) / m.h;
+            let f1 = ((wc0.1 + LAY_WIN_H / 2.0) - m.y) / m.h;
+            (if dx >= 0.0 { 0u8 } else { 1u8 }, f0.clamp(0.0, 1.0), f1.clamp(0.0, 1.0))
+        } else {
+            let f0 = ((wc0.0 - LAY_WIN_W / 2.0) - m.x) / m.w;
+            let f1 = ((wc0.0 + LAY_WIN_W / 2.0) - m.x) / m.w;
+            (if dy >= 0.0 { 2u8 } else { 3u8 }, f0.clamp(0.0, 1.0), f1.clamp(0.0, 1.0))
+        };
+        // 斜め(4-7)表現: 水平辺で接続範囲が半分未満なら上下の半分側へ
+        let mut side = edge;
+        if edge <= 1 && (f1 - f0) < 0.6 {
+            side = if (f0 + f1) / 2.0 < 0.5 { edge + 4 } else { edge + 5 };
+        }
+        crate::set_side(side);
+        // 細かい範囲で上書き(set_side は半分単位で設定するため)
+        *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = (f0, f1.max(f0 + 0.05));
+        // 見た目を辺にスナップ
+        let (lo, hi) = *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
+        let mid = (lo + hi) / 2.0;
+        let snapped = match edge {
+            0 => (m.x + m.w + 8.0 + LAY_WIN_W / 2.0, m.y + mid * m.h),
+            1 => (m.x - 8.0 - LAY_WIN_W / 2.0, m.y + mid * m.h),
+            2 => (m.x + mid * m.w, m.y + m.h + 8.0 + LAY_WIN_H / 2.0),
+            _ => (m.x + mid * m.w, m.y - 8.0 - LAY_WIN_H / 2.0),
+        };
+        *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (
+            snapped.0.clamp(LAY_WIN_W / 2.0 + 2.0, LAY_VW - LAY_WIN_W / 2.0 - 2.0),
+            snapped.1.clamp(LAY_WIN_H / 2.0 + 2.0, LAY_VH - LAY_WIN_H / 2.0 - 2.0),
+        );
+        let snd: unsafe extern "C" fn(ID, SEL, u8) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        snd(_self, sel(c"setNeedsDisplay:"), 1);
+        eprintln!("[lay] 配置を更新: {}(範囲 {:.2}〜{:.2})", crate::side_name(), lo, hi);
+    }
+}
+
+/// 配置エディタの NSView サブクラスを登録して生成(初回のみ)
+unsafe fn make_layout_view(target_frame_host: ID) -> ID {
+    unsafe {
+        let _ = target_frame_host;
+        static CLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cls = *CLS.get_or_init(|| {
+            let super_cls = objc_getClass(c"NSView".as_ptr());
+            if super_cls.is_null() {
+                return 0usize;
+            }
+            let cls = objc_allocateClassPair(super_cls, c"TSLayView".as_ptr(), 0);
+            if cls.is_null() {
+                return 0usize;
+            }
+            let ok1 = class_addMethod(
+                cls,
+                sel(c"drawRect:"),
+                lay_draw as *const () as usize,
+                c"v@:{CGRect={CGPoint=dd}{CGSize=dd}}".as_ptr(),
+            );
+            let ok2 = class_addMethod(cls, sel(c"mouseDown:"), lay_down as *const () as usize, c"v@:@".as_ptr());
+            let ok3 = class_addMethod(
+                cls,
+                sel(c"mouseDragged:"),
+                lay_dragged as *const () as usize,
+                c"v@:@".as_ptr(),
+            );
+            let ok4 = class_addMethod(cls, sel(c"mouseUp:"), lay_up as *const () as usize, c"v@:@".as_ptr());
+            if ok1 == 0 || ok2 == 0 || ok3 == 0 || ok4 == 0 {
+                return 0usize;
+            }
+            objc_registerClassPair(cls);
+            cls as usize
+        });
+        if cls == 0 {
+            return std::ptr::null_mut();
+        }
+        let init: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        init(
+            msg0(cls as ID, sel(c"alloc")),
+            sel(c"initWithFrame:"),
+            NSRect { x: 0.0, y: 0.0, w: LAY_VW, h: LAY_VH },
+        )
+    }
+}
+
 /// 見出しラベル(小さめグレーのキャプション=モダンな設定画面のセクション題)
 unsafe fn section_heading(cv: ID, text: &str, frame: NSRect) {
     unsafe {
@@ -635,7 +836,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 710.0 },
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 930.0 },
             1 | 2 | 8 | 0x8000, // +FullSizeContentView
             2,
             0,
@@ -655,7 +856,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         // NSSize(f64×2)のため f64 2 引数の transmute で渡す(NSRect 32byte と混同注意)
         let set_min: unsafe extern "C" fn(ID, SEL, f64, f64) =
             std::mem::transmute(crate::objc_msgSend as usize);
-        set_min(win, sel(c"setContentMinSize:"), 400.0, 710.0);
+        set_min(win, sel(c"setContentMinSize:"), 400.0, 930.0);
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
@@ -691,7 +892,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 710.0 - 56.0, w: 360.0, h: 24.0 });
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 930.0 - 56.0, w: 360.0, h: 24.0 });
             let font_cls = objc_getClass(c"NSFont".as_ptr());
             if !font_cls.is_null() {
                 let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
@@ -706,7 +907,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
 
         // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
-        let mut y = 710.0 - 84.0;
+        let mut y = 930.0 - 84.0;
         let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
@@ -721,6 +922,33 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 slot.store(b as usize, Ordering::Relaxed);
             }
         };
+        section_heading(cv, "モニター配置(ドラッグで Windows の位置を決める)", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 24.0;
+        let lay = make_layout_view(cv);
+        if !lay.is_null() {
+            set_frame(lay, sel(c"setFrame:"), NSRect { x: 20.0, y: y - LAY_VH + 4.0, w: LAY_VW, h: LAY_VH });
+            msg1_void_id(cv, sel(c"addSubview:"), lay);
+        }
+        // 凡例(配置エディタの右下に重ねず、下段へ)
+        let leg = label(
+            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+            nsstring("灰=Mac ・ 青=Windows(ドラッグして離すと確定)"),
+        );
+        if !leg.is_null() {
+            set_frame(leg, sel(c"setFrame:"), NSRect { x: 20.0, y: y - LAY_VH - 14.0, w: 344.0, h: 16.0 });
+            let color_cls = objc_getClass(c"NSColor".as_ptr());
+            if !color_cls.is_null() {
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+                if !color.is_null() {
+                    msg1_void_id(leg, sel(c"setTextColor:"), color);
+                }
+            }
+            msg1_void_id(cv, sel(c"addSubview:"), leg);
+        }
+        y -= LAY_VH + 40.0;
+
         section_heading(cv, "切替", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
         place_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE, y);
@@ -735,7 +963,10 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 std::mem::transmute(crate::objc_msgSend as usize);
             let pop = init_frame(alloc_p, sel(c"initWithFrame:"), NSRect { x: 20.0, y: y - 30.0, w: 180.0, h: 26.0 });
             if !pop.is_null() {
-                for t in ["Windows は右", "Windows は左", "Windows は上", "Windows は下"] {
+                for t in [
+                    "Windows は右", "Windows は左", "Windows は上", "Windows は下",
+                    "Windows は右上", "Windows は右下", "Windows は左上", "Windows は左下",
+                ] {
                     msg1_void_id(pop, sel(c"addItemWithTitle:"), nsstring(t));
                 }
                 msg1_void_id(pop, sel(c"setTarget:"), target);

@@ -669,19 +669,44 @@ pub static CTRL_CLICK: AtomicBool = AtomicBool::new(false);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
 static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
-/// 現在の SIDE(0=右/1=左/2=上/3=下)を文字列表現で
+/// SIDE(0=右/1=左/2=上/3=下/4=右上/5=右下/6=左上/7=左下)を文字列表現で
 pub fn side_name() -> &'static str {
     match SIDE.load(Ordering::Relaxed) {
         1 => "左",
         2 => "上",
         3 => "下",
+        4 => "右上",
+        5 => "右下",
+        6 => "左上",
+        7 => "左下",
         _ => "右",
     }
 }
 
+/// SIDE を「境界方向(0=右/1=左/2=上/3=下)」へ正規化(斜めは水平境界に寄せる)
+fn side_dir() -> u8 {
+    match SIDE.load(Ordering::Relaxed) {
+        1 | 6 | 7 => 1,
+        2 => 2,
+        3 => 3,
+        _ => 0,
+    }
+}
+
+/// 接続する境界の範囲(境界に沿った位置の割合 0..1)。Mac の「ディスプレイ配置」
+/// と同じ発想: Windows 画面が Mac の端のどの範囲に接しているか。
+/// 斜め(4-7)は半分、それ以外は全域。配置エディタのドラッグで更に細かく決まる
+pub static LAY_RANGE: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 1.0));
+
 /// SIDE を設定し、Windows へ Cfg で同期する
 pub fn set_side(v: u8) {
-    SIDE.store(v.min(3), Ordering::Relaxed);
+    let v = v.min(7);
+    SIDE.store(v, Ordering::Relaxed);
+    *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = match v {
+        4 | 6 => (0.0, 0.5),
+        5 | 7 => (0.5, 1.0),
+        _ => (0.0, 1.0),
+    };
     send_msg(&Msg::Cfg {
         cmd_alt: CMD_ALT.load(Ordering::Relaxed),
         spk_mute: SPK_MUTE.load(Ordering::Relaxed),
@@ -827,7 +852,7 @@ fn enter_win_mode_cursor_lock() {
         }
         // SIDE の境界端に固定(SCREEN_W はメイン画面幅なので、右サブモニターが
         // ある環境で右端固定すると隠れカーソルが MacBook 側へ飛んでしまう)
-        let side = SIDE.load(Ordering::Relaxed);
+        let dir = side_dir();
         let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
         let edge_x = UNION_MAX_X.get().copied().unwrap_or_else(|| {
             SCREEN_W.get().copied().unwrap_or(2056.0)
@@ -839,7 +864,7 @@ fn enter_win_mode_cursor_lock() {
             lock_x2 = loc2.x;
             CFRelease(ev2);
         }
-        let (lock_x, lock_y) = match side {
+        let (lock_x, lock_y) = match dir {
             1 => (2.0, lock_y),                     // 左端
             2 => (lock_x2, 2.0),                    // 上端
             3 => (lock_x2, main_h - 2.0),           // 下端
@@ -1080,19 +1105,36 @@ unsafe extern "C" fn tap_callback(
                 drop(pos);
                 let edge = edge_px();
                 // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
-                let main_w = w;
+                let main_w = *w;
                 let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
                 let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
                 let side = SIDE.load(Ordering::Relaxed);
+                let dir = side_dir();
+                let (lay_lo, lay_hi) = *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
                 // SIDE に応じた「切替境界までの距離」(小さいほど端に近い)。
-                // Deskflow の links(left/right/up/down)相当。左/上は主画面原点(0)基点
+                // Deskflow の links 相当+斜め(4-7)は境界の半分(上/下)でのみ接続
                 let gap = |x: f64, y: f64| -> f64 {
-                    match side {
+                    let base = match dir {
                         1 => x,            // 左端
                         2 => y,            // 上端
                         3 => main_h - y,   // 下端
                         _ => edge_x - x,   // 右端(既定)
+                    };
+                    if base > edge + 40.0 {
+                        return base; // 境界から遠い=範囲判定不要
                     }
+                    // 境界付近でのみ範囲(斜め)制限を適用:
+                    // 水平境界(左右)は上下半分、垂直境界(上下)は左右半分
+                    let (lo, hi, v) = if dir == 2 || dir == 3 {
+                        (0.0, main_w, x) // 上下境界: 横位置で判定
+                    } else {
+                        (0.0, main_h, y) // 左右境界: 縦位置で判定
+                    };
+                    let f = ((v - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+                    if f < lay_lo || f > lay_hi {
+                        return f64::MAX; // Windows 画面が接している範囲外
+                    }
+                    base
                 };
                 // 境界から十分内側へ戻ったらヒット状態をリセット(次の到達を1回目として数える)
                 if gap(px, py) > edge + 8.0 {
@@ -1457,7 +1499,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-025713-d82f346";
+const BUILD_ID: &str = "build-20260926-032126-ae3b5ec";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1575,6 +1617,10 @@ fn main() {
         Some("left") => SIDE.store(1, Ordering::Relaxed),
         Some("up") => SIDE.store(2, Ordering::Relaxed),
         Some("down") => SIDE.store(3, Ordering::Relaxed),
+        Some("upright") => SIDE.store(4, Ordering::Relaxed),
+        Some("lowright") | Some("downright") => SIDE.store(5, Ordering::Relaxed),
+        Some("upleft") => SIDE.store(6, Ordering::Relaxed),
+        Some("lowleft") | Some("downleft") => SIDE.store(7, Ordering::Relaxed),
         _ => {}
     }
     if let Some(v) = envutil::get("TSUNAGU_SWITCH_DELAY").and_then(|v| v.parse::<u64>().ok()) {

@@ -684,7 +684,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-030020-d82f346";
+const BUILD_ID: &str = "win-20260926-032145-ae3b5ec";
 
 fn main() {
     ensure_stdout();
@@ -1386,10 +1386,10 @@ fn maybe_notify_return(
     unsafe { GetCursorPos(&mut p) };
     let side = SIDE_W.load(Ordering::Relaxed);
     let hit = match side {
-        1 => p.x >= w - 1,   // Mac は左にある → Win の右端で戻る
-        2 => p.y >= h - 1,   // Mac は上にある → Win の下端で戻る
-        3 => p.y <= 1,       // Mac は下にある → Win の上端で戻る
-        _ => p.x <= 1,       // 既定: Mac は右にある → Win の左端で戻る
+        1 | 6 | 7 => p.x >= w - 1, // Mac は左(左上/左下含む)→ Win の右端で戻る
+        2 => p.y >= h - 1,          // Mac は上にある → Win の下端で戻る
+        3 => p.y <= 1,              // Mac は下にある → Win の上端で戻る
+        _ => p.x <= 1,              // 既定: Mac は右(右上/右下含む)→ 左端で戻る
     };
     if hit && last.elapsed() >= Duration::from_millis(700) {
         let ny = match side {
