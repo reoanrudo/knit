@@ -100,6 +100,82 @@ unsafe extern "C" {
     static kCFRunLoopCommonModes: CFStringRef;
 }
 
+// ---------- ObjC ランタイム直宣言(NSPasteboard 操作) ----------
+#[link(name = "objc", kind = "dylib")]
+unsafe extern "C" {
+    fn objc_getClass(name: *const core::ffi::c_char) -> *mut core::ffi::c_void;
+    fn sel_registerName(name: *const core::ffi::c_char) -> *mut core::ffi::c_void;
+    fn objc_msgSend(
+        receiver: *mut core::ffi::c_void,
+        sel: *mut core::ffi::c_void,
+        ...
+    ) -> *mut core::ffi::c_void;
+}
+
+/// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
+static LAST_RECV_CLIP: Mutex<Option<String>> = Mutex::new(None);
+const CLIP_MAX_BYTES: usize = 512 * 1024;
+
+unsafe fn nsstring(s: &str) -> *mut core::ffi::c_void {
+    let mut buf = s.as_bytes().to_vec();
+    buf.push(0);
+    objc_msgSend(
+        objc_getClass(c"NSString".as_ptr()),
+        sel_registerName(c"stringWithUTF8String:".as_ptr()),
+        buf.as_ptr(),
+    )
+}
+
+unsafe fn general_pasteboard() -> *mut core::ffi::c_void {
+    objc_msgSend(
+        objc_getClass(c"NSPasteboard".as_ptr()),
+        sel_registerName(c"generalPasteboard".as_ptr()),
+    )
+}
+
+/// 戻り値が NSInteger のメソッド用に objc_msgSend を呼ぶ
+unsafe fn msg_isize(obj: *mut core::ffi::c_void, sel: *mut core::ffi::c_void) -> isize {
+    let f: unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> isize =
+        std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
+    f(obj, sel)
+}
+
+/// NSPasteboard へテキストを書き込む(Windows→Mac 受信時)
+unsafe fn mac_set_clipboard(text: &str) -> bool {
+    let pb = general_pasteboard();
+    if pb.is_null() {
+        return false;
+    }
+    objc_msgSend(pb, sel_registerName(c"clearContents".as_ptr()));
+    let s = nsstring(text);
+    let uti = nsstring("public.utf8-plain-text");
+    objc_msgSend(pb, sel_registerName(c"setString:forType:".as_ptr()), s, uti);
+    true
+}
+
+/// NSPasteboard からテキストを読む(Mac→Windows 送信時)
+unsafe fn mac_get_clipboard() -> Option<String> {
+    let pb = general_pasteboard();
+    if pb.is_null() {
+        return None;
+    }
+    let uti = nsstring("public.utf8-plain-text");
+    let s = objc_msgSend(pb, sel_registerName(c"stringForType:".as_ptr()), uti);
+    if s.is_null() {
+        return None;
+    }
+    let utf8 =
+        objc_msgSend(s, sel_registerName(c"UTF8String".as_ptr())) as *const core::ffi::c_char;
+    if utf8.is_null() {
+        return None;
+    }
+    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+}
+
+fn clipboard_change_count() -> isize {
+    unsafe { msg_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
+}
+
 // ---------- 共有状態 ----------
 static WIN_MODE: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -453,6 +529,13 @@ fn main() {
                                     eprintln!("[mode] MAC (return)");
                                     leave_win_mode_cursor_unlock(Some(ny));
                                 }
+                                Msg::Clip { text } => {
+                                    if text.len() <= CLIP_MAX_BYTES {
+                                        *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
+                                        unsafe { mac_set_clipboard(&text) };
+                                        eprintln!("[clip] win->mac {} bytes", text.len());
+                                    }
+                                }
                                 Msg::Pong => {}
                                 Msg::Bye => break,
                                 _ => {}
@@ -596,6 +679,32 @@ fn main() {
             }
         });
     }
+
+    // クリップボード監視(Mac→Windows 方向): changeCount の変化でテキストを送る
+    std::thread::spawn(|| {
+        let mut last_count = clipboard_change_count();
+        loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let cnt = clipboard_change_count();
+            if cnt == last_count {
+                continue;
+            }
+            last_count = cnt;
+            if !CONNECTED.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some(text) = (unsafe { mac_get_clipboard() }) else { continue };
+            if text.is_empty() || text.len() > CLIP_MAX_BYTES {
+                continue;
+            }
+            // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
+            if LAST_RECV_CLIP.lock().unwrap().as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            eprintln!("[clip] mac->win {} bytes", text.len());
+            send_msg(&Msg::Clip { text });
+        }
+    });
 
     // イベントタップ(メインスレッドで RunLoop)
     let mask: CGEventMask = (1 << EVT_LEFT_DOWN)

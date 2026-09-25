@@ -36,6 +36,88 @@ unsafe extern "system" {
     fn OpenInputDesktop(dwFlags: u32, fInherit: bool, dwDesiredAccess: u32) -> *mut core::ffi::c_void;
     fn SetThreadDesktop(hdesktop: *mut core::ffi::c_void) -> i32;
     fn CloseDesktop(hdesktop: *mut core::ffi::c_void) -> i32;
+    // クリップボード
+    fn OpenClipboard(hWndNewOwner: *mut core::ffi::c_void) -> i32;
+    fn CloseClipboard() -> i32;
+    fn EmptyClipboard() -> i32;
+    fn GetClipboardData(uFormat: u32) -> *mut core::ffi::c_void;
+    fn SetClipboardData(uFormat: u32, hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+// ---------- Win32 直宣言(グローバルメモリ) ----------
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GlobalAlloc(uFlags: u32, dwBytes: usize) -> *mut core::ffi::c_void;
+    fn GlobalLock(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn GlobalUnlock(hMem: *mut core::ffi::c_void) -> i32;
+    fn GlobalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+/// 最後に Mac から受信して書き込んだテキスト(エコーバック送信防止)
+static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+const CLIP_MAX_CHARS: usize = 512 * 1024;
+
+fn clipboard_read_text() -> Option<String> {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None; // 他プロセス占有中(次回ポーリングで再試行)
+        }
+        let h = GetClipboardData(CF_UNICODETEXT);
+        let mut locked = false;
+        let out = if h.is_null() {
+            None // テキスト形式ではない(画像等)
+        } else {
+            let p = GlobalLock(h) as *const u16;
+            if p.is_null() {
+                None
+            } else {
+                locked = true;
+                let mut len = 0usize;
+                while *p.add(len) != 0 && len <= CLIP_MAX_CHARS {
+                    len += 1;
+                }
+                Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)))
+            }
+        };
+        if locked {
+            GlobalUnlock(h);
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+fn clipboard_write_text(s: &str) -> bool {
+    let mut utf16: Vec<u16> = s.encode_utf16().collect();
+    utf16.push(0);
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, utf16.len() * 2);
+        if h.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let p = GlobalLock(h) as *mut u16;
+        if p.is_null() {
+            GlobalFree(h);
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), p, utf16.len());
+        GlobalUnlock(h);
+        if SetClipboardData(CF_UNICODETEXT, h).is_null() {
+            GlobalFree(h); // 設定失敗時は呼び出し側の解放責任
+            CloseClipboard();
+            return false;
+        }
+        CloseClipboard();
+        true
+    }
 }
 
 // ---------- INPUT 手動パック(type+pad+32byte共用体=40byte) ----------
@@ -268,6 +350,35 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     });
     let _ = hb_writer;
 
+    // クリップボード監視スレッド(Windows→Mac 方向)。起動時点の内容は送らない。
+    let mut cb_writer = writer.try_clone()?;
+    let cb_running = running.clone();
+    std::thread::spawn(move || {
+        let mut last_sent = clipboard_read_text();
+        while cb_running.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(400));
+            let Some(text) = clipboard_read_text() else { continue };
+            if text.len() > CLIP_MAX_CHARS || last_sent.as_deref() == Some(text.as_str()) {
+                continue;
+            }
+            // Mac から受信して書き込んだ内容は送り返さない(ループ防止)
+            let echo = LAST_RECV_CLIP
+                .lock()
+                .map(|g| g.as_deref() == Some(text.as_str()))
+                .unwrap_or(false);
+            if echo {
+                continue;
+            }
+            if writeln!(cb_writer, "{}", encode(&Msg::Clip { text: text.clone() }))
+                .and_then(|_| cb_writer.flush())
+                .is_ok()
+            {
+                println!("[clip] win->mac {} bytes", text.len());
+                last_sent = Some(text);
+            }
+        }
+    });
+
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
@@ -361,6 +472,17 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     println!("[minimize] {title}");
                 } else {
                     println!("[minimize] window not found: {title}");
+                }
+            }
+            Msg::Clip { text } => {
+                if text.len() > CLIP_MAX_CHARS {
+                    continue;
+                }
+                *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
+                if clipboard_write_text(&text) {
+                    println!("[clip] mac->win {} bytes", text.len());
+                } else {
+                    println!("[clip] mac->win write failed");
                 }
             }
             Msg::Bye => {
