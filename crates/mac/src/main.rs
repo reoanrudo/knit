@@ -310,7 +310,7 @@ fn enter_win_mode_cursor_lock() {
 fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
-        EDGE_GUARD_UNTIL_MS.store(now_ms() + 300, Ordering::Relaxed);
+        EDGE_GUARD_UNTIL_MS.store(now_ms() + 250, Ordering::Relaxed);
         if let Some(loc) = live_cursor() {
             *CUR_POS.lock().unwrap() = (loc.x, loc.y);
         }
@@ -328,7 +328,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                 }
                 None => 400.0,
             };
-            CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y });
+            CGWarpMouseCursorPosition(CGPoint { x: *w - 50.0, y });
         }
     }
 }
@@ -416,7 +416,11 @@ unsafe extern "C" fn tap_callback(
                     if let Some(sh) = SCREEN_H.get() {
                         ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
                     }
-                    send_msg(&Msg::Warp { nx: 0.03, ny });
+                    // ドラッグ中の切替はボタンを離して持ち込まない(誤ドラッグ防止)
+                    if event_type != EVT_MOUSE_MOVED {
+                        send_msg(&Msg::MouseButton { btn: 0, down: false });
+                    }
+                    send_msg(&Msg::Warp { nx: 0.05, ny });
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
                 }

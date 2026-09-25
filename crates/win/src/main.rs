@@ -577,7 +577,7 @@ fn maybe_notify_return(
 ) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
-    if p.x <= 0 && last.elapsed() >= Duration::from_secs(1) {
+    if p.x <= 0 && last.elapsed() >= Duration::from_millis(700) {
         let ny = if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 };
         let _ = writeln!(writer, "{}", encode(&Msg::Return { ny }));
         *last = Instant::now();
