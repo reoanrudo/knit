@@ -574,9 +574,23 @@ unsafe fn neon_rule(cv: ID, frame: NSRect) {
 const LAY_VW: f64 = 344.0;
 const LAY_VH: f64 = 170.0;
 const LAY_MAC_W: f64 = 188.0;
-const LAY_MAC_H: f64 = LAY_MAC_W / 1.547; // Mac 画面アスペクト(2056x1329)
-const LAY_WIN_W: f64 = 94.0;
-const LAY_WIN_H: f64 = LAY_WIN_W / 1.778; // Windows 画面アスペクト(16:9)
+const LAY_MAC_H: f64 = LAY_MAC_W / 1.547; // Mac 画面の既定アスペクト(2056x1329)
+
+/// Windows 矩形のサイズ: 実際の画面サイズ(hello で受信した WIN_SCREEN)を
+/// Mac と同じ縮尺へ射影する。未接続時は 1920x1080 想定。これで
+/// 「実際のモニターの大きさ比」(例: ワイドで背の低い外部モニター)が
+/// 見た目どおりに再現される
+fn lay_win_size() -> (f64, f64) {
+    let (mw, mh) = (
+        crate::SCREEN_W.get().copied().unwrap_or(2056.0),
+        crate::SCREEN_H.get().copied().unwrap_or(1329.0),
+    );
+    let (ww_px, wh_px) = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    let scale = LAY_MAC_H / mh.max(1.0); // Mac の縮尺に合わせる
+    let w = (ww_px.max(640.0) * scale).clamp(40.0, 300.0);
+    let h = (wh_px.max(480.0) * scale).clamp(24.0, 160.0);
+    (w, h)
+}
 static LAY_WIN: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((292.0, 85.0)); // Win 矩形中心
 static LAY_GRAB: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
 static LAY_DRAG: AtomicBool = AtomicBool::new(false);
@@ -633,10 +647,11 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
         CGContextFillRect(ctx, lay_mac_rect());
         // Windows(青=標準アクセント)
         let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let (ww, wh) = lay_win_size();
         CGContextSetRGBFillColor(ctx, 0.16, 0.50, 0.98, 1.0);
         CGContextFillRect(
             ctx,
-            NSRect { x: wc.0 - LAY_WIN_W / 2.0, y: wc.1 - LAY_WIN_H / 2.0, w: LAY_WIN_W, h: LAY_WIN_H },
+            NSRect { x: wc.0 - ww / 2.0, y: wc.1 - wh / 2.0, w: ww, h: wh },
         );
     }
 }
@@ -645,10 +660,11 @@ unsafe extern "C" fn lay_down(_self: ID, _cmd: SEL, ev: ID) {
     unsafe {
         let p = lay_point_in_view(_self, ev);
         let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
-        let inside = p.x >= wc.0 - LAY_WIN_W / 2.0 - 4.0
-            && p.x <= wc.0 + LAY_WIN_W / 2.0 + 4.0
-            && p.y >= wc.1 - LAY_WIN_H / 2.0 - 4.0
-            && p.y <= wc.1 + LAY_WIN_H / 2.0 + 4.0;
+        let (ww, wh) = lay_win_size();
+        let inside = p.x >= wc.0 - ww / 2.0 - 4.0
+            && p.x <= wc.0 + ww / 2.0 + 4.0
+            && p.y >= wc.1 - wh / 2.0 - 4.0
+            && p.y <= wc.1 + wh / 2.0 + 4.0;
         if inside {
             LAY_DRAG.store(true, Ordering::Relaxed);
             *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner()) = (p.x - wc.0, p.y - wc.1);
@@ -663,8 +679,9 @@ unsafe extern "C" fn lay_dragged(_self: ID, _cmd: SEL, ev: ID) {
         }
         let p = lay_point_in_view(_self, ev);
         let g = *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner());
-        let nx = (p.x - g.0).clamp(LAY_WIN_W / 2.0 + 2.0, LAY_VW - LAY_WIN_W / 2.0 - 2.0);
-        let ny = (p.y - g.1).clamp(LAY_WIN_H / 2.0 + 2.0, LAY_VH - LAY_WIN_H / 2.0 - 2.0);
+        let (ww, wh) = lay_win_size();
+        let nx = (p.x - g.0).clamp(ww / 2.0 + 2.0, LAY_VW - ww / 2.0 - 2.0);
+        let ny = (p.y - g.1).clamp(wh / 2.0 + 2.0, LAY_VH - wh / 2.0 - 2.0);
         *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
             std::mem::transmute(crate::objc_msgSend as usize);
@@ -682,15 +699,16 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         let m = lay_mac_rect();
         let mc = (m.x + m.w / 2.0, m.y + m.h / 2.0);
         let wc0 = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let (ww, wh) = lay_win_size();
         let (dx, dy) = (wc0.0 - mc.0, wc0.1 - mc.1);
         let (edge, f0, f1) = if dx.abs() >= dy.abs() {
             // 左右いずれかの辺に接続。Win の縦範囲が Mac の縦範囲のどこに来るか
-            let f0 = ((wc0.1 - LAY_WIN_H / 2.0) - m.y) / m.h;
-            let f1 = ((wc0.1 + LAY_WIN_H / 2.0) - m.y) / m.h;
+            let f0 = ((wc0.1 - wh / 2.0) - m.y) / m.h;
+            let f1 = ((wc0.1 + wh / 2.0) - m.y) / m.h;
             (if dx >= 0.0 { 0u8 } else { 1u8 }, f0.clamp(0.0, 1.0), f1.clamp(0.0, 1.0))
         } else {
-            let f0 = ((wc0.0 - LAY_WIN_W / 2.0) - m.x) / m.w;
-            let f1 = ((wc0.0 + LAY_WIN_W / 2.0) - m.x) / m.w;
+            let f0 = ((wc0.0 - ww / 2.0) - m.x) / m.w;
+            let f1 = ((wc0.0 + ww / 2.0) - m.x) / m.w;
             (if dy >= 0.0 { 2u8 } else { 3u8 }, f0.clamp(0.0, 1.0), f1.clamp(0.0, 1.0))
         };
         // 斜め(4-7)表現: 水平辺で接続範囲が半分未満なら上下の半分側へ
@@ -705,14 +723,14 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         let (lo, hi) = *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
         let mid = (lo + hi) / 2.0;
         let snapped = match edge {
-            0 => (m.x + m.w + 8.0 + LAY_WIN_W / 2.0, m.y + mid * m.h),
-            1 => (m.x - 8.0 - LAY_WIN_W / 2.0, m.y + mid * m.h),
-            2 => (m.x + mid * m.w, m.y + m.h + 8.0 + LAY_WIN_H / 2.0),
-            _ => (m.x + mid * m.w, m.y - 8.0 - LAY_WIN_H / 2.0),
+            0 => (m.x + m.w + 8.0 + ww / 2.0, m.y + mid * m.h),
+            1 => (m.x - 8.0 - ww / 2.0, m.y + mid * m.h),
+            2 => (m.x + mid * m.w, m.y + m.h + 8.0 + wh / 2.0),
+            _ => (m.x + mid * m.w, m.y - 8.0 - wh / 2.0),
         };
         *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (
-            snapped.0.clamp(LAY_WIN_W / 2.0 + 2.0, LAY_VW - LAY_WIN_W / 2.0 - 2.0),
-            snapped.1.clamp(LAY_WIN_H / 2.0 + 2.0, LAY_VH - LAY_WIN_H / 2.0 - 2.0),
+            snapped.0.clamp(ww / 2.0 + 2.0, LAY_VW - ww / 2.0 - 2.0),
+            snapped.1.clamp(wh / 2.0 + 2.0, LAY_VH - wh / 2.0 - 2.0),
         );
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
             std::mem::transmute(crate::objc_msgSend as usize);

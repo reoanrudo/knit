@@ -729,7 +729,7 @@ static EDGE_GUARD_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// 負荷としてカクつきに効くため、積算+間欠同期(Deskflow の m_xCursor 方式)にする。
 static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// 接続相手(Windows)の画面サイズ(px)。hello で受信しスケール自動算出に使う
-static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
+pub(crate) static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
 /// WIN モード中の Windows 仮想カーソル位置(px)。絶対位置送信モードで使う
 static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// 前回送信した絶対位置(量子化変化検出用)
@@ -1499,7 +1499,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-032126-ae3b5ec";
+const BUILD_ID: &str = "build-20260926-033344-3613d22";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
