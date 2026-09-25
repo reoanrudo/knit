@@ -125,7 +125,7 @@ unsafe extern "C" {
 
 /// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: Mutex<Option<String>> = Mutex::new(None);
-const CLIP_MAX_BYTES: usize = 512 * 1024;
+const CLIP_MAX_BYTES: usize = 1024 * 1024; // 1MB(Win側と同じ上限)
 
 type ID = *mut core::ffi::c_void;
 type SEL = *mut core::ffi::c_void;
@@ -229,6 +229,7 @@ static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -283,6 +284,8 @@ unsafe fn set_cursor_in_background() {
 }
 
 fn enter_win_mode_cursor_lock() {
+    // 持ち越していたスクロール残量を切替時に捨てる(切替直後の意図しないスクロール防止)
+    *SCROLL_ACC.lock().unwrap() = (0.0, 0.0);
     // Deskflow leave() 相当: hideCursor(プロパティ付き) → suppression間隔最小化 → 関連切断 → warp固定
     unsafe {
         set_cursor_in_background();
@@ -361,10 +364,18 @@ unsafe extern "C" fn tap_callback(
     // F13 = 手動トグル(常に有効、握る)
     if event_type == EVT_KEY_DOWN || event_type == EVT_FLAGS_CHANGED {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
+        if kc == KC_F13 {
+            if event_type == EVT_KEY_UP {
+                return std::ptr::null_mut(); // トグル専用キーのため up も握る
+            }
+        }
         if kc == KC_F13 && event_type == EVT_KEY_DOWN {
             if connected {
                 let next = !win_mode;
                 WIN_MODE.store(next, Ordering::Relaxed);
+                if next {
+                    DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 eprintln!("[mode] {} (F13)", if next { "WINDOWS" } else { "MAC" });
                 if next {
                     enter_win_mode_cursor_lock();
@@ -411,6 +422,7 @@ unsafe extern "C" fn tap_callback(
                     // 切替の瞬間はライブ位置で正確な高さを取る
                     let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
                     WIN_MODE.store(true, Ordering::Relaxed);
+                    DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0})", loc.x, loc.y);
                     let mut ny = 0.5;
                     if let Some(sh) = SCREEN_H.get() {
@@ -540,8 +552,9 @@ fn main() {
         }
     }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={}",
-        SCROLL_DIV.get().copied().unwrap_or(120.0)
+        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={}",
+        SCROLL_DIV.get().copied().unwrap_or(120.0),
+        MOUSE_SCALE.get().copied().unwrap_or(1.0)
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -798,19 +811,20 @@ fn main() {
             let mut last_cursor = (0.0f64, 0.0f64);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd, wp) = (
+                let (mode, mv, kd, sd, wp, mc) = (
                     WIN_MODE.load(Ordering::Relaxed),
                     DIAG_MOVE_COUNT.load(Ordering::Relaxed),
                     DIAG_KEY_COUNT.load(Ordering::Relaxed),
                     DIAG_SEND_COUNT.load(Ordering::Relaxed),
                     DIAG_WARP_COUNT.load(Ordering::Relaxed),
+                    DIAG_MODE_COUNT.load(Ordering::Relaxed),
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
                     let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
-                        "[diag] mode={} move_recv={mv} key_recv={kd} sent={sd} warp_fixed={wp} cursor=({:.0},{:.0}) cursor_moving={}",
+                        "[diag] mode={} moves={mv} keys={kd} sent={sd} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
                         if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
                     );
                     last_cursor = (p.x, p.y);
@@ -853,7 +867,7 @@ fn main() {
     std::thread::spawn(|| {
         let mut fixes: u64 = 0;
         loop {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(150));
             if !WIN_MODE.load(Ordering::Relaxed) {
                 continue;
             }

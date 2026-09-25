@@ -95,7 +95,7 @@ const CF_UNICODETEXT: u32 = 13;
 const GMEM_MOVEABLE: u32 = 0x0002;
 /// 最後に Mac から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-const CLIP_MAX_CHARS: usize = 512 * 1024;
+const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 
 fn clipboard_read_text() -> Option<String> {
     unsafe {
@@ -496,8 +496,9 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     accum.0 -= ix;
                     accum.1 -= iy;
                     inject_mouse_move_rel(ix as i32, iy as i32);
+                    // 実際にカーソルが動いたときだけ左端到達を判定する
+                    maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
                 }
-                maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
@@ -580,7 +581,7 @@ fn maybe_notify_return(
 ) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
-    if p.x <= 0 && last.elapsed() >= Duration::from_millis(700) {
+    if p.x <= 1 && last.elapsed() >= Duration::from_millis(700) {
         let ny = if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 };
         let _ = writeln!(writer, "{}", encode(&Msg::Return { ny }));
         *last = Instant::now();
