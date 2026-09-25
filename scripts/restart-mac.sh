@@ -23,3 +23,7 @@ sleep 4
 echo "[restart-mac] status:"
 head -1 /tmp/sd-mac-run.log   # ビルドID確認用
 grep -E "tap active|established|fatal" /tmp/sd-mac-run.log || echo "(接続待ち: sd-win が再接続します)"
+if ! pgrep -q -f "target/release/sd-mac"; then
+  echo "[restart-mac] WARN: プロセスが起動直後に終了しました。ログ末尾:"
+  tail -5 /tmp/sd-mac-run.log
+fi

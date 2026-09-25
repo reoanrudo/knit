@@ -433,6 +433,7 @@ unsafe extern "C" fn tap_callback(
                         send_msg(&Msg::MouseButton { btn: 0, down: false });
                     }
                     send_msg(&Msg::Warp { nx: 0.05, ny });
+                    eprintln!("[warp] -> win ({:.2},{:.2})", 0.05, ny);
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
                 }
@@ -623,7 +624,7 @@ fn main() {
             };
             eprintln!("[conn] accepted from {peer}");
             stream.set_nodelay(true).ok();
-            stream.set_read_timeout(Some(Duration::from_secs(20))).ok();
+            stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
             // hello を待つ(検証して hello_ok を返す)
             let mut reader = std::io::BufReader::new(match stream.try_clone() {
                 Ok(s) => s,

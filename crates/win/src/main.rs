@@ -381,19 +381,8 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     let running = Arc::new(AtomicBool::new(true));
     let running_w = running.clone();
 
-    // heartbeat 監視スレッド(15秒 pong なしで切断)
-    let hb_writer = writer.try_clone()?;
-    let hb_running = running.clone();
-    std::thread::spawn(move || {
-        let mut last_recv = Instant::now();
-        let _ = hb_writer; // ping送信は省略(クライアント主導)
-        while hb_running.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_secs(1));
-            // 読み取り側が last_recv を共有しない簡易版: ソケット生死は read ブロックで判定
-            // (TCP keepalive 相当。切断了ら read が Err を返し running=false になる)
-        }
-    });
-    let _ = hb_writer;
+    // (旧heartbeatスレッドは削除: ソケット生死は read のエラーで判定し、
+    //  接続監視は Mac 側の ping/pong が担うため不要だった)
 
     // クリップボード監視スレッド(Windows→Mac 方向)。起動時点の内容は送らない。
     let mut cb_writer = writer.try_clone()?;
@@ -553,10 +542,12 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     continue;
                 }
                 *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
-                if clipboard_write_text(&text) {
+                let ok = clipboard_write_text(&text)
+                    || (std::thread::sleep(Duration::from_millis(150)), clipboard_write_text(&text)).1;
+                if ok {
                     println!("[clip] mac->win {} bytes", text.len());
                 } else {
-                    println!("[clip] mac->win write failed");
+                    println!("[clip] mac->win write failed (busy clipboard)");
                 }
             }
             Msg::Bye => {

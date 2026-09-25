@@ -3,7 +3,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 1;
+    pub const VERSION: u32 = 2; // 2: Clip同期・Return ny 追加(旧バイナリ混在の早期検知用)
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
