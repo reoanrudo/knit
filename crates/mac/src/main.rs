@@ -1250,7 +1250,9 @@ unsafe extern "C" fn tap_callback(
                 acc.0 += dx;
                 acc.1 = now;
                 if acc.0.abs() >= 60.0 && now.saturating_sub(acc.2) >= 500 {
-                    let btn = if acc.0 < 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
+                    // Mac の操作感: 指を右へスワイプ(ページを左へめくる)=戻る。
+                    // dx>0=指右 → XButton1(戻る)、dx<0=指左 → XButton2(進む)
+                    let btn = if acc.0 > 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
                     send_msg(&Msg::MouseButton { btn, down: true });
                     send_msg(&Msg::MouseButton { btn, down: false });
                     eprintln!("[swipe] {} 送信(total={:.0})", if btn == 3 { "戻る" } else { "進む" }, acc.0);
@@ -1295,7 +1297,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-004022-d120952";
+const BUILD_ID: &str = "build-20260926-004242-a20d855";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
