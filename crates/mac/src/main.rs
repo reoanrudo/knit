@@ -86,6 +86,7 @@ unsafe extern "C" {
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGGetActiveDisplayList(max_displays: u32, active_displays: *mut u32, display_count: *mut u32) -> i32;
     fn CGWarpMouseCursorPosition(new: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connect: bool) -> i32;
     fn CGDisplayHideCursor(display: u32) -> i32;
@@ -279,6 +280,10 @@ static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
 static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
 /// 右端切替の判定閾値(px、画面右端からの距離)。SEAMLESS_EDGE_PX で調整可。
 static EDGE_PX: OnceLock<f64> = OnceLock::new();
+/// 全ディスプレイ領域(union)の右端。右にサブモニターがある環境では
+/// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
+/// 仮想画面全体の右端で判定する
+static UNION_MAX_X: OnceLock<f64> = OnceLock::new();
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -346,7 +351,8 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         let d = CGMainDisplayID();
         CGDisplayShowCursor(d);
         CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
-        if let Some(w) = SCREEN_W.get() {
+        let edge_x = UNION_MAX_X.get().copied().or(SCREEN_W.get().copied());
+        if let Some(w) = edge_x {
             let y = match ny {
                 Some(n) => {
                     let h = SCREEN_H.get().copied().unwrap_or(1000.0);
@@ -354,7 +360,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                 }
                 None => 400.0,
             };
-            CGWarpMouseCursorPosition(CGPoint { x: *w - 50.0, y });
+            CGWarpMouseCursorPosition(CGPoint { x: w - 50.0, y });
         }
     }
 }
@@ -442,7 +448,9 @@ unsafe extern "C" fn tap_callback(
                 let (px, _py) = *pos;
                 drop(pos);
                 let edge = EDGE_PX.get().copied().unwrap_or(2.0);
-                if px >= *w - edge {
+                // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
+                let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
+                if px >= edge_x - edge {
                     // 切替の瞬間はライブ位置で正確な高さを取る
                     let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
                     WIN_MODE.store(true, Ordering::Relaxed);
@@ -523,16 +531,22 @@ unsafe extern "C" fn tap_callback(
                         SCREEN_H.get().copied().unwrap_or(1329.0),
                     );
                     let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
-                    let mut wc = WIN_CUR.lock().unwrap();
-                    wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
-                    wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
-                    let (nx, ny) = (wc.0 / ww, wc.1 / wh);
+                    // 重要: WIN_CUR のガードをこのブロック内で必ず解放してから
+                    // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
+                    // するため、保持したまま呼ぶと自己デッドロックでタップが固まる)
+                    let (nx, ny, at_left) = {
+                        let mut wc = WIN_CUR.lock().unwrap();
+                        wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
+                        wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
+                        (wc.0 / ww, wc.1 / wh, event_type == EVT_MOUSE_MOVED && wc.0 <= 2.0)
+                    };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
                     *LAST_ABS_SENT.lock().unwrap() = (nx, ny);
                     DIAG_ABS_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::MouseAbs { nx, ny });
                     // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
-                    if wc.0 <= 1.0 {
+                    // ドラッグ中は意図しない復帰をしない(ボタン操作中の境界越えのため)
+                    if at_left {
                         WIN_MODE.store(false, Ordering::Relaxed);
                         DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                         eprintln!("[mode] MAC (abs-left)");
@@ -579,7 +593,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-170138-67d944f";
+const BUILD_ID: &str = "build-20260925-170925-a770734";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -605,6 +619,20 @@ fn main() {
         let b = CGDisplayBounds(d);
         (b.size.w, b.size.h)
     };
+    // 全アクティブディスプレイの bounds 和集合の右端(仮想画面の右端)
+    let union_max_x = unsafe {
+        let mut ids = [0u32; 16];
+        let mut n = 0u32;
+        let mut max_x = screen_w;
+        if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+            for id in &ids[..n as usize] {
+                let b = CGDisplayBounds(*id);
+                max_x = max_x.max(b.origin.x + b.size.w);
+            }
+        }
+        max_x
+    };
+    let _ = UNION_MAX_X.set(union_max_x);
     let _ = SCREEN_W.set(screen_w);
     let _ = SCREEN_H.set(screen_h);
     unsafe {
@@ -633,7 +661,7 @@ fn main() {
         }
     }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={}",
+        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
