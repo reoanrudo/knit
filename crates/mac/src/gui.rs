@@ -19,6 +19,7 @@ unsafe fn sel(name: &std::ffi::CStr) -> SEL {
 
 #[link(name = "AppKit", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
+#[link(name = "CoreGraphics", kind = "framework")]
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
     static kCFRunLoopCommonModes: *mut core::ffi::c_void;
@@ -34,6 +35,30 @@ unsafe extern "C" {
         types: *const core::ffi::c_char,
     ) -> i32;
     fn objc_registerClassPair(cls: CLS);
+    // メニューバーアイコンを CoreGraphics で描くための最小セット
+    fn CGColorSpaceCreateDeviceRGB() -> *mut core::ffi::c_void;
+    fn CGBitmapContextCreate(
+        data: *mut u8, width: usize, height: usize, bits_per_component: usize,
+        bytes_per_row: usize, space: *mut core::ffi::c_void, bitmap_info: u32,
+    ) -> *mut core::ffi::c_void;
+    fn CGBitmapContextCreateImage(ctx: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn CGContextRelease(ctx: *mut core::ffi::c_void);
+    fn CGImageRelease(img: *mut core::ffi::c_void);
+    fn CGContextSetRGBFillColor(
+        ctx: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64,
+    );
+    fn CGContextSetRGBStrokeColor(
+        ctx: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64,
+    );
+    fn CGContextSetLineWidth(ctx: *mut core::ffi::c_void, w: f64);
+    fn CGContextSetLineCap(ctx: *mut core::ffi::c_void, cap: u32);
+    fn CGContextBeginPath(ctx: *mut core::ffi::c_void);
+    fn CGContextMoveToPoint(ctx: *mut core::ffi::c_void, x: f64, y: f64);
+    fn CGContextAddLineToPoint(ctx: *mut core::ffi::c_void, x: f64, y: f64);
+    fn CGContextClosePath(ctx: *mut core::ffi::c_void);
+    fn CGContextFillPath(ctx: *mut core::ffi::c_void);
+    fn CGContextStrokePath(ctx: *mut core::ffi::c_void);
+    fn CFRelease(cf: *mut core::ffi::c_void);
 }
 
 // ---------- 固定シグネチャ呼び出しヘルパ(この画面で必要なものだけ) ----------
@@ -195,8 +220,87 @@ fn refresh_status() {
     }
 }
 
-unsafe fn make_target() -> ID {
-    let super_cls = objc_getClass(c"NSObject".as_ptr());
+/// メニューバー用テンプレートアイコン(アプリアイコンと同モチーフの白カーソル+残像)。
+/// CoreGraphics で 44px ビットマップに描き NSImage(template) 化する。
+/// template なのでメニューバーの明暗に自動追従する(色ではなくアルファで描画)
+unsafe fn make_menu_icon() -> ID {
+    const C: usize = 44;
+    let mut data = vec![0u8; C * 4 * C];
+    let space = CGColorSpaceCreateDeviceRGB();
+    let ctx = CGBitmapContextCreate(
+        data.as_mut_ptr(), C, C, 8, C * 4, space, 2 | (2 << 12), // BGRA
+    );
+    if ctx.is_null() {
+        return std::ptr::null_mut();
+    }
+    // 黒(=テンプレート。実際の色はシステムが決める)
+    CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
+    CGContextSetRGBStrokeColor(ctx, 0.0, 0.0, 0.0, 1.0);
+    CGContextSetLineCap(ctx, 1); // round
+
+    // カーソルポインタ(設計座標、原点=左下)。スケール 1.7 で約 20x32px
+    let arrow: [(f64, f64); 7] = [
+        (0.0, 18.8), (0.0, 2.3), (4.2, 6.2), (6.8, 0.0), (9.3, 1.0), (6.7, 6.9), (11.9, 7.4),
+    ];
+    let (sc, ox, oy) = (1.7f64, 10.0, 5.5);
+    // 残像(移動感の 2 ストローク)を先に描く
+    for (alpha, w, x1, y1, x2, y2) in [
+        (0.32f64, 3.2, 30.0, 12.0, 37.0, 5.0),
+        (0.16, 3.2, 33.0, 19.0, 39.0, 13.0),
+    ] {
+        CGContextSetRGBStrokeColor(ctx, 0.0, 0.0, 0.0, alpha);
+        CGContextSetLineWidth(ctx, w);
+        CGContextBeginPath(ctx);
+        CGContextMoveToPoint(ctx, x1, y1);
+        CGContextAddLineToPoint(ctx, x2, y2);
+        CGContextStrokePath(ctx);
+    }
+    // カーソル本体(少し傾ける)
+    let theta = -14.0_f64.to_radians();
+    let (t, cx, cy) = (theta, 22.0f64, 22.0f64);
+    let (cos_t, sin_t) = (t.cos(), t.sin());
+    // 回転を手動適用(中心(22,22)周り、CG は y 上向き)
+    let rot = |x: f64, y: f64| -> (f64, f64) {
+        let dx = x - cx;
+        let dy = y - cy;
+        (cx + cos_t * dx - sin_t * dy, cy + sin_t * dx + cos_t * dy)
+    };
+    CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
+    CGContextBeginPath(ctx);
+    let (x0, y0) = rot(ox + arrow[0].0 * sc, oy + arrow[0].1 * sc);
+    CGContextMoveToPoint(ctx, x0, y0);
+    for (x, y) in &arrow[1..] {
+        let (rx, ry) = rot(ox + x * sc, oy + y * sc);
+        CGContextAddLineToPoint(ctx, rx, ry);
+    }
+    CGContextClosePath(ctx);
+    CGContextFillPath(ctx);
+
+    let img = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx);
+    CFRelease(space);
+    if img.is_null() {
+        return std::ptr::null_mut();
+    }
+    // NSImage initWithCGImage:size: (NSSize は arm64 で d0/d1 レジスタ渡し)
+    let f: unsafe extern "C" fn(ID, SEL, ID, f64, f64) -> ID =
+        std::mem::transmute(crate::objc_msgSend as usize);
+    let nsimg = f(
+        msg0(objc_getClass(c"NSImage".as_ptr()), sel(c"alloc")),
+        sel(c"initWithCGImage:size:"),
+        img,
+        18.0,
+        18.0,
+    );
+    CGImageRelease(img);
+    if nsimg.is_null() {
+        return std::ptr::null_mut();
+    }
+    msg1_void_u8(nsimg, sel(c"setTemplate:"), 1);
+    nsimg
+}
+
+unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_ptr());
     if super_cls.is_null() {
         return std::ptr::null_mut();
     }
@@ -343,6 +447,11 @@ pub fn start() -> bool {
             return false;
         }
         let _ = GUI_BUTTON.store(button as usize, Ordering::Relaxed);
+        // アイコン(テンプレート)+状態テキストの併記。失敗時はテキストのみで継続
+        let icon = make_menu_icon();
+        if !icon.is_null() {
+            msg1_void_id(button, sel(c"setImage:"), icon);
+        }
         msg1_void_id(item, sel(c"setMenu:"), menu);
 
         // 毎秒の状態反映。メニュー追跡中も止まらないよう common modes へ登録する

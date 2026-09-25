@@ -33,6 +33,7 @@ cat > "$ROOT/$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VER</string>
   <key>CFBundleVersion</key><string>$NEW_ID</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
   <key>NSSupportsAutomaticTermination</key><false/>
   <key>NSSupportsSuddenTermination</key><false/>
@@ -40,10 +41,17 @@ cat > "$ROOT/$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
+# アプリアイコン(icns)を Resources へ
+mkdir -p "$ROOT/$APP/Contents/Resources"
+if [ -f assets/AppIcon.icns ]; then
+  cp assets/AppIcon.icns "$ROOT/$APP/Contents/Resources/AppIcon.icns"
+else
+  echo "[package-mac] WARN: assets/AppIcon.icns が無い(scripts/gen-icons.sh を実行)"
+fi
+
 # トークン設定をバンドル内へ封入(配布先で最初から接続可能にする。
 # 不要な場合はこのブロックを削除し、配布先で ~/.config/seamless-desk/env を設定する)
 if [ -f "$HOME/.config/seamless-desk/env" ]; then
-  mkdir -p "$ROOT/$APP/Contents/Resources"
   cp "$HOME/.config/seamless-desk/env" "$ROOT/$APP/Contents/Resources/.env"
   chmod 600 "$ROOT/$APP/Contents/Resources/.env"
   echo "[package-mac] トークン設定を Resources/.env に封入しました"
