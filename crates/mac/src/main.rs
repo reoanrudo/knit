@@ -287,10 +287,6 @@ static EDGE_PX: OnceLock<f64> = OnceLock::new();
 static UNION_MAX_X: OnceLock<f64> = OnceLock::new();
 /// カーソル非表示状態の管理(hide/show の対称性を保証し、復帰時に必ず表示する)
 static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 境界切替の再武装フラグ。復帰後はカーソルが境界から十分離れるまで次の
-/// 切替を無効化する(境界付近に戻されるたび即再突入するチャタリング防止)。
-/// 時間ガード(EDGE_GUARD)だけでは「戻されて→また飛ぶ」を防げないため距離で判定する
-static EDGE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -332,7 +328,11 @@ fn enter_win_mode_cursor_lock() {
             lock_y = loc.y;
             CFRelease(ev);
         }
-        let lock_x = SCREEN_W.get().copied().unwrap_or(2056.0) - 2.0;
+        // union 右端に固定(SCREEN_W はメイン画面幅なので、右サブモニターがある
+        // 環境で固定すると隠れカーソルが MacBook 側へ飛んでしまう)
+        let lock_x = UNION_MAX_X.get().copied().unwrap_or_else(|| {
+            SCREEN_W.get().copied().unwrap_or(2056.0)
+        }) - 2.0;
         CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
     }
@@ -352,9 +352,8 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                     ((wc.0 / ww).clamp(0.05, 0.95), (wc.1 / wh).clamp(0.05, 0.95));
             }
         }
-        EDGE_GUARD_UNTIL_MS.store(now_ms() + 200, Ordering::Relaxed);
-        // 境界から離れるまで次の切替を無効化(チャタリング防止の距離ガード)
-        EDGE_ARMED.store(false, Ordering::Relaxed);
+        // 時間ガードを 400ms に増強し、復帰直後の再突入を防ぐ(距離ガードの代替)
+        EDGE_GUARD_UNTIL_MS.store(now_ms() + 400, Ordering::Relaxed);
         if let Some(loc) = live_cursor() {
             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
@@ -379,9 +378,9 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                 }
                 None => 400.0,
             };
-            // 注意: この復帰位置は再武装閾値(edge-100)より必ず内側にすること。
-            // 内側になっていないと復帰後にアームされず Windows へ行けなくなる
-            CGWarpMouseCursorPosition(CGPoint { x: w - 120.0, y });
+            // 境界から 150px 内側へ置き、時間ガード(400ms)と合わせて
+            // 復帰直後のうっかり再突入を防ぐ(意図的な移動は妨げない)
+            CGWarpMouseCursorPosition(CGPoint { x: w - 150.0, y });
         }
     }
 }
@@ -471,11 +470,10 @@ unsafe extern "C" fn tap_callback(
                 let edge = EDGE_PX.get().copied().unwrap_or(2.0);
                 // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
                 let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
-                // 復帰後アーム: 境界から 100px 以上内側へ離れたら次の切替を有効化する
-                if !EDGE_ARMED.load(Ordering::Relaxed) && px < edge_x - 100.0 {
-                    EDGE_ARMED.store(true, Ordering::Relaxed);
-                }
-                if EDGE_ARMED.load(Ordering::Relaxed) && px >= edge_x - edge {
+                // 距離アームは廃止: 復帰後に右方向へ動くユーザーの自然な操作が
+                // 「内側へ離れる」条件を満たせず Windows へ行けなくなるため。
+                // チャタリング防止は復帰位置 150px 内側 + 時間ガードで担保する
+                if px >= edge_x - edge {
                     // 切替の瞬間はライブ位置で正確な高さを取る
                     let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
                     WIN_MODE.store(true, Ordering::Relaxed);
@@ -618,7 +616,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-172511-dd377e5";
+const BUILD_ID: &str = "build-20260925-172806-88ecb13";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
