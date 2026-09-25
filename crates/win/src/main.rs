@@ -98,6 +98,8 @@ const CF_UNICODETEXT: u32 = 13;
 const GMEM_MOVEABLE: u32 = 0x0002;
 /// 最後に Mac から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// cmd+Tab → Alt+Tab 変換中(Alt を保持し、cmd 離下で確定する)
+static ALT_TAB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 
 fn clipboard_read_text() -> Option<String> {
@@ -296,9 +298,13 @@ impl ModState {
     fn release_all(&mut self) {
         self.apply(false, false, false, false);
     }
+    /// Mac cmd キーの押下状態(self.ctrl が cmd に対応)
+    fn cmd_pressed(&self) -> bool {
+        self.ctrl
+    }
 }
 
-const BUILD_ID: &str = "win-20260925-170150-67d944f";
+const BUILD_ID: &str = "win-20260925-170344-b24c922";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
@@ -486,6 +492,31 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                         }
                         _ => {}
                     }
+                }
+                // Mac の cmd+Tab(ウィンドウ切替)は Windows の Alt+Tab へ変換する。
+                // Alt は cmd が離されるまで保持し、離した瞬間に切替を確定させる
+                let prev_cmd = mods.cmd_pressed();
+                if ALT_TAB_ACTIVE.load(Ordering::Relaxed) && !cmd && prev_cmd {
+                    // cmd 離下 → Alt+Tab 確定
+                    inject_key(0x09, true); // VK_TAB up
+                    inject_key(VK_MENU, true);
+                    ALT_TAB_ACTIVE.store(false, Ordering::Relaxed);
+                    println!("[alttab] confirmed");
+                }
+                if kc == 48 && cmd && !opt && !ctrl {
+                    if down {
+                        // cmd 分の Ctrl 押下を抑制してから Alt+Tab を合成
+                        mods.apply(false, opt, false, shift);
+                        inject_key(VK_MENU, false);
+                        inject_key(0x09, false);
+                        ALT_TAB_ACTIVE.store(true, Ordering::Relaxed);
+                    } else {
+                        inject_key(0x09, true); // Tab up のみ(Alt は保持)
+                    }
+                    if DEBUG_KEYS.load(Ordering::Relaxed) {
+                        println!("[alttab] cmd+tab -> alt+tab");
+                    }
+                    continue;
                 }
                 mods.apply(ctrl, opt, cmd, shift);
                 if let Some(vk) = mac_kc_to_win_vk(kc) {
