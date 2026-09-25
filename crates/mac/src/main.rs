@@ -405,6 +405,9 @@ static EDGE_PX: OnceLock<f64> = OnceLock::new();
 /// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
 /// 仮想画面全体の右端で判定する
 static UNION_MAX_X: OnceLock<f64> = OnceLock::new();
+/// 出口(union 右端を持つディスプレイ)のグローバル y 範囲。
+/// 切替・復帰の高さ対応を MacBook 基準ではなく出口モニター基準で正確に行う
+static EDGE_DISP_Y: OnceLock<(f64, f64)> = OnceLock::new();
 /// カーソル非表示状態の管理(hide/show の対称性を保証し、復帰時に必ず表示する)
 static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -501,12 +504,23 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
         let taps = EDGE_TAPS.get().copied().unwrap_or(2);
         let x = if taps >= 2 { edge_x - 60.0 } else { (main_w - 100.0).min(edge_x - 150.0) };
+        // 高さは出口ディスプレイの y 範囲へ対応付ける(Windows 側の高さ比を
+        // そのまま出口モニターの範囲へ写像。MacBook 基準だと位置がずれる)
         let y = match ny {
             Some(n) => {
-                let h = SCREEN_H.get().copied().unwrap_or(1000.0);
-                (n.clamp(0.0, 1.0) * h).clamp(20.0, (h - 20.0).max(20.0))
+                let (ymin, ymax) = EDGE_DISP_Y
+                    .get()
+                    .copied()
+                    .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
+                (ymin + n.clamp(0.0, 1.0) * (ymax - ymin)).clamp(ymin + 20.0, (ymax - 20.0).max(ymin + 20.0))
             }
-            None => 400.0,
+            None => {
+                let (ymin, ymax) = EDGE_DISP_Y
+                    .get()
+                    .copied()
+                    .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
+                (ymin + ymax) / 2.0
+            }
         };
         CGWarpMouseCursorPosition(CGPoint { x, y });
         // ワープ先を CUR_POS へ反映(同期をワープ前に取ると境界値が残り
@@ -633,10 +647,16 @@ unsafe extern "C" fn tap_callback(
                         let taps = EDGE_TAPS.get().copied().unwrap_or(2);
                         let now = now_ms();
                         let prev = EDGE_LAST_HIT_MS.swap(now, Ordering::Relaxed);
-                        let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= 500);
+                        let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= 700);
                         if !fire {
-                            eprintln!("[edge] 1回目の到達(ダブルタップ待ち)");
-                            return event; // 2回目を待つ(この間カーソルは素通り)
+                            // 1回目: 境界から少し内側へ弾き返す。壁に当たった感触で
+                            // 「もう一度押すと通る」ことを体感させる(本質の可視化)
+                            eprintln!("[edge] 1回目の到達(跳ね返し)");
+                            let bx = edge_x - 15.0;
+                            CGWarpMouseCursorPosition(CGPoint { x: bx, y: loc.y });
+                            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (bx, loc.y);
+                            EDGE_AT_EDGE.store(false, Ordering::Relaxed);
+                            return event;
                         }
                         EDGE_LAST_HIT_MS.store(0, Ordering::Relaxed);
                     }
@@ -651,13 +671,20 @@ unsafe extern "C" fn tap_callback(
                     if event_type != EVT_MOUSE_MOVED {
                         send_msg(&Msg::MouseButton { btn: 0, down: false });
                     }
-                    // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ
+                    // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
+                    // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
                     let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
                     if nx < 0.0 {
                         nx = 0.05;
-                        if let Some(sh) = SCREEN_H.get() {
-                            ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
-                        }
+                        let (ymin, ymax) = EDGE_DISP_Y
+                            .get()
+                            .copied()
+                            .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
+                        ny = if ymax > ymin {
+                            ((loc.y - ymin) / (ymax - ymin)).clamp(0.0, 1.0)
+                        } else {
+                            0.5
+                        };
                     }
                     send_msg(&Msg::Warp { nx, ny });
                     eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
@@ -814,19 +841,25 @@ fn main() {
         (b.size.w, b.size.h)
     };
     // 全アクティブディスプレイの bounds 和集合の右端(仮想画面の右端)
-    let union_max_x = unsafe {
+    let (union_max_x, edge_disp_y) = unsafe {
         let mut ids = [0u32; 16];
         let mut n = 0u32;
         let mut max_x = screen_w;
+        let mut disp_y = (0.0, screen_h);
         if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
             for id in &ids[..n as usize] {
                 let b = CGDisplayBounds(*id);
-                max_x = max_x.max(b.origin.x + b.size.w);
+                let right = b.origin.x + b.size.w;
+                if right > max_x {
+                    max_x = right;
+                    disp_y = (b.origin.y, b.origin.y + b.size.h);
+                }
             }
         }
-        max_x
+        (max_x, disp_y)
     };
     let _ = UNION_MAX_X.set(union_max_x);
+    let _ = EDGE_DISP_Y.set(edge_disp_y);
     let _ = SCREEN_W.set(screen_w);
     let _ = SCREEN_H.set(screen_h);
     unsafe {
