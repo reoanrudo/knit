@@ -654,6 +654,12 @@ fn main() {
                                 }
                                 Msg::Clip { text } => {
                                     if text.len() <= CLIP_MAX_BYTES {
+                                        // Windows の CRLF は Mac 向けに LF へ正規化
+                                        let text = if text.contains("\r\n") {
+                                            text.replace("\r\n", "\n")
+                                        } else {
+                                            text
+                                        };
                                         *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
                                         unsafe { mac_set_clipboard(&text) };
                                         eprintln!("[clip] win->mac {} bytes", text.len());
@@ -810,15 +816,16 @@ fn main() {
     std::thread::spawn(|| {
         let mut last_count = clipboard_change_count();
         loop {
-            std::thread::sleep(Duration::from_millis(400));
+            std::thread::sleep(Duration::from_millis(250));
+            // 未接続の間は基準を更新しない(切断中のコピーも再接続後に送る)
+            if !CONNECTED.load(Ordering::Relaxed) {
+                continue;
+            }
             let cnt = clipboard_change_count();
             if cnt == last_count {
                 continue;
             }
             last_count = cnt;
-            if !CONNECTED.load(Ordering::Relaxed) {
-                continue;
-            }
             let Some(text) = (unsafe { mac_get_clipboard() }) else { continue };
             if text.is_empty() || text.len() > CLIP_MAX_BYTES {
                 continue;
