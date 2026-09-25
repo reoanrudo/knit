@@ -417,7 +417,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     std::thread::spawn(move || {
         let mut last_sent = clipboard_read_text();
         while cb_running.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(200));
             let Some(text) = clipboard_read_text() else { continue };
             if text.len() > CLIP_MAX_CHARS || last_sent.as_deref() == Some(text.as_str()) {
                 continue;

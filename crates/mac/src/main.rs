@@ -433,7 +433,7 @@ unsafe extern "C" fn tap_callback(
                 let mut pos = CUR_POS.lock().unwrap();
                 pos.0 += dx;
                 pos.1 += dy;
-                if n % 32 == 0 {
+                if n % 16 == 0 {
                     if let Some(loc) = live_cursor() {
                         *pos = (loc.x, loc.y);
                     }
@@ -706,6 +706,7 @@ fn main() {
             eprintln!("[conn] accepted from {peer}");
             stream.set_nodelay(true).ok();
             stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
             // hello を待つ(検証して hello_ok を返す)
             let mut reader = std::io::BufReader::new(match stream.try_clone() {
                 Ok(s) => s,
@@ -925,7 +926,7 @@ fn main() {
     std::thread::spawn(|| {
         let mut last_count = clipboard_change_count();
         loop {
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(200));
             // 未接続の間は基準を更新しない(切断中のコピーも再接続後に送る)
             if !CONNECTED.load(Ordering::Relaxed) {
                 continue;
