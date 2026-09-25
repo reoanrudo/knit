@@ -123,3 +123,12 @@ seamless-desk/
   (対処: タスクを /RL HIGHEST で登録する選択肢)
 - Tailscale の遅延変動(WiFi 状況次第)。有線 Tailscale/直接 LAN は将来検討
 - Mac 側キーリピート・日本語IMEの状態同期は未対応(Phase 1 は英語入力前提)
+
+## マウス絶対位置送信モード(2026-09-25 追加)
+
+Mac の加速済み delta に Windows のポインタ加速が二重に乗るのを避けるため、
+WIN モード中は Mac 側が Windows 画面の仮想カーソル(px, f64)を管理し、
+正規化座標 MouseAbs を毎イベント送信する。Windows 側は MOUSEEVENTF_ABSOLUTE
+で注入(加速曲線を通らない)。画面比率の見た目距離は方向別スケール
+(win_w/mac_w, win_h/mac_h)で自動補正。左端到達の復帰は Mac 内完結で即時。
+SEAMLESS_MOUSE_MODE=rel で従来の相対移動に切替可能。
