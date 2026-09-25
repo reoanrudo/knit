@@ -258,6 +258,9 @@ static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((0.05, 0.5));
 /// 絶対位置送信モード(既定ON。SEAMLESS_MOUSE_MODE=rel で旧・相対移動に戻す)
 static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 切替方式: false=境界+ホットキー(既定)/ true=ホットキー(F13)のみで切替、
+/// 切替後は境界を超えても戻らないロック状態になる(SEAMLESS_SWITCH_MODE=hotkey)
+static HOTKEY_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// ライブカーソル位置を取得(CFRelease まで面倒を見る)
@@ -432,7 +435,13 @@ unsafe extern "C" fn tap_callback(
                 if next {
                     enter_win_mode_cursor_lock();
                 } else {
-                    leave_win_mode_cursor_unlock(None);
+                    // 戻り先の高さは Windows 側カーソルの現在高さに合わせる
+                    let ny = {
+                        let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
+                        let (_ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+                        if wh > 0.0 { (wc.1 / wh).clamp(0.0, 1.0) } else { 0.5 }
+                    };
+                    leave_win_mode_cursor_unlock(Some(ny));
                 }
             }
             return std::ptr::null_mut();
@@ -452,6 +461,7 @@ unsafe extern "C" fn tap_callback(
         // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
         if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)
             && connected
+            && !HOTKEY_ONLY.load(Ordering::Relaxed) // hotkey モードでは境界切替しない(ロック)
             && now_ms() >= EDGE_GUARD_UNTIL_MS.load(Ordering::Relaxed)
         {
             if let Some(w) = SCREEN_W.get() {
@@ -564,7 +574,13 @@ unsafe extern "C" fn tap_callback(
                         let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
                         wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
                         wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
-                        (wc.0 / ww, wc.1 / wh, event_type == EVT_MOUSE_MOVED && wc.0 <= 2.0)
+                        (
+                            wc.0 / ww,
+                            wc.1 / wh,
+                            !HOTKEY_ONLY.load(Ordering::Relaxed)
+                                && event_type == EVT_MOUSE_MOVED
+                                && wc.0 <= 2.0,
+                        )
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
                     *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
@@ -686,13 +702,19 @@ fn main() {
             MOUSE_ABS_MODE.store(false, Ordering::Relaxed);
         }
     }
+    if let Some(m) = std::env::var("SEAMLESS_SWITCH_MODE").ok() {
+        if m.eq_ignore_ascii_case("hotkey") {
+            HOTKEY_ONLY.store(true, Ordering::Relaxed);
+        }
+    }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={}",
+        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
         CLIP_MAX_BYTES / 1024,
-        if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" }
+        if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" },
+        if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" }
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -812,6 +834,11 @@ fn main() {
                         if let Some(msg) = decode(&line) {
                             match msg {
                                 Msg::Return { ny } => {
+                                    if HOTKEY_ONLY.load(Ordering::Relaxed) {
+                                        // hotkey モードでは Windows 側の左端到達を無視し、
+                                        // F13 で戻すまで Windows のまま(ロック状態)
+                                        continue;
+                                    }
                                     WIN_MODE.store(false, Ordering::Relaxed);
                                     eprintln!("[mode] MAC (return)");
                                     leave_win_mode_cursor_unlock(Some(ny));
