@@ -78,6 +78,19 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 | `SEAMLESS_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
 | `SEAMLESS_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
 | `SEAMLESS_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
+## ホットキーロックモード(オプション)
+
+`./scripts/restart-mac.sh --hotkey` で起動すると、画面境界での自動切替をやめ、
+**ホットキー1つだけで Mac⇄Windows を切替**できます。切替後は境界を超えても
+勝手に切り替わらないロック状態になり、もう一度ホットキーを押すまで戻りません
+(Windows 側で左端に行っても戻りません)。`--edge` で従来モードに戻ります。
+
+- 既定のホットキーは **F13**(Mac keycode 105)。MacBook 内蔵キーボードに F13 が
+  無い場合は `SEAMLESS_HOTKEY_KC` で変更できます(例: 右 Cmd=54、F6=97)
+  - 起動例: `SEAMLESS_HOTKEY_KC=54 ./scripts/restart-mac.sh --diag --hotkey`
+- 起動ログに `switch_mode=hotkey(ロック) hotkey_kc=105` の形式で反映状況が出ます
+
+| 変数 | 既定 | 説明 |
 | `SEAMLESS_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
 | `SEAMLESS_DESK_TOKEN` | seamless-desk-dev | 両側共通の認証トークン |
 

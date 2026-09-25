@@ -68,6 +68,13 @@ const FLAG_OPT: CGEventFlags = 0x0008_0000;
 const FLAG_CMD: CGEventFlags = 0x0010_0000;
 
 const KC_F13: i64 = 105;
+/// 切替ホットキー(Mac keycode)。SEAMLESS_HOTKEY_KC で変更可。
+/// MacBook 内蔵キーボードには F13 が無いため、例えば右Cmd(54)等に変えられる
+static HOTKEY_KC: OnceLock<i64> = OnceLock::new();
+
+fn hotkey_kc() -> i64 {
+    HOTKEY_KC.get().copied().unwrap_or(KC_F13)
+}
 
 #[link(name = "CoreGraphics", kind = "framework")]
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -430,12 +437,12 @@ unsafe extern "C" fn tap_callback(
     // F13 = 手動トグル(常に有効、握る)
     if event_type == EVT_KEY_DOWN || event_type == EVT_FLAGS_CHANGED {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
-        if kc == KC_F13 {
+        if kc == hotkey_kc() {
             if event_type == EVT_KEY_UP {
                 return std::ptr::null_mut(); // トグル専用キーのため up も握る
             }
         }
-        if kc == KC_F13 && event_type == EVT_KEY_DOWN {
+        if kc == hotkey_kc() && event_type == EVT_KEY_DOWN {
             if connected {
                 let next = !win_mode;
                 WIN_MODE.store(next, Ordering::Relaxed);
@@ -655,7 +662,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-174029-91ca47f";
+const BUILD_ID: &str = "build-20260925-174322-6ba4d34";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -727,14 +734,20 @@ fn main() {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
     }
+    if let Some(k) = std::env::var("SEAMLESS_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
+        if (1..=127).contains(&k) {
+            let _ = HOTKEY_KC.set(k);
+        }
+    }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={}",
+        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
         CLIP_MAX_BYTES / 1024,
         if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" },
-        if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" }
+        if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" },
+        hotkey_kc()
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)

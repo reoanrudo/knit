@@ -13,10 +13,21 @@ touch crates/mac/src/main.rs
 cargo build --release 2>&1 | grep -E "^error" -A 3 && exit 1 || true
 cargo build --release 2>&1 | tail -1
 
-echo "[restart-mac] restarting..."
+# --hotkey/--edge を切替モードへ変換し、残りは sd-mac へそのまま渡す
+SWITCH_MODE=edge
+ARGS=""
+for a in "$@"; do
+  case "$a" in
+    --hotkey) SWITCH_MODE=hotkey ;;
+    --edge)   SWITCH_MODE=edge ;;
+    *)        ARGS="$ARGS $a" ;;
+  esac
+done
+
+echo "[restart-mac] restarting (switch_mode=$SWITCH_MODE)..."
 pkill -9 -f "target/release/sd-mac" 2>/dev/null || true
 sleep 1
-nohup ./target/release/sd-mac "$@" > /tmp/sd-mac-run.log 2>&1 &
+SEAMLESS_SWITCH_MODE=$SWITCH_MODE nohup ./target/release/sd-mac $ARGS > /tmp/sd-mac-run.log 2>&1 &
 disown
 sleep 4
 
