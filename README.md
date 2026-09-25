@@ -94,5 +94,7 @@ cargo test                                                       # テスト(def
 
 ## 開発ノート
 
+- **AI/自動化で扱う場合**の必読事項(環境固有の罠・ワンコマンド): [docs/agent-guide.md](docs/agent-guide.md)
+
 - 第三者レビュー(Wave1 6視点 + Wave2 統合): [docs/reviews/](docs/reviews/wave2-integration.md)
 - 改善履歴: [docs/improvement-log.md](docs/improvement-log.md)

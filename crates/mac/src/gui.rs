@@ -132,6 +132,10 @@ static PREFS_DELAY_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DELAY_LBL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DBL_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DBL_LBL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_MSCALE_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_MSCALE_LBL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_EDGE_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_EDGE_LBL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
 static GUI_SIDE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
@@ -299,6 +303,34 @@ unsafe extern "C" fn imp_dbl_tap(_s: ID, _c: SEL, sender: ID) {
         let lbl = PREFS_DBL_LBL.load(Ordering::Relaxed) as ID;
         if !lbl.is_null() {
             msg1_void_id(lbl, sel(c"setStringValue:"), nsstring(&format!("{v:.0}ms 以内の2回")));
+        }
+    }
+}
+
+/// カーソル速度スライダ(0.2..3.0。倍率=Windows 上の移動量)
+unsafe extern "C" fn imp_mouse_scale(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let v = get(sender, sel(c"doubleValue"));
+        crate::set_mouse_scale(v);
+        let lbl = PREFS_MSCALE_LBL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            msg1_void_id(lbl, sel(c"setStringValue:"), nsstring(&format!("速度 x{v:.1}")));
+        }
+    }
+}
+
+/// 境界の敏感さスライダ(0..30px。大きいほど境界に届きやすい)
+unsafe extern "C" fn imp_edge_px(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let v = get(sender, sel(c"doubleValue"));
+        crate::set_edge_px(v);
+        let lbl = PREFS_EDGE_LBL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            msg1_void_id(lbl, sel(c"setStringValue:"), nsstring(&format!("敏感さ {v:.0}px")));
         }
     }
 }
@@ -745,7 +777,57 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             msg1_void_id(cv, sel(c"addSubview:"), gain_lbl);
             PREFS_GAIN_LABEL.store(gain_lbl as usize, Ordering::Relaxed);
         }
-        y -= 44.0;
+        y -= 40.0;
+        // 境界の敏感さスライダ(0..30px)
+        let mk4: unsafe extern "C" fn(ID, SEL, f64, f64, f64, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        if !slider_cls.is_null() {
+            let sl = mk4(
+                slider_cls, sel(c"sliderWithValue:minValue:maxValue:target:action:"),
+                crate::edge_px(), 0.0, 30.0,
+                target, sel(c"sdEdgePx:"),
+            );
+            if !sl.is_null() {
+                set_frame(sl, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 28.0, w: 180.0, h: 22.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), sl);
+                PREFS_EDGE_SLIDER.store(sl as usize, Ordering::Relaxed);
+            }
+        }
+        let el = label(
+            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+            nsstring(&format!("境界の敏感さ {:.0}px", crate::edge_px())),
+        );
+        if !el.is_null() {
+            set_frame(el, sel(c"setFrame:"), NSRect { x: 212.0, y: y - 26.0, w: 170.0, h: 18.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), el);
+            PREFS_EDGE_LBL.store(el as usize, Ordering::Relaxed);
+        }
+        y -= 40.0;
+        // カーソル速度スライダ(0.2..3.0)
+        let mk3: unsafe extern "C" fn(ID, SEL, f64, f64, f64, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        if !slider_cls.is_null() {
+            let sl = mk3(
+                slider_cls, sel(c"sliderWithValue:minValue:maxValue:target:action:"),
+                crate::mouse_scale(), 0.2, 3.0,
+                target, sel(c"sdMouseScale:"),
+            );
+            if !sl.is_null() {
+                set_frame(sl, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 28.0, w: 180.0, h: 22.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), sl);
+                PREFS_MSCALE_SLIDER.store(sl as usize, Ordering::Relaxed);
+            }
+        }
+        let ml = label(
+            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+            nsstring(&format!("カーソル速度 x{:.1}", crate::mouse_scale())),
+        );
+        if !ml.is_null() {
+            set_frame(ml, sel(c"setFrame:"), NSRect { x: 212.0, y: y - 26.0, w: 170.0, h: 18.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), ml);
+            PREFS_MSCALE_LBL.store(ml as usize, Ordering::Relaxed);
+        }
+        y -= 40.0;
 
         // ---- Windows ----
         section_heading(cv, "Windows", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
@@ -762,6 +844,49 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         y -= 26.0;
         place_check("クリップボードを共有(テキスト/画像)", c"sdClipShare:", &PREFS_CHK_CLIP, y);
         y -= 38.0;
+
+        // ---- 操作ガイド(Mac の操作感の見える化) ----
+        section_heading(cv, "操作ガイド(Windows 画面でも Mac と同じ操作)", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 24.0;
+        let guide = [
+            "⌘←→ 行頭/行末・⌘↑↓ 文書先頭/末尾・⌥←→ 単語移動",
+            "⌘] / ⌘[ … タブの切替・⌘⇧4 切取り・⌘⇧5 録画",
+            "⌘G 次を検索・⌘. キャンセル・⌘M 最小化・⌘Q 閉じる",
+            "⌘⌥Esc タスクマネージャ・⌘Ctrl+Q ロック・fn+F11 デスクトップ",
+            "Ctrl+クリック=右クリック・横スワイプ=戻る/進む",
+            "⌘C/V/A などは Ctrl 系へ自動変換(⌘Tab=Alt+Tab)",
+        ];
+        let small: unsafe extern "C" fn(ID, SEL, f64) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        for line in guide {
+            let l = label(
+                objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
+                nsstring(line),
+            );
+            if !l.is_null() {
+                set_frame(l, sel(c"setFrame:"), NSRect { x: 24.0, y: y - 16.0, w: 350.0, h: 16.0 });
+                let f = crate::msg0(l, sel(c"font"));
+                if !f.is_null() {
+                    let sf = small(f, sel(c"fontWithSize:"), 11.0);
+                    if !sf.is_null() {
+                        msg1_void_id(l, sel(c"setFont:"), sf);
+                    }
+                }
+                // 補足色へ
+                let color_cls = objc_getClass(c"NSColor".as_ptr());
+                if !color_cls.is_null() {
+                    let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                        std::mem::transmute(crate::objc_msgSend as usize);
+                    let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+                    if !color.is_null() {
+                        msg1_void_id(l, sel(c"setTextColor:"), color);
+                    }
+                }
+                msg1_void_id(cv, sel(c"addSubview:"), l);
+            }
+            y -= 20.0;
+        }
+        y -= 6.0;
 
         // ---- 操作ボタン(切替 + ファイル送信)。音量はキーボードの
         // F10/F11/F12(ミュート/▼/▲)で Windows 側を直接操作できる ----
@@ -1072,6 +1197,8 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdDblTap:", imp_dbl_tap as *const () as usize),
         (c"sdClipShare:", imp_clip_share as *const () as usize),
         (c"sdRotateSide:", imp_rotate_side as *const () as usize),
+        (c"sdMouseScale:", imp_mouse_scale as *const () as usize),
+        (c"sdEdgePx:", imp_edge_px as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];

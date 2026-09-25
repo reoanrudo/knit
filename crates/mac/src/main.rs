@@ -656,6 +656,10 @@ pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
 static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// 横スワイプ(戻る/進む)の状態: (累積 dx, 最終イベント時刻, 最終発火時刻)
 static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
+/// ドラッグ中切替(TSUNAGU_DRAG_SWITCH=1): 押したまま境界を越えられる
+pub static DRAG_SWITCH: AtomicBool = AtomicBool::new(false);
+/// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
+static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
 /// 現在の SIDE(0=右/1=左/2=上/3=下)を文字列表現で
 pub fn side_name() -> &'static str {
@@ -735,10 +739,34 @@ pub fn set_scroll_div(v: f64) {
     SCROLL_DIV.store(clamped.to_bits(), Ordering::Relaxed);
 }
 /// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
-/// TSUNAGU_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
-static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
-/// 右端切替の判定閾値(px、画面右端からの距離)。TSUNAGU_EDGE_PX で調整可。
-static EDGE_PX: OnceLock<f64> = OnceLock::new();
+/// カーソル速度倍率(abs 座標系)。設定ウィンドウのスライダーから可変。
+/// f64 を AtomicU64 ビットで保持(スクロール除数と同じ方式)
+static MOUSE_SCALE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1.0f64.to_bits());
+
+/// 現在のカーソル速度倍率
+pub fn mouse_scale() -> f64 {
+    f64::from_bits(MOUSE_SCALE.load(Ordering::Relaxed))
+}
+
+/// カーソル速度倍率を設定(0.2..3.0 にクランプ)
+pub fn set_mouse_scale(v: f64) {
+    MOUSE_SCALE.store(v.clamp(0.2, 3.0).to_bits(), Ordering::Relaxed);
+}
+/// 境界切替の判定閾値(px、境界からの距離)。設定窓スライダーで可変。
+/// f64 を AtomicU64 ビットで保持
+static EDGE_PX: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(2.0f64.to_bits());
+
+/// 現在の境界判定閾値(px)
+pub fn edge_px() -> f64 {
+    f64::from_bits(EDGE_PX.load(Ordering::Relaxed))
+}
+
+/// 境界判定閾値を設定(0..50px にクランプ)。大きいほど切替が敏感になる
+pub fn set_edge_px(v: f64) {
+    EDGE_PX.store(v.clamp(0.0, 50.0).to_bits(), Ordering::Relaxed);
+}
 /// 全ディスプレイ領域(union)の右端。右にサブモニターがある環境では
 /// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
 /// 仮想画面全体の右端で判定する
@@ -1002,7 +1030,10 @@ unsafe extern "C" fn tap_callback(
         // Mac モード: 右端到達で Windows モードへ。
         // Deskflow onMouseMove 準拠: イベント位置はキュー滞留で数フレーム遅れるため、
         // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
-        if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)
+        let drag_ok = DRAG_SWITCH.load(Ordering::Relaxed);
+        if (matches!(event_type, EVT_MOUSE_MOVED)
+            || (drag_ok
+                && matches!(event_type, EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)))
             && connected
             && !HOTKEY_ONLY.load(Ordering::Relaxed) // hotkey モードでは境界切替しない(ロック)
             && now_ms() >= EDGE_GUARD_UNTIL_MS.load(Ordering::Relaxed)
@@ -1023,7 +1054,7 @@ unsafe extern "C" fn tap_callback(
                 }
                 let (px, py) = *pos;
                 drop(pos);
-                let edge = EDGE_PX.get().copied().unwrap_or(2.0);
+                let edge = edge_px();
                 // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
                 let main_w = w;
                 let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
@@ -1109,11 +1140,20 @@ unsafe extern "C" fn tap_callback(
                     if let Some(sh) = SCREEN_H.get() {
                         ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
                     }
-                    // ドラッグ中の切替は全ボタンを離して持ち込まない(誤ドラッグ防止)。
-                    // 左だけでなく右/中ドラッグの持ち込みも防ぐ(レビュー Wave1 C-S13)
+                    // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
+                    // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
+                    // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験
                     if event_type != EVT_MOUSE_MOVED {
-                        for b in 0u8..=2 {
-                            send_msg(&Msg::MouseButton { btn: b, down: false });
+                        if DRAG_SWITCH.load(Ordering::Relaxed) {
+                            for b in 0u8..=2 {
+                                if BTN_DOWN[b as usize].load(Ordering::Relaxed) {
+                                    send_msg(&Msg::MouseButton { btn: b, down: true });
+                                }
+                            }
+                        } else {
+                            for b in 0u8..=2 {
+                                send_msg(&Msg::MouseButton { btn: b, down: false });
+                            }
                         }
                     }
                     // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
@@ -1222,6 +1262,13 @@ unsafe extern "C" fn tap_callback(
                         23 if shift => { send(15, down, false, true, false, false); true }
                         // ⌘Q = ウィンドウを閉じる(Alt+F4 = opt フラグ+F4)
                         12 => { send(118, down, false, true, false, false); true }
+                        // ⌘G / ⌘⇧G = 次を検索 / 前を検索(F3 / Shift+F3)
+                        // G の Mac keycode=32、F3=99
+                        32 if !shift => { send(99, down, false, false, false, false); true }
+                        32 => { send(99, down, false, false, false, true); true }
+                        // ⌘⇧N = シークレット/新規ウィンドウ系は Ctrl+Shift+N で自然に動く
+                        // ⌘. (kc47? . は47) = キャンセル→Escape 相当(Windows でも Esc)
+                        47 => { send(53, down, false, false, false, false); true }
                         // ⌘Space = IME/言語切替(Win+Space = ctrl フラグ)
                         49 => { send(49, down, true, false, false, false); true }
                         _ => false,
@@ -1247,7 +1294,7 @@ unsafe extern "C" fn tap_callback(
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
-                let sc = MOUSE_SCALE.get().copied().unwrap_or(1.0);
+                let sc = mouse_scale();
                 if MOUSE_ABS_MODE.load(Ordering::Relaxed) {
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
@@ -1296,10 +1343,20 @@ unsafe extern "C" fn tap_callback(
         EVT_LEFT_DOWN | EVT_LEFT_UP => {
             // Mac 流「Ctrl+クリック=右クリック」を Windows でもそのまま再現
             let btn = if ctrl { 1u8 } else { 0 };
-            send_msg(&Msg::MouseButton { btn, down: event_type == EVT_LEFT_DOWN });
+            let d = event_type == EVT_LEFT_DOWN;
+            BTN_DOWN[0].store(d, Ordering::Relaxed);
+            send_msg(&Msg::MouseButton { btn, down: d });
         }
-        EVT_RIGHT_DOWN | EVT_RIGHT_UP => send_msg(&Msg::MouseButton { btn: 1, down: event_type == EVT_RIGHT_DOWN }),
-        EVT_OTHER_DOWN | EVT_OTHER_UP => send_msg(&Msg::MouseButton { btn: 2, down: event_type == EVT_OTHER_DOWN }),
+        EVT_RIGHT_DOWN | EVT_RIGHT_UP => {
+            let d = event_type == EVT_RIGHT_DOWN;
+            BTN_DOWN[1].store(d, Ordering::Relaxed);
+            send_msg(&Msg::MouseButton { btn: 1, down: d });
+        }
+        EVT_OTHER_DOWN | EVT_OTHER_UP => {
+            let d = event_type == EVT_OTHER_DOWN;
+            BTN_DOWN[2].store(d, Ordering::Relaxed);
+            send_msg(&Msg::MouseButton { btn: 2, down: d });
+        }
         EVT_SCROLL_WHEEL => {
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
@@ -1372,7 +1429,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-010711-beb3d52";
+const BUILD_ID: &str = "build-20260926-011938-cba41d8";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1443,12 +1500,12 @@ fn main() {
     }
     if let Some(m) = std::env::var("TSUNAGU_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
         if m > 0.0 {
-            let _ = MOUSE_SCALE.set(m);
+            set_mouse_scale(m);
         }
     }
     if let Some(e) = std::env::var("TSUNAGU_EDGE_PX").ok().and_then(|v| v.parse::<f64>().ok()) {
         if e >= 0.0 && e < 100.0 {
-            let _ = EDGE_PX.set(e);
+            set_edge_px(e);
         }
     }
     if let Some(m) = std::env::var("TSUNAGU_MOUSE_MODE").ok() {
@@ -1504,6 +1561,9 @@ fn main() {
     if envutil::get("TSUNAGU_CLIP").as_deref() == Some("0") {
         CLIP_SHARE.store(false, Ordering::Relaxed);
     }
+    if envutil::get("TSUNAGU_DRAG_SWITCH").as_deref() == Some("1") {
+        DRAG_SWITCH.store(true, Ordering::Relaxed);
+    }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
     }
@@ -1513,8 +1573,8 @@ fn main() {
     eprintln!(
         "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
         scroll_div(),
-        MOUSE_SCALE.get().copied().unwrap_or(1.0),
-        EDGE_PX.get().copied().unwrap_or(2.0),
+        mouse_scale(),
+        edge_px(),
         CLIP_MAX_BYTES / 1024,
         if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" },
         if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" },
