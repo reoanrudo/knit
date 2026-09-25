@@ -137,6 +137,7 @@ static PREFS_MSCALE_LBL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_EDGE_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_EDGE_LBL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_SCOMPAT: AtomicUsize = AtomicUsize::new(0);
 static GUI_SIDE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
 /// 起動直後に設定ウィンドウを開く(--show-prefs。1 秒タイマーの初回で処理)
@@ -335,6 +336,13 @@ unsafe extern "C" fn imp_edge_px(_s: ID, _c: SEL, sender: ID) {
     }
 }
 
+/// スクロール互換モードのトグル(120 未満を無視する古いアプリ向け)
+unsafe extern "C" fn imp_scroll_compat(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::SCROLL_COMPAT.load(Ordering::Relaxed);
+    crate::SCROLL_COMPAT.store(next, Ordering::Relaxed);
+    eprintln!("[cfg] スクロール互換モード -> {next}");
+}
+
 /// clipboardSharing トグル(Deskflow 標準オプション)
 unsafe extern "C" fn imp_clip_share(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::CLIP_SHARE.load(Ordering::Relaxed);
@@ -518,6 +526,7 @@ fn sync_prefs_state() {
         set(&PREFS_CHK_SCROLL, !crate::SCROLL_FLIP.load(Ordering::Relaxed));
         set(&PREFS_CHK_SPK, crate::SPK_MUTE.load(Ordering::Relaxed));
         set(&PREFS_CHK_CLIP, crate::CLIP_SHARE.load(Ordering::Relaxed));
+        set(&PREFS_CHK_SCOMPAT, crate::SCROLL_COMPAT.load(Ordering::Relaxed));
     }
 }
 
@@ -753,6 +762,13 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         section_heading(cv, "スクロール", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
         place_check("方向を Mac に合わせる(オフ: Windows 標準)", c"sdScroll:", &PREFS_CHK_SCROLL, y);
+        y -= 38.0;
+        place_check(
+            "互換モード(一部のアプリでスクロールが効かない時)",
+            c"sdScrollCompat:",
+            &PREFS_CHK_SCOMPAT,
+            y,
+        );
         y -= 38.0;
 
         // ---- スクロール速度スライダー(右ほど遅い=除数 20..240) ----
@@ -1204,6 +1220,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdDelay:", imp_switch_delay as *const () as usize),
         (c"sdDblTap:", imp_dbl_tap as *const () as usize),
         (c"sdClipShare:", imp_clip_share as *const () as usize),
+        (c"sdScrollCompat:", imp_scroll_compat as *const () as usize),
         (c"sdRotateSide:", imp_rotate_side as *const () as usize),
         (c"sdMouseScale:", imp_mouse_scale as *const () as usize),
         (c"sdEdgePx:", imp_edge_px as *const () as usize),

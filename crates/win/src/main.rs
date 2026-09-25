@@ -674,7 +674,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-014223-a17f37a";
+const BUILD_ID: &str = "win-20260926-015921-bffbae6";
 
 fn main() {
     ensure_stdout();

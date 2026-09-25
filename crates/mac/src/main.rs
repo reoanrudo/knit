@@ -652,6 +652,10 @@ pub static DOUBLE_TAP_MS: AtomicU64 = AtomicU64::new(700);
 pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
 /// クリップボード共有(clipboardSharing)
 pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
+/// スクロール互換モード(TSUNAGU_SCROLL_COMPAT=1 / 設定窓): 120 未満の
+/// ホイール量を無視する古い設計のアプリ向けに 1 ノッチ(120)単位で送る。
+/// 既定 OFF=高解像度(0.05 ノッチ刻み)で滑らかに
+pub static SCROLL_COMPAT: AtomicBool = AtomicBool::new(false);
 /// 端到達の開始時刻(switchDelay の滞在計測用)
 static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// 横スワイプ(戻る/進む)の状態: (累積 dx, 最終イベント時刻, 最終発火時刻)
@@ -1421,7 +1425,9 @@ unsafe extern "C" fn tap_callback(
                 // 送る=Windows のプレシジョンタッチパッドと同じ高解像度スクロール。
                 // 0.25刻み(30 units)は低速スクロールがカクつくため細かくした。
                 // 除数を大きくすると遅くなる(設定ウィンドウのスライダーで可変)。端数は持ち越し
-                const Q: f64 = 0.05; // 量子化幅(ノッチ)
+                // 互換モードは 1 ノッチ(120)単位に量子化(旧来のホイール相当)。
+                // 既定は 0.05 ノッチ(=6 wheel units)の高解像度
+                let q: f64 = if SCROLL_COMPAT.load(Ordering::Relaxed) { 1.0 } else { 0.05 };
                 let div = scroll_div();
                 // 方向: 既定は Mac の操作感に合わせる(自然スクロール設定を起動時に
                 // 取得)。SCROLL_FLIP=true は「Windows 標準」への手動上書き。
@@ -1435,7 +1441,7 @@ unsafe extern "C" fn tap_callback(
                 if acc.0.abs() > 1.0e6 || acc.1.abs() > 1.0e6 {
                     *acc = (0.0, 0.0);
                 }
-                let (ix, iy) = ((acc.0 / Q).trunc() * Q, (acc.1 / Q).trunc() * Q);
+                let (ix, iy) = ((acc.0 / q).trunc() * q, (acc.1 / q).trunc() * q);
                 if ix != 0.0 || iy != 0.0 {
                     acc.0 -= ix;
                     acc.1 -= iy;
@@ -1451,7 +1457,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-015011-509434c";
+const BUILD_ID: &str = "build-20260926-015908-bffbae6";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1589,6 +1595,9 @@ fn main() {
     if envutil::get("TSUNAGU_CTRL_CLICK").as_deref() == Some("1") {
         CTRL_CLICK.store(true, Ordering::Relaxed);
     }
+    if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
+        SCROLL_COMPAT.store(true, Ordering::Relaxed);
+    }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
     }
@@ -1624,18 +1633,24 @@ fn main() {
                     // 小パケット連打になり、WiFi の揺らぎで束になって到着=カクつきの原因。
                     // キューに滞留中の行をまとめて 1 回の write にする(順序は保存され、
                     // Windows 側は行ごとに注入するため見た目の滑らかさが向上する)
+                    // マウス移動(mouse_abs)は束ねない: 束ねると複数の目標位置が
+                    // 同一フレームに到達して中間が描画されず、カクつきの原因になる。
+                    // 移動は「最新位置の即時配送」が滑らかさの本体
+                    let is_move = line.starts_with("{\"t\":\"mouse_abs\"");
                     let mut buf = line;
                     let mut total = buf.len();
-                    for _ in 0..32 {
-                        if total > 256 * 1024 {
-                            break; // 巨大行(ファイル chunk 等)の連結は程々に
-                        }
-                        match rx.try_recv() {
-                            Ok(next) => {
-                                total += next.len();
-                                buf.push_str(&next);
+                    if !is_move {
+                        for _ in 0..32 {
+                            if total > 256 * 1024 {
+                                break; // 巨大行(ファイル chunk 等)の連結は程々に
                             }
-                            Err(_) => break,
+                            match rx.try_recv() {
+                                Ok(next) => {
+                                    total += next.len();
+                                    buf.push_str(&next);
+                                }
+                                Err(_) => break,
+                            }
                         }
                     }
                     let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());

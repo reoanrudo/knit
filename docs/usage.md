@@ -142,6 +142,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | `TSUNAGU_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |
 | `TSUNAGU_CORNER_PX` | 0 | 四隅 N px 内では切替しない(switchCorners/cornerSize) |
 | `TSUNAGU_SWIPE_NAV` | 1 | 2本指横スワイプをブラウザの戻る/進むへ翻訳(XButton)。0 で従来の横ホイール |
+| `TSUNAGU_SCROLL_COMPAT` | 0 | スクロール互換モード(1 で 1ノッチ=120単位送信。一部の古いアプリでスクロールが効かない時) |
 | `TSUNAGU_CLIP` | 1 | クリップボード共有(clipboardSharing)。0 で無効 |
 | `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
 | `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
