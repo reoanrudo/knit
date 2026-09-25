@@ -159,12 +159,20 @@ unsafe extern "C" fn aq_callback(
                 DROP_BYTES.fetch_add(excess as u64, Ordering::Relaxed);
                 ring.drain(..excess);
             }
-            // 滑らかな追い込み: 滞留が目標を超えている間、読み出し速度を最大 2%
-            // 速くする(線形補間)。フレーム欠け(位相ジャンプ=割れ音)ではなく
-            // 波形を連続したまま遅延を目標へ戻す。位相はコールバック間で
-            // 持ち越すため、ratio=1.0 のときは素通し=ドロップ・重複ゼロ
-            let over = ring.len().saturating_sub(RING_SOFT_TARGET);
-            let ratio = 1.0 + (over as f64 / RING_SOFT_TARGET as f64).min(1.0) * 0.02;
+            // 滑らかな追い込み: 滞留が「目標+デッドバンド(≈5ms)」を超えている
+            // 間だけ読み出し速度を最大 1% 速くする。フレーム欠けではなく波形を
+            // 連続したまま遅延を目標へ戻す。位相はコールバック間で持ち越すため
+            // ratio=1.0 のときは素通り=ドロップ・重複ゼロ。
+            // 音質優先の設計: (a)超過が僅か(デッドバンド内)の間は補間しない
+            // (b)補間は 3次 Catmull-Rom(高域までほぼフラット。線形補間は
+            // 高域が減衰する)(c)速度変化の上限は 1%(知覚不可)
+            const SOFT_DEAD: usize = 2048;
+            let over = ring.len().saturating_sub(RING_SOFT_TARGET + SOFT_DEAD);
+            let ratio = if over == 0 {
+                1.0
+            } else {
+                1.0 + (over as f64 / RING_SOFT_TARGET as f64).min(1.0) * 0.01
+            };
             let need = (cap as f64 * ratio) as usize + 16;
             let src: Vec<u8> = ring.iter().take(need).copied().collect();
             let src_frames = src.len() / 8; // 1フレーム=8バイト(L+R)
@@ -175,9 +183,14 @@ unsafe extern "C" fn aq_callback(
                     f32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]])
                 };
                 // sp はフレーム単位の読み出し位置(整数部=フレーム、端数=補間位相)。
-                // L(偶数サンプル)は L 同士、R は R 同士で補間するため L/R は混ざらない
+                // L(偶数サンプル)は L 同士、R は R 同士で補間するため L/R は混ざらない。
+                // 補間カーネルは Catmull-Rom(4点3次): 線形補間と違い高域まで
+                // ほぼ劣化させない(音質優先)。frac=0 のときは厳密に素通り
                 let mut sp = phase_load();
                 let mut written_bytes = 0usize;
+                let fidx = |k: i64| -> usize {
+                    (k.max(0) as usize).min(src_frames.saturating_sub(1))
+                };
                 for o in 0..out_frames {
                     let i0 = sp as usize;
                     if i0 + 1 >= src_frames {
@@ -189,9 +202,35 @@ unsafe extern "C" fn aq_callback(
                         sp = (src_frames - 1) as f64;
                         break;
                     }
-                    let frac = (sp - i0 as f64) as f32;
-                    let l = sample(i0 * 2) + (sample(i0 * 2 + 2) - sample(i0 * 2)) * frac;
-                    let r = sample(i0 * 2 + 1) + (sample(i0 * 2 + 3) - sample(i0 * 2 + 1)) * frac;
+                    let t = (sp - i0 as f64) as f32;
+                    let (l, r);
+                    if i0 + 2 < src_frames {
+                        let t2 = t * t;
+                        let t3 = t2 * t;
+                        let cm = |p0: f32, p1: f32, p2: f32, p3: f32| -> f32 {
+                            0.5 * ((2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+                        };
+                        let m = i0 as i64;
+                        l = cm(
+                            sample(fidx(m - 1) * 2),
+                            sample(i0 * 2),
+                            sample((i0 + 1) * 2),
+                            sample(fidx(m + 2) * 2),
+                        );
+                        r = cm(
+                            sample(fidx(m - 1) * 2 + 1),
+                            sample(i0 * 2 + 1),
+                            sample((i0 + 1) * 2 + 1),
+                            sample(fidx(m + 2) * 2 + 1),
+                        );
+                    } else {
+                        // 在庫の終端1フレーム手前: 線形補間でフォールバック
+                        l = sample(i0 * 2) + (sample(i0 * 2 + 2) - sample(i0 * 2)) * t;
+                        r = sample(i0 * 2 + 1) + (sample(i0 * 2 + 3) - sample(i0 * 2 + 1)) * t;
+                    }
                     dst_f.add(o * 2).write(l);
                     dst_f.add(o * 2 + 1).write(r);
                     written_bytes = (o + 1) * 8;
