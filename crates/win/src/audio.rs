@@ -115,13 +115,14 @@ struct WfxHead {
     cb_size: u16,
 }
 
-/// 初期化済みループバックキャプチャ(1接続分の寿命)
+/// 初期化済みループバックキャプチャ(1接続分の寿命)。
+/// fmt_kind: 0=f32 / 1=s16 / 2=i32(ミックス形式の実型)
 struct Capture {
     client: *mut ObjVt<IAudioClientVtbl>,
     capture: *mut ObjVt<IAudioCaptureClientVtbl>,
     channels: usize,
     sample_rate: u32,
-    float_fmt: bool,
+    fmt_kind: u8,
     bytes_per_frame: usize,
 }
 
@@ -167,8 +168,29 @@ unsafe fn capture_open() -> Result<Capture, String> {
         let channels = (*fmt).channels as usize;
         let rate = (*fmt).rate;
         let bits = (*fmt).bits as usize;
-        // float(3=WAVE_FORMAT_IEEE_FLOAT / 0xFFFE=Extensible+32bit) か s16 か
-        let float_fmt = (*fmt).tag == 3 || ((*fmt).tag == 0xFFFE && bits == 32);
+        let fmt_tag = (*fmt).tag;
+        // サンプル実型の判別。WAVE_FORMAT_EXTENSIBLE(0xFFFE) は bits=32 だけでは
+        // float か 32bit 整数か区別できず、SubFormat GUID の Data1 で判別する
+        // (誤ると激しい割れ音になるため厳密に)。3=IEEE_FLOAT / 1=PCM
+        let fmt_kind: u8 = if fmt_tag == 3 {
+            0 // f32
+        } else if fmt_tag == 0xFFFE && (*fmt).cb_size >= 22 {
+            let p = fmt as *const u8;
+            let sub1 = u32::from_le_bytes([
+                *p.add(24), *p.add(25), *p.add(26), *p.add(27),
+            ]);
+            println!("[audio] extensible subformat data1=0x{sub1:x}");
+            match (sub1, bits) {
+                (3, 32) => 0,     // IEEE float
+                (1, 16) => 1,     // 16bit PCM
+                (1, 32) => 2,     // 32bit PCM(整数)
+                _ => if bits == 16 { 1 } else { 2 },
+            }
+        } else if fmt_tag == 1 {
+            if bits == 16 { 1 } else { 2 }
+        } else {
+            2 // 不明: 整数側とみなす
+        };
         let bytes_per_frame = channels * (bits / 8);
         // ループバック(再生音を取り込む)で初期化。バッファ指定は共有モードの
         // エンジン周期に近い 50ms を指定(低遅延: 大きいと取得側の滞留が増える)
@@ -192,7 +214,12 @@ unsafe fn capture_open() -> Result<Capture, String> {
         }
         let capture = capture as *mut ObjVt<IAudioCaptureClientVtbl>;
         (cvt.Start)(client as *mut _);
-        Ok(Capture { client, capture, channels, sample_rate: rate, float_fmt, bytes_per_frame })
+        // フォーマット診断(kind: 0=f32 / 1=s16 / 2=i32)
+        println!(
+            "[audio] mix format: tag={} ch={} rate={} bits={} kind={}",
+            fmt_tag, channels, rate, bits, fmt_kind
+        );
+        Ok(Capture { client, capture, channels, sample_rate: rate, fmt_kind, bytes_per_frame })
     }
 }
 
@@ -228,25 +255,39 @@ unsafe fn capture_read(cap: &mut Capture) -> Option<Vec<u8>> {
     }
 }
 
-/// ミックス形式(任意ch/f32 or s16)→ f32/stereo への変換(ch>2 は先頭2chで代表)
+/// ミックス形式(任意ch/f32, s16, i32)→ f32/stereo への変換(ch>2 は先頭2chで代表)
 fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
     let ch = cap.channels.max(1);
     let frames = src.len() / cap.bytes_per_frame;
     out.reserve(frames * 8);
     for f in 0..frames {
         let base = f * cap.bytes_per_frame;
-        let (l, r): (f32, f32) = if cap.float_fmt {
-            let s = |i: usize| -> f32 {
-                let o = base + i * 4;
-                f32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]])
-            };
-            (s(0), if ch >= 2 { s(1) } else { s(0) })
-        } else {
-            let s = |i: usize| -> f32 {
-                let o = base + i * 2;
-                i16::from_le_bytes([src[o], src[o + 1]]) as f32 / 32768.0
-            };
-            (s(0), if ch >= 2 { s(1) } else { s(0) })
+        let (l, r): (f32, f32) = match cap.fmt_kind {
+            0 => {
+                // f32
+                let s = |i: usize| -> f32 {
+                    let o = base + i * 4;
+                    f32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]])
+                };
+                (s(0), if ch >= 2 { s(1) } else { s(0) })
+            }
+            1 => {
+                // s16
+                let s = |i: usize| -> f32 {
+                    let o = base + i * 2;
+                    i16::from_le_bytes([src[o], src[o + 1]]) as f32 / 32768.0
+                };
+                (s(0), if ch >= 2 { s(1) } else { s(0) })
+            }
+            _ => {
+                // 32bit 整数 PCM(WAVEFORMATEXTENSIBLE 環境向け)
+                let s = |i: usize| -> f32 {
+                    let o = base + i * 4;
+                    i32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]]) as f32
+                        / 2147483648.0
+                };
+                (s(0), if ch >= 2 { s(1) } else { s(0) })
+            }
         };
         out.extend_from_slice(&l.clamp(-1.0, 1.0).to_le_bytes());
         out.extend_from_slice(&r.clamp(-1.0, 1.0).to_le_bytes());

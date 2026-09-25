@@ -106,8 +106,11 @@ unsafe extern "C" {
 }
 
 /// AudioQueue の出力コールバック: リングから必要分だけ取り出して埋める。
-/// 不足分は無音で埋め(遅延がまだ追いついていない起動直後など)
+/// 不足分は無音で埋める。滞留が目標を超えているときは線形補間でわずかに
+/// 速く読み(リサンプル追い込み)、波形を切らないまま遅延を調整する
 static CB_FIRED: AtomicBool = AtomicBool::new(false);
+/// 間引き(緊急クリップ)した累計バイト。音割れ調査の指標として diag へ出す
+static DROP_BYTES: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" fn aq_callback(
     _user: *mut core::ffi::c_void,
     aq: AudioQueueRef,
@@ -137,26 +140,62 @@ unsafe extern "C" fn aq_callback(
                 }
                 PRIMED.store(true, Ordering::Relaxed);
             }
-            // 滞留の追い込み(2 段階)。遅延が育ち続けるのを防ぐ一方、
-            // まとめて捨てすぎると位相ジャンプでプツプツ音になるため、
-            // 日常は超過分の 1/32 ずつ(=数サンプル単位)で滑らかに戻す。
-            //
-            // 【重要】ドロップ量は必ず 8 バイト(f32×2ch = 1フレーム)境界に丸める。
-            // 途中のバイトから読み出し始めると全ストリームの位相が恒久的にずれ、
-            // 元の音源が分からない激しい破壊音として再生され続ける
-            let floor8 = |n: usize| n & !7usize;
+            // 緊急クリップ(大バーストのみ): 8 バイト(f32×2ch=1フレーム)境界で
+            // 一括間引き。超過は通常この経路を通らず、通った量は diag で見える
             if ring.len() > RING_HARD_CLIP {
-                let excess = floor8(ring.len() - RING_SOFT_TARGET);
+                let excess = (ring.len() - RING_SOFT_TARGET) & !7usize;
+                DROP_BYTES.fetch_add(excess as u64, Ordering::Relaxed);
                 ring.drain(..excess);
-            } else if ring.len() > RING_SOFT_TARGET {
-                let drop = floor8(((ring.len() - RING_SOFT_TARGET) / 32).max(1));
-                ring.drain(..drop);
             }
-            let take = ring.len().min(cap);
-            for i in 0..take {
-                dst.add(i).write(ring.pop_front().unwrap_or(0));
+            // 滑らかな追い込み: 滞留が目標を超えている間、読み出し速度を最大 2%
+            // 速くする(線形補間)。フレーム欠け(位相ジャンプ=割れ音)ではなく
+            // 波形を連続したまま遅延を目標へ戻す。ピッチ変化 <2% は一時的で
+            // 聴感上ほぼ無害。定常のクロック差(数十ppm)は 1.000x 倍で吸収される
+            let over = ring.len().saturating_sub(RING_SOFT_TARGET);
+            let ratio = 1.0 + (over as f64 / RING_SOFT_TARGET as f64).min(1.0) * 0.02;
+            // 先頭の必要分をスナップショット(VecDeque は添字アクセスが高いため)
+            let need = (cap as f64 * ratio) as usize + 8;
+            let src: Vec<u8> = ring.iter().take(need).copied().collect();
+            let src_samples = src.len() / 4;
+            let out_samples = cap / 4;
+            if src_samples >= 2 {
+                let dst_f = dst as *mut f32;
+                let sample = |i: usize| -> f32 {
+                    f32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]])
+                };
+                let mut pos = 0.0f64;
+                let mut written = 0usize; // 書けた f32 サンプル数
+                for o in 0..out_samples {
+                    let i0 = pos as usize;
+                    if i0 + 1 >= src_samples {
+                        // 在庫の終端に到達: 最後のサンプルをホールドして埋める
+                        dst_f.add(o).write(sample(src_samples - 1));
+                        written = o + 1;
+                        break; // 残りは呼び出し元でゼロ埋めされる
+                    }
+                    let frac = (pos - i0 as f64) as f32;
+                    let v = sample(i0) + (sample(i0 + 1) - sample(i0)) * frac;
+                    dst_f.add(o).write(v);
+                    written = o + 1;
+                    pos += ratio;
+                }
+                // 消費は 2 サンプル(8バイト=L+R 1フレーム)境界で切り上げ:
+                // 奇数サンプルで切ると L/R が入れ替わり恒久的に歪む
+                let mut consumed_samples = (pos as usize) + 2;
+                if consumed_samples % 2 == 1 {
+                    consumed_samples += 1;
+                }
+                let consumed = (consumed_samples * 4).min(ring.len());
+                ring.drain(..consumed);
+                filled = (written * 4).min(cap);
+            } else if !ring.is_empty() {
+                // 在庫が 1 サンプル未満(通常ない): そのまま取り出す
+                let take = ring.len().min(cap);
+                for i in 0..take {
+                    dst.add(i).write(ring.pop_front().unwrap_or(0));
+                }
+                filled = take;
             }
-            filled = take;
         }
         // 残りは無音のまま(バッファは前回の内容が残るため明示的にゼロクリア)
         for i in filled..cap {
@@ -354,8 +393,9 @@ pub fn start(token: String) {
     });
 }
 
-/// 10 秒毎の診断ログ(受信量/再生量/滞留と実効遅延 lag)。無音期間は
-/// キープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる
+/// 10 秒毎の診断ログ(受信量/再生量/滞留 lag/間引き drop)。
+/// 無音期間はキープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる。
+/// drop が増え続けていれば波形を切っている=音割れの原因として疑う
 fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {
     if last_diag.elapsed() < std::time::Duration::from_secs(10) {
         return;
@@ -365,8 +405,9 @@ fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {
     let play = PLAY_BYTES.load(Ordering::Relaxed) / 1024;
     let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len();
     let lag_ms = queued as u64 * 1000 / (rate as u64 * 8);
+    let drop = DROP_BYTES.swap(0, Ordering::Relaxed) / 1024;
     eprintln!(
-        "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms",
+        "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms drop={drop}KB",
         queued / 1024
     );
 }

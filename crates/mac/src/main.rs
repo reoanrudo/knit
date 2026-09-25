@@ -1029,7 +1029,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-211949-e4e4ab7";
+const BUILD_ID: &str = "build-20260925-212829-7988c2a";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
