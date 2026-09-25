@@ -426,10 +426,12 @@ fn inject_key(vk: u16, up: bool) -> bool {
         fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
     }
     let scan = unsafe { MapVirtualKeyW(vk as u32, 0 /*MAPVK_VK_TO_VSC*/) } as u32;
+    // KEYBDINPUT の共用体先頭 u32 は「低16bit=wVk / 高16bit=wScan」
+    let vk_scan = ((scan & 0xFFFF) << 16) | (vk as u32 & 0xFFFF);
     send_input_buf(InputBuf {
         itype: INPUT_KEYBOARD,
         _pad: 0,
-        body: [vk as u32, if up { KEYEVENTF_KEYUP } else { 0 }, scan, 0, 0, 0],
+        body: [vk_scan, if up { KEYEVENTF_KEYUP } else { 0 }, 0, 0, 0, 0],
         extra: 0,
     })
 }
@@ -664,7 +666,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-011952-cba41d8";
+const BUILD_ID: &str = "win-20260926-012757-b62a2d0";
 
 fn main() {
     ensure_stdout();
@@ -1122,7 +1124,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                         Some(files_key(&files));
                 }
             }
-            Msg::Key { kc, down, ctrl, opt, cmd, shift } => {
+            Msg::Key { kc, down, ctrl, opt, cmd, shift, tr } => {
                 if !hello_done {
                     continue;
                 }
@@ -1163,7 +1165,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     ALT_TAB_ACTIVE.store(false, Ordering::Relaxed);
                     println!("[alttab] confirmed");
                 }
-                if kc == 48 && cmd && !opt && !ctrl {
+                if kc == 48 && cmd && !opt && !ctrl && !tr {
                     if down {
                         // cmd 分の Ctrl 押下を抑制してから Alt+Tab を合成
                         mods.apply(false, opt, false, shift);
@@ -1380,8 +1382,17 @@ fn maybe_notify_return(
         };
         let _ = wtx.send(encode(&Msg::Return { ny }));
         *last = Instant::now();
-        // Mac へ制御を返すため、押しっぱなしの修飾キーを離して後片付けする
+        // Mac へ制御を返すための後片付け: 押しっぱなしの修飾キーに加え、
+        // (a) ドラッグ中のマウスボタンを離す(選択ドラッグの残留防止)
+        // (b) Alt+Tab 変換が未確定なら確定する(スイッチャー残留防止)
         mods.release_all();
+        for b in 0u8..=2 {
+            inject_mouse_btn(b, false);
+        }
+        if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
+            inject_key(0x09, true); // VK_TAB up
+            inject_key(VK_MENU, true);
+        }
     }
 }
 

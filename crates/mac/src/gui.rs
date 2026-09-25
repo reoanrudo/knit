@@ -470,6 +470,14 @@ unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
 /// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)
 fn sync_prefs_state() {
     unsafe {
+        // Windows の位置ポップアップ(メニューのローテート反映。閉じた状態への
+        // selectItemAtIndex はユーザー操作と競合しない)
+        let pop = PREFS_SIDE_POP.load(Ordering::Relaxed) as ID;
+        if !pop.is_null() {
+            let select: unsafe extern "C" fn(ID, SEL, isize) =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            select(pop, sel(c"selectItemAtIndex:"), crate::SIDE.load(Ordering::Relaxed) as isize);
+        }
         // 状態行(接続・操作中・遅延)
         let st = PREFS_STATE.load(Ordering::Relaxed) as ID;
         if !st.is_null() {

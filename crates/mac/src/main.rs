@@ -831,14 +831,13 @@ fn enter_win_mode_cursor_lock() {
             lock_x2 = loc2.x;
             CFRelease(ev2);
         }
-        let (lock_x, use_y) = match side {
+        let (lock_x, lock_y) = match side {
             1 => (2.0, lock_y),                     // 左端
             2 => (lock_x2, 2.0),                    // 上端
             3 => (lock_x2, main_h - 2.0),           // 下端
             _ => (edge_x - 2.0, lock_y),            // 右端(既定)
         };
-        let _ = use_y;
-        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: use_y });
+        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
         // タップが握った位置を CUR_POS にも反映(積算の起点を正しくする)
         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (lock_x, lock_y);
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
@@ -1025,6 +1024,17 @@ unsafe extern "C" fn tap_callback(
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         DIAG_KEY_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+    // マウスボタンの押下状態はモードに関係なく追跡する(ドラッグ中切替の
+    // 持ち込み判定に使う。Mac モードの素通し経路でも更新が必要)
+    match event_type {
+        EVT_LEFT_DOWN => BTN_DOWN[0].store(true, Ordering::Relaxed),
+        EVT_LEFT_UP => BTN_DOWN[0].store(false, Ordering::Relaxed),
+        EVT_RIGHT_DOWN => BTN_DOWN[1].store(true, Ordering::Relaxed),
+        EVT_RIGHT_UP => BTN_DOWN[1].store(false, Ordering::Relaxed),
+        EVT_OTHER_DOWN => BTN_DOWN[2].store(true, Ordering::Relaxed),
+        EVT_OTHER_UP => BTN_DOWN[2].store(false, Ordering::Relaxed),
+        _ => {}
+    }
 
     if !win_mode {
         // Mac モード: 右端到達で Windows モードへ。
@@ -1079,7 +1089,7 @@ unsafe extern "C" fn tap_callback(
                     // switchCorners(+cornerSize): 四隅 N px 内では切替しない(誤爆防止)
                     let corner = CORNER_PX.load(Ordering::Relaxed) as f64;
                     if corner > 0.0
-                        && (px < corner || px > main_w - corner)
+                        && (px < corner || px > edge_x - corner)
                         && (py < corner || py > main_h - corner)
                     {
                         return event;
@@ -1136,10 +1146,7 @@ unsafe extern "C" fn tap_callback(
                     WIN_MODE.store(true, Ordering::Relaxed);
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0})", loc.x, loc.y);
-                    let mut ny = 0.5;
-                    if let Some(sh) = SCREEN_H.get() {
-                        ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
-                    }
+
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
                     // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
                     // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験
@@ -1222,8 +1229,12 @@ unsafe extern "C" fn tap_callback(
             if event_type != EVT_FLAGS_CHANGED
                 && envutil::get("TSUNAGU_MAC_KEYS").as_deref() != Some("0")
             {
+                // 翻訳先の修飾は「既定マップ(cmd→Ctrl / opt→Alt)」で解釈させる。
+                // CMD_ALT=true でも翻訳の意味が変わらないよう、cmd/opt を差し替える
+                let swap = crate::CMD_ALT.load(Ordering::Relaxed);
                 let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool| {
-                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c, opt: o, cmd: m, shift: sh });
+                    let (c2, o2, m2) = if swap { (c, m, o) } else { (c, o, m) };
+                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c2, opt: o2, cmd: m2, shift: sh, tr: true });
                 };
                 // fn+F11(Mac のデスクトップ表示)= Win+D
                 if kc == 103 && flags & FLAG_FN != 0 {
@@ -1288,7 +1299,7 @@ unsafe extern "C" fn tap_callback(
                     return std::ptr::null_mut(); // 元キーは送らない
                 }
             }
-            send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift });
+            send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift, tr: false });
         }
         EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED => {
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
@@ -1429,7 +1440,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-011938-cba41d8";
+const BUILD_ID: &str = "build-20260926-012744-b62a2d0";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1697,8 +1708,8 @@ fn main() {
             eprintln!("[test2] typing into notepad...");
             let type_str = |pairs: &[(u16, bool)]| {
                 for &(kc, shift) in pairs {
-                    send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift });
-                    send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift });
+                    send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift, tr: false });
+                    send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift, tr: false });
                     std::thread::sleep(Duration::from_millis(25));
                 }
             };
@@ -1716,12 +1727,12 @@ fn main() {
             type_str(&body);
             std::thread::sleep(Duration::from_millis(300));
             // Cmd+S -> Win Ctrl+S(保存ダイアログ)
-            send_msg(&Msg::Key { kc: 1, down: true, ctrl: false, opt: false, cmd: true, shift: false });
-            send_msg(&Msg::Key { kc: 1, down: false, ctrl: false, opt: false, cmd: true, shift: false });
+            send_msg(&Msg::Key { kc: 1, down: true, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
+            send_msg(&Msg::Key { kc: 1, down: false, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
             std::thread::sleep(Duration::from_millis(800));
             // ファイル名欄: Cmd+A(全選択)して上書き
-            send_msg(&Msg::Key { kc: 0, down: true, ctrl: false, opt: false, cmd: true, shift: false });
-            send_msg(&Msg::Key { kc: 0, down: false, ctrl: false, opt: false, cmd: true, shift: false });
+            send_msg(&Msg::Key { kc: 0, down: true, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
+            send_msg(&Msg::Key { kc: 0, down: false, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
             std::thread::sleep(Duration::from_millis(200));
             // "e2eok.txt"
             let name: Vec<(u16, bool)> = "e2eok.txt".chars().filter_map(|c| {
@@ -1735,8 +1746,8 @@ fn main() {
             type_str(&name);
             std::thread::sleep(Duration::from_millis(200));
             // Enter(36)
-            send_msg(&Msg::Key { kc: 36, down: true, ctrl: false, opt: false, cmd: false, shift: false });
-            send_msg(&Msg::Key { kc: 36, down: false, ctrl: false, opt: false, cmd: false, shift: false });
+            send_msg(&Msg::Key { kc: 36, down: true, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
+            send_msg(&Msg::Key { kc: 36, down: false, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
             std::thread::sleep(Duration::from_millis(500));
             eprintln!("[test2] done (typed + saved)");
             WIN_MODE.store(false, Ordering::Relaxed);
@@ -1761,8 +1772,8 @@ fn main() {
             eprintln!("[test] sending key sequence...");
             // "SDEOK" の Mac keycode 列
             for kc in [1u16, 2, 14, 31, 40] {
-                send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift: false });
-                send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift: false });
+                send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
+                send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
                 std::thread::sleep(Duration::from_millis(50));
             }
             send_msg(&Msg::MouseMove { dx: 120.0, dy: 60.0 });

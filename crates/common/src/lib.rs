@@ -98,7 +98,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 6; // 6: 画面位置(side)・切替オプションの同期(Deskflow標準パリティ)
+    pub const VERSION: u32 = 7; // 7: Key に翻訳済みフラグ(tr)追加
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -124,6 +124,10 @@ pub mod proto {
             opt: bool,
             cmd: bool,
             shift: bool,
+            /// 翻訳済みキー(⌘]→Tab 等)。Win 側の ⌘Tab→Alt+Tab 変換など
+            /// 「生の Mac 入力」前提の特殊処理を適用しない
+            #[serde(default)]
+            tr: bool,
         },
         #[serde(rename = "mouse_move")]
         MouseMove { dx: f64, dy: f64 },
