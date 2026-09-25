@@ -453,13 +453,13 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             0
         }
         WM_CTLCOLOREDIT2 => {
-            // サーバー編集欄のダーク対応(濃い背景+白文字)
+            // サーバー編集欄: 白背景+黒文字(標準ライト)
             unsafe {
                 let hdc = wparam as *mut core::ffi::c_void;
-                SetTextColor(hdc, 0xEDEDF2);
-                SetBkColor(hdc, rgb(CLR_CARD));
+                SetTextColor(hdc, 0x1A1A1A);
+                SetBkColor(hdc, 0xFFFFFF);
                 static EDIT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                let b = *EDIT_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_CARD)) as usize);
+                let b = *EDIT_BRUSH.get_or_init(|| CreateSolidBrush(0xFFFFFF) as usize);
                 b as LRESULT
             }
         }
@@ -493,11 +493,11 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 };
                 SetTextColor(hdc, color);
                 SetBkMode(hdc, TRANSPARENT_BK);
-                extern "system" {
-                    fn GetStockObject(index: i32) -> *mut core::ffi::c_void;
-                }
-                // 背景ブラシに NULL ブラシを返す=親(WM_PAINT)の背景が透けて見える
-                GetStockObject(5 /*NULL_BRUSH*/) as LRESULT
+                // 背景ブラシを窓背景色で返す: 透過(NULL_BRUSH)だと文字更新時に
+                // 古い文字が残って重なって見える(ゴースト)ため不透明で塗る
+                static BG_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let b = *BG_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_BG)) as usize);
+                b as LRESULT
             }
         }
         WM_DRAWITEM2 => {
@@ -711,7 +711,7 @@ unsafe fn open_status_window() {
             PostMessageW(ic as _, 0x0172 /*STM_SETICON*/, icon32 as usize, 0);
         }
         // 状態行は太字・大きめで最初に目に入るように。以降は通常行
-        let state_h = make_child("STATIC", "状態: …", 0, 18, 16, 420, 26, ID_LBL_STATE as usize);
+        let state_h = make_child("STATIC", "状態: …", 0, 60, 16, 378, 26, ID_LBL_STATE as usize);
         PostMessageW(state_h as _, WM_SETFONT, font_bold as usize, 1);
         let _ = LABEL_STATE.store(state_h, Ordering::Relaxed);
         let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 18, 46, 420, 20, ID_LBL_BUILD as usize), Ordering::Relaxed);
