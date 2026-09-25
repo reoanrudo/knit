@@ -324,6 +324,15 @@ fn enter_win_mode_cursor_lock() {
 fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
+        // 次回の切替で同じ場所へ戻れるよう、Windows 画面内の現在地を記憶する
+        {
+            let wc = *WIN_CUR.lock().unwrap();
+            let (ww, wh) = *WIN_SCREEN.lock().unwrap();
+            if ww > 0.0 && wh > 0.0 && wc.0 >= 0.0 {
+                *LAST_WIN_POS.lock().unwrap() =
+                    ((wc.0 / ww).clamp(0.05, 0.95), (wc.1 / wh).clamp(0.05, 0.95));
+            }
+        }
         EDGE_GUARD_UNTIL_MS.store(now_ms() + 250, Ordering::Relaxed);
         if let Some(loc) = live_cursor() {
             *CUR_POS.lock().unwrap() = (loc.x, loc.y);
@@ -444,12 +453,20 @@ unsafe extern "C" fn tap_callback(
                     if event_type != EVT_MOUSE_MOVED {
                         send_msg(&Msg::MouseButton { btn: 0, down: false });
                     }
-                    send_msg(&Msg::Warp { nx: 0.05, ny });
-                    eprintln!("[warp] -> win ({:.2},{:.2})", 0.05, ny);
+                    // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ
+                    let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap();
+                    if nx < 0.0 {
+                        nx = 0.05;
+                        if let Some(sh) = SCREEN_H.get() {
+                            ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
+                        }
+                    }
+                    send_msg(&Msg::Warp { nx, ny });
+                    eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
                     // 絶対位置モードの仮想カーソルを Warp 先で初期化
                     {
                         let (ww, wh) = *WIN_SCREEN.lock().unwrap();
-                        *WIN_CUR.lock().unwrap() = (0.05 * ww, ny * wh);
+                        *WIN_CUR.lock().unwrap() = (nx * ww, ny * wh);
                         *LAST_ABS_SENT.lock().unwrap() = (-1.0, -1.0);
                     }
                     enter_win_mode_cursor_lock();
@@ -507,12 +524,15 @@ unsafe extern "C" fn tap_callback(
                     wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 1.0);
                     wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 1.0);
                     let (nx, ny) = (wc.0 / ww, wc.1 / wh);
-                    let mut ls = LAST_ABS_SENT.lock().unwrap();
-                    // 量子化後(1/65535)に変わるときだけ送信する(無駄打ち防止)
-                    if (ls.0 - nx).abs() >= 1.0 / 65535.0 || (ls.1 - ny).abs() >= 1.0 / 65535.0 {
-                        *ls = (nx, ny);
-                        drop(ls);
-                        send_msg(&Msg::MouseAbs { nx, ny });
+                    // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
+                    *LAST_ABS_SENT.lock().unwrap() = (nx, ny);
+                    send_msg(&Msg::MouseAbs { nx, ny });
+                    // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
+                    if wc.0 <= 1.0 {
+                        WIN_MODE.store(false, Ordering::Relaxed);
+                        DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("[mode] MAC (abs-left)");
+                        leave_win_mode_cursor_unlock(Some(ny));
                     }
                 } else {
                     // 相対移動モード(従来互換)
@@ -555,7 +575,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-165200-3779a4e";
+const BUILD_ID: &str = "build-20260925-170138-67d944f";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
