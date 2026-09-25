@@ -696,11 +696,14 @@ fn main() {
     if args.iter().any(|a| a == "--debug-keys") {
         DEBUG_KEYS.store(true, Ordering::Relaxed);
     }
+    // 接続先は優先度順に: --host 引数 > TSUNAGU_HOST(.env 可)> Tailscale の既定
+    // (有線直結 Thunderbolt ブリッジ / USB-LAN 直結の際は .env で指定する)
     let host = args
         .iter()
         .position(|a| a == "--host")
         .and_then(|i| args.get(i + 1))
         .cloned()
+        .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"))
         .unwrap_or_else(|| "100.100.10.9".to_string());
     println!("[info] desktop attached. screen {w}x{h}. connecting to {host}:{port}");
 

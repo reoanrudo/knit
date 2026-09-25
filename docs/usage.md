@@ -46,6 +46,25 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
   取って正確な高さを Windows 側へ引き継ぐ
 - 移動倍率は `TSUNAGU_MOUSE_SCALE` で調整(既定 1.0)
 
+## 有線直結(遅延・揺らぎの低減)
+
+WiFi の瞬間的な揺らぎがカーソルのカクつきの原因になる場合、Mac と Windows を
+有線で結ぶと改善します。**通常の USB ケーブルでの Mac⇄PC 直結はできません**
+(USB はホスト↔デバイス接続のため、PC 同士は双方ホストになる)。
+実用的な選択肢:
+
+| 方法 | 内容 | 備考 |
+|---|---|---|
+| **USB-LAN アダプタ×2 + LAN ケーブル** | 両側に変換アダプタを付け直結(またはルータへ有線接続) | 最も安価・確実。推奨 |
+| **Thunderbolt ブリッジ** | Thunderbolt 対応 PC と Thunderbolt ケーブルで直結 | 高速。Windows 側の Thunderbolt Networking 対応が必要 |
+| USB リンクケーブル | ブリッジチップ入りの転送用ケーブル | Mac 対応品がほぼ無い |
+
+いずれも IP リンクが張れれば Tsunagu はそのまま動きます(TCP のみのため)。
+直結 IP への切り替えは Windows 側 `.env` に `TSUNAGU_HOST=<Macの直結IP>` を
+設定(例: リンクローカル 169.254.x.x、または手動 IP)。Mac の IP は
+`ifconfig` で確認(Thunderbolt ブリッジは bridge0、USB-LAN は en* )。
+Tailscale 経続併用も可能(戻す場合は .env の行を削除)。
+
 ## スクロール
 
 - Mac のスクロールのピクセル delta を除数(既定 60・設定ウィンドウのスライダーで可変)で変換して
