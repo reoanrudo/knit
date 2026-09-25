@@ -93,6 +93,15 @@ unsafe extern "C" {
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
     fn CGEventCreate(allocator: CFAllocatorRef) -> CGEventRef;
     fn CFRelease(cf: *mut core::ffi::c_void);
+    fn CFStringCreateWithCString(
+        alloc: CFAllocatorRef, c_str: *const core::ffi::c_char, encoding: u32,
+    ) -> CFStringRef;
+    static kCFBooleanTrue: *const core::ffi::c_void;
+    // Deskflow hideCursor/showCursor が使う非公開 CGS API(カーソル非表示の安定化)
+    fn _CGSDefaultConnection() -> i32;
+    fn CGSSetConnectionProperty(
+        cid: i32, target_cid: i32, key: CFStringRef, value: *const core::ffi::c_void,
+    ) -> i32;
     fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
@@ -228,9 +237,25 @@ static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
+/// Deskflow hideCursor/showCursor 内の「SetsCursorInBackground」プロパティ設定。
+/// バックグラウンド接続でもカーソル表示状態を維持し、非表示がランダムに解除されるのを防ぐ
+unsafe fn set_cursor_in_background() {
+    let key = CFStringCreateWithCString(
+        std::ptr::null_mut(),
+        c"SetsCursorInBackground".as_ptr(),
+        0, // kCFStringEncodingMacRoman
+    );
+    if !key.is_null() {
+        let cid = _CGSDefaultConnection();
+        CGSSetConnectionProperty(cid, cid, key, kCFBooleanTrue);
+        CFRelease(key);
+    }
+}
+
 fn enter_win_mode_cursor_lock() {
-    // Deskflow leave() 相当: hideCursor → suppression間隔最小化 → 関連切断 → warp固定
+    // Deskflow leave() 相当: hideCursor(プロパティ付き) → suppression間隔最小化 → 関連切断 → warp固定
     unsafe {
+        set_cursor_in_background();
         let d = CGMainDisplayID();
         CGDisplayHideCursor(d);
         CGSetLocalEventsSuppressionInterval(0.0001);
@@ -253,12 +278,14 @@ fn enter_win_mode_cursor_lock() {
 /// Windows モード終了: 関連を復元し、右端の内側へカーソルを戻す。
 /// ny は Windows 側カーソルの高さ(0..1)。与えられた場合は同じ高さへ戻す(境界連続性)。
 fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
-    // Deskflow enter() 相当: 関連復元 → showCursor → 位置復帰
+    // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
         *LOCK_POS.lock().unwrap() = None;
         CGAssociateMouseAndMouseCursorPosition(true);
+        set_cursor_in_background();
         let d = CGMainDisplayID();
         CGDisplayShowCursor(d);
+        CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
         if let Some(w) = SCREEN_W.get() {
             let y = match ny {
                 Some(n) => {
