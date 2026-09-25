@@ -1,7 +1,7 @@
 # seamless-desk 操作ガイド
 
 Mac のキーボード/トラックパッドで Windows デスクトップを操作するツール。
-Mac=サーバ(Listen 24900)、Windows=クライアント(接続し続ける逆転構成)。
+Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し続ける逆転構成)。
 
 ## 基本操作
 
@@ -11,17 +11,64 @@ Mac=サーバ(Listen 24900)、Windows=クライアント(接続し続ける逆�
 | Windows のカーソルを画面左端へ | Mac へ戻る(同じ高さで右端内側に復帰) |
 | F13 キー | 手動トグル(切替が効かないときの保険) |
 
+切替まわりの細部の挙動:
+
+- 右端判定は Mac 画面右端から `SEAMLESS_EDGE_PX`(既定 2px)の内側。
+  Windows 側の復帰判定は左端(x ≤ 1)で、実際にカーソルが動いたときだけ判定する
+- 切替時にドラッグしていた場合は Windows 側へ左ボタンを離すイベントを送り、
+  誤ドラッグを持ち込まない
+- Mac への復帰直後 250ms は右端判定を無効化し、切替の往復チャタリングを防止
+- Windows 側の左端復帰は 0.7 秒のクールダウン付き(連打による往復を防止)
+
 ## キーボード
 
 - Mac の修飾キーは自動変換: Cmd→Ctrl、Option→Alt、Control→Win、Shift→Shift
-- **かなキー** → Windows 側の IME を ON(ひらがな入力)
-- **英数キー** → Windows 側の IME を OFF(英字入力)
+  (Win 側では「Mac と同じ修飾の組合せ」になるよう差分で押し替え、復帰時に全解放)
+- **かなキー**(Mac keycode 104)→ Windows 側の IME を ON(ひらがな入力)
+- **英数キー**(Mac keycode 102)→ Windows 側の IME を OFF(英字入力)
+  - フォアグラウンドウィンドウの IME コンテキスト(`ImmGetContext`)が取れる場合は
+    `ImmSetOpenStatus` で方向指定どおりに開閉
+  - IME コンテキストが取れないウィンドウでは半角/全角相当のキー注入
+    (VK_KANJI 押し離し)へフォールバック。キー注入はトグル動作のため、
+    この場合のみ開閉の方向が保証されない
+  - 成否は Mac 側ログ(`[ime] kc=104 (かな) 転送` 等)と Windows 側ログ
+    (`[ime] ImmSetOpenStatus(true) ok` 等)で切り分けられる
 - 変換・確定(Enter/Space)はそのまま転送され Windows の IME が処理する
+
+## マウス
+
+- **Windows 側はサブピクセル累積方式**: 受け取った移動量(dx, dy)を f64 で累積し、
+  整数部だけ SendInput で注入、端数は次のイベントへ持ち越す。1px 未満の
+  トラックパッドの細かい動きも消えず滑らかに動く
+- **Mac 側は delta 積算 + 間欠同期で切替判定**: タップコールバック内で移動 delta を
+  積算して自前のカーソル位置を追跡し、32 イベントに 1 回だけ実カーソル位置へ同期
+  する(毎イベントの位置取得は負荷が高くカクつくため)。切替の瞬間だけ実位置を
+  取って正確な高さを Windows 側へ引き継ぐ
+- 移動倍率は `SEAMLESS_MOUSE_SCALE` で調整(既定 1.0)
+
+## スクロール
+
+- Mac のスクロールのピクセル delta を `SEAMLESS_SCROLL_DIV`(既定 120)で除算して
+  ノッチ単位へ変換し、**0.25 ノッチ刻み**で Windows へ送信する(端数は持ち越し)
+- Windows 側はノッチ × 120 ホイールユニットで注入
+- 除数を大きくすると遅くなる(40〜200 程度で調整)
 
 ## クリップボード(双方向同期)
 
-- コピーして約 0.5 秒で相手側に反映(プレーンテキスト、512KB まで)
+- 両側で 0.25 秒間隔にポーリングし、コピーして約 0.25 秒で相手側に反映
+  (プレーンテキスト、1MB まで)
+- Win→Mac は CRLF を LF へ正規化して書き込む。Windows 側の書き込みが
+  他プロセスのクリップボード占有で失敗した場合は 150ms 後に 1 回だけ再試行
+- 相手から受信して書き込んだ内容は送り返さない(ループ防止)
+- 接続が切れている間にコピーした内容も、再接続後に自動送信される
 - 画像や書式は未対応(今後の課題)
+
+## 接続の挙動
+
+- ping を 3 秒間隔で送り、10 秒間 pong が無ければ実質切断扱い(TCP が生きていても
+  相手プロセスが固まった場合を拾う)
+- Windows 側は切断後 0.5 秒から最大 3 秒のバックオフで自動再接続
+- Windows モード中に切断したら即 Mac モードへ復帰(入力の閉じ込め防止)
 
 ## 調整用環境変数(sd-mac 起動時)
 
@@ -29,31 +76,50 @@ Mac=サーバ(Listen 24900)、Windows=クライアント(接続し続ける逆�
 |------|------|------|
 | `SEAMLESS_SCROLL_DIV` | 120 | スクロール速度の除数。大きくすると遅い(40〜200で調整) |
 | `SEAMLESS_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
+| `SEAMLESS_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
 | `SEAMLESS_DESK_TOKEN` | seamless-desk-dev | 両側共通の認証トークン |
 
 ## 改善ループ(開発者用)
 
-変更→検証の1サイクルを回す手順:
+変更→検証の 1 サイクルを回す手順:
 
 ```bash
 # Mac 側: ビルド鮮度保証付きで再起動(引数はそのまま sd-mac へ)
+# 起動直後に異常終了した場合はログ末尾とともに WARN を表示する
 ./scripts/restart-mac.sh --diag
 
-# Windows 側: ビルド→停止→配布→起動
+# Windows 側: ビルド → 停止 → 配布 → 対話起動
 ./scripts/deploy-win.sh
 
-# 自動検証(プロセス/接続/クリップボード双方向)
+# 自動検証(プロセス/接続/クリップボード双方向/IMEログ/diag集計)
 ./scripts/verify.sh
 ```
 
-- `restart-mac.sh` は起動のたび BUILD_ID(日時+git短縮sha)を埋め込み、
-  `/tmp/sd-mac-run.log` 先頭行で配布物の鮮度を確認できる
-- `--diag` は毎秒 `mode/move_recv/key_recv/sent/warp_fixed/cursor/cursor_moving` をログ出力。
-  境界問題の切り分けは `warp_fixed`(カーソル巻き戻し回数)と `cursor_moving`(WIN中は false が正常)で行う
-- ログ: Mac=`/tmp/sd-mac-run.log`、Windows=`C:\Users\<user>\seamless-desk\sd-win.log`(ssh home で type)
+- `restart-mac.sh` / `deploy-win.sh` は起動のたび BUILD_ID(日時+git短縮sha)を
+  埋め込み、`/tmp/sd-mac-run.log`・`C:\Users\<user>\seamless-desk\sd-win.log` の
+  先頭行(`[info] sd-mac ...` / `[info] sd-win ...`)で配布物の鮮度を確認できる
+- `--diag` は毎秒
+  `mode/moves/keys/sent/scrolls/warp_fixed/switches/cursor/moving` をログ出力。
+  境界問題の切り分けは `warp_fixed`(カーソル巻き戻し回数)と
+  `moving`(WIN中は false が正常)で行う。`switches` はモード切替回数、
+  `scrolls` はスクロール送信回数
+- 起動ログにスクロール除数・マウス倍率・切替判定幅・クリップボード上限の
+  調整値がまとめて出る(`[info] screen ... scroll_div=... mouse_scale=...`)
+- `verify.sh` は Windows へ ssh できない場合、該当項目を NG にせず WARN 扱いにして
+  続行する(検証不能と失敗を区別)
+- `check-mouse.sh` は切替後に Mac 側カーソルが凍結(抑制)されているかを検証する
+- ログ: Mac=`/tmp/sd-mac-run.log`、Windows=`C:\Users\<user>\seamless-desk\sd-win.log`
+  (ssh home で type)
 
 ## 既知の制限
 
-- クリップボードはテキストのみ
-- Windows 側のウィンドウ操作(Focus/Minimize)はタイトル部分一致
+- クリップボードはプレーンテキストのみ(1MB 上限)。画像・書式・ファイルは未対応
+- Windows 側のウィンドウ操作(Focus/Minimize)は可視ウィンドウのタイトル部分一致
+  (先に見つかった 1 枚に対して動作)
 - Mac 側の IME 状態とは独立(かな/英数キーで Windows 側だけ切替)
+- IME コンテキストが取れないウィンドウでのみ、IME フォールバックがトグル動作のため
+  開閉の方向が保証されない
+- UAC 昇格中のプロセスには UIPI により SendInput が弾かれる
+  (design.md「残リスク」参照)
+- 通信の暗号化は Tailscale(WireGuard)層に依存し、アプリ層はトークン認証のみ
+  (TLS なし)
