@@ -849,7 +849,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-190901-3717521";
+const BUILD_ID: &str = "build-20260925-195722-4669e01";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -1005,176 +1005,29 @@ fn main() {
         }
     });
 
-    // サーバ(受信待ち)スレッド: Windows からの接続を受け入れる
-    // (本環境では Mac 発コネクションが不通なため、Windows 発に限定した設計)
-    std::thread::spawn(move || {
-        use std::io::{BufRead, Read};
-        // 1行の長さ上限(画像base64 5MB 上限に対し余裕を持たせる。
-        // 未認証helloを含む巨大行によるメモリ消費(DoS)対策)
-        const MAX_LINE: u64 = 8 * 1024 * 1024;
-        // 待受アドレス: 既定は Tailscale IF を想定した制限なし設定だが、
-        // restart-mac.sh が SEAMLESS_BIND=$(tailscale ip -4) を渡すため、
-        // 通常運用では Tailscale インタフェース以外で listen しない
-        let bind_ip = envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
-        let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[fatal] listen :{port} failed: {e}");
+    // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。SEAMLESS_ROLE=client +
+    // SEAMLESS_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
+    // その場合は Windows 側を SEAMLESS_ROLE=server で待ち受ける)
+    let client_role = envutil::get("SEAMLESS_ROLE").as_deref() == Some("client");
+    if client_role {
+        let host = args
+            .iter()
+            .position(|a| a == "--host")
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+            .or_else(|| envutil::get("SEAMLESS_HOST"))
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "[fatal] SEAMLESS_ROLE=client には SEAMLESS_HOST=<Windows側IP> \
+                     (または --host <IP>)の指定が必要です"
+                );
                 std::process::exit(1);
-            }
-        };
-        eprintln!("[info] listening on :{port}");
-        loop {
-            let (stream, peer) = match listener.accept() {
-                Ok(x) => x,
-                Err(e) => {
-                    eprintln!("[conn] accept error: {e}");
-                    std::thread::sleep(Duration::from_millis(500));
-                    continue;
-                }
-            };
-            eprintln!("[conn] accepted from {peer}");
-            // ピア許可: Tailscale の CGNAT 範囲(100.64.0.0/10)以外は即切断する。
-            // 0.0.0.0 で listen してしまった場合の WiFi/LAN 露出に対する装置的防御
-            let oct = match peer.ip() {
-                std::net::IpAddr::V4(v4) => v4.octets(),
-                std::net::IpAddr::V6(_) => [0, 0, 0, 0],
-            };
-            if !(oct[0] == 100 && (64..=127).contains(&oct[1])) {
-                eprintln!("[conn] rejected: {peer} は Tailscale 範囲外です");
-                continue;
-            }
-            stream.set_nodelay(true).ok();
-            stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
-            stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-            // hello を待つ(検証して hello_ok を返す)
-            let mut reader = std::io::BufReader::new(match stream.try_clone() {
-                Ok(s) => s,
-                Err(_) => continue,
             });
-            let mut line = String::new();
-            // 最初の行=hello(この時点では未認証のため、take で読み込み段階から制限する)
-            line.clear();
-            match (&mut reader).take(MAX_LINE + 1).read_line(&mut line) {
-                Ok(0) | Err(_) => {
-                    eprintln!("[conn] closed before hello");
-                    continue;
-                }
-                Ok(_) if line.len() as u64 > MAX_LINE => {
-                    eprintln!("[conn] hello too large. dropped");
-                    continue;
-                }
-                Ok(_) => {}
-            }
-            let ok = match decode(&line) {
-                Some(Msg::Hello { ver, name, token: t, w, h }) if ver == VERSION && t == token => {
-                    let _ = name;
-                    // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
-                    if w > 0 && h > 0 {
-                        *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
-                        eprintln!("[info] win screen {w}x{h}");
-                    }
-                    true
-                }
-                _ => false,
-            };
-            if !ok {
-                eprintln!("[conn] invalid hello");
-                continue;
-            }
-            {
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-                *guard = Some(stream);
-            }
-            // hello_ok 送信は送信スレッド経由で確実に
-            send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
-            CONNECTED.store(true, Ordering::Relaxed);
-            LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
-            eprintln!("[conn] established");
-            notify("seamless-desk", "Windows に接続しました");
-            // 以降の受信ループ(Return / Pong / Bye)
-            loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) if line.len() as u64 > MAX_LINE => {
-                        eprintln!("[conn] line too large. dropping connection");
-                        break;
-                    }
-                    Ok(_) => {
-                        if let Some(msg) = decode(&line) {
-                            match msg {
-                                Msg::Return { ny } => {
-                                    if HOTKEY_ONLY.load(Ordering::Relaxed) {
-                                        // hotkey モードでは Windows 側の左端到達を無視し、
-                                        // F13 で戻すまで Windows のまま(ロック状態)
-                                        continue;
-                                    }
-                                    // abs-left 復帰後に遅延到着した Return で二重に leave
-                                    // され再ワープされるのを防ぐ(既に Mac の場合は無視)
-                                    if !WIN_MODE.load(Ordering::Relaxed) {
-                                        continue;
-                                    }
-                                    WIN_MODE.store(false, Ordering::Relaxed);
-                                    eprintln!("[mode] MAC (return)");
-                                    leave_win_mode_cursor_unlock(Some(ny));
-                                }
-                                Msg::ClipData { kind, data } => {
-                                    // 受信側にも上限を課す(送信側制限のみに依存しない)
-                                    if data.len() > 8 * 1024 * 1024 {
-                                        eprintln!("[clip] win->mac image too large. skipped");
-                                        continue;
-                                    }
-                                    if kind == "image/dib" {
-                                        if let Some(bytes) = sd_common::b64::decode(&data) {
-                                            let bmp = dib_to_bmp(&bytes);
-                                            let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
-                                            eprintln!(
-                                                "[clip] win->mac image {}KB {}",
-                                                bytes.len() / 1024,
-                                                if ok { "ok" } else { "FAILED" }
-                                            );
-                                        }
-                                    }
-                                }
-                                Msg::Clip { text } => {
-                                    if text.len() <= CLIP_MAX_BYTES {
-                                        // Windows の CRLF は Mac 向けに LF へ正規化
-                                        let text = if text.contains("\r\n") {
-                                            text.replace("\r\n", "\n")
-                                        } else {
-                                            text
-                                        };
-                                        *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
-                                        unsafe { mac_set_clipboard(&text) };
-                                        eprintln!("[clip] win->mac {} bytes", text.len());
-                                    }
-                                }
-                                Msg::Pong => {
-                                    LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
-                                }
-                                Msg::Bye => break,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            {
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-                *guard = None;
-            }
-            CONNECTED.store(false, Ordering::Relaxed);
-            // WIN モード中の切断は正規の leave 経由で復帰させる(カーソル表示・
-            // EDGE_GUARD・CUR_POS 整合を自己修復スレッドの「たまたま」に任せない)
-            if WIN_MODE.swap(false, Ordering::Relaxed) {
-                eprintln!("[return] -> mac (disconnect)");
-                leave_win_mode_cursor_unlock(None);
-            }
-            eprintln!("[conn] lost. waiting for reconnect...");
-            notify("seamless-desk", "切断しました(自動再接続中)");
-        }
-    });
+        eprintln!("[info] client mode: connecting to {host}:{port}");
+        std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
+    } else {
+        std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
+    }
 
     // 実機E2E: notepadへ入力して Ctrl+S → ファイル名 → Enter で保存
     if args.iter().any(|a| a == "--test2") {
@@ -1443,5 +1296,266 @@ fn main() {
         unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)
     } else {
         unsafe { CFRunLoopRun() };
+    }
+}
+
+// ---------- 接続セッション(サーバ/クライアント両モード共通) ----------
+
+/// 1行の長さ上限(画像base64 5MB 上限に対し余裕を持たせる。
+/// 未認証helloを含む巨大行によるメモリ消費(DoS)対策)
+const MAX_LINE: u64 = 8 * 1024 * 1024;
+
+/// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)
+fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
+    use std::io::BufRead;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) if line.len() as u64 > MAX_LINE => {
+                eprintln!("[conn] line too large. dropping connection");
+                break;
+            }
+            Ok(_) => {
+                if let Some(msg) = decode(&line) {
+                    match msg {
+                        Msg::Return { ny } => {
+                            if HOTKEY_ONLY.load(Ordering::Relaxed) {
+                                // hotkey モードでは Windows 側の左端到達を無視し、
+                                // F13 で戻すまで Windows のまま(ロック状態)
+                                continue;
+                            }
+                            // abs-left 復帰後に遅延到着した Return で二重に leave
+                            // され再ワープされるのを防ぐ(既に Mac の場合は無視)
+                            if !WIN_MODE.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            WIN_MODE.store(false, Ordering::Relaxed);
+                            eprintln!("[mode] MAC (return)");
+                            leave_win_mode_cursor_unlock(Some(ny));
+                        }
+                        Msg::ClipData { kind, data } => {
+                            // 受信側にも上限を課す(送信側制限のみに依存しない)
+                            if data.len() > 8 * 1024 * 1024 {
+                                eprintln!("[clip] win->mac image too large. skipped");
+                                continue;
+                            }
+                            if kind == "image/dib" {
+                                if let Some(bytes) = sd_common::b64::decode(&data) {
+                                    let bmp = dib_to_bmp(&bytes);
+                                    let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
+                                    eprintln!(
+                                        "[clip] win->mac image {}KB {}",
+                                        bytes.len() / 1024,
+                                        if ok { "ok" } else { "FAILED" }
+                                    );
+                                }
+                            }
+                        }
+                        Msg::Clip { text } => {
+                            if text.len() <= CLIP_MAX_BYTES {
+                                // Windows の CRLF は Mac 向けに LF へ正規化
+                                let text = if text.contains("\r\n") {
+                                    text.replace("\r\n", "\n")
+                                } else {
+                                    text
+                                };
+                                *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some(text.clone());
+                                unsafe { mac_set_clipboard(&text) };
+                                eprintln!("[clip] win->mac {} bytes", text.len());
+                            }
+                        }
+                        Msg::Pong => {
+                            LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+                        }
+                        Msg::Bye => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// セッション終了の共通後処理(スロット解除・切断通知・WIN 中なら正規 leave)
+fn on_disconnect() {
+    {
+        let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+    CONNECTED.store(false, Ordering::Relaxed);
+    // WIN モード中の切断は正規の leave 経由で復帰させる(カーソル表示・
+    // EDGE_GUARD・CUR_POS 整合を自己修復スレッドの「たまたま」に任せない)
+    if WIN_MODE.swap(false, Ordering::Relaxed) {
+        eprintln!("[return] -> mac (disconnect)");
+        leave_win_mode_cursor_unlock(None);
+    }
+    eprintln!("[conn] lost. waiting for reconnect...");
+    notify("seamless-desk", "切断しました(自動再接続中)");
+}
+
+/// 待受モード(既定): Windows からの接続を受け入れる
+/// (本環境では Mac 発コネクションが不通なため、Windows 発に限定した設計)
+fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
+    use std::io::{BufRead, Read};
+    // 待受アドレス: 既定は Tailscale IF を想定した制限なし設定だが、
+    // restart-mac.sh が SEAMLESS_BIND=$(tailscale ip -4) を渡すため、
+    // 通常運用では Tailscale インタフェース以外で listen しない
+    let bind_ip = envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("[info] server mode. listening on {bind_ip}:{port}");
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[conn] accept error: {e}");
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        eprintln!("[conn] accepted from {peer}");
+        // ピア許可: Tailscale の CGNAT 範囲(100.64.0.0/10)以外は即切断する。
+        // 0.0.0.0 で listen してしまった場合の WiFi/LAN 露出に対する装置的防御
+        let oct = match peer.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets(),
+            std::net::IpAddr::V6(_) => [0, 0, 0, 0],
+        };
+        if !(oct[0] == 100 && (64..=127).contains(&oct[1])) {
+            eprintln!("[conn] rejected: {peer} は Tailscale 範囲外です");
+            continue;
+        }
+        stream.set_nodelay(true).ok();
+        stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        // hello を待つ(検証して hello_ok を返す)
+        let mut reader = std::io::BufReader::new(match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => continue,
+        });
+        let mut line = String::new();
+        // 最初の行=hello(この時点では未認証のため、take で読み込み段階から制限する)
+        match (&mut reader).take(MAX_LINE + 1).read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                eprintln!("[conn] closed before hello");
+                continue;
+            }
+            Ok(_) if line.len() as u64 > MAX_LINE => {
+                eprintln!("[conn] hello too large. dropped");
+                continue;
+            }
+            Ok(_) => {}
+        }
+        let ok = match decode(&line) {
+            Some(Msg::Hello { ver, name, token: t, w, h }) if ver == VERSION && t == token => {
+                let _ = name;
+                // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
+                if w > 0 && h > 0 {
+                    *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
+                    eprintln!("[info] win screen {w}x{h}");
+                }
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            eprintln!("[conn] invalid hello");
+            continue;
+        }
+        {
+            let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(stream);
+        }
+        // hello_ok 送信は送信スレッド経由で確実に
+        send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
+        CONNECTED.store(true, Ordering::Relaxed);
+        LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+        eprintln!("[conn] established");
+        notify("seamless-desk", "Windows に接続しました");
+        session_receive_loop(&mut reader);
+        on_disconnect();
+    }
+}
+
+/// 接続モードの 1 セッション分(ハンドシェイク+本体)。Result はリトライ理由
+fn client_attempt(
+    addr: &std::net::SocketAddr,
+    token: &str,
+    screen_w: f64,
+    screen_h: f64,
+) -> Result<(), String> {
+    use std::io::{BufRead, Read, Write};
+    let s = std::net::TcpStream::connect_timeout(addr, Duration::from_secs(3))
+        .map_err(|e| format!("connect failed: {e}"))?;
+    eprintln!("[conn] connected");
+    s.set_nodelay(true).ok();
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    // hello(自画面サイズを相手へ伝える。相手は hello_ok で自画面を返す)
+    let mut hw = s.try_clone().map_err(|e| format!("clone failed: {e}"))?;
+    let hello = encode(&Msg::Hello {
+        ver: VERSION,
+        name: "macbook".into(),
+        token: token.to_string(),
+        w: screen_w as i32,
+        h: screen_h as i32,
+    });
+    hw.write_all(hello.as_bytes())
+        .and_then(|_| hw.flush())
+        .map_err(|_| "hello send failed".to_string())?;
+    // hello_ok を待つ(行長制限付き)
+    let sr = s.try_clone().map_err(|e| format!("clone failed: {e}"))?;
+    let mut reader = std::io::BufReader::new(sr);
+    let mut line = String::new();
+    (&mut reader)
+        .take(MAX_LINE + 1)
+        .read_line(&mut line)
+        .map_err(|_| "hello_ok read failed".to_string())?;
+    if line.len() as u64 > MAX_LINE {
+        return Err("hello_ok too large".into());
+    }
+    match decode(&line) {
+        Some(Msg::HelloOk { w: mw, h: mh, .. }) if mw > 0 && mh > 0 => {
+            *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (mw as f64, mh as f64);
+            eprintln!("[info] win screen {mw}x{mh}");
+        }
+        _ => return Err("invalid hello_ok".into()),
+    }
+    {
+        let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(s);
+    }
+    CONNECTED.store(true, Ordering::Relaxed);
+    LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+    eprintln!("[conn] established");
+    notify("seamless-desk", "Windows に接続しました");
+    session_receive_loop(&mut reader);
+    on_disconnect();
+    Ok(())
+}
+
+/// 接続モード(SEAMLESS_ROLE=client): Windows(サーバ)へ接続し続ける
+fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h: f64) {
+    use std::net::ToSocketAddrs;
+    let Some(addr) = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next())
+    else {
+        eprintln!("[fatal] invalid host: {host}");
+        std::process::exit(1);
+    };
+    let mut backoff = 500u64;
+    loop {
+        if let Err(e) = client_attempt(&addr, &token, screen_w, screen_h) {
+            eprintln!("[conn] {e}");
+        } else {
+            backoff = 500;
+        }
+        std::thread::sleep(Duration::from_millis(backoff));
+        backoff = (backoff * 2).min(3000);
     }
 }
