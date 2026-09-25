@@ -233,6 +233,7 @@ static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ABS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_SELF_HEAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -306,7 +307,7 @@ unsafe fn set_cursor_in_background() {
 
 fn enter_win_mode_cursor_lock() {
     // 持ち越していたスクロール残量を切替時に捨てる(切替直後の意図しないスクロール防止)
-    *SCROLL_ACC.lock().unwrap() = (0.0, 0.0);
+    *SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
     // Deskflow leave() 相当: hideCursor(プロパティ付き) → suppression間隔最小化 → 関連切断 → warp固定
     unsafe {
         set_cursor_in_background();
@@ -329,7 +330,7 @@ fn enter_win_mode_cursor_lock() {
         }
         let lock_x = SCREEN_W.get().copied().unwrap_or(2056.0) - 2.0;
         CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
-        *LOCK_POS.lock().unwrap() = Some((lock_x, lock_y));
+        *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
     }
 }
 
@@ -340,18 +341,18 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     unsafe {
         // 次回の切替で同じ場所へ戻れるよう、Windows 画面内の現在地を記憶する
         {
-            let wc = *WIN_CUR.lock().unwrap();
-            let (ww, wh) = *WIN_SCREEN.lock().unwrap();
+            let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
+            let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
             if ww > 0.0 && wh > 0.0 && wc.0 >= 0.0 {
-                *LAST_WIN_POS.lock().unwrap() =
+                *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner()) =
                     ((wc.0 / ww).clamp(0.05, 0.95), (wc.1 / wh).clamp(0.05, 0.95));
             }
         }
         EDGE_GUARD_UNTIL_MS.store(now_ms() + 200, Ordering::Relaxed);
         if let Some(loc) = live_cursor() {
-            *CUR_POS.lock().unwrap() = (loc.x, loc.y);
+            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
-        *LOCK_POS.lock().unwrap() = None;
+        *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
         let d = CGMainDisplayID();
@@ -449,7 +450,7 @@ unsafe extern "C" fn tap_callback(
                 let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
                 let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
                 let n = CUR_SYNC_N.fetch_add(1, Ordering::Relaxed);
-                let mut pos = CUR_POS.lock().unwrap();
+                let mut pos = CUR_POS.lock().unwrap_or_else(|e| e.into_inner());
                 pos.0 += dx;
                 pos.1 += dy;
                 if n % 16 == 0 {
@@ -477,7 +478,7 @@ unsafe extern "C" fn tap_callback(
                         send_msg(&Msg::MouseButton { btn: 0, down: false });
                     }
                     // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ
-                    let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap();
+                    let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
                     if nx < 0.0 {
                         nx = 0.05;
                         if let Some(sh) = SCREEN_H.get() {
@@ -488,9 +489,9 @@ unsafe extern "C" fn tap_callback(
                     eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
                     // 絶対位置モードの仮想カーソルを Warp 先で初期化
                     {
-                        let (ww, wh) = *WIN_SCREEN.lock().unwrap();
-                        *WIN_CUR.lock().unwrap() = (nx * ww, ny * wh);
-                        *LAST_ABS_SENT.lock().unwrap() = (-1.0, -1.0);
+                        let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+                        *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner()) = (nx * ww, ny * wh);
+                        *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (-1.0, -1.0);
                     }
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
@@ -537,7 +538,7 @@ unsafe extern "C" fn tap_callback(
                 if MOUSE_ABS_MODE.load(Ordering::Relaxed) {
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
-                    let (ww, wh) = *WIN_SCREEN.lock().unwrap();
+                    let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
                     let (mw, mh) = (
                         SCREEN_W.get().copied().unwrap_or(2056.0),
                         SCREEN_H.get().copied().unwrap_or(1329.0),
@@ -547,13 +548,13 @@ unsafe extern "C" fn tap_callback(
                     // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
                     // するため、保持したまま呼ぶと自己デッドロックでタップが固まる)
                     let (nx, ny, at_left) = {
-                        let mut wc = WIN_CUR.lock().unwrap();
+                        let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
                         wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
                         wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
                         (wc.0 / ww, wc.1 / wh, event_type == EVT_MOUSE_MOVED && wc.0 <= 2.0)
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
-                    *LAST_ABS_SENT.lock().unwrap() = (nx, ny);
+                    *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
                     DIAG_ABS_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::MouseAbs { nx, ny });
                     // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
@@ -584,7 +585,7 @@ unsafe extern "C" fn tap_callback(
                 // 除数を大きくすると遅くなる(従来40は速すぎたので既定120)。端数は持ち越し。
                 const Q: f64 = 0.25; // 量子化幅(ノッチ)= Windows 側は 30 wheel units 刻み
                 let div = SCROLL_DIV.get().copied().unwrap_or(120.0);
-                let mut acc = SCROLL_ACC.lock().unwrap();
+                let mut acc = SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner());
                 acc.0 += -dx / div;
                 acc.1 += -dy / div;
                 // 異常な残高(1e6超)は何かの暴発なので捨てる
@@ -605,7 +606,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-170925-a770734";
+const BUILD_ID: &str = "build-20260925-171713-1d56ada";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -649,7 +650,7 @@ fn main() {
     let _ = SCREEN_H.set(screen_h);
     unsafe {
         if let Some(loc) = live_cursor() {
-            *CUR_POS.lock().unwrap() = (loc.x, loc.y);
+            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
     }
     if let Some(d) = std::env::var("SEAMLESS_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
@@ -694,7 +695,7 @@ fn main() {
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(line) => {
-                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = guard.as_mut() {
                         if writeln!(s, "{line}").and_then(|_| s.flush()).is_err() {
                             *guard = None; // 書けなくなったら外す(接続ループが検知)
@@ -710,11 +711,11 @@ fn main() {
                 // (TCP が生きていても相手プロセスが固まった場合を拾う)
                 if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 10_000 {
                     eprintln!("[conn] pong timeout. dropping stream");
-                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                     *guard = None;
                     continue;
                 }
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = guard.as_mut() {
                     if writeln!(s, "{}", encode(&Msg::Ping)).and_then(|_| s.flush()).is_err() {
                         *guard = None;
@@ -769,7 +770,7 @@ fn main() {
                     let _ = name;
                     // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
                     if w > 0 && h > 0 {
-                        *WIN_SCREEN.lock().unwrap() = (w as f64, h as f64);
+                        *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
                         eprintln!("[info] win screen {w}x{h}");
                     }
                     true
@@ -781,7 +782,7 @@ fn main() {
                 continue;
             }
             {
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(stream);
             }
             // hello_ok 送信は送信スレッド経由で確実に
@@ -810,7 +811,7 @@ fn main() {
                                         } else {
                                             text
                                         };
-                                        *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
+                                        *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
                                         unsafe { mac_set_clipboard(&text) };
                                         eprintln!("[clip] win->mac {} bytes", text.len());
                                     }
@@ -826,7 +827,7 @@ fn main() {
                 }
             }
             {
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 *guard = None;
             }
             CONNECTED.store(false, Ordering::Relaxed);
@@ -941,7 +942,7 @@ fn main() {
             let mut last_cursor = (0.0f64, 0.0f64);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd, wp, mc, sc, ab) = (
+                let (mode, mv, kd, sd, wp, mc, sc, ab, heal) = (
                     WIN_MODE.load(Ordering::Relaxed),
                     DIAG_MOVE_COUNT.load(Ordering::Relaxed),
                     DIAG_KEY_COUNT.load(Ordering::Relaxed),
@@ -950,13 +951,14 @@ fn main() {
                     DIAG_MODE_COUNT.load(Ordering::Relaxed),
                     DIAG_SCROLL_COUNT.load(Ordering::Relaxed),
                     DIAG_ABS_COUNT.load(Ordering::Relaxed),
+                    DIAG_SELF_HEAL.load(Ordering::Relaxed),
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
                     let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
-                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
+                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} self_heal={heal} cursor=({:.0},{:.0}) moving={}",
                         if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
                     );
                     last_cursor = (p.x, p.y);
@@ -984,7 +986,7 @@ fn main() {
                 continue;
             }
             // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
-            if LAST_RECV_CLIP.lock().unwrap().as_deref() == Some(text.as_str()) {
+            if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
                 continue;
             }
             eprintln!("[clip] mac->win {} bytes", text.len());
@@ -1000,10 +1002,24 @@ fn main() {
         let mut fixes: u64 = 0;
         loop {
             std::thread::sleep(Duration::from_millis(150));
+            // 自己修復: WIN モードでないのにカーソルが隠れたままの異常状態
+            // (将来の同種バグや予期しない経路)を検知し、表示を復元する
+            if !WIN_MODE.load(Ordering::Relaxed) && CURSOR_HIDDEN.load(Ordering::Relaxed) {
+                unsafe {
+                    let d = CGMainDisplayID();
+                    for _ in 0..3 {
+                        CGDisplayShowCursor(d);
+                    }
+                    CGAssociateMouseAndMouseCursorPosition(true);
+                }
+                CURSOR_HIDDEN.store(false, Ordering::Relaxed);
+                DIAG_SELF_HEAL.fetch_add(1, Ordering::Relaxed);
+                eprintln!("[cursor] self-heal: 復帰漏れを修復しました");
+            }
             if !WIN_MODE.load(Ordering::Relaxed) {
                 continue;
             }
-            let Some((lx, ly)) = *LOCK_POS.lock().unwrap() else { continue };
+            let Some((lx, ly)) = *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) else { continue };
             unsafe {
                 let Some(loc) = live_cursor() else { continue };
                 if (loc.x - lx).abs() > 1.0 || (loc.y - ly).abs() > 1.0 {

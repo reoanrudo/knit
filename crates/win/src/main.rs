@@ -304,7 +304,7 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-170344-b24c922";
+const BUILD_ID: &str = "win-20260925-170936-a770734";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
@@ -610,7 +610,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 if text.len() > CLIP_MAX_CHARS {
                     continue;
                 }
-                *LAST_RECV_CLIP.lock().unwrap() = Some(text.clone());
+                *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
                 let ok = clipboard_write_text(&text)
                     || (std::thread::sleep(Duration::from_millis(150)), clipboard_write_text(&text)).1;
                 if ok {
