@@ -30,9 +30,12 @@ ssh -o BatchMode=yes home "schtasks /End /TN seamless_desk_run" >/dev/null 2>&1 
 ssh -o BatchMode=yes home "taskkill /IM sd-win.exe /F" >/dev/null 2>&1 || true
 sleep 2
 scp -o BatchMode=yes target/x86_64-pc-windows-gnu/release/sd-win.exe home:C:/Users/<user>/seamless-desk/sd-win.exe
-# 起動資材(ログローテーション実効化のため bat 経由へ変更)+ トークンも更新
+# 起動資材(ログローテーション実効化のため bat 経由へ変更)+アイコン+トークンも更新
 scp -o BatchMode=yes win-dist/run_sd.vbs win-dist/run_sd.bat home:C:/Users/<user>/seamless-desk/ >/dev/null
+scp -o BatchMode=yes win-dist/app.ico home:C:/Users/<user>/seamless-desk/ >/dev/null
 scp -o BatchMode=yes "$TOKEN_SRC" home:C:/Users/<user>/seamless-desk/.env >/dev/null
+# 自動復帰ウォッチ(5分毎。二重起動は exe 側のミューテックスで即終了)
+ssh -o BatchMode=yes home "schtasks /Create /TN seamless_desk_watch /TR "wscript.exe \"C:\\Users\\<user>\\seamless-desk\\run_sd.vbs\"" /SC MINUTE /MO 5 /F" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /Run /TN seamless_desk_run" >/dev/null 2>&1
 sleep 3
 

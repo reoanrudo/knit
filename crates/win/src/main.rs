@@ -1,7 +1,11 @@
 // sd-win: Windows 側サーバ。TCP で受けた入力イベントを SendInput で注入する。
 // 必須: 対話セッション起動 + OpenInputDesktop(フル権限) + SetThreadDesktop
+// v0.5: GUI サブシステム化(コンソール非依存)+タスクトレイ常駐+待受モード追加
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
+#![windows_subsystem = "windows"]
+
+mod tray;
 
 use sd_common::keymap::mac_kc_to_win_vk;
 
@@ -102,6 +106,8 @@ const GMEM_MOVEABLE: u32 = 0x0002;
 static LAST_RECV_CLIP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// cmd+Tab → Alt+Tab 変換中(Alt を保持し、cmd 離下で確定する)
 static ALT_TAB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// トレイ/バルーン表示用の接続状態(セッション確立で true)
+static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 
 fn clipboard_read_text() -> Option<String> {
@@ -332,9 +338,60 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-190103-3717521";
+// ---------- Win32 直宣言(コンソール無し運用/二重起動防止) ----------
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetStdHandle(n_std_handle: u32) -> *mut core::ffi::c_void;
+    fn SetStdHandle(n_std_handle: u32, handle: *mut core::ffi::c_void) -> i32;
+    fn CreateMutexW(
+        attrs: *mut core::ffi::c_void,
+        initial_owner: i32,
+        name: *const u16,
+    ) -> *mut core::ffi::c_void;
+}
+
+/// GUI サブシステムでは stdout が無効な場合があり、そのままだと println! が
+/// パニックするため NUL デバイスへ繋ぎ替える(リダイレクト起動時は何もしない)
+fn ensure_stdout() {
+    unsafe {
+        const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (u32)-11
+        const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF2; // (u32)-12
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if !out.is_null() && out as isize != -1 {
+            return; // リダイレクト起動などで有効
+        }
+        if let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") {
+            use std::os::windows::io::AsRawHandle;
+            let h = nul.as_raw_handle() as *mut core::ffi::c_void;
+            SetStdHandle(STD_OUTPUT_HANDLE, h);
+            SetStdHandle(STD_ERROR_HANDLE, h);
+            std::mem::forget(nul); // ハンドルはプロセス終了まで保持
+        }
+    }
+}
+
+/// 二重起動防止(5分毎の自動復帰タスクが既存インスタンスと並走しないように)
+fn acquire_single_instance() -> bool {
+    unsafe {
+        let mut name: Vec<u16> = "Local\\seamless-desk-sd-win".encode_utf16().collect();
+        name.push(0);
+        let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if windows_sys::Win32::Foundation::GetLastError() == 183 {
+            // ERROR_ALREADY_EXISTS = 既に起動している(自動復帰タスクからの起動等)
+            let _ = h;
+            return false;
+        }
+        true // ミューテックスはプロセス終了まで保持(明示解放しない)
+    }
+}
+
+const BUILD_ID: &str = "win-20260925-195622-4669e01";
 
 fn main() {
+    ensure_stdout();
+    if !acquire_single_instance() {
+        return; // 既に起動している(トレイの既存インスタンスが稼働中)
+    }
     println!("[info] sd-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
     // トークンは必須(旧既定値 "seamless-desk-dev" での脆弱な稼働を廃止)。
@@ -385,6 +442,21 @@ fn main() {
         .unwrap_or_else(|| "100.100.10.9".to_string());
     println!("[info] desktop attached. screen {w}x{h}. connecting to {host}:{port}");
 
+    // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
+    // SEAMLESS_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
+    // (通常ネットワークの配布先向け)
+    let role_server = args.iter().any(|a| a == "--listen")
+        || sd_common::envutil::get("SEAMLESS_ROLE").as_deref() == Some("server");
+
+    // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
+    tray::start();
+
+    if role_server {
+        println!("[info] server mode. screen {w}x{h}");
+        server_loop(&token, port, w, h);
+        return;
+    }
+
     use std::net::ToSocketAddrs;
     let addr = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next());
     let addr = match addr {
@@ -394,14 +466,18 @@ fn main() {
             exit(1);
         }
     };
+    println!("[info] client mode: connecting to {host}:{port}");
+    client_loop(&addr, &token, w, h);
+}
 
-    // クライアントとして Mac へ接続し続ける(Mac 発コネクションは本環境で不通のため)
+/// 接続モード(既定): 相手(Mac)へ接続し続ける。切断は指数バックオフで再接続
+fn client_loop(addr: &std::net::SocketAddr, token: &str, w: i32, h: i32) {
     let mut backoff = 500u64;
     loop {
-        match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+        match std::net::TcpStream::connect_timeout(addr, Duration::from_secs(3)) {
             Ok(s) => {
                 println!("[conn] connected");
-                if let Err(e) = serve(s, &token, w, h) {
+                if let Err(e) = client_session(s, token, w, h) {
                     println!("[disc] {e}");
                 }
                 backoff = 500;
@@ -413,11 +489,91 @@ fn main() {
     }
 }
 
-fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> {
+/// 待受モード(SEAMLESS_ROLE=server): 相手(Mac=クライアント)からの接続を受け入れる。
+/// hello のトークン検証後に hello_ok(自画面 w/h 付き)を返す
+fn server_loop(token: &str, port: u16, w: i32, h: i32) {
+    use std::io::Read;
+    let bind_ip = sd_common::envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
+            exit(1);
+        }
+    };
+    println!("[info] listening on {bind_ip}:{port}");
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) => {
+                println!("[conn] accept error: {e}");
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+        };
+        println!("[conn] accepted from {peer}");
+        // Tailscale CGNAT(100.64.0.0/10)外は即拒否(0.0.0.0 待受時の装置的防御)
+        if let std::net::IpAddr::V4(v4) = peer.ip() {
+            let o = v4.octets();
+            if !(o[0] == 100 && (64..=127).contains(&o[1])) {
+                println!("[conn] rejected: {peer} は Tailscale 範囲外です");
+                continue;
+            }
+        } else {
+            println!("[conn] rejected: {peer} (IPv6)");
+            continue;
+        }
+        stream.set_nodelay(true).ok();
+        // hello を待つ(未認証のため 8MB の行長制限付き)
+        let mut pre = match stream.try_clone() {
+            Ok(s) => std::io::BufReader::new(s),
+            Err(_) => continue,
+        };
+        let mut line = String::new();
+        match (&mut pre).take(8 * 1024 * 1024 + 1).read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                println!("[conn] closed before hello");
+                continue;
+            }
+            Ok(_) => {}
+        }
+        if line.len() > 8 * 1024 * 1024 {
+            println!("[conn] hello too large. dropped");
+            continue;
+        }
+        let ok = match decode(&line) {
+            Some(Msg::Hello { ver, name, token: t, .. }) if ver == VERSION && t == token => {
+                println!("[hello] from {name}");
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            println!("[conn] invalid hello");
+            continue;
+        }
+        // hello_ok(相手=Mac が画面サイズを得られるよう自画面 w/h を含める)
+        let mut wr = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = wr
+            .write_all(encode(&Msg::HelloOk { name: "desktop".into(), w, h }).as_bytes())
+            .and_then(|_| wr.flush());
+        drop(wr);
+        CONNECTED.store(true, Ordering::Relaxed);
+        println!("[conn] established");
+        tray::notify("seamless-desk", "接続しました");
+        let _ = session(stream, w, h);
+        CONNECTED.store(false, Ordering::Relaxed);
+        println!("[conn] lost. waiting for reconnect...");
+        tray::notify("seamless-desk", "切断しました(待機中)");
+    }
+}
+
+/// 接続モード(既定)のセッション: hello 送信 → hello_ok 受信 → 本体セッション
+fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
-    // 読み出しタイムアウット: Mac は3秒毎に ping を送るため 12秒無音は経路断。
-    // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
-    stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let mut writer = stream.try_clone()?;
     // クライアントとして hello を送る(encode() が行末 \n を持つため write_all で送る)
@@ -439,10 +595,36 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     if !hello_sent {
         return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "hello send failed"));
     }
+    // hello_ok を待つ
+    let mut pre = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    pre.read_line(&mut line)?;
+    match decode(line.trim()) {
+        Some(Msg::HelloOk { name, w: mw, h: mh }) => {
+            println!("[hello] ok from {name} (mac screen {mw}x{mh})");
+        }
+        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hello_ok")),
+    }
+    CONNECTED.store(true, Ordering::Relaxed);
+    tray::notify("seamless-desk", "接続しました");
+    let r = session(stream, w, h);
+    CONNECTED.store(false, Ordering::Relaxed);
+    tray::notify("seamless-desk", "切断しました(自動再接続中)");
+    r
+}
+
+/// 認証済みストリームの本体処理(接続/待受 両モード共通)
+fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
+    stream.set_nodelay(true).ok();
+    // 読み出しタイムアウト: Mac は3秒毎に ping を送るため 12秒無音は経路断。
+    // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
+    stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
     let (wtx, wrx) = std::sync::mpsc::channel::<String>();
+    let mut writer = stream.try_clone()?;
     std::thread::spawn(move || {
         while let Ok(line) = wrx.recv() {
             if writer.write_all(line.as_bytes()).and_then(|_| writer.flush()).is_err() {
@@ -456,7 +638,8 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
     // 端数は次イベントへ持ち越す。
     let mut accum = (0.0f64, 0.0f64);
-    let mut hello_done = false;
+    // 認証は session の前(client_session/server_loop)で完了している
+    let mut hello_done = true;
     let mut last_return_notify = Instant::now() - Duration::from_secs(10);
     let running = Arc::new(AtomicBool::new(true));
     let running_w = running.clone();
@@ -524,8 +707,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
         };
         match msg {
             Msg::HelloOk { name, w: mw, h: mh } => {
-                println!("[hello] ok from {name} (mac screen {mw}x{mh})");
-                hello_done = true;
+                println!("[hello] (重複) ok from {name} (mac screen {mw}x{mh})");
             }
             Msg::Ping => {
                 let _ = wtx.send(encode(&Msg::Pong));

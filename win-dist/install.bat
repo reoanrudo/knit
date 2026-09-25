@@ -18,6 +18,10 @@ schtasks /Create /TN seamless_desk /TR "wscript.exe \"%DIR%\run_sd.vbs\"" /SC ON
 REM one-shot task for immediate/restart (run via: schtasks /Run /TN seamless_desk_run)
 schtasks /Create /TN seamless_desk_run /TR "wscript.exe \"%DIR%\run_sd.vbs\"" /SC ONCE /ST 23:59 /F >nul 2>&1
 
+REM auto-recovery: 5分毎に起動を試みる(既に起動していれば exe 側の
+REM 二重起動防止(名前付きミューテックス)が即終了する=落ちても自動復帰)
+schtasks /Create /TN seamless_desk_watch /TR "wscript.exe \"%DIR%\run_sd.vbs\"" /SC MINUTE /MO 5 /F >nul 2>&1
+
 REM kill old instance and start fresh
 taskkill /IM sd-win.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
