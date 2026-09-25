@@ -128,6 +128,7 @@ static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
 static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_SIDE_POP: AtomicUsize = AtomicUsize::new(0);
+static LAYOUT_WND: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DELAY_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DELAY_LBL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_DBL_SLIDER: AtomicUsize = AtomicUsize::new(0);
@@ -355,6 +356,97 @@ unsafe extern "C" fn imp_rotate_side(_s: ID, _c: SEL, _n: ID) {
     let next = (crate::SIDE.load(Ordering::Relaxed) + 1) % 4;
     crate::set_side(next);
     refresh_status();
+}
+
+/// 配置エディタ(独立ウィンドウ)を開く
+unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
+    unsafe {
+        let app = msg0(objc_getClass(c"NSApplication".as_ptr()), sel(c"sharedApplication"));
+        if !app.is_null() {
+            msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+        }
+        let existing = LAYOUT_WND.load(Ordering::Relaxed) as ID;
+        if existing.is_null() {
+            let w = make_layout_window();
+            if w.is_null() {
+                eprintln!("[gui] 配置ウィンドウの生成に失敗");
+                return;
+            }
+            LAYOUT_WND.store(w as usize, Ordering::Relaxed);
+        }
+        msg1_void_id(
+            LAYOUT_WND.load(Ordering::Relaxed) as ID,
+            sel(c"makeKeyAndOrderFront:"),
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+/// 配置エディタ専用の小ウィンドウ(設定窓に収まらないため分離)
+unsafe fn make_layout_window() -> ID {
+    unsafe {
+        let init: unsafe extern "C" fn(ID, SEL, NSRect, u64, u64, u8) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let set_frame: unsafe extern "C" fn(ID, SEL, NSRect) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let alloc = msg0(objc_getClass(c"NSWindow".as_ptr()), sel(c"alloc"));
+        let win = init(
+            alloc,
+            sel(c"initWithContentRect:styleMask:backing:defer:"),
+            NSRect { x: 0.0, y: 0.0, w: 420.0, h: 252.0 },
+            1 | 2, // titled | closable
+            2,
+            0,
+        );
+        if win.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg1_void_id(win, sel(c"setTitle:"), nsstring("モニター配置"));
+        msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
+        msg0_void(win, sel(c"center"));
+        let cv = msg0(win, sel(c"contentView"));
+        if cv.is_null() {
+            return std::ptr::null_mut();
+        }
+        // 説明行(上)
+        let mklabel: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let top = mklabel(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithString:"),
+            nsstring("Windows(青)をドラッグして実際の配置へ。離すと確定"),
+        );
+        if !top.is_null() {
+            set_frame(top, sel(c"setFrame:"), NSRect { x: 20.0, y: 212.0, w: 380.0, h: 18.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), top);
+        }
+        // 配置ビュー(中央)
+        let lay = make_layout_view(cv);
+        if !lay.is_null() {
+            set_frame(lay, sel(c"setFrame:"), NSRect { x: 32.0, y: 32.0, w: LAY_VW, h: LAY_VH });
+            msg1_void_id(cv, sel(c"addSubview:"), lay);
+        }
+        // 凡例(下)
+        let leg = mklabel(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithString:"),
+            nsstring("灰=Mac ・ 青=Windows(大きさは実際の比)"),
+        );
+        if !leg.is_null() {
+            set_frame(leg, sel(c"setFrame:"), NSRect { x: 20.0, y: 8.0, w: 380.0, h: 16.0 });
+            let color_cls = objc_getClass(c"NSColor".as_ptr());
+            if !color_cls.is_null() {
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+                if !color.is_null() {
+                    msg1_void_id(leg, sel(c"setTextColor:"), color);
+                }
+            }
+            msg1_void_id(cv, sel(c"addSubview:"), leg);
+        }
+        win
+    }
 }
 
 unsafe extern "C" fn imp_scroll_flip(_s: ID, _c: SEL, _n: ID) {
@@ -854,7 +946,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 930.0 },
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 710.0 },
             1 | 2 | 8 | 0x8000, // +FullSizeContentView
             2,
             0,
@@ -874,7 +966,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         // NSSize(f64×2)のため f64 2 引数の transmute で渡す(NSRect 32byte と混同注意)
         let set_min: unsafe extern "C" fn(ID, SEL, f64, f64) =
             std::mem::transmute(crate::objc_msgSend as usize);
-        set_min(win, sel(c"setContentMinSize:"), 400.0, 930.0);
+        set_min(win, sel(c"setContentMinSize:"), 400.0, 710.0);
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
@@ -910,7 +1002,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 930.0 - 56.0, w: 360.0, h: 24.0 });
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 710.0 - 56.0, w: 360.0, h: 24.0 });
             let font_cls = objc_getClass(c"NSFont".as_ptr());
             if !font_cls.is_null() {
                 let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
@@ -925,7 +1017,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
 
         // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
-        let mut y = 930.0 - 84.0;
+        let mut y = 710.0 - 84.0;
         let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
@@ -940,32 +1032,8 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 slot.store(b as usize, Ordering::Relaxed);
             }
         };
-        section_heading(cv, "モニター配置(ドラッグで Windows の位置を決める)", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
-        y -= 24.0;
-        let lay = make_layout_view(cv);
-        if !lay.is_null() {
-            set_frame(lay, sel(c"setFrame:"), NSRect { x: 20.0, y: y - LAY_VH + 4.0, w: LAY_VW, h: LAY_VH });
-            msg1_void_id(cv, sel(c"addSubview:"), lay);
-        }
-        // 凡例(配置エディタの右下に重ねず、下段へ)
-        let leg = label(
-            objc_getClass(c"NSTextField".as_ptr()), sel(c"labelWithString:"),
-            nsstring("灰=Mac ・ 青=Windows(ドラッグして離すと確定)"),
-        );
-        if !leg.is_null() {
-            set_frame(leg, sel(c"setFrame:"), NSRect { x: 20.0, y: y - LAY_VH - 14.0, w: 344.0, h: 16.0 });
-            let color_cls = objc_getClass(c"NSColor".as_ptr());
-            if !color_cls.is_null() {
-                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
-                    std::mem::transmute(crate::objc_msgSend as usize);
-                let color = get_color(color_cls, sel(c"secondaryLabelColor"));
-                if !color.is_null() {
-                    msg1_void_id(leg, sel(c"setTextColor:"), color);
-                }
-            }
-            msg1_void_id(cv, sel(c"addSubview:"), leg);
-        }
-        y -= LAY_VH + 40.0;
+        section_heading(cv, "切替", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 26.0;
 
         section_heading(cv, "切替", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
@@ -995,6 +1063,18 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 msg1_void_id(cv, sel(c"addSubview:"), pop);
                 PREFS_SIDE_POP.store(pop as usize, Ordering::Relaxed);
             }
+        }
+        // 配置エディタは独立ウィンドウ(設定窓に収まらないため別窓化)
+        let lay_btn = push_btn(
+            btn_cls,
+            sel(c"buttonWithTitle:target:action:"),
+            nsstring("配置エディタ…"),
+            target,
+            sel(c"sdLayout:"),
+        );
+        if !lay_btn.is_null() {
+            set_frame(lay_btn, sel(c"setFrame:"), NSRect { x: 212.0, y: y - 30.0, w: 168.0, h: 26.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), lay_btn);
         }
         y -= 40.0;
         // switchDelay スライダ(0..1000ms)
@@ -1511,6 +1591,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdClipShare:", imp_clip_share as *const () as usize),
         (c"sdScrollCompat:", imp_scroll_compat as *const () as usize),
         (c"sdRotateSide:", imp_rotate_side as *const () as usize),
+        (c"sdLayout:", imp_show_layout as *const () as usize),
         (c"sdMouseScale:", imp_mouse_scale as *const () as usize),
         (c"sdEdgePx:", imp_edge_px as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
@@ -1683,6 +1764,13 @@ pub fn start() -> bool {
         msg1_void_id(prefs, sel(c"setTarget:"), target);
         msg1_void_sel(prefs, sel(c"setAction:"), sel(c"sdShowPrefs:"));
         add_item(menu, prefs);
+
+        let layout_item = menu_item("モニター配置…", Some(c"sdLayout:"), "");
+        if !layout_item.is_null() {
+            msg1_void_id(layout_item, sel(c"setTarget:"), target);
+            msg1_void_sel(layout_item, sel(c"setAction:"), sel(c"sdLayout:"));
+            add_item(menu, layout_item);
+        }
 
         for (title, action) in [
             ("ログを開く…", c"sdOpenLog:"),

@@ -1499,7 +1499,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-033344-3613d22";
+const BUILD_ID: &str = "build-20260926-033640-d66011a";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
