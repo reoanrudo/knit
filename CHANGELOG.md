@@ -2,6 +2,19 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
+## [0.10.2] - 2026-09-25
+
+### 修正
+- **マウスのカクつき軽減**: 送信側(writer)に束ね送信(coalescing)を実装。
+  従来はマウス移動 1 行ごとに write+flush し小パケット連打で、WiFi の揺らぎで
+  パケットが束になって到着するとカーソルがジャンプしていた。キュー滞留分を
+  まとめて 1 回の write にすることで滑らかさが向上(順序保存・上限 256KB)
+- 設定ウィンドウが開けなかった不具合を修正(セレクタ名の誤り:
+  labelWithTitle:→labelWithString: / checkWithTitle:→checkboxWithTitle:)
+- 設定ウィンドウの体裁: タイトル非表示化(FullSizeContentView との重なり解消)、
+  ボタン文言の短縮と幅調整(はみ出し解消)、高さ 730→640、setContentMinSize を
+  NSSize(f64×2)渡しに修正
+
 ## [0.10.1] - 2026-09-25
 
 ### 修正

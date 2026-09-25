@@ -1,6 +1,6 @@
 [package]
 name = "tsunagu-win"
-version = "0.10.1"
+version = "0.10.2"
 edition = "2021"
 
 [dependencies]
@@ -10,6 +10,7 @@ serde_json = { workspace = true }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Threading",

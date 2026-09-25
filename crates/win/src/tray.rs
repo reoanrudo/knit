@@ -27,11 +27,102 @@ unsafe extern "system" {
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
+
+// ---------- ダークテーマ(モダンUI)の色定義(0xRRGGBB) ----------
+const CLR_BG: u32 = 0x1C1C22; // 窓背景
+const CLR_CARD: u32 = 0x2A2A32; // カード面
+const CLR_HEAD: u32 = 0xEDEDF2; // 見出し・状態行(白系)
+const CLR_TEXT: u32 = 0xB4B4BE; // 本文(明るいグレー)
+const CLR_SUB: u32 = 0x7C7C88; // 補足(暗めグレー)
+const CLR_ACCENT: u32 = 0x3D6DF2; // ボタン(青)
+const CLR_DANGER: u32 = 0xC2504B; // 終了ボタン(赤系)
+/// 0xRRGGBB → COLORREF(0x00BBGGRR)
+fn rgb(c: u32) -> u32 {
+    ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
+}
+const TRANSPARENT_BK: i32 = 1;
+
+// ---------- 描画に必要な Gdi32/user32(自前 extern) ----------
+#[link(name = "gdi32")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn CreateSolidBrush(color: u32) -> *mut core::ffi::c_void;
+    fn CreatePen(style: i32, width: i32, color: u32) -> *mut core::ffi::c_void;
+    fn SelectObject(hdc: *mut core::ffi::c_void, obj: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn DeleteObject(obj: *mut core::ffi::c_void) -> i32;
+    fn SetTextColor(hdc: *mut core::ffi::c_void, color: u32) -> u32;
+    fn SetBkColor(hdc: *mut core::ffi::c_void, color: u32) -> u32;
+    fn SetBkMode(hdc: *mut core::ffi::c_void, mode: i32) -> i32;
+    fn FillRect(hdc: *mut core::ffi::c_void, rect: *const Rect, brush: *mut core::ffi::c_void) -> i32;
+    fn RoundRect(
+        hdc: *mut core::ffi::c_void, l: i32, t: i32, r: i32, b: i32, ew: i32, eh: i32,
+    ) -> i32;
+    fn DrawTextW(
+        hdc: *mut core::ffi::c_void, text: *mut u16, count: i32, rect: *mut Rect, flags: u32,
+    ) -> i32;
+    fn SetWindowPos(
+        hwnd: HWND, after: HWND, x: i32, y: i32, w: i32, h: i32, flags: u32,
+    ) -> i32;
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+const DT_CENTER: u32 = 0x1;
+const DT_VCENTER: u32 = 0x4;
+const DT_SINGLELINE: u32 = 0x20;
+
+/// WM_DRAWITEM の lparam(Win32 ABI)
+#[repr(C)]
+struct DrawItemStruct {
+    ctl_type: u32,
+    ctl_id: u32,
+    item_id: u32,
+    item_action: u32,
+    item_state: u32,
+    hwnd_item: *mut core::ffi::c_void,
+    hdc: *mut core::ffi::c_void,
+    rc_item: Rect,
+    item_data: usize,
+}
+
+/// DWM: タイトルバーをダークへ(Windows 10 1809+/11 対応。失敗時は無地のまま)
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(
+        hwnd: HWND, attr: u32, val: *const core::ffi::c_void, size: u32,
+    ) -> i32;
+}
+unsafe fn apply_dark_titlebar(hwnd: HWND) {
+    unsafe {
+        let dark: i32 = 1;
+        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark as *const i32 as *const core::ffi::c_void,
+            4,
+        );
+    }
+}
 const MENU_QUIT: u32 = 1001;
 const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
 const MENU_OPENLOG: u32 = 1004;
 const MENU_RESTART: u32 = 1005;
+// ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
+const ID_LBL_STATE: u32 = 210;
+const ID_HEAD_CONN: u32 = 211;
+const ID_HEAD_ACT: u32 = 212;
+const ID_LBL_BUILD: u32 = 213;
+const ID_LBL_RTT: u32 = 214;
+const ID_LBL_AUDIO: u32 = 215;
+const ID_LBL_SPK: u32 = 216;
+const ID_LBL_FILES: u32 = 217;
 
 #[link(name = "shell32")]
 #[link(name = "user32")]
@@ -243,6 +334,10 @@ unsafe fn handle_command(id: u32) {
 }
 
 unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    const WM_PAINT2: u32 = 0x000F;
+    const WM_ERASEBKGND2: u32 = 0x0014;
+    const WM_CTLCOLORSTATIC2: u32 = 0x0138;
+    const WM_DRAWITEM2: u32 = 0x002B;
     match msg {
         WM_COMMAND => {
             handle_command((wparam & 0xFFFF) as u32);
@@ -253,7 +348,122 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             ShowWindow(hwnd, SW_HIDE);
             0
         }
+        WM_ERASEBKGND2 => 1, // 背景は WM_PAINT で全描き(ちらつき防止)
+        WM_PAINT2 => {
+            unsafe { paint_status(hwnd) };
+            0
+        }
+        WM_CTLCOLORSTATIC2 => {
+            // ラベルの文字色をテーマへ(見出し/状態=白、本文=グレー、補助=暗グレー)。
+            // 背景は透過(WM_PAINT のカード面がそのまま見える)
+            unsafe {
+                let hdc = wparam as *mut core::ffi::c_void;
+                let child = lparam as HWND;
+                extern "system" {
+                    fn GetDlgCtrlID(hwnd: HWND) -> i32;
+                }
+                let id = GetDlgCtrlID(child);
+                let color = match id as u32 {
+                    ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT => rgb(CLR_HEAD),
+                    ID_LBL_BUILD => rgb(CLR_SUB),
+                    _ => rgb(CLR_TEXT),
+                };
+                SetTextColor(hdc, color);
+                SetBkMode(hdc, TRANSPARENT_BK);
+                extern "system" {
+                    fn GetStockObject(index: i32) -> *mut core::ffi::c_void;
+                }
+                // 背景ブラシに NULL ブラシを返す=親(WM_PAINT)の背景が透けて見える
+                GetStockObject(5 /*NULL_BRUSH*/) as LRESULT
+            }
+        }
+        WM_DRAWITEM2 => {
+            // オーナードローボタン: 角丸フラット+中央白文字(終了のみ赤系)
+            unsafe {
+                let dis = lparam as *const DrawItemStruct;
+                if dis.is_null() {
+                    return 0;
+                }
+                let d = &*dis;
+                let brush_color = if d.ctl_id == MENU_QUIT { CLR_DANGER } else { CLR_ACCENT };
+                let brush = CreateSolidBrush(rgb(brush_color));
+                let pen = CreatePen(0 /*PS_SOLID*/, 1, rgb(brush_color));
+                let old_b = SelectObject(d.hdc, brush);
+                let old_p = SelectObject(d.hdc, pen);
+                RoundRect(
+                    d.hdc,
+                    d.rc_item.left,
+                    d.rc_item.top,
+                    d.rc_item.right,
+                    d.rc_item.bottom,
+                    8,
+                    8,
+                );
+                SelectObject(d.hdc, old_b);
+                SelectObject(d.hdc, old_p);
+                DeleteObject(brush);
+                DeleteObject(pen);
+                SetTextColor(d.hdc, 0xFFFFFF);
+                SetBkMode(d.hdc, TRANSPARENT_BK);
+                // ボタン文字はウィンドウテキストから取る
+                let mut buf = [0u16; 64];
+                extern "system" {
+                    fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
+                }
+                let len = GetWindowTextW(d.hwnd_item as HWND, buf.as_mut_ptr(), 64);
+                if len > 0 {
+                    let mut r = d.rc_item;
+                    r.left += 4;
+                    r.right -= 4;
+                    DrawTextW(d.hdc, buf.as_mut_ptr(), len, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                }
+            }
+            1 // 描画済み
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 窓の全面描画: ダーク背景 + 接続情報カード(角丸)
+unsafe fn paint_status(hwnd: HWND) {
+    unsafe {
+        #[repr(C)]
+        struct PaintStruct {
+            hdc: *mut core::ffi::c_void,
+            erase: i32,
+            rc_paint: Rect,
+            restore: i32,
+            inc_update: i32,
+            reserved: [u8; 32],
+        }
+        extern "system" {
+            fn BeginPaint(hwnd: HWND, ps: *mut PaintStruct) -> *mut core::ffi::c_void;
+            fn EndPaint(hwnd: HWND, ps: *const PaintStruct) -> i32;
+            fn GetClientRect(hwnd: HWND, rect: *mut Rect) -> i32;
+        }
+        let mut ps = std::mem::zeroed::<PaintStruct>();
+        let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_null() {
+            return;
+        }
+        let mut rc = std::mem::zeroed::<Rect>();
+        GetClientRect(hwnd, &mut rc);
+        // 背景
+        let bg = CreateSolidBrush(rgb(CLR_BG));
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+        // 接続カード(RTT/スピーカー/ファイル を囲む角丸面)
+        let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 200 };
+        let card_brush = CreateSolidBrush(rgb(CLR_CARD));
+        let card_pen = CreatePen(0, 1, rgb(CLR_CARD));
+        let ob = SelectObject(hdc, card_brush);
+        let op = SelectObject(hdc, card_pen);
+        RoundRect(hdc, card.left, card.top, card.right, card.bottom, 10, 10);
+        SelectObject(hdc, ob);
+        SelectObject(hdc, op);
+        DeleteObject(card_brush);
+        DeleteObject(card_pen);
+        EndPaint(hwnd, &ps);
     }
 }
 
@@ -302,8 +512,8 @@ unsafe fn open_status_window() {
             hInstance: hinst,
             hIcon: TRAY_HICON.load(Ordering::Relaxed) as *mut core::ffi::c_void,
             hCursor: std::ptr::null_mut(),
-            // 標準のシステム色(白系)で塗る=未指定だと背景が残って見苦しい
-            hbrBackground: 6 /*COLOR_WINDOW + 1*/ as *mut core::ffi::c_void,
+            // 背景は WM_PAINT で自前描画するため未指定(WM_ERASEBKGND も抑制)
+            hbrBackground: std::ptr::null_mut(),
             lpszMenuName: std::ptr::null(),
             lpszClassName: class.as_ptr(),
         };
@@ -314,7 +524,7 @@ unsafe fn open_status_window() {
             class.as_ptr(),
             wide("tsunagu").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 460, 380,
+            60, 60, 460, 300,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -324,6 +534,7 @@ unsafe fn open_status_window() {
             eprintln!("[tray] ステータスウィンドウ生成失敗");
             return;
         }
+        apply_dark_titlebar(hwnd);
         let _ = STATUS_HWND.store(hwnd as usize, Ordering::Relaxed);
         let font = segoe_font(false, 17);
         let font_bold = segoe_font(true, 19);
@@ -345,24 +556,26 @@ unsafe fn open_status_window() {
             child as usize
         };
         // 状態行は太字・大きめで最初に目に入るように。以降は通常行
-        let state_h = make_child("STATIC", "状態: …", 0, 18, 20, 420, 26, 0);
+        let state_h = make_child("STATIC", "状態: …", 0, 18, 16, 420, 26, ID_LBL_STATE as usize);
         PostMessageW(state_h as _, WM_SETFONT, font_bold as usize, 1);
         let _ = LABEL_STATE.store(state_h, Ordering::Relaxed);
-        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 18, 50, 420, 20, 0), Ordering::Relaxed);
-        // 見出し「接続」(太字)。項目は 1 段字下げして階層を見せる
-        let head_conn = make_child("STATIC", "接続", 0, 18, 78, 420, 18, 0);
+        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 18, 46, 420, 20, ID_LBL_BUILD as usize), Ordering::Relaxed);
+        // 見出し「接続」(太字)とカード内の項目(paint_status のカード矩形に合わせる)
+        let head_conn = make_child("STATIC", "接続", 0, 26, 80, 400, 18, ID_HEAD_CONN as usize);
         PostMessageW(head_conn as _, WM_SETFONT, font_bold as usize, 1);
-        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 30, 100, 410, 20, 0), Ordering::Relaxed);
-        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 30, 124, 410, 20, 0), Ordering::Relaxed);
-        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 30, 148, 410, 20, 0), Ordering::Relaxed);
-        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 30, 172, 410, 20, 0), Ordering::Relaxed);
+        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 38, 102, 390, 20, ID_LBL_RTT as usize), Ordering::Relaxed);
+        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 38, 124, 390, 20, ID_LBL_AUDIO as usize), Ordering::Relaxed);
+        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 38, 146, 390, 20, ID_LBL_SPK as usize), Ordering::Relaxed);
+        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 38, 168, 390, 20, ID_LBL_FILES as usize), Ordering::Relaxed);
         // 見出し「操作」(太字)
-        let head_act = make_child("STATIC", "操作", 0, 18, 202, 420, 18, 0);
+        let head_act = make_child("STATIC", "操作", 0, 18, 212, 420, 18, ID_HEAD_ACT as usize);
         PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
-        make_child("BUTTON", "ログを開く", 0, 18, 226, 100, 34, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 124, 226, 108, 34, MENU_AUDIO as usize);
-        make_child("BUTTON", "再起動", 0, 238, 226, 88, 34, MENU_RESTART as usize);
-        make_child("BUTTON", "終了", 0, 332, 226, 88, 34, MENU_QUIT as usize);
+        // ボタンはオーナードロー(角丸フラット・WM_DRAWITEM で描画)
+        const BS_OWNERDRAW: u32 = 0x000B;
+        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 236, 100, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 124, 236, 108, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "再起動", BS_OWNERDRAW, 238, 236, 88, 36, MENU_RESTART as usize);
+        make_child("BUTTON", "終了", BS_OWNERDRAW, 332, 236, 88, 36, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
@@ -489,6 +702,10 @@ unsafe fn tray_loop() {
     }
     SetTimer(hwnd, 1, 1000, None);
     eprintln!("[tray] タスクトレイに常駐しました");
+    // デバッグ/スクリーンショット検証用: TSUNAGU_STATUS_SHOW=1 で起動時に窓を開く
+    if tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1") {
+        open_status_window();
+    }
 
     let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG =
         std::mem::zeroed();

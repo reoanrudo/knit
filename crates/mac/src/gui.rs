@@ -4,9 +4,9 @@
 // 呼び出し規約: このモジュールの全関数はメインスレッドから呼ぶこと
 // (start() は main() の末尾、IMP は AppKit のイベント配信=メインRunLoop)。
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::{do_toggle, msg0, nsstring, objc_getClass};
+use crate::{do_toggle, msg0, msg0_cstr, nsstring, objc_getClass};
 
 type ID = *mut core::ffi::c_void;
 type SEL = *mut core::ffi::c_void;
@@ -128,8 +128,10 @@ static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
 static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
+/// 起動直後に設定ウィンドウを開く(--show-prefs。1 秒タイマーの初回で処理)
+pub static SHOW_AT_START: AtomicBool = AtomicBool::new(false);
 
-/// NSRect(f64 x4)。NSWindow 初期化など by-value 渡しに使う
+/// NSRect(f64 x4)。戻り値受け取りにのみ使う(渡しは rect_args を使う)
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NSRect {
@@ -137,6 +139,36 @@ struct NSRect {
     y: f64,
     w: f64,
     h: f64,
+}
+
+/// Apple arm64 の objc ABI では構造体引数は汎用レジスタへ分解して渡される
+/// (HFA のまま v レジスタで渡すと未認識セレクタ扱いで NSException になる)。
+/// そのため NSRect は f64::to_bits した u64 x4 として渡す
+#[allow(clippy::too_many_arguments)]
+unsafe fn rect_call(
+    target: ID,
+    cmd: SEL,
+    r: NSRect,
+    more: &[u64],
+    tr8: u8,
+) -> ID {
+    unsafe {
+        // (id, sel, x, y, w, h, ...more...) を最大 8 整数引数まで扱う
+        let mut args = [
+            r.x.to_bits(),
+            r.y.to_bits(),
+            r.w.to_bits(),
+            r.h.to_bits(),
+            0u64,
+            0u64,
+        ];
+        for (i, v) in more.iter().take(2).enumerate() {
+            args[4 + i] = *v;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, u64, u64, u64, u64, u64, u64, u8) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        f(target, cmd, args[0], args[1], args[2], args[3], args[4], args[5], tr8)
+    }
 }
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
@@ -293,14 +325,34 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
         crate::send_files_to_win(pb);
     }
 }
-/// 設定ウィンドウを開く(初回のみ生成。以降は同一ウィンドウを前面化)
-unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
+/// 設定ウィンドウを開く(初回のみ生成。以降は同一ウィンドウを前面化)。
+/// メニューの IMP と起動直後(--show-prefs)の両方から呼ぶ
+/// NSException の内容を abort 前にログへ(objc が unwind 前に呼ぶ)
+unsafe extern "C" fn uncaught_exc_handler(exc: ID) {
+    unsafe {
+        let name = msg0_cstr(msg0(exc, sel(c"name")), sel(c"UTF8String"));
+        let reason = msg0_cstr(msg0(exc, sel(c"reason")), sel(c"UTF8String"));
+        eprintln!(
+            "[prefs] NSException name={:?} reason={:?}",
+            if name.is_null() { None } else { std::ffi::CStr::from_ptr(name).to_str().ok() },
+            if reason.is_null() { None } else { std::ffi::CStr::from_ptr(reason).to_str().ok() },
+        );
+    }
+}
+
+pub fn show_prefs() {
+    eprintln!("[prefs] enter");
     unsafe {
         let app = msg0(objc_getClass(c"NSApplication".as_ptr()), sel(c"sharedApplication"));
         if !app.is_null() {
             // メニューバー常駐型は非アクティブなので明示的に前面化する
             msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
         }
+        extern "C" {
+            fn NSSetUncaughtExceptionHandler(h: Option<unsafe extern "C" fn(ID)>);
+        }
+        unsafe { NSSetUncaughtExceptionHandler(Some(uncaught_exc_handler)) };
+        eprintln!("[prefs] activated");
         let existing = PREFS_WIN.load(Ordering::Relaxed) as ID;
         if existing.is_null() {
             let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
@@ -315,6 +367,10 @@ unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
         msg1_void_id(win, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
         sync_prefs_state();
     }
+}
+
+unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
+    show_prefs();
 }
 
 /// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)
@@ -369,7 +425,7 @@ unsafe fn section_heading(cv: ID, text: &str, frame: NSRect) {
             std::mem::transmute(crate::objc_msgSend as usize);
         let lbl = mk(
             objc_getClass(c"NSTextField".as_ptr()),
-            sel(c"labelWithTitle:"),
+            sel(c"labelWithString:"),
             crate::nsstring(text),
         );
         if lbl.is_null() {
@@ -390,11 +446,12 @@ unsafe fn section_heading(cv: ID, text: &str, frame: NSRect) {
                 setc(lbl, sel(c"setTextColor:"), color);
             }
         }
-        let f = crate::msg0(lbl, sel(c"font"));
-        if !f.is_null() {
+        // boldSystemFontOfSize: は NSFont のクラスメソッド(インスタンスへは送れない)
+        let font_cls = objc_getClass(c"NSFont".as_ptr());
+        if !font_cls.is_null() {
             let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
                 std::mem::transmute(crate::objc_msgSend as usize);
-            let bf = bold(f, sel(c"boldSystemFontOfSize:"), 11.0);
+            let bf = bold(font_cls, sel(c"boldSystemFontOfSize:"), 11.0);
             if !bf.is_null() {
                 let setf: unsafe extern "C" fn(ID, SEL, ID) =
                     std::mem::transmute(crate::objc_msgSend as usize);
@@ -423,12 +480,14 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             std::mem::transmute(crate::objc_msgSend as usize);
 
         // titled(1) | closable(2) | resizable(8)、backing=Buffered(2)、defer=NO
+        eprintln!("[prefs] building");
         let alloc = msg0(objc_getClass(c"NSWindow".as_ptr()), sel(c"alloc"));
+        eprintln!("[prefs] alloc ok");
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 730.0 },
-            1 | 2 | 8,
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 640.0 },
+            1 | 2 | 8 | 0x8000, // +FullSizeContentView
             2,
             0,
         );
@@ -436,31 +495,56 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             return std::ptr::null_mut();
         }
         msg1_void_id(win, sel(c"setTitle:"), nsstring("Tsunagu 設定"));
-        // リサイズしても崩れないよう最小サイズを固定(リサイズ不可の誤操作防止)
-        let set_min: unsafe extern "C" fn(ID, SEL, NSRect) =
+        // タイトルバーを透過し、すりガラスを窓全面に(モダンな設定画面の見た目)
+        msg1_void_u8(win, sel(c"setTitlebarAppearsTransparent:"), 1);
+        // FullSizeContentView により中央タイトル/traffic lights が内容と重なるため
+        // タイトル文字は非表示にする(左上ボタンのみ残す)
+        msg1_void_i64(win, sel(c"setTitleVisibility:"), 1);
+        // リサイズしても崩れないよう最小サイズを固定。setContentMinSize: の引数は
+        // NSSize(f64×2)のため f64 2 引数の transmute で渡す(NSRect 32byte と混同注意)
+        let set_min: unsafe extern "C" fn(ID, SEL, f64, f64) =
             std::mem::transmute(crate::objc_msgSend as usize);
-        set_min(win, sel(c"setContentMinSize:"), NSRect { x: 400.0, y: 730.0, w: 400.0, h: 730.0 });
+        set_min(win, sel(c"setContentMinSize:"), 400.0, 640.0);
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
         if cv.is_null() {
             return std::ptr::null_mut();
         }
+        // ---- すりガラス背景(NSVisualEffectView)。最初に追加=最背面 ----
+        let ve_cls = objc_getClass(c"NSVisualEffectView".as_ptr());
+        if !ve_cls.is_null() {
+            let bounds: unsafe extern "C" fn(ID, SEL) -> NSRect =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            let b = bounds(cv, sel(c"bounds"));
+            let alloc_v = msg0(ve_cls, sel(c"alloc"));
+            let init_frame: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            let ve = init_frame(alloc_v, sel(c"initWithFrame:"), b);
+            if !ve.is_null() {
+                msg1_void_i64(ve, sel(c"setMaterial:"), 2); // Sidebar(穏当な明るさ)
+                msg1_void_i64(ve, sel(c"setBlendingMode:"), 0); // behind window
+                msg1_void_i64(ve, sel(c"setState:"), 1); // active
+                // 窓リサイズに追従(width|height sizable)
+                msg1_void_i64(ve, sel(c"setAutoresizingMask:"), 2 | 16);
+                msg1_void_id(cv, sel(c"addSubview:"), ve);
+            }
+        }
         let btn_cls = objc_getClass(c"NSButton".as_ptr());
 
         // ---- 状態行(最上部・太字。1 秒タイマーで更新・接続状態で色が変わる) ----
         let state_lbl = label(
             objc_getClass(c"NSTextField".as_ptr()),
-            sel(c"labelWithTitle:"),
+            sel(c"labelWithString:"),
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 730.0 - 40.0, w: 360.0, h: 24.0 });
-            let f = msg0(state_lbl, sel(c"font"));
-            if !f.is_null() {
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 640.0 - 56.0, w: 360.0, h: 24.0 });
+            let font_cls = objc_getClass(c"NSFont".as_ptr());
+            if !font_cls.is_null() {
                 let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
                     std::mem::transmute(crate::objc_msgSend as usize);
-                let bf = bold(f, sel(c"boldSystemFontOfSize:"), 13.0);
+                let bf = bold(font_cls, sel(c"boldSystemFontOfSize:"), 13.0);
                 if !bf.is_null() {
                     msg1_void_id(state_lbl, sel(c"setFont:"), bf);
                 }
@@ -470,11 +554,11 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
 
         // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
-        let mut y = 730.0 - 76.0;
+        let mut y = 640.0 - 84.0;
         let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
-                sel(c"checkWithTitle:target:action:"),
+                sel(c"checkboxWithTitle:target:action:"),
                 nsstring(title),
                 target,
                 sel(action),
@@ -488,15 +572,15 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         section_heading(cv, "切替", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
         place_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE, y);
-        y -= 34.0;
+        y -= 38.0;
         place_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS, y);
-        y -= 34.0;
+        y -= 38.0;
 
         // ---- スクロール ----
         section_heading(cv, "スクロール", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
         place_check("方向を Mac に合わせる(オフ: Windows 標準)", c"sdScroll:", &PREFS_CHK_SCROLL, y);
-        y -= 34.0;
+        y -= 38.0;
 
         // ---- スクロール速度スライダー(右ほど遅い=除数 20..240) ----
         let slider_cls = objc_getClass(c"NSSlider".as_ptr());
@@ -520,8 +604,8 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
         let gain_lbl = label(
             objc_getClass(c"NSTextField".as_ptr()),
-            sel(c"labelWithTitle:"),
-            nsstring(&format!("スクロール速度: ({:.0})", crate::scroll_div())),
+            sel(c"labelWithString:"),
+            nsstring(&format!("速度: {:.0}", crate::scroll_div())),
         );
         if !gain_lbl.is_null() {
             set_frame(gain_lbl, sel(c"setFrame:"), NSRect { x: 232.0, y: y - 2.0, w: 130.0, h: 20.0 });
@@ -534,33 +618,33 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         section_heading(cv, "Windows", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
         y -= 26.0;
         place_check("Windows の音声を Mac で再生", c"sdAudio:", &PREFS_CHK_AUDIO, y);
-        y -= 34.0;
+        y -= 38.0;
         place_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD, y);
-        y -= 34.0;
+        y -= 38.0;
         place_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK, y);
-        y -= 34.0;
+        y -= 38.0;
 
         // ---- 操作ボタン(切替 + ファイル送信) ----
         let toggle_btn = push_btn(
             btn_cls,
             sel(c"buttonWithTitle:target:action:"),
-            nsstring("Windows へ切替 / Mac へ戻る"),
+            nsstring("切替(Mac ⇄ Windows)"),
             target,
             sel(c"sdToggle:"),
         );
         if !toggle_btn.is_null() {
-            set_frame(toggle_btn, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 180.0, h: 32.0 });
+            set_frame(toggle_btn, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 195.0, h: 32.0 });
             msg1_void_id(cv, sel(c"addSubview:"), toggle_btn);
         }
         let send = push_btn(
             btn_cls,
             sel(c"buttonWithTitle:target:action:"),
-            nsstring("Windows へファイルを送る…"),
+            nsstring("ファイルを送る…"),
             target,
             sel(c"sdSendFile:"),
         );
         if !send.is_null() {
-            set_frame(send, sel(c"setFrame:"), NSRect { x: 210.0, y: y - 4.0, w: 150.0, h: 32.0 });
+            set_frame(send, sel(c"setFrame:"), NSRect { x: 225.0, y: y - 4.0, w: 145.0, h: 32.0 });
             msg1_void_id(cv, sel(c"addSubview:"), send);
         }
         y -= 46.0;
@@ -570,12 +654,12 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             let b = push_btn(
                 btn_cls,
                 sel(c"buttonWithTitle:target:action:"),
-                nsstring(&format!("Windows {title}")),
+                nsstring(title),
                 target,
                 sel(c"sdVol:"),
             );
             if !b.is_null() {
-                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 112.0, h: 30.0 });
+                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 130.0, h: 30.0 });
                 msg1_void_id(cv, sel(c"addSubview:"), b);
                 msg1_void_i64(b, sel(c"setTag:"), tag as i64);
             }
@@ -585,7 +669,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         // バージョン/状態の情報行(選択不可ラベル)
         let info = label(
             objc_getClass(c"NSTextField".as_ptr()),
-            sel(c"labelWithTitle:"),
+            sel(c"labelWithString:"),
             nsstring(&format!("Tsunagu {} ・ {}", crate::VERSION_STR, crate::BUILD_ID)),
         );
         if !info.is_null() {
@@ -619,6 +703,11 @@ unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     std::process::exit(0);
 }
 unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
+    // --show-prefs: NSApp.run 開始後のタイマーコンテキストで開く
+    // (run 前のウィンドウ操作は NSException で abort するため遅延させる)
+    if SHOW_AT_START.swap(false, Ordering::Relaxed) {
+        show_prefs();
+    }
     refresh_status();
 }
 

@@ -1153,7 +1153,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260925-225359-a616d36";
+const BUILD_ID: &str = "build-20260925-233958-967d8a8";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1297,11 +1297,29 @@ fn main() {
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(line) => {
+                    // 送信の束ね(coalescing): 高頻度のマウス移動は 1 行 1 write+flush だと
+                    // 小パケット連打になり、WiFi の揺らぎで束になって到着=カクつきの原因。
+                    // キューに滞留中の行をまとめて 1 回の write にする(順序は保存され、
+                    // Windows 側は行ごとに注入するため見た目の滑らかさが向上する)
+                    let mut buf = line;
+                    let mut total = buf.len();
+                    for _ in 0..32 {
+                        if total > 256 * 1024 {
+                            break; // 巨大行(ファイル chunk 等)の連結は程々に
+                        }
+                        match rx.try_recv() {
+                            Ok(next) => {
+                                total += next.len();
+                                buf.push_str(&next);
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = guard.as_mut() {
                         // encode() が行末 \n を持つため writeln! だと二重改行で
                         // ワイヤが \n\n になる(受信側の空行パースが倍増する)。write_all で送る
-                        if s.write_all(line.as_bytes()).and_then(|_| s.flush()).is_err() {
+                        if s.write_all(buf.as_bytes()).and_then(|_| s.flush()).is_err() {
                             *guard = None; // 書けなくなったら外す(接続ループが検知)
                         }
                     }
@@ -1635,6 +1653,11 @@ fn main() {
         || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v| v == "1");
     if !no_gui && gui::start() {
         eprintln!("[gui] メニューバー常駐を開始しました");
+        // --show-prefs: 起動直後に設定ウィンドウを開く(スクリーンショット検証用)。
+        // 実際の生成は NSApp.run 後のタイマー初回で行う
+        if args.iter().any(|a| a == "--show-prefs") {
+            gui::SHOW_AT_START.store(true, Ordering::Relaxed);
+        }
         unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)
     } else {
         unsafe { CFRunLoopRun() };
