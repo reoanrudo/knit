@@ -20,8 +20,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_LWIN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetSystemMetrics, GetWindowTextW, IsWindowVisible,
-    SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+    EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
+    IsWindowVisible, SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
+    SW_RESTORE,
 };
 
 const INPUT_MOUSE: u32 = 0;
@@ -51,6 +52,31 @@ unsafe extern "system" {
     fn GlobalLock(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn GlobalUnlock(hMem: *mut core::ffi::c_void) -> i32;
     fn GlobalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+// ---------- Win32 直宣言(IME 制御) ----------
+#[link(name = "imm32")]
+unsafe extern "system" {
+    fn ImmGetContext(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn ImmSetOpenStatus(himc: *mut core::ffi::c_void, fOpen: i32) -> i32;
+    fn ImmReleaseContext(hwnd: *mut core::ffi::c_void, himc: *mut core::ffi::c_void) -> i32;
+}
+
+/// フォアグラウンドウィンドウの IME を開(かな)/閉じ(英数)する。
+/// キーエミュレート(VK_KANJI 等)と違い方向指定が確実。
+fn ime_set_open(open: bool) {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_null() {
+            return;
+        }
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return; // IME 非対応ウィンドウ(コンソール等)
+        }
+        ImmSetOpenStatus(himc, open as i32);
+        ImmReleaseContext(hwnd, himc);
+    }
 }
 
 const CF_UNICODETEXT: u32 = 13;
@@ -410,6 +436,26 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
                     let ch = sd_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
+                }
+                // Mac JIS の かな(102)/英数(104)キーは Windows 側 IME の開閉に変換する
+                if down {
+                    match kc {
+                        102 => {
+                            ime_set_open(true);
+                            if DEBUG_KEYS.load(Ordering::Relaxed) {
+                                println!("[ime] kana -> IME on");
+                            }
+                            continue;
+                        }
+                        104 => {
+                            ime_set_open(false);
+                            if DEBUG_KEYS.load(Ordering::Relaxed) {
+                                println!("[ime] eisu -> IME off");
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
                 }
                 mods.apply(ctrl, opt, cmd, shift);
                 if let Some(vk) = mac_kc_to_win_vk(kc) {
