@@ -153,6 +153,14 @@ static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下)。Mac から Cfg で同期
 pub static SIDE_W: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Windows 側で現在押下中のマウスボタン(後片付けの UP 注入を押下中のみに絞る。
+/// 押されていないボタンへの UP は通常無害だが、一部アプリで意図しない
+/// クリックとして扱われる懸念を排除する)
+static BTN_W: [std::sync::atomic::AtomicBool; 3] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 /// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
 static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
@@ -666,7 +674,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-012757-b62a2d0";
+const BUILD_ID: &str = "win-20260926-014223-a17f37a";
 
 fn main() {
     ensure_stdout();
@@ -1228,6 +1236,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     // XButton1/2(トラックパッドの戻る/進むスワイプ)
                     inject_xbutton(btn - 3, down);
                 } else {
+                    BTN_W[btn as usize].store(down, Ordering::Relaxed);
                     inject_mouse_btn(btn, down);
                 }
             }
@@ -1387,7 +1396,9 @@ fn maybe_notify_return(
         // (b) Alt+Tab 変換が未確定なら確定する(スイッチャー残留防止)
         mods.release_all();
         for b in 0u8..=2 {
-            inject_mouse_btn(b, false);
+            if BTN_W[b as usize].swap(false, Ordering::Relaxed) {
+                inject_mouse_btn(b, false); // 押下中のボタンだけ確実に離す
+            }
         }
         if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
             inject_key(0x09, true); // VK_TAB up

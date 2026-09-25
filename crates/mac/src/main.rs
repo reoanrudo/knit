@@ -985,8 +985,14 @@ unsafe extern "C" fn tap_callback(
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
         // 音量キー(F10/11/12 相当: 74=ミュート/73=下/72=上)は Mac の音量を変えず
-        // Windows 側の音量として転送する(実体は Vol メッセージ+イベント握りつぶし)
-        if event_type == EVT_KEY_DOWN && (72..=74).contains(&kc) && win_mode {
+        // Windows 側の音量として転送する(実体は Vol メッセージ+イベント握りつぶし)。
+        // FN フラグ付き(=本体の音量キー操作)のみ。F11 全画面など F キーとしての
+        // 使用は Windows へ素通しさせ、誤転送(意図しない音量变化)を防ぐ
+        if event_type == EVT_KEY_DOWN
+            && (72..=74).contains(&kc)
+            && CGEventGetFlags(event) & FLAG_FN != 0
+            && win_mode
+        {
             let op = match kc {
                 72 => 0u8, // VolumeUp
                 73 => 1,   // VolumeDown
@@ -1440,7 +1446,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-012744-b62a2d0";
+const BUILD_ID: &str = "build-20260926-014208-a17f37a";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");

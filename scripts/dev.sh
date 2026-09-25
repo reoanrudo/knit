@@ -4,6 +4,7 @@
 #   --no-win    Windows 配備をスキップ(Mac 側だけ変えた時)
 #   --no-verify 自動検証をスキップ
 set -e
+set -o pipefail
 cd "$(dirname "$0")/.."
 source $HOME/.cargo/env 2>/dev/null || true
 
