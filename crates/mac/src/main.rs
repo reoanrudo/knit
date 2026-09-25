@@ -246,6 +246,12 @@ static TAP_REARM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// 「ユーザーが操作中なのに Windows へ届いていない」状態を検知する
 static LAST_EVENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 境界ダブルタップ切替(Deskflow switchDoubleTap 相当)。
+/// SEAMLESS_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
+/// 切替しないため、境界付近での日常作業と Windows への移動が分離される
+static EDGE_TAPS: OnceLock<u32> = OnceLock::new();
+static EDGE_AT_EDGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static EDGE_LAST_HIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -502,6 +508,10 @@ unsafe extern "C" fn tap_callback(
                 let edge = EDGE_PX.get().copied().unwrap_or(2.0);
                 // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
                 let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
+                // 境界から十分内側へ戻ったらヒット状態をリセット(次の到達を1回目として数える)
+                if px < edge_x - edge - 8.0 {
+                    EDGE_AT_EDGE.store(false, Ordering::Relaxed);
+                }
                 // 距離アームは廃止: 復帰後に右方向へ動くユーザーの自然な操作が
                 // 「内側へ離れる」条件を満たせず Windows へ行けなくなるため。
                 // チャタリング防止は復帰位置 150px 内側 + 時間ガードで担保する
@@ -514,6 +524,20 @@ unsafe extern "C" fn tap_callback(
                         // 積算ドリフト検出: 実位置で CUR_POS を補正して通過
                         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
                         return event;
+                    }
+                    // ダブルタップ判定: 閾値を「下から跨いだ瞬間」だけをヒットと数え、
+                    // 500ms 以内の 2回目のヒットでのみ切替する(1回目は素通し)。
+                    // カーソルが境界に張り付いたまま出す delta は継続扱いで数えない
+                    if !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
+                        let taps = EDGE_TAPS.get().copied().unwrap_or(2);
+                        let now = now_ms();
+                        let prev = EDGE_LAST_HIT_MS.swap(now, Ordering::Relaxed);
+                        let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= 500);
+                        if !fire {
+                            eprintln!("[edge] 1回目の到達(ダブルタップ待ち)");
+                            return event; // 2回目を待つ(この間カーソルは素通り)
+                        }
+                        EDGE_LAST_HIT_MS.store(0, Ordering::Relaxed);
                     }
                     WIN_MODE.store(true, Ordering::Relaxed);
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -734,20 +758,26 @@ fn main() {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
     }
+    if let Some(t) = std::env::var("SEAMLESS_EDGE_TAPS").ok().and_then(|v| v.parse::<u32>().ok()) {
+        if t >= 1 && t <= 3 {
+            let _ = EDGE_TAPS.set(t);
+        }
+    }
     if let Some(k) = std::env::var("SEAMLESS_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
         if (1..=127).contains(&k) {
             let _ = HOTKEY_KC.set(k);
         }
     }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={}",
+        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
         CLIP_MAX_BYTES / 1024,
         if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" },
         if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" },
-        hotkey_kc()
+        hotkey_kc(),
+        EDGE_TAPS.get().copied().unwrap_or(2)
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
