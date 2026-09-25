@@ -77,6 +77,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 | `SEAMLESS_SCROLL_DIV` | 120 | スクロール速度の除数。大きくすると遅い(40〜200で調整) |
 | `SEAMLESS_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
 | `SEAMLESS_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
+| `SEAMLESS_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
 | `SEAMLESS_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
 | `SEAMLESS_DESK_TOKEN` | seamless-desk-dev | 両側共通の認証トークン |
 
