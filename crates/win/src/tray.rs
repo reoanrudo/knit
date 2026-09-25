@@ -115,6 +115,8 @@ const MENU_AUDIO: u32 = 1003;
 const MENU_OPENLOG: u32 = 1004;
 const MENU_RESTART: u32 = 1005;
 const MENU_SAVEHOST: u32 = 1006;
+const MENU_BACKMAC: u32 = 1007;
+const MENU_OPENFOLDER: u32 = 1008;
 // ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
 const ID_LBL_STATE: u32 = 210;
 const ID_HEAD_CONN: u32 = 211;
@@ -171,6 +173,10 @@ static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static LABEL_RTT: AtomicUsize = AtomicUsize::new(0);
 static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FILES: AtomicUsize = AtomicUsize::new(0);
+static LABEL_MACCFG: AtomicUsize = AtomicUsize::new(0);
+static LABEL_FOOTER: AtomicUsize = AtomicUsize::new(0);
+/// プロセス起動時刻(稼働時間表示用)
+static START_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
 /// 現在接続先としているホスト(サーバー編集欄の初期値)
 pub static HOST_NOW: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
@@ -216,6 +222,29 @@ fn save_host_to_env(host: &str) {
         .collect();
     lines.push(format!("TSUNAGU_HOST={host}"));
     let _ = std::fs::write(&path, lines.join("\r\n") + "\r\n");
+}
+
+/// Mac 側の設定(画面位置・⌘キー割当)の表示。Mac から Cfg で同期された値
+fn maccfg_line() -> String {
+    let side = match crate::SIDE_W.load(Ordering::Relaxed) {
+        1 => "左",
+        2 => "上",
+        3 => "下",
+        _ => "右",
+    };
+    let cmd = if crate::CMD_ALT.load(Ordering::Relaxed) { "Alt" } else { "Ctrl" };
+    format!("Mac の設定: Windows は{side}・⌘キーは {cmd}")
+}
+
+/// フッター: 接続先サーバーと稼働時間(1 秒タイマーで更新)
+fn footer_line() -> String {
+    let host = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let up = START_AT
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs();
+    let (h, m) = (up / 3600, (up % 3600) / 60);
+    format!("接続先: {host} ・ 稼働 {h}時間{m:02}分")
 }
 
 /// ファイル受信の累計(ステータス窓の表示)
@@ -339,6 +368,35 @@ unsafe fn handle_command(id: u32) {
             let np = wide("notepad.exe");
             ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
         }
+        MENU_BACKMAC => {
+            // Mac へ制御を返す(Return を送る=左端到達と同じ経路)
+            let guard = crate::WTX.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(crate::proto_return());
+                println!("[tray] Mac へ戻る");
+            }
+        }
+        MENU_OPENFOLDER => {
+            // 受信フォルダ(DOWNLOADS\\Tsunagu)をエクスプローラーで開く
+            let dir = std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join("Downloads")
+                .join("Tsunagu");
+            let _ = std::fs::create_dir_all(&dir);
+            let mut path: Vec<u16> = dir.to_string_lossy().encode_utf16().collect();
+            path.push(0);
+            let verb = wide("open");
+            let target = wide("explorer.exe");
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                target.as_ptr(),
+                path.as_ptr(),
+                std::ptr::null(),
+                5,
+            );
+        }
         MENU_SAVEHOST => {
             // サーバー(Mac)アドレスを .env へ保存して再起動(自動復帰が起こす)
             let hwnd = EDIT_HOST.load(Ordering::Relaxed) as HWND;
@@ -414,9 +472,22 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                     fn GetDlgCtrlID(hwnd: HWND) -> i32;
                 }
                 let id = GetDlgCtrlID(child);
+                // RTT は値で色分け(緑=快適/黄=やや遅延/赤=遅延)
                 let color = match id as u32 {
                     ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT => rgb(CLR_HEAD),
-                    ID_LBL_BUILD => rgb(CLR_SUB),
+                    ID_LBL_BUILD | 1002 => rgb(CLR_SUB),
+                    ID_LBL_RTT => {
+                        let ms = crate::RTT_MS.load(Ordering::Relaxed);
+                        if !crate::CONNECTED.load(Ordering::Relaxed) || ms == 0 {
+                            rgb(CLR_TEXT)
+                        } else if ms <= 10 {
+                            0x53D769 // 緑
+                        } else if ms <= 40 {
+                            0xF5D547 // 黄
+                        } else {
+                            0xF26B5B // 赤
+                        }
+                    }
                     _ => rgb(CLR_TEXT),
                 };
                 SetTextColor(hdc, color);
@@ -504,7 +575,7 @@ unsafe fn paint_status(hwnd: HWND) {
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
         // 接続カード(RTT/スピーカー/ファイル を囲む角丸面)
-        let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 200 };
+        let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 216 };
         let card_brush = CreateSolidBrush(rgb(CLR_CARD));
         let card_pen = CreatePen(0, 1, rgb(CLR_CARD));
         let ob = SelectObject(hdc, card_brush);
@@ -569,13 +640,23 @@ unsafe fn open_status_window() {
             lpszClassName: class.as_ptr(),
         };
         RegisterClassW(&wc);
-        // タイトルバー+枠で十分なクライアント領域になるよう補正は省略(十分実用)
+        // 表示位置はカーソル(トレイ)の近く=画面内に収まる左上側(Windows 標準の
+        // トレイウィンドウ挙動)。座標系はそのままで十分実用
+        let mut wx: i32 = 60;
+        let mut wy: i32 = 60;
+        {
+            let mut pt = POINT { x: 0, y: 0 };
+            if GetCursorPos(&mut pt) != 0 {
+                wx = (pt.x - 480).max(0);
+                wy = (pt.y - 470).max(0);
+            }
+        }
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
-            wide("tsunagu").as_ptr(),
+            wide("Tsunagu ステータス").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 460, 372,
+            wx, wy, 460, 446,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -618,8 +699,9 @@ unsafe fn open_status_window() {
         let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 38, 124, 390, 20, ID_LBL_AUDIO as usize), Ordering::Relaxed);
         let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 38, 146, 390, 20, ID_LBL_SPK as usize), Ordering::Relaxed);
         let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 38, 168, 390, 20, ID_LBL_FILES as usize), Ordering::Relaxed);
+        let _ = LABEL_MACCFG.store(make_child("STATIC", &maccfg_line(), 0, 38, 190, 390, 20, 1001 as usize), Ordering::Relaxed);
         // 見出し「サーバー」(太字)+ 接続先(Mac)編集 + 保存して再接続
-        let head_srv = make_child("STATIC", "サーバー(Mac)", 0, 18, 212, 420, 18, 1000 as usize);
+        let head_srv = make_child("STATIC", "サーバー(Mac)", 0, 18, 228, 420, 18, 1000 as usize);
         PostMessageW(head_srv as _, WM_SETFONT, font_bold as usize, 1);
         let host_init = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let edit = make_child(
@@ -627,7 +709,7 @@ unsafe fn open_status_window() {
             &host_init,
             0x0080 /*ES_AUTOHSCROLL*/ | 1 /*WS_BORDER*/,
             18,
-            236,
+            252,
             250,
             26,
             0,
@@ -635,16 +717,20 @@ unsafe fn open_status_window() {
         PostMessageW(edit as _, WM_SETFONT, font as usize, 1);
         let _ = EDIT_HOST.store(edit, Ordering::Relaxed);
         const BS_OWNERDRAW2: u32 = 0x000B;
-        make_child("BUTTON", "保存して再接続", BS_OWNERDRAW2, 276, 234, 144, 30, MENU_SAVEHOST as usize);
+        make_child("BUTTON", "保存して再接続", BS_OWNERDRAW2, 276, 250, 144, 30, MENU_SAVEHOST as usize);
         // 見出し「操作」(太字)
-        let head_act = make_child("STATIC", "操作", 0, 18, 278, 420, 18, ID_HEAD_ACT as usize);
+        let head_act = make_child("STATIC", "操作", 0, 18, 294, 420, 18, ID_HEAD_ACT as usize);
         PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
         // ボタンはオーナードロー(角丸フラット・WM_DRAWITEM で描画)
         const BS_OWNERDRAW: u32 = 0x000B;
-        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 302, 100, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 124, 302, 108, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "再起動", BS_OWNERDRAW, 238, 302, 88, 36, MENU_RESTART as usize);
-        make_child("BUTTON", "終了", BS_OWNERDRAW, 332, 302, 88, 36, MENU_QUIT as usize);
+        make_child("BUTTON", "Mac へ戻る", BS_OWNERDRAW, 18, 316, 128, 36, MENU_BACKMAC as usize);
+        make_child("BUTTON", "受信フォルダ", BS_OWNERDRAW, 152, 316, 124, 36, MENU_OPENFOLDER as usize);
+        make_child("BUTTON", "音声 ON/OFF", BS_OWNERDRAW, 284, 316, 80, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "終了", BS_OWNERDRAW, 370, 316, 50, 36, MENU_QUIT as usize);
+        make_child("BUTTON", "ログを開く", BS_OWNERDRAW, 18, 358, 128, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "再起動", BS_OWNERDRAW, 152, 358, 124, 36, MENU_RESTART as usize);
+        // フッター(接続先と稼働時間)
+        let _ = LABEL_FOOTER.store(make_child("STATIC", &footer_line(), 0, 18, 406, 420, 20, 1002 as usize), Ordering::Relaxed);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
@@ -659,6 +745,8 @@ unsafe fn update_labels() {
     set_text(LABEL_RTT.load(Ordering::Relaxed), &rtt_line());
     set_text(LABEL_SPK.load(Ordering::Relaxed), &spk_line());
     set_text(LABEL_FILES.load(Ordering::Relaxed), &files_line());
+    set_text(LABEL_MACCFG.load(Ordering::Relaxed), &maccfg_line());
+    set_text(LABEL_FOOTER.load(Ordering::Relaxed), &footer_line());
 }
 
 unsafe fn open_menu(hwnd: HWND) {
@@ -676,6 +764,10 @@ unsafe fn open_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
     let mut audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
+    let mut bm = wide("Mac へ戻る");
+    AppendMenuW(menu, MF_STRING, MENU_BACKMAC as usize, bm.as_ptr());
+    let mut fo = wide("受信フォルダを開く");
+    AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
     let mut log_w = wide("ログを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
     let mut rs = wide("再起動");

@@ -156,6 +156,16 @@ pub static SIDE_W: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 /// Windows 側で現在押下中のマウスボタン(後片付けの UP 注入を押下中のみに絞る。
 /// 押されていないボタンへの UP は通常無害だが、一部アプリで意図しない
 /// クリックとして扱われる懸念を排除する)
+/// 送信チャネル(wtx)の共有: トレイの「Mac へ戻る」等から送るために
+/// session の開始時に登録し、終了時に外す
+pub static WTX: std::sync::Mutex<Option<std::sync::mpsc::Sender<String>>> =
+    std::sync::Mutex::new(None);
+
+/// 「Mac へ戻る」用の Return 行(高さは画面中央相当)
+pub fn proto_return() -> String {
+    encode(&Msg::Return { ny: 0.5 })
+}
+
 static BTN_W: [std::sync::atomic::AtomicBool; 3] = [
     std::sync::atomic::AtomicBool::new(false),
     std::sync::atomic::AtomicBool::new(false),
@@ -674,7 +684,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-015921-bffbae6";
+const BUILD_ID: &str = "win-20260926-022656-6c4e3c9";
 
 fn main() {
     ensure_stdout();
@@ -939,6 +949,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
     let (wtx, wrx) = std::sync::mpsc::channel::<String>();
+    *WTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(wtx.clone());
     let mut writer = stream.try_clone()?;
     std::thread::spawn(move || {
         while let Ok(line) = wrx.recv() {
