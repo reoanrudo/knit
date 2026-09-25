@@ -60,6 +60,9 @@ ssh -o BatchMode=yes home "if not exist C:\Users\<user>\tsunagu mkdir C:\Users\<
 ssh -o BatchMode=yes home 'schtasks /Create /TN tsunagu_run /TR "wscript.exe C:\Users\<user>\tsunagu\run_tsunagu.vbs" /SC ONCE /ST 23:59 /F' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /End /TN tsunagu_run" >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "taskkill /IM tsunagu-win.exe /F" >/dev/null 2>&1 || true
+# 起動 bat のローテーションが「前プロセスが掴んだままのログ」に負けて失敗し、
+# ログ先頭に古い起動が残るのを防ぐ(プロセス停止後にこちらで退避しておく)
+ssh -o BatchMode=yes home "move /y C:\Users\<user>\tsunagu\tsunagu-win.log C:\Users\<user>\tsunagu\tsunagu-win.log.prev >nul 2>&1" >/dev/null 2>&1 || true
 sleep 2
 scp -o BatchMode=yes target/x86_64-pc-windows-gnu/release/tsunagu-win.exe home:C:/Users/<user>/tsunagu/tsunagu-win.exe
 # 起動資材(ログローテーション実効化のため bat 経由へ変更)+アイコン+トークンも更新

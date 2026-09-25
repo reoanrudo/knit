@@ -599,7 +599,8 @@ static CMD_ALT: AtomicBool = AtomicBool::new(false);
 /// トグル時に Windows へ Cfg で同期(TSUNAGU_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE: AtomicBool = AtomicBool::new(true);
 /// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
-static SCROLL_FLIP: AtomicBool = AtomicBool::new(false);
+/// スクロール方向(既定 true=自然スクロール・Mac 準拠。false=Windows 標準)
+static SCROLL_FLIP: AtomicBool = AtomicBool::new(true);
 /// Windows との RTT(ms)。ping/pong 往復で測定(メニュー状態行の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ファイル送信中(多重送信の抑制)
@@ -675,8 +676,20 @@ unsafe fn live_cursor() -> Option<CGPoint> {
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
 static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
-/// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。TSUNAGU_SCROLL_DIV で調整可。
-static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
+/// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。設定ウィンドウの
+/// スライダーからも可変(TSUNAGU_SCROLL_DIV は初期値)。f64 を AtomicU64 ビットで保持
+static SCROLL_DIV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60.0f64.to_bits());
+
+/// 現在のスクロール除数を f64 で読む
+pub fn scroll_div() -> f64 {
+    f64::from_bits(SCROLL_DIV.load(Ordering::Relaxed))
+}
+
+/// スクロール除数を設定(20..240 にクランプ)。設定ウィンドウから呼ばれる
+pub fn set_scroll_div(v: f64) {
+    let clamped = v.clamp(20.0, 240.0);
+    SCROLL_DIV.store(clamped.to_bits(), Ordering::Relaxed);
+}
 /// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
 /// TSUNAGU_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
 static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
@@ -1094,12 +1107,14 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
             if dx != 0.0 || dy != 0.0 {
-                // ピクセル delta → ノッチ単位へ累積変換。0.25ノッチ刻みで送る。
-                // 整数ノッチ単位だと遅いスクロールがカクつくため、細かい量子化で滑らかに。
-                // 除数を大きくすると遅くなる(従来40は速すぎたので既定120)。端数は持ち越し。
-                const Q: f64 = 0.25; // 量子化幅(ノッチ)= Windows 側は 30 wheel units 刻み
-                let div = SCROLL_DIV.get().copied().unwrap_or(120.0);
-                // 方向トグル(メニュー): 既定は Windows 標準の指の動きに合わせる(反転)
+                // ピクセル delta → ノッチ単位へ累積変換。0.05ノッチ(=6 wheel units)刻みで
+                // 送る=Windows のプレシジョンタッチパッドと同じ高解像度スクロール。
+                // 0.25刻み(30 units)は低速スクロールがカクつくため細かくした。
+                // 除数を大きくすると遅くなる(設定ウィンドウのスライダーで可変)。端数は持ち越し
+                const Q: f64 = 0.05; // 量子化幅(ノッチ)
+                let div = scroll_div();
+                // 方向(メニュー/設定で切替可): 既定は Mac と同じ自然スクロール
+                // (コンテンツが指に追従)。FLIP 無効=Windows 標準のホイール方向
                 let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) { 1.0 } else { -1.0 };
                 let mut acc = SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner());
                 acc.0 += sgn * dx / div;
@@ -1124,7 +1139,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260925-223137-46e09e6";
+const BUILD_ID: &str = "build-20260925-224340-f6e9443";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1190,7 +1205,7 @@ fn main() {
     }
     if let Some(d) = std::env::var("TSUNAGU_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
-            let _ = SCROLL_DIV.set(d);
+            set_scroll_div(d);
         }
     }
     if let Some(m) = std::env::var("TSUNAGU_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
@@ -1224,8 +1239,8 @@ fn main() {
         }
     }
     // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
-    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
-        SCROLL_FLIP.store(true, Ordering::Relaxed);
+    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("0") {
+        SCROLL_FLIP.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
@@ -1235,7 +1250,7 @@ fn main() {
     }
     eprintln!(
         "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
-        SCROLL_DIV.get().copied().unwrap_or(120.0),
+        scroll_div(),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
         CLIP_MAX_BYTES / 1024,

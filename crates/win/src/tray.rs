@@ -31,6 +31,7 @@ const MENU_QUIT: u32 = 1001;
 const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
 const MENU_OPENLOG: u32 = 1004;
+const MENU_RESTART: u32 = 1005;
 
 #[link(name = "shell32")]
 #[link(name = "user32")]
@@ -77,6 +78,7 @@ static LABEL_BUILD: AtomicUsize = AtomicUsize::new(0);
 static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static LABEL_RTT: AtomicUsize = AtomicUsize::new(0);
 static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
+static LABEL_FILES: AtomicUsize = AtomicUsize::new(0);
 
 fn wide_into(buf: &mut [u16], s: &str) {
     for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
@@ -85,7 +87,7 @@ fn wide_into(buf: &mut [u16], s: &str) {
 }
 
 fn build_line() -> String {
-    format!("ビルド: {}", crate::BUILD_ID)
+    format!("バージョン: {} ({})", crate::VERSION_STR, crate::BUILD_ID)
 }
 fn audio_line() -> String {
     if crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed) {
@@ -106,6 +108,16 @@ fn rtt_line() -> String {
         format!("遅延: {ms}ms")
     }
 }
+/// ファイル受信の累計(ステータス窓の表示)
+fn files_line() -> String {
+    let n = crate::FILES_RX.load(Ordering::Relaxed);
+    if n == 0 {
+        "ファイル受信: なし".to_string()
+    } else {
+        format!("ファイル受信: 累計 {n} 件")
+    }
+}
+
 /// この PC のスピーカー状態(接続中ミュート=Mac のみ発音 の表示)
 fn spk_line() -> String {
     if !crate::audio::AUDIO_ACTIVE.load(Ordering::Relaxed) {
@@ -217,6 +229,11 @@ unsafe fn handle_command(id: u32) {
             let mut np = wide("notepad.exe");
             ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
         }
+        MENU_RESTART => {
+            // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
+            eprintln!("[tray] 再起動します(自動復帰タスクが起こします)");
+            std::process::exit(0);
+        }
         MENU_QUIT => {
             eprintln!("[tray] メニューから終了しました");
             std::process::exit(0);
@@ -276,7 +293,7 @@ unsafe fn open_status_window() {
             class.as_ptr(),
             wide("tsunagu").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 396, 284,
+            60, 60, 440, 330,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -309,10 +326,12 @@ unsafe fn open_status_window() {
         let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 14, 42, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 14, 70, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 14, 98, 350, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 14, 126, 350, 22, 0), Ordering::Relaxed);
-        make_child("BUTTON", "ログを開く", 0, 14, 160, 112, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 136, 160, 112, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "終了", 0, 258, 160, 112, 36, MENU_QUIT as usize);
+        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 14, 126, 400, 22, 0), Ordering::Relaxed);
+        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 14, 154, 400, 22, 0), Ordering::Relaxed);
+        make_child("BUTTON", "ログを開く", 0, 14, 192, 100, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 120, 192, 108, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "再起動", 0, 234, 192, 88, 36, MENU_RESTART as usize);
+        make_child("BUTTON", "終了", 0, 328, 192, 86, 36, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
@@ -326,6 +345,7 @@ unsafe fn update_labels() {
     set_text(LABEL_AUDIO.load(Ordering::Relaxed), &audio_line());
     set_text(LABEL_RTT.load(Ordering::Relaxed), &rtt_line());
     set_text(LABEL_SPK.load(Ordering::Relaxed), &spk_line());
+    set_text(LABEL_FILES.load(Ordering::Relaxed), &files_line());
 }
 
 unsafe fn open_menu(hwnd: HWND) {
@@ -345,6 +365,8 @@ unsafe fn open_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
     let mut log_w = wide("ログを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
+    let mut rs = wide("再起動");
+    AppendMenuW(menu, MF_STRING, MENU_RESTART as usize, rs.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
     let mut quit = wide("終了");
     AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());

@@ -156,6 +156,8 @@ static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// 累計ファイル受信数(ステータス窓の表示用)
+pub static FILES_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 /// ファイル送信 1 チャンクの生バイト上限(b64 後 4MB = プロトコル行上限 8MB 未満)
 const FILE_CHUNK_RAW: usize = 3 * 1024 * 1024;
@@ -471,11 +473,14 @@ fn inject_mouse_btn(btn: u8, down: bool) -> bool {
 }
 
 fn inject_scroll(dx: f64, dy: f64) -> bool {
-    // WHEEL_DELTA=120。縦優先で1イベントにまとめる
+    // WHEEL_DELTA=120 を 1 として 6 units(0.05 ノッチ)刻みで注入する。
+    // プレシジョンタッチパッドと同じ高解像度スクロールで、主要アプリは
+    // 120 未満の delta を正しく累積するため滑らかに動く(旧: 1.0 ノッチ未満は切り捨て)
     const WHEEL: u32 = 0x0800;
     const HWHEEL: u32 = 0x1000;
+    let min_units = |v: f64| (v * 120.0).round().abs() >= 1.0;
     let mut ok = true;
-    if dy.abs() >= 1.0 {
+    if min_units(dy) {
         let amount = (-dy * 120.0).round() as i32; // 下スクロール(Mac dy負)→Winは正
         ok &= send_input_buf(InputBuf {
             itype: INPUT_MOUSE,
@@ -484,7 +489,7 @@ fn inject_scroll(dx: f64, dy: f64) -> bool {
             extra: 0,
         });
     }
-    if dx.abs() >= 1.0 {
+    if min_units(dx) {
         let amount = (dx * 120.0).round() as i32;
         ok &= send_input_buf(InputBuf {
             itype: INPUT_MOUSE,
@@ -638,7 +643,9 @@ fn detach_if_console() {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-223013-46e09e6";
+/// 表示用のリリースバージョン(ステータス窓等)
+pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
+const BUILD_ID: &str = "win-20260925-224237-f6e9443";
 
 fn main() {
     ensure_stdout();
@@ -1083,6 +1090,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     .unwrap_or_default();
                 if !files.is_empty() && clipboard_write_files(&files) {
                     let n = files.len();
+                    FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
                     println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
                     tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
                     // 自分が載せた CF_HDROP を監視スレッドが検出しても送り返さない

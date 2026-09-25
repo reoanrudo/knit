@@ -125,6 +125,9 @@ static PREFS_CHK_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CMD: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_SCROLL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
+static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
 
 /// NSRect(f64 x4)。NSWindow 初期化など by-value 渡しに使う
 #[repr(C)]
@@ -137,6 +140,25 @@ struct NSRect {
 }
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
+
+/// スクロール速度スライダー(値=除数。小さいほど速い)。ドラッグ中も連続で飛ぶ
+unsafe extern "C" fn imp_scroll_gain(_s: ID, _c: SEL, sender: ID) {
+    unsafe {
+        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let v = get(sender, sel(c"doubleValue"));
+        crate::set_scroll_div(v);
+        let lbl = PREFS_GAIN_LABEL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            let speed = if v <= 40.0 { "速い" } else if v >= 140.0 { "遅い" } else { "標準" };
+            msg1_void_id(
+                lbl,
+                sel(c"setStringValue:"),
+                nsstring(&format!("スクロール速度: {speed}({v:.0})")),
+            );
+        }
+    }
+}
 
 unsafe extern "C" fn imp_toggle(_s: ID, _c: SEL, _n: ID) {
     do_toggle("menu");
@@ -298,6 +320,33 @@ unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
 /// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)
 fn sync_prefs_state() {
     unsafe {
+        // 状態行(接続・操作中・遅延)
+        let st = PREFS_STATE.load(Ordering::Relaxed) as ID;
+        if !st.is_null() {
+            let connected = crate::CONNECTED.load(Ordering::Relaxed);
+            let win = crate::WIN_MODE.load(Ordering::Relaxed);
+            let rtt = crate::RTT_MS.load(Ordering::Relaxed);
+            let conn = if connected {
+                if rtt > 0 { format!("接続済(遅延 {rtt}ms)") } else { "接続済".into() }
+            } else {
+                "切断(再接続待機中)".to_string()
+            };
+            let mode = if win { "Windows 操作中" } else { "Mac 操作中" };
+            msg1_void_id(st, sel(c"setStringValue:"), nsstring(&format!("状態: {conn} ・ {mode}")));
+            // 切断時は赤で強調(接続時は標準ラベル色へ戻す)
+            let color_cls = objc_getClass(c"NSColor".as_ptr());
+            if !color_cls.is_null() {
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let color = get_color(
+                    color_cls,
+                    sel(if connected { c"labelColor" } else { c"systemRedColor" }),
+                );
+                if !color.is_null() {
+                    msg1_void_id(st, sel(c"setTextColor:"), color);
+                }
+            }
+        }
         let set = |slot: &AtomicUsize, on: bool| {
             let b = slot.load(Ordering::Relaxed) as ID;
             if !b.is_null() {
@@ -333,7 +382,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 360.0, h: 400.0 },
+            NSRect { x: 0.0, y: 0.0, w: 380.0, h: 640.0 },
             1 | 2 | 8,
             2,
             0,
@@ -350,8 +399,20 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
         let btn_cls = objc_getClass(c"NSButton".as_ptr());
 
-        // チェック項目(タイトル, action, static 保存先)。y は下から積む
-        let mut y = 400.0 - 44.0;
+        // ---- 状態行(最上部。1 秒タイマーで更新・接続状態で色が変わる) ----
+        let state_lbl = label(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithTitle:"),
+            nsstring("状態: …"),
+        );
+        if !state_lbl.is_null() {
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 640.0 - 40.0, w: 340.0, h: 22.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), state_lbl);
+            PREFS_STATE.store(state_lbl as usize, Ordering::Relaxed);
+        }
+
+        // ---- チェック項目(タイトル, action, static 保存先) ----
+        let mut y = 640.0 - 76.0;
         let mut add_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize| {
             let b = check_btn(
                 btn_cls,
@@ -361,20 +422,63 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 sel(action),
             );
             if !b.is_null() {
-                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y, w: 320.0, h: 28.0 });
+                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y, w: 340.0, h: 28.0 });
                 msg1_void_id(cv, sel(c"addSubview:"), b);
                 slot.store(b as usize, Ordering::Relaxed);
             }
-            y -= 36.0;
+            y -= 34.0;
         };
         add_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE);
         add_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS);
         add_check("Windows の音声を Mac で再生", c"sdAudio:", &PREFS_CHK_AUDIO);
         add_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD);
-        add_check("スクロール方向を反転(Mac 準拠)", c"sdScroll:", &PREFS_CHK_SCROLL);
+        add_check("スクロール方向: 自然スクロール(Mac 準拠)", c"sdScroll:", &PREFS_CHK_SCROLL);
         add_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK);
 
-        // ファイル送信ボタン(押しボタン型)
+        // ---- スクロール速度スライダー(右ほど遅い=除数 20..240) ----
+        let slider_cls = objc_getClass(c"NSSlider".as_ptr());
+        let mk_slider: unsafe extern "C" fn(ID, SEL, f64, f64, f64, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        if !slider_cls.is_null() {
+            let slider = mk_slider(
+                slider_cls,
+                sel(c"sliderWithValue:minValue:maxValue:target:action:"),
+                crate::scroll_div(),
+                20.0,
+                240.0,
+                target,
+                sel(c"sdScrollGain:"),
+            );
+            if !slider.is_null() {
+                set_frame(slider, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 200.0, h: 24.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), slider);
+                PREFS_SLIDER.store(slider as usize, Ordering::Relaxed);
+            }
+        }
+        let gain_lbl = label(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithTitle:"),
+            nsstring(&format!("スクロール速度: ({:.0})", crate::scroll_div())),
+        );
+        if !gain_lbl.is_null() {
+            set_frame(gain_lbl, sel(c"setFrame:"), NSRect { x: 232.0, y: y - 2.0, w: 130.0, h: 20.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), gain_lbl);
+            PREFS_GAIN_LABEL.store(gain_lbl as usize, Ordering::Relaxed);
+        }
+        y -= 44.0;
+
+        // ---- 操作ボタン(切替 + ファイル送信) ----
+        let toggle_btn = push_btn(
+            btn_cls,
+            sel(c"buttonWithTitle:target:action:"),
+            nsstring("Windows へ切替 / Mac へ戻る"),
+            target,
+            sel(c"sdToggle:"),
+        );
+        if !toggle_btn.is_null() {
+            set_frame(toggle_btn, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 180.0, h: 32.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), toggle_btn);
+        }
         let send = push_btn(
             btn_cls,
             sel(c"buttonWithTitle:target:action:"),
@@ -383,10 +487,27 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             sel(c"sdSendFile:"),
         );
         if !send.is_null() {
-            set_frame(send, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 6.0, w: 200.0, h: 32.0 });
+            set_frame(send, sel(c"setFrame:"), NSRect { x: 210.0, y: y - 4.0, w: 150.0, h: 32.0 });
             msg1_void_id(cv, sel(c"addSubview:"), send);
         }
-        y -= 48.0;
+        y -= 46.0;
+
+        // ---- Windows の音量操作(▲ / ▼ / ミュート。tag で判別) ----
+        for (title, tag) in [("音量 ▲", 1isize), ("音量 ▼", 2), ("ミュート", 3)] {
+            let b = push_btn(
+                btn_cls,
+                sel(c"buttonWithTitle:target:action:"),
+                nsstring(&format!("Windows {title}")),
+                target,
+                sel(c"sdVol:"),
+            );
+            if !b.is_null() {
+                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 112.0, h: 30.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), b);
+                msg1_void_i64(b, sel(c"setTag:"), tag as i64);
+            }
+            y -= 36.0;
+        }
 
         // バージョン/状態の情報行(選択不可ラベル)
         let info = label(
@@ -503,7 +624,7 @@ fn refresh_status() {
         let scroll_item = GUI_SCROLL_ITEM.load(Ordering::Relaxed) as ID;
         if !scroll_item.is_null() {
             let t = if crate::SCROLL_FLIP.load(Ordering::Relaxed) {
-                "スクロール方向: 反転(Mac準拠)"
+                "スクロール方向: 自然(Mac準拠)"
             } else {
                 "スクロール方向: 標準(Windows準拠)"
             };
@@ -626,6 +747,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
+        (c"sdScrollGain:", imp_scroll_gain as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];
