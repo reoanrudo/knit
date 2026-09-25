@@ -229,6 +229,14 @@ static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 /// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
@@ -525,6 +533,14 @@ fn main() {
             }
             if ping_at.elapsed() >= Duration::from_secs(5) {
                 ping_at = std::time::Instant::now();
+                // 15 秒 pong が無ければ実質切断扱いでストリームを外す
+                // (TCP が生きていても相手プロセスが固まった場合を拾う)
+                if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 15_000 {
+                    eprintln!("[conn] pong timeout. dropping stream");
+                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
+                    *guard = None;
+                    continue;
+                }
                 let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
                 if let Some(s) = guard.as_mut() {
                     if writeln!(s, "{}", encode(&Msg::Ping)).and_then(|_| s.flush()).is_err() {
@@ -592,6 +608,7 @@ fn main() {
             // hello_ok 送信は送信スレッド経由で確実に
             send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
             CONNECTED.store(true, Ordering::Relaxed);
+            LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
             eprintln!("[conn] established");
             // 以降の受信ループ(Return / Pong / Bye)
             loop {
@@ -613,7 +630,9 @@ fn main() {
                                         eprintln!("[clip] win->mac {} bytes", text.len());
                                     }
                                 }
-                                Msg::Pong => {}
+                                Msg::Pong => {
+                                    LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+                                }
                                 Msg::Bye => break,
                                 _ => {}
                             }
