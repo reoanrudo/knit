@@ -653,8 +653,8 @@ pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
 pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
 /// 端到達の開始時刻(switchDelay の滞在計測用)
 static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
-/// 横スワイプ(戻る/進む)の累積量と最終発火時刻
-static SWIPE_ACC: std::sync::Mutex<(f64, u64)> = std::sync::Mutex::new((0.0, 0));
+/// 横スワイプ(戻る/進む)の状態: (累積 dx, 最終イベント時刻, 最終発火時刻)
+static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
 
 /// 現在の SIDE(0=右/1=左/2=上/3=下)を文字列表現で
 pub fn side_name() -> &'static str {
@@ -1231,22 +1231,33 @@ unsafe extern "C" fn tap_callback(
         EVT_SCROLL_WHEEL => {
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
-            // 2本指の横スワイプは「戻る/進む」へ翻訳する(トラックパッド適応の要)。
-            // 横が縦より優勢なスワイプだけをナビゲーションとみなし、累積 150px で
-            // 1 回発火(クールダウン 500ms)。TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ
+            // 2本指の横スワイプ →「戻る/進む」。トラックパッドの delta は px 連続値で
+            // 数イベントに分かれて届くため「ジェスチャ単位」で累積する:
+            // 300ms 以上イベントが途切れたら新しいジェスチャとして累積を引き直す。
+            // 閾値 60px(従来 150 は届きにくかった)。横優勢(|dx|*2>|dy|)のみ対象。
+            // TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ戻せる
             let swipe_nav = envutil::get("TSUNAGU_SWIPE_NAV").as_deref() != Some("0");
-            if swipe_nav && win_mode && dx != 0.0 && dx.abs() > dy.abs() {
-                let mut acc = SWIPE_ACC.lock().unwrap_or_else(|e| e.into_inner());
-                acc.0 += dx;
+            if swipe_nav && win_mode && dx != 0.0 && dx.abs() * 2.0 > dy.abs() {
                 let now = now_ms();
-                if acc.0.abs() >= 150.0 && now.saturating_sub(acc.1) >= 500 {
+                let mut acc = SWIPE_ACC.lock().unwrap_or_else(|e| e.into_inner());
+                // 前回のイベントから 300ms 以上空いていたら別ジェスチャ(累積引き直し)
+                if now.saturating_sub(acc.1) > 300 {
+                    if acc.0.abs() > 8.0 {
+                        eprintln!("[swipe] gesture total={:.0}(未達)", acc.0);
+                    }
+                    acc.0 = 0.0;
+                }
+                acc.0 += dx;
+                acc.1 = now;
+                if acc.0.abs() >= 60.0 && now.saturating_sub(acc.2) >= 500 {
                     let btn = if acc.0 < 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
                     send_msg(&Msg::MouseButton { btn, down: true });
                     send_msg(&Msg::MouseButton { btn, down: false });
-                    eprintln!("[swipe] {} 送信", if btn == 3 { "戻る" } else { "進む" });
-                    *acc = (0.0, now);
+                    eprintln!("[swipe] {} 送信(total={:.0})", if btn == 3 { "戻る" } else { "進む" }, acc.0);
+                    acc.0 = 0.0;
+                    acc.2 = now;
                 }
-                // 横主導のジェスチャはここで完結(縦の僅かな揺れも無視して二重発火を防ぐ)
+                // 横優勢ジェスチャはここで完結(縦の揺れも無視し二重発火を防ぐ)
                 return std::ptr::null_mut();
             }
             if dx != 0.0 || dy != 0.0 {
@@ -1284,7 +1295,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-003723-83910a6";
+const BUILD_ID: &str = "build-20260926-004022-d120952";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
