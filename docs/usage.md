@@ -78,6 +78,11 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | ⌘Q | Alt+F4(ウィンドウを閉じる) |
 | ⌘] / ⌘[ | ブラウザの次/前のタブ(Ctrl(+Shift)+Tab) |
 | ⌘⇧4 / ⌘⇧3 | スクリーンショット(Win+Shift+S の切取り) |
+| ⌘⇧←→ / ⌘⇧↑↓ | 行選択 / 文書選択(Shift+Home/End 等) |
+| ⌥⇧←→ | 単語単位の選択 |
+| ⌘⌥Esc | タスクマネージャ(Ctrl+Shift+Esc) |
+| ⌘Ctrl+Q | 画面ロック(Win+L) |
+| fn+F11 | デスクトップ表示(Win+D) |
 | Ctrl+クリック | 右クリック(Mac 流の操作をそのまま再現) |
 | ⌘Space | Win+Space(IME/言語の切替) |
 | ⌘C/⌘V/⌘A 等 | Ctrl+C/V/A(⌘→Ctrl 自動変換、従来どおり) |

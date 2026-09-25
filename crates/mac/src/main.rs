@@ -70,6 +70,7 @@ const FLAG_SHIFT: CGEventFlags = 0x0002_0000;
 const FLAG_CTRL: CGEventFlags = 0x0004_0000;
 const FLAG_OPT: CGEventFlags = 0x0008_0000;
 const FLAG_CMD: CGEventFlags = 0x0010_0000;
+const FLAG_FN: CGEventFlags = 0x8000_0000; // kCGEventFlagMaskSecondaryFn
 
 const KC_F13: i64 = 105;
 /// 切替ホットキー(Mac keycode)。TSUNAGU_HOTKEY_KC で変更可。
@@ -1184,14 +1185,31 @@ unsafe extern "C" fn tap_callback(
                 let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool| {
                     send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c, opt: o, cmd: m, shift: sh });
                 };
-                let translated = if cmd && !ctrl && !opt {
+                // fn+F11(Mac のデスクトップ表示)= Win+D
+                if kc == 103 && flags & FLAG_FN != 0 {
+                    send(2, down, true, false, false, false); // D + ctrl フラグ(Win キー)
+                    return std::ptr::null_mut();
+                }
+                let translated = if cmd && ctrl && !opt {
+                    // ⌘Ctrl+Q = 画面ロック(Win+L)
                     match kc {
-                        // ⌘←→ = 行頭/行末(Windows の Home/End)
-                        123 => { send(115, down, false, false, false, false); true }
-                        124 => { send(119, down, false, false, false, false); true }
-                        // ⌘↑↓ = 文書先頭/末尾(Ctrl+Home/End = cmd フラグ付き Home/End)
-                        126 => { send(115, down, false, false, true, false); true }
-                        125 => { send(119, down, false, false, true, false); true }
+                        12 => { send(37, down, true, false, false, false); true }
+                        _ => false,
+                    }
+                } else if cmd && opt && !ctrl {
+                    // ⌘⌥Esc = タスクマネージャ(Ctrl+Shift+Esc)
+                    match kc {
+                        53 => { send(53, down, false, false, true, true); true }
+                        _ => false,
+                    }
+                } else if cmd && !ctrl && !opt {
+                    match kc {
+                        // ⌘←→ = 行頭/行末(Windows の Home/End)。Shift は透過(行選択)
+                        123 => { send(115, down, false, false, false, shift); true }
+                        124 => { send(119, down, false, false, false, shift); true }
+                        // ⌘↑↓ = 文書先頭/末尾(Ctrl+Home/End)。Shift 透過(文書選択)
+                        126 => { send(115, down, false, false, true, shift); true }
+                        125 => { send(119, down, false, false, true, shift); true }
                         // ⌘M/⌘H = 最小化(Win+Down = ctrl フラグ)
                         43 | 4 => { send(125, down, true, false, false, false); true }
                         // ⌘] / ⌘[ = ブラウザの次/前タブ(Ctrl(+Shift)+Tab)
@@ -1208,9 +1226,10 @@ unsafe extern "C" fn tap_callback(
                     }
                 } else if opt && !cmd && !ctrl {
                     match kc {
-                        // ⌥←→ = 単語移動(Windows では Ctrl+←→ = cmd フラグ)
-                        123 => { send(123, down, false, false, true, false); true }
-                        124 => { send(124, down, false, false, true, false); true }
+                        // ⌥←→ = 単語移動(Windows では Ctrl+←→ = cmd フラグ)。
+                        // Shift は透過(⌥⇧←→ = 単語単位の選択)
+                        123 => { send(123, down, false, false, true, shift); true }
+                        124 => { send(124, down, false, false, true, shift); true }
                         _ => false,
                     }
                 } else {
@@ -1351,7 +1370,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-005419-e03e790";
+const BUILD_ID: &str = "build-20260926-005940-2dcc524";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
