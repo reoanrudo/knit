@@ -87,6 +87,7 @@ unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGWarpMouseCursorPosition(new: CGPoint) -> i32;
+    fn CGAssociateMouseAndMouseCursorPosition(connect: bool) -> i32;
     fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
@@ -101,6 +102,23 @@ static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
 static SCREEN_W: OnceLock<f64> = OnceLock::new();
 static SCREEN_H: OnceLock<f64> = OnceLock::new();
+
+/// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
+/// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
+fn enter_win_mode_cursor_lock() {
+    // カーソル移動とマウス入力の関連を切断(カーソルは現在位置=右端に留まる)
+    unsafe { CGAssociateMouseAndMouseCursorPosition(false); }
+}
+
+/// Windows チェモード終了: 関連を復元し、右端の内側へカーソルを戻す
+fn leave_win_mode_cursor_unlock() {
+    unsafe {
+        CGAssociateMouseAndMouseCursorPosition(true);
+        if let Some(w) = SCREEN_W.get() {
+            CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y: 400.0 });
+        }
+    }
+}
 
 fn send_msg(msg: &Msg) {
     if let Some(tx) = TX.get() {
@@ -127,6 +145,11 @@ unsafe extern "C" fn tap_callback(
                 let next = !win_mode;
                 WIN_MODE.store(next, Ordering::Relaxed);
                 eprintln!("[mode] {} (F13)", if next { "WINDOWS" } else { "MAC" });
+                if next {
+                    enter_win_mode_cursor_lock();
+                } else {
+                    leave_win_mode_cursor_unlock();
+                }
             }
             return std::ptr::null_mut();
         }
@@ -143,10 +166,12 @@ unsafe extern "C" fn tap_callback(
                     WIN_MODE.store(true, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge)");
                     // Windows カーソルを画面左端の対応高さへワープ(連続的な「向こうへ行く」体験)
+                    let mut ny = 0.5;
                     if let Some(sh) = SCREEN_H.get() {
-                        let ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
-                        send_msg(&Msg::Warp { nx: 0.02, ny });
+                        ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
                     }
+                    send_msg(&Msg::Warp { nx: 0.02, ny });
+                    enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
                 }
             }
@@ -334,11 +359,7 @@ fn main() {
                                 Msg::Return => {
                                     WIN_MODE.store(false, Ordering::Relaxed);
                                     eprintln!("[mode] MAC (return)");
-                                    if let Some(w) = SCREEN_W.get() {
-                                        unsafe {
-                                            CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y: 400.0 });
-                                        }
-                                    }
+                                    leave_win_mode_cursor_unlock();
                                 }
                                 Msg::Pong => {}
                                 Msg::Bye => break,

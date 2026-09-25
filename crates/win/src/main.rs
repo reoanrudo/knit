@@ -350,6 +350,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 let x = (nx.clamp(0.0, 1.0) * w as f64) as i32;
                 let y = (ny.clamp(0.0, 1.0) * h as f64) as i32;
                 unsafe { SetCursorPos(x, y) };
+                last_return_notify = Instant::now();
             }
             Msg::Minimize { title } => {
                 if !hello_done {
