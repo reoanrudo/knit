@@ -4,6 +4,10 @@ set -e
 cd "$(dirname "$0")/.."
 source $HOME/.cargo/env 2>/dev/null || true
 
+echo "[deploy-win] stamping BUILD_ID..."
+NEW_ID="win-$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
+sed -i '' "s|const BUILD_ID: &str = [^;]*;|const BUILD_ID: \\\"$NEW_ID\\\";|" crates/win/src/main.rs
+
 echo "[deploy-win] building..."
 touch crates/win/src/main.rs
 cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | grep -E "^error" -A 3 && exit 1 || true

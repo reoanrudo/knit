@@ -283,7 +283,10 @@ impl ModState {
     }
 }
 
+const BUILD_ID: &str = "win-dev";
+
 fn main() {
+    println!("[info] sd-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
     let token = std::env::var("SEAMLESS_DESK_TOKEN")
         .unwrap_or_else(|_| "seamless-desk-dev".to_string());
@@ -347,7 +350,7 @@ fn main() {
             Err(e) => println!("[conn] failed: {e}"),
         }
         std::thread::sleep(Duration::from_millis(backoff));
-        backoff = (backoff * 2).min(5000);
+        backoff = (backoff * 2).min(3000);
     }
 }
 

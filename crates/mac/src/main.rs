@@ -453,6 +453,9 @@ unsafe extern "C" fn tap_callback(
             } else {
                 event_type == EVT_KEY_DOWN
             };
+            if down && (kc == 104 || kc == 102) {
+                eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
+            }
             send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift });
         }
         EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED => {
@@ -564,11 +567,11 @@ fn main() {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
             }
-            if ping_at.elapsed() >= Duration::from_secs(5) {
+            if ping_at.elapsed() >= Duration::from_secs(3) {
                 ping_at = std::time::Instant::now();
                 // 15 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う)
-                if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 15_000 {
+                if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 10_000 {
                     eprintln!("[conn] pong timeout. dropping stream");
                     let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap();
                     *guard = None;
