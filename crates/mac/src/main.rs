@@ -224,6 +224,22 @@ fn clipboard_change_count() -> isize {
     unsafe { msg0_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
 }
 
+/// macOS の通知センターへ表示(接続/切断のユーザー可視化)。
+/// osascript 経由で追加権限なしで出せる。失敗しても本体には影響しない
+fn notify(title: &str, body: &str) {
+    let out = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "display notification \"{}\" with title \"{}\"",
+                body.replace('"', "'"),
+                title.replace('"', "'")
+            ),
+        ])
+        .output();
+    let _ = out;
+}
+
 // ---------- 共有状態 ----------
 static WIN_MODE: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -888,6 +904,7 @@ fn main() {
             CONNECTED.store(true, Ordering::Relaxed);
             LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
             eprintln!("[conn] established");
+            notify("seamless-desk", "Windows に接続しました");
             // 以降の受信ループ(Return / Pong / Bye)
             loop {
                 line.clear();
@@ -936,6 +953,7 @@ fn main() {
             CONNECTED.store(false, Ordering::Relaxed);
             WIN_MODE.store(false, Ordering::Relaxed);
             eprintln!("[conn] lost. waiting for reconnect...");
+            notify("seamless-desk", "切断しました(自動再接続中)");
         }
     });
 
