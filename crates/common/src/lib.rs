@@ -27,8 +27,15 @@ pub mod proto {
         MouseButton { btn: u8, down: bool },
         #[serde(rename = "scroll")]
         Scroll { dx: f64, dy: f64 },
+        /// Windows 左端到達による復帰通知。ny = 復帰時のカーソル高さ(0..1、Mac 側復帰位置へ反映)
         #[serde(rename = "return")]
-        Return,
+        Return {
+            #[serde(default)]
+            ny: f64,
+        },
+        /// クリップボード同期(プレーンテキスト)
+        #[serde(rename = "clip")]
+        Clip { text: String },
         #[serde(rename = "focus")]
         Focus { title: String },
         #[serde(rename = "minimize")]

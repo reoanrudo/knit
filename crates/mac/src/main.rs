@@ -92,6 +92,7 @@ unsafe extern "C" {
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
     fn CGEventCreate(allocator: CFAllocatorRef) -> CGEventRef;
+    fn CFRelease(cf: *mut core::ffi::c_void);
     fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
@@ -111,28 +112,51 @@ static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
+static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
 fn enter_win_mode_cursor_lock() {
-    // Deskflow leave() 相当: hideCursor → suppression間隔最小化 → 関連切断
+    // Deskflow leave() 相当: hideCursor → suppression間隔最小化 → 関連切断 → warp固定
     unsafe {
         let d = CGMainDisplayID();
         CGDisplayHideCursor(d);
         CGSetLocalEventsSuppressionInterval(0.0001);
         CGAssociateMouseAndMouseCursorPosition(false);
+        // 関連切断は非同期で効き始めるため、切替直後の漏れ移動が数ピクセル出る。
+        // 固定位置を右端内側に warp しておき、以降の漏れは都度巻き戻す(境界の同時移動対策)
+        let mut lock_y = 400.0;
+        let ev = CGEventCreate(std::ptr::null_mut());
+        if !ev.is_null() {
+            let loc = CGEventGetLocation(ev);
+            lock_y = loc.y;
+            CFRelease(ev);
+        }
+        let lock_x = SCREEN_W.get().copied().unwrap_or(2056.0) - 2.0;
+        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
+        *LOCK_POS.lock().unwrap() = Some((lock_x, lock_y));
     }
 }
 
-/// Windows チェモード終了: 関連を復元し、右端の内側へカーソルを戻す
-fn leave_win_mode_cursor_unlock() {
+/// Windows モード終了: 関連を復元し、右端の内側へカーソルを戻す。
+/// ny は Windows 側カーソルの高さ(0..1)。与えられた場合は同じ高さへ戻す(境界連続性)。
+fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     // Deskflow enter() 相当: 関連復元 → showCursor → 位置復帰
     unsafe {
+        *LOCK_POS.lock().unwrap() = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         let d = CGMainDisplayID();
         CGDisplayShowCursor(d);
         if let Some(w) = SCREEN_W.get() {
-            CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y: 400.0 });
+            let y = match ny {
+                Some(n) => {
+                    let h = SCREEN_H.get().copied().unwrap_or(1000.0);
+                    (n.clamp(0.0, 1.0) * h).clamp(20.0, (h - 20.0).max(20.0))
+                }
+                None => 400.0,
+            };
+            CGWarpMouseCursorPosition(CGPoint { x: *w - 60.0, y });
         }
     }
 }
@@ -173,7 +197,7 @@ unsafe extern "C" fn tap_callback(
                 if next {
                     enter_win_mode_cursor_lock();
                 } else {
-                    leave_win_mode_cursor_unlock();
+                    leave_win_mode_cursor_unlock(None);
                 }
             }
             return std::ptr::null_mut();
@@ -242,6 +266,17 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
                 send_msg(&Msg::MouseMove { dx, dy });
+            }
+            // カーソル固定監視: 関連切断の効き始め猶予に漏れた移動を固定位置へ巻き戻す
+            if let Some((lx, ly)) = *LOCK_POS.lock().unwrap() {
+                let probe = CGEventCreate(std::ptr::null_mut());
+                if !probe.is_null() {
+                    let loc = CGEventGetLocation(probe);
+                    CFRelease(probe);
+                    if (loc.x - lx).abs() > 4.0 || (loc.y - ly).abs() > 4.0 {
+                        CGWarpMouseCursorPosition(CGPoint { x: lx, y: ly });
+                    }
+                }
             }
         }
         EVT_LEFT_DOWN | EVT_LEFT_UP => send_msg(&Msg::MouseButton { btn: 0, down: event_type == EVT_LEFT_DOWN }),
@@ -391,10 +426,10 @@ fn main() {
                     Ok(_) => {
                         if let Some(msg) = decode(&line) {
                             match msg {
-                                Msg::Return => {
+                                Msg::Return { ny } => {
                                     WIN_MODE.store(false, Ordering::Relaxed);
                                     eprintln!("[mode] MAC (return)");
-                                    leave_win_mode_cursor_unlock();
+                                    leave_win_mode_cursor_unlock(Some(ny));
                                 }
                                 Msg::Pong => {}
                                 Msg::Bye => break,
