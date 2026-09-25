@@ -234,6 +234,7 @@ static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ABS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SELF_HEAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAP_REARM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -337,6 +338,8 @@ fn enter_win_mode_cursor_lock() {
             SCREEN_W.get().copied().unwrap_or(2056.0)
         }) - 2.0;
         CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
+        // タップが握った位置を CUR_POS にも反映(積算の起点を正しくする)
+        *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (lock_x, lock_y);
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
     }
 }
@@ -357,9 +360,10 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         }
         // 時間ガードを 400ms に増強し、復帰直後の再突入を防ぐ(距離ガードの代替)
         EDGE_GUARD_UNTIL_MS.store(now_ms() + 400, Ordering::Relaxed);
-        if let Some(loc) = live_cursor() {
-            *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
-        }
+        // 注意: ここでライブ位置を同期すると「復帰ワープ前」の境界位置
+        // (2309)を掴んでしまい、ガード明けに即再突入する原因になる。
+        // CUR_POS はこの後のワープ先で上書きするため、ここでは同期しない
+        
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
@@ -387,6 +391,9 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
             None => 400.0,
         };
         CGWarpMouseCursorPosition(CGPoint { x, y });
+        // ワープ先を CUR_POS へ反映(同期をワープ前に取ると境界値が残り
+        // 復帰直後に必ず再突入して戻れなくなる)
+        *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (x, y);
         eprintln!("[return] -> mac ({x:.0},{y:.0})");
     }
 }
@@ -487,8 +494,15 @@ unsafe extern "C" fn tap_callback(
                 // 「内側へ離れる」条件を満たせず Windows へ行けなくなるため。
                 // チャタリング防止は復帰位置 150px 内側 + 時間ガードで担保する
                 if px >= edge_x - edge {
-                    // 切替の瞬間はライブ位置で正確な高さを取る
-                    let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
+                    // 二段階判定: 積算値が閾値を超えても、実カーソル(ライブ位置)が
+                    // 境界付近でなければ発火しない。ドリフトが残っていても
+                    // MacBook 中央などでの誤発火を構造的に防ぐ
+                    let Some(loc) = live_cursor() else { return event };
+                    if loc.x < edge_x - edge - 40.0 {
+                        // 積算ドリフト検出: 実位置で CUR_POS を補正して通過
+                        *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
+                        return event;
+                    }
                     WIN_MODE.store(true, Ordering::Relaxed);
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0})", loc.x, loc.y);
@@ -635,7 +649,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-173134-fbc6b95";
+const BUILD_ID: &str = "build-20260925-173925-4581cf5";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -1055,6 +1069,14 @@ fn main() {
                 CURSOR_HIDDEN.store(false, Ordering::Relaxed);
                 DIAG_SELF_HEAL.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[cursor] self-heal: 復帰漏れを修復しました");
+            }
+            // タップ健全性: システムがタイムアウトでタップを無効化した際、
+            // 無効化通知を取り逃しても 1 秒毎の冪等な再 enable で必ず復帰させる
+            if let Some(&tap) = TAP_PORT.get() {
+                if TAP_REARM_N.fetch_add(1, Ordering::Relaxed) % 7 == 0 {
+                    // 150ms×7 ≒ 1秒毎
+                    unsafe { CGEventTapEnable(tap as CFMachPortRef, true) };
+                }
             }
             if !WIN_MODE.load(Ordering::Relaxed) {
                 continue;
