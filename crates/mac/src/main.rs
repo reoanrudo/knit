@@ -1176,8 +1176,11 @@ unsafe extern "C" fn tap_callback(
             // ---- Mac 流ショートカットの Windows 翻訳(指癖をそのまま通す) ----
             // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
             //   cmd→Win Ctrl / opt→Win Alt / ctrl→Win キー(既定マップ)
-            // 注意: flagsChanged(mod キー単体)は翻訳しない
-            if event_type != EVT_FLAGS_CHANGED {
+            // 注意: flagsChanged(mod キー単体)は翻訳しない。
+            // 常時有効(マスト機能)。TSUNAGU_MAC_KEYS=0 でのみオフ
+            if event_type != EVT_FLAGS_CHANGED
+                && envutil::get("TSUNAGU_MAC_KEYS").as_deref() != Some("0")
+            {
                 let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool| {
                     send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c, opt: o, cmd: m, shift: sh });
                 };
@@ -1269,33 +1272,36 @@ unsafe extern "C" fn tap_callback(
         EVT_SCROLL_WHEEL => {
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
-            // 2本指の横スワイプ →「戻る/進む」。トラックパッドの delta は px 連続値で
-            // 数イベントに分かれて届くため「ジェスチャ単位」で累積する:
-            // 300ms 以上イベントが途切れたら新しいジェスチャとして累積を引き直す。
-            // 閾値 60px(従来 150 は届きにくかった)。横優勢(|dx|*2>|dy|)のみ対象。
+            // 2本指の横スワイプ →「戻る/進む」。Mac の体感(1スワイプ=1ページ)を
+            // 忠実に再現する: ジェスチャは「300ms イベントが途切れるまで」を一続きと
+            // みなし、その間の発火は 1 回だけ(指を離した後の慣性 delta が届いても
+            // 再発火しない=2段階戻りの防止)。閾値 60px・横優勢(|dx|*2>|dy|)のみ。
             // TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ戻せる
             let swipe_nav = envutil::get("TSUNAGU_SWIPE_NAV").as_deref() != Some("0");
             if swipe_nav && win_mode && dx != 0.0 && dx.abs() * 2.0 > dy.abs() {
                 let now = now_ms();
                 let mut acc = SWIPE_ACC.lock().unwrap_or_else(|e| e.into_inner());
-                // 前回のイベントから 300ms 以上空いていたら別ジェスチャ(累積引き直し)
+                // 前回のイベントから 300ms 以上空いていたら新しいジェスチャ
+                // (=累積と発火済みフラグの両方を引き直す)
                 if now.saturating_sub(acc.1) > 300 {
-                    if acc.0.abs() > 8.0 {
+                    if acc.2 != 0 {
+                        eprintln!("[swipe] gesture 追加分={:.0}(発火済みのため不採用)", acc.0);
+                    } else if acc.0.abs() > 8.0 {
                         eprintln!("[swipe] gesture total={:.0}(未達)", acc.0);
                     }
-                    acc.0 = 0.0;
+                    *acc = (0.0, now, 0);
                 }
                 acc.0 += dx;
                 acc.1 = now;
-                if acc.0.abs() >= 60.0 && now.saturating_sub(acc.2) >= 500 {
+                // acc.2 != 0 = このジェスチャで発火済み。以後の累積は破棄扱い
+                if acc.2 == 0 && acc.0.abs() >= 60.0 {
                     // Mac の操作感: 指を右へスワイプ(ページを左へめくる)=戻る。
                     // dx>0=指右 → XButton1(戻る)、dx<0=指左 → XButton2(進む)
                     let btn = if acc.0 > 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
                     send_msg(&Msg::MouseButton { btn, down: true });
                     send_msg(&Msg::MouseButton { btn, down: false });
                     eprintln!("[swipe] {} 送信(total={:.0})", if btn == 3 { "戻る" } else { "進む" }, acc.0);
-                    acc.0 = 0.0;
-                    acc.2 = now;
+                    *acc = (0.0, now, now); // 発火済みマーク(ジェスチャ完結まで保持)
                 }
                 // 横優勢ジェスチャはここで完結(縦の揺れも無視し二重発火を防ぐ)
                 return std::ptr::null_mut();
@@ -1335,7 +1341,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-004626-d8f8ad3";
+const BUILD_ID: &str = "build-20260926-005029-c3512a5";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
