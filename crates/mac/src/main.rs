@@ -1173,6 +1173,44 @@ unsafe extern "C" fn tap_callback(
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
             }
+            // ---- Mac 流ショートカットの Windows 翻訳(指癖をそのまま通す) ----
+            // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
+            //   cmd→Win Ctrl / opt→Win Alt / ctrl→Win キー(既定マップ)
+            // 注意: flagsChanged(mod キー単体)は翻訳しない
+            if event_type != EVT_FLAGS_CHANGED {
+                let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool| {
+                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c, opt: o, cmd: m, shift: sh });
+                };
+                let translated = if cmd && !ctrl && !opt {
+                    match kc {
+                        // ⌘←→ = 行頭/行末(Windows の Home/End)
+                        123 => { send(115, down, false, false, false, false); true }
+                        124 => { send(119, down, false, false, false, false); true }
+                        // ⌘↑↓ = 文書先頭/末尾(Ctrl+Home/End = cmd フラグ付き Home/End)
+                        126 => { send(115, down, false, false, true, false); true }
+                        125 => { send(119, down, false, false, true, false); true }
+                        // ⌘M/⌘H = 最小化(Win+Down = ctrl フラグ)
+                        43 | 4 => { send(125, down, true, false, false, false); true }
+                        // ⌘Q = ウィンドウを閉じる(Alt+F4 = opt フラグ+F4)
+                        12 => { send(118, down, false, true, false, false); true }
+                        // ⌘Space = IME/言語切替(Win+Space = ctrl フラグ)
+                        49 => { send(49, down, true, false, false, false); true }
+                        _ => false,
+                    }
+                } else if opt && !cmd && !ctrl {
+                    match kc {
+                        // ⌥←→ = 単語移動(Windows では Ctrl+←→ = cmd フラグ)
+                        123 => { send(123, down, false, false, true, false); true }
+                        124 => { send(124, down, false, false, true, false); true }
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                if translated {
+                    return std::ptr::null_mut(); // 元キーは送らない
+                }
+            }
             send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift });
         }
         EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED => {
@@ -1297,7 +1335,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-004242-a20d855";
+const BUILD_ID: &str = "build-20260926-004626-d8f8ad3";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
