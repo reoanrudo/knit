@@ -393,7 +393,7 @@ unsafe fn make_layout_window() -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 420.0, h: 252.0 },
+            NSRect { x: 0.0, y: 0.0, w: 604.0, h: 300.0 },
             1 | 2, // titled | closable
             2,
             0,
@@ -417,13 +417,13 @@ unsafe fn make_layout_window() -> ID {
             nsstring("Windows(青)をドラッグして実際の配置へ。離すと確定"),
         );
         if !top.is_null() {
-            set_frame(top, sel(c"setFrame:"), NSRect { x: 20.0, y: 212.0, w: 380.0, h: 18.0 });
+            set_frame(top, sel(c"setFrame:"), NSRect { x: 20.0, y: 258.0, w: 560.0, h: 18.0 });
             msg1_void_id(cv, sel(c"addSubview:"), top);
         }
         // 配置ビュー(中央)
         let lay = make_layout_view(cv);
         if !lay.is_null() {
-            set_frame(lay, sel(c"setFrame:"), NSRect { x: 32.0, y: 32.0, w: LAY_VW, h: LAY_VH });
+            set_frame(lay, sel(c"setFrame:"), NSRect { x: 22.0, y: 42.0, w: LAY_VW, h: LAY_VH });
             msg1_void_id(cv, sel(c"addSubview:"), lay);
         }
         // 凡例(下)
@@ -433,7 +433,7 @@ unsafe fn make_layout_window() -> ID {
             nsstring("灰=Mac ・ 青=Windows(大きさは実際の比)"),
         );
         if !leg.is_null() {
-            set_frame(leg, sel(c"setFrame:"), NSRect { x: 20.0, y: 8.0, w: 380.0, h: 16.0 });
+            set_frame(leg, sel(c"setFrame:"), NSRect { x: 20.0, y: 14.0, w: 560.0, h: 16.0 });
             let color_cls = objc_getClass(c"NSColor".as_ptr());
             if !color_cls.is_null() {
                 let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
@@ -663,36 +663,57 @@ unsafe fn neon_rule(cv: ID, frame: NSRect) {
 // ---------- モニター配置エディタ(Mac の「ディスプレイ配置」相当) ----------
 // 灰色=Mac、青=Windows の矩形を描き、Windows 側をドラッグして物理配置を再現する。
 // ドロップ時に「接する辺+辺に沿った接続範囲」を算出して SIDE/LAY_RANGE へ反映
-const LAY_VW: f64 = 344.0;
-const LAY_VH: f64 = 170.0;
-const LAY_MAC_W: f64 = 188.0;
-const LAY_MAC_H: f64 = LAY_MAC_W / 1.547; // Mac 画面の既定アスペクト(2056x1329)
+const LAY_VW: f64 = 560.0;
+const LAY_VH: f64 = 230.0;
 
-/// Windows 矩形のサイズ: 実際の画面サイズ(hello で受信した WIN_SCREEN)を
-/// Mac と同じ縮尺へ射影する。未接続時は 1920x1080 想定。これで
-/// 「実際のモニターの大きさ比」(例: ワイドで背の低い外部モニター)が
-/// 見た目どおりに再現される
-fn lay_win_size() -> (f64, f64) {
-    let (mw, mh) = (
+/// Mac/Win 両画面の実ピクセルサイズ(hello 受信値。未接続時は一般値)
+fn lay_px() -> ((f64, f64), (f64, f64)) {
+    let mac = (
         crate::SCREEN_W.get().copied().unwrap_or(2056.0),
         crate::SCREEN_H.get().copied().unwrap_or(1329.0),
     );
-    let (ww_px, wh_px) = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-    let scale = LAY_MAC_H / mh.max(1.0); // Mac の縮尺に合わせる
-    let w = (ww_px.max(640.0) * scale).clamp(40.0, 300.0);
-    let h = (wh_px.max(480.0) * scale).clamp(24.0, 160.0);
-    (w, h)
+    let win = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+    (mac, win)
 }
-static LAY_WIN: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((292.0, 85.0)); // Win 矩形中心
+
+/// 共通縮尺: 両モニターを横並び + 縦に収める(重ならず両方必ず見える)
+fn lay_scale() -> f64 {
+    let ((mw, mh), (ww, wh)) = lay_px();
+    let by_w = (LAY_VW - 80.0) / (mw + ww).max(1.0);
+    let by_h = (LAY_VH - 40.0) / mh.max(wh).max(1.0);
+    by_w.min(by_h)
+}
+
+/// Windows 矩形のサイズ(実際の大きさ比・共通縮尺)
+fn lay_win_size() -> (f64, f64) {
+    let (_, (ww, wh)) = lay_px();
+    let sc = lay_scale();
+    (ww * sc, wh * sc)
+}
+static LAY_WIN: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0)); // Win 矩形中心(0=既定=Macの右隣)
+
+/// Win 矩形の中心(未設定なら Mac 右隣の既定位置)
+fn lay_win_center() -> (f64, f64) {
+    let c = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+    if c.0 <= 0.0 {
+        let m = lay_mac_rect();
+        let (ww, wh) = lay_win_size();
+        return (m.x + m.w + 16.0 + ww / 2.0, m.y + m.h / 2.0);
+    }
+    c
+}
 static LAY_GRAB: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
 static LAY_DRAG: AtomicBool = AtomicBool::new(false);
 
 fn lay_mac_rect() -> NSRect {
+    let ((mw, mh), _) = lay_px();
+    let sc = lay_scale();
+    let h = mh * sc;
     NSRect {
-        x: 26.0,
-        y: (LAY_VH - LAY_MAC_H) / 2.0,
-        w: LAY_MAC_W,
-        h: LAY_MAC_H,
+        x: 30.0,
+        y: (LAY_VH - h) / 2.0,
+        w: mw * sc,
+        h,
     }
 }
 
@@ -738,7 +759,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
         CGContextSetRGBFillColor(ctx, 0.42, 0.45, 0.50, 1.0);
         CGContextFillRect(ctx, lay_mac_rect());
         // Windows(青=標準アクセント)
-        let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let wc = lay_win_center();
         let (ww, wh) = lay_win_size();
         CGContextSetRGBFillColor(ctx, 0.16, 0.50, 0.98, 1.0);
         CGContextFillRect(
@@ -751,7 +772,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
 unsafe extern "C" fn lay_down(_self: ID, _cmd: SEL, ev: ID) {
     unsafe {
         let p = lay_point_in_view(_self, ev);
-        let wc = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let wc = lay_win_center();
         let (ww, wh) = lay_win_size();
         let inside = p.x >= wc.0 - ww / 2.0 - 4.0
             && p.x <= wc.0 + ww / 2.0 + 4.0
@@ -790,7 +811,7 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         }
         let m = lay_mac_rect();
         let mc = (m.x + m.w / 2.0, m.y + m.h / 2.0);
-        let wc0 = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
+        let wc0 = lay_win_center();
         let (ww, wh) = lay_win_size();
         let (dx, dy) = (wc0.0 - mc.0, wc0.1 - mc.1);
         let (edge, f0, f1) = if dx.abs() >= dy.abs() {
