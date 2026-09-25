@@ -599,8 +599,20 @@ static CMD_ALT: AtomicBool = AtomicBool::new(false);
 /// トグル時に Windows へ Cfg で同期(TSUNAGU_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE: AtomicBool = AtomicBool::new(true);
 /// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
-/// スクロール方向(既定 true=自然スクロール・Mac 準拠。false=Windows 標準)
-static SCROLL_FLIP: AtomicBool = AtomicBool::new(true);
+/// スクロール方向の手動上書き(true=Windows 標準。false 既定=Mac の設定に合わせる)
+static SCROLL_FLIP: AtomicBool = AtomicBool::new(false);
+/// macOS の「自然スクロール」設定(起動時に取得。true=トラックパッドのコンテンツ追従)
+static NATURAL_SCROLL: AtomicBool = AtomicBool::new(true);
+
+/// macOS のスクロール方向設定を読む(失敗時は出荷既定の自然スクロール扱い)。
+/// ユーザーが Mac で使っている向きへ Windows 側も自動で合わせるために使う
+fn detect_natural_scroll() -> bool {
+    std::process::Command::new("defaults")
+        .args(["read", "-g", "com.apple.swipescrolledirection"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() != "0")
+        .unwrap_or(true)
+}
 /// Windows との RTT(ms)。ping/pong 往復で測定(メニュー状態行の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ファイル送信中(多重送信の抑制)
@@ -1113,9 +1125,11 @@ unsafe extern "C" fn tap_callback(
                 // 除数を大きくすると遅くなる(設定ウィンドウのスライダーで可変)。端数は持ち越し
                 const Q: f64 = 0.05; // 量子化幅(ノッチ)
                 let div = scroll_div();
-                // 方向(メニュー/設定で切替可): 既定は Mac と同じ自然スクロール
-                // (コンテンツが指に追従)。FLIP 無効=Windows 標準のホイール方向
-                let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) { 1.0 } else { -1.0 };
+                // 方向: 既定は Mac の操作感に合わせる(自然スクロール設定を起動時に
+                // 取得)。SCROLL_FLIP=true は「Windows 標準」への手動上書き。
+                // 実測: 自然スクロール環境で Mac と同じ向きになるのは -1 側
+                let aligned = if NATURAL_SCROLL.load(Ordering::Relaxed) { -1.0 } else { 1.0 };
+                let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) { -aligned } else { aligned };
                 let mut acc = SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner());
                 acc.0 += sgn * dx / div;
                 acc.1 += sgn * dy / div;
@@ -1139,7 +1153,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260925-224340-f6e9443";
+const BUILD_ID: &str = "build-20260925-225359-a616d36";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1239,8 +1253,18 @@ fn main() {
         }
     }
     // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
-    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("0") {
-        SCROLL_FLIP.store(false, Ordering::Relaxed);
+    NATURAL_SCROLL.store(detect_natural_scroll(), Ordering::Relaxed);
+    eprintln!(
+        "[info] macOS scroll: {} / tsunagu 方向: {}",
+        if NATURAL_SCROLL.load(Ordering::Relaxed) { "自然スクロール" } else { "標準(非自然)" },
+        if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
+            "Windows 標準(手動上書き)"
+        } else {
+            "Mac に合わせる"
+        },
+    );
+    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
+        SCROLL_FLIP.store(true, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);

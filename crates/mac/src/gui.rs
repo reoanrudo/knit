@@ -357,8 +357,53 @@ fn sync_prefs_state() {
         set(&PREFS_CHK_TAPS, crate::EDGE_TAPS.load(Ordering::Relaxed) >= 2);
         set(&PREFS_CHK_AUDIO, !crate::audio::MUTED.load(Ordering::Relaxed));
         set(&PREFS_CHK_CMD, crate::CMD_ALT.load(Ordering::Relaxed));
-        set(&PREFS_CHK_SCROLL, crate::SCROLL_FLIP.load(Ordering::Relaxed));
+        set(&PREFS_CHK_SCROLL, !crate::SCROLL_FLIP.load(Ordering::Relaxed));
         set(&PREFS_CHK_SPK, crate::SPK_MUTE.load(Ordering::Relaxed));
+    }
+}
+
+/// 見出しラベル(小さめグレーのキャプション=モダンな設定画面のセクション題)
+unsafe fn section_heading(cv: ID, text: &str, frame: NSRect) {
+    unsafe {
+        let mk: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let lbl = mk(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithTitle:"),
+            crate::nsstring(text),
+        );
+        if lbl.is_null() {
+            return;
+        }
+        let set_frame: unsafe extern "C" fn(ID, SEL, NSRect) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        set_frame(lbl, sel(c"setFrame:"), frame);
+        // secondaryLabelColor で補足色へ
+        let color_cls = objc_getClass(c"NSColor".as_ptr());
+        if !color_cls.is_null() {
+            let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+            if !color.is_null() {
+                let setc: unsafe extern "C" fn(ID, SEL, ID) =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                setc(lbl, sel(c"setTextColor:"), color);
+            }
+        }
+        let f = crate::msg0(lbl, sel(c"font"));
+        if !f.is_null() {
+            let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
+                std::mem::transmute(crate::objc_msgSend as usize);
+            let bf = bold(f, sel(c"boldSystemFontOfSize:"), 11.0);
+            if !bf.is_null() {
+                let setf: unsafe extern "C" fn(ID, SEL, ID) =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                setf(lbl, sel(c"setFont:"), bf);
+            }
+        }
+        let add: unsafe extern "C" fn(ID, SEL, ID) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        add(cv, sel(c"addSubview:"), lbl);
     }
 }
 
@@ -382,7 +427,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 380.0, h: 640.0 },
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 730.0 },
             1 | 2 | 8,
             2,
             0,
@@ -391,6 +436,10 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             return std::ptr::null_mut();
         }
         msg1_void_id(win, sel(c"setTitle:"), nsstring("Tsunagu 設定"));
+        // リサイズしても崩れないよう最小サイズを固定(リサイズ不可の誤操作防止)
+        let set_min: unsafe extern "C" fn(ID, SEL, NSRect) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        set_min(win, sel(c"setContentMinSize:"), NSRect { x: 400.0, y: 730.0, w: 400.0, h: 730.0 });
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
@@ -399,21 +448,30 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
         let btn_cls = objc_getClass(c"NSButton".as_ptr());
 
-        // ---- 状態行(最上部。1 秒タイマーで更新・接続状態で色が変わる) ----
+        // ---- 状態行(最上部・太字。1 秒タイマーで更新・接続状態で色が変わる) ----
         let state_lbl = label(
             objc_getClass(c"NSTextField".as_ptr()),
             sel(c"labelWithTitle:"),
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 640.0 - 40.0, w: 340.0, h: 22.0 });
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 730.0 - 40.0, w: 360.0, h: 24.0 });
+            let f = msg0(state_lbl, sel(c"font"));
+            if !f.is_null() {
+                let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let bf = bold(f, sel(c"boldSystemFontOfSize:"), 13.0);
+                if !bf.is_null() {
+                    msg1_void_id(state_lbl, sel(c"setFont:"), bf);
+                }
+            }
             msg1_void_id(cv, sel(c"addSubview:"), state_lbl);
             PREFS_STATE.store(state_lbl as usize, Ordering::Relaxed);
         }
 
-        // ---- チェック項目(タイトル, action, static 保存先) ----
-        let mut y = 640.0 - 76.0;
-        let mut add_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize| {
+        // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
+        let mut y = 730.0 - 76.0;
+        let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
                 sel(c"checkWithTitle:target:action:"),
@@ -422,18 +480,23 @@ unsafe fn make_prefs_window(target: ID) -> ID {
                 sel(action),
             );
             if !b.is_null() {
-                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y, w: 340.0, h: 28.0 });
+                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y: yy, w: 360.0, h: 28.0 });
                 msg1_void_id(cv, sel(c"addSubview:"), b);
                 slot.store(b as usize, Ordering::Relaxed);
             }
-            y -= 34.0;
         };
-        add_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE);
-        add_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS);
-        add_check("Windows の音声を Mac で再生", c"sdAudio:", &PREFS_CHK_AUDIO);
-        add_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD);
-        add_check("スクロール方向: 自然スクロール(Mac 準拠)", c"sdScroll:", &PREFS_CHK_SCROLL);
-        add_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK);
+        section_heading(cv, "切替", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 26.0;
+        place_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE, y);
+        y -= 34.0;
+        place_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS, y);
+        y -= 34.0;
+
+        // ---- スクロール ----
+        section_heading(cv, "スクロール", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 26.0;
+        place_check("方向を Mac に合わせる(オフ: Windows 標準)", c"sdScroll:", &PREFS_CHK_SCROLL, y);
+        y -= 34.0;
 
         // ---- スクロール速度スライダー(右ほど遅い=除数 20..240) ----
         let slider_cls = objc_getClass(c"NSSlider".as_ptr());
@@ -466,6 +529,16 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             PREFS_GAIN_LABEL.store(gain_lbl as usize, Ordering::Relaxed);
         }
         y -= 44.0;
+
+        // ---- Windows ----
+        section_heading(cv, "Windows", NSRect { x: 20.0, y: y + 8.0, w: 360.0, h: 18.0 });
+        y -= 26.0;
+        place_check("Windows の音声を Mac で再生", c"sdAudio:", &PREFS_CHK_AUDIO, y);
+        y -= 34.0;
+        place_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD, y);
+        y -= 34.0;
+        place_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK, y);
+        y -= 34.0;
 
         // ---- 操作ボタン(切替 + ファイル送信) ----
         let toggle_btn = push_btn(
@@ -516,6 +589,15 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring(&format!("Tsunagu {} ・ {}", crate::VERSION_STR, crate::BUILD_ID)),
         );
         if !info.is_null() {
+            let color_cls = objc_getClass(c"NSColor".as_ptr());
+            if !color_cls.is_null() {
+                let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let color = get_color(color_cls, sel(c"secondaryLabelColor"));
+                if !color.is_null() {
+                    msg1_void_id(info, sel(c"setTextColor:"), color);
+                }
+            }
             set_frame(info, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 320.0, h: 22.0 });
             let f = msg0(info, sel(c"font"));
             if !f.is_null() {
@@ -624,9 +706,9 @@ fn refresh_status() {
         let scroll_item = GUI_SCROLL_ITEM.load(Ordering::Relaxed) as ID;
         if !scroll_item.is_null() {
             let t = if crate::SCROLL_FLIP.load(Ordering::Relaxed) {
-                "スクロール方向: 自然(Mac準拠)"
+                "スクロール方向: Windows 標準"
             } else {
-                "スクロール方向: 標準(Windows準拠)"
+                "スクロール方向: Mac に合わせる"
             };
             msg1_void_id(scroll_item, sel(c"setTitle:"), nsstring(t));
         }

@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::{GetStockObject, DEFAULT_GUI_FONT};
+
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
@@ -257,6 +257,26 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     }
 }
 
+/// モダンな見た目のための Segoe UI フォント生成(通常/太字)。
+/// 既定の DEFAULT_GUI_FONT は古いシステムフォントになるため使わない
+unsafe fn segoe_font(bold: bool, height: i32) -> *mut core::ffi::c_void {
+    unsafe {
+        let mut name: Vec<u16> = "Segoe UI".encode_utf16().collect();
+        name.push(0);
+        extern "system" {
+            fn CreateFontW(
+                height: i32, width: i32, escapement: i32, orientation: i32, weight: i32,
+                italic: u32, underline: u32, strikeout: u32, charset: u32, outprecision: u32,
+                clipprecision: u32, quality: u32, pitchandfamily: u32, face: *const u16,
+            ) -> *mut core::ffi::c_void;
+        }
+        CreateFontW(
+            height, 0, 0, 0, if bold { 700 } else { 400 }, 0, 0, 0, 1 /*DEFAULT_CHARSET*/,
+            0, 0, 5 /*CLEARTYPE_QUALITY*/, 0, name.as_ptr(),
+        )
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     let mut w: Vec<u16> = s.encode_utf16().collect();
     w.push(0);
@@ -282,7 +302,8 @@ unsafe fn open_status_window() {
             hInstance: hinst,
             hIcon: TRAY_HICON.load(Ordering::Relaxed) as *mut core::ffi::c_void,
             hCursor: std::ptr::null_mut(),
-            hbrBackground: std::ptr::null_mut(),
+            // 標準のシステム色(白系)で塗る=未指定だと背景が残って見苦しい
+            hbrBackground: 6 /*COLOR_WINDOW + 1*/ as *mut core::ffi::c_void,
             lpszMenuName: std::ptr::null(),
             lpszClassName: class.as_ptr(),
         };
@@ -293,7 +314,7 @@ unsafe fn open_status_window() {
             class.as_ptr(),
             wide("tsunagu").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 440, 330,
+            60, 60, 460, 380,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -304,7 +325,8 @@ unsafe fn open_status_window() {
             return;
         }
         let _ = STATUS_HWND.store(hwnd as usize, Ordering::Relaxed);
-        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let font = segoe_font(false, 17);
+        let font_bold = segoe_font(true, 19);
         let make_child = |class_name: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| -> usize {
             let child = CreateWindowExW(
                 0,
@@ -322,16 +344,25 @@ unsafe fn open_status_window() {
             }
             child as usize
         };
-        let _ = LABEL_STATE.store(make_child("STATIC", "状態: …", 0, 14, 14, 350, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 14, 42, 350, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 14, 70, 350, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 14, 98, 350, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 14, 126, 400, 22, 0), Ordering::Relaxed);
-        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 14, 154, 400, 22, 0), Ordering::Relaxed);
-        make_child("BUTTON", "ログを開く", 0, 14, 192, 100, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 120, 192, 108, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "再起動", 0, 234, 192, 88, 36, MENU_RESTART as usize);
-        make_child("BUTTON", "終了", 0, 328, 192, 86, 36, MENU_QUIT as usize);
+        // 状態行は太字・大きめで最初に目に入るように。以降は通常行
+        let state_h = make_child("STATIC", "状態: …", 0, 18, 20, 420, 26, 0);
+        PostMessageW(state_h as _, WM_SETFONT, font_bold as usize, 1);
+        let _ = LABEL_STATE.store(state_h, Ordering::Relaxed);
+        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 18, 50, 420, 20, 0), Ordering::Relaxed);
+        // 見出し「接続」(太字)。項目は 1 段字下げして階層を見せる
+        let head_conn = make_child("STATIC", "接続", 0, 18, 78, 420, 18, 0);
+        PostMessageW(head_conn as _, WM_SETFONT, font_bold as usize, 1);
+        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 30, 100, 410, 20, 0), Ordering::Relaxed);
+        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 30, 124, 410, 20, 0), Ordering::Relaxed);
+        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 30, 148, 410, 20, 0), Ordering::Relaxed);
+        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 30, 172, 410, 20, 0), Ordering::Relaxed);
+        // 見出し「操作」(太字)
+        let head_act = make_child("STATIC", "操作", 0, 18, 202, 420, 18, 0);
+        PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
+        make_child("BUTTON", "ログを開く", 0, 18, 226, 100, 34, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 124, 226, 108, 34, MENU_AUDIO as usize);
+        make_child("BUTTON", "再起動", 0, 238, 226, 88, 34, MENU_RESTART as usize);
+        make_child("BUTTON", "終了", 0, 332, 226, 88, 34, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
