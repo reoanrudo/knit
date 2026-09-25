@@ -237,6 +237,9 @@ fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+
+/// 復帰直後は右端判定を一定時間無効化する(再突入チャタリング防止)
+static EDGE_GUARD_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
@@ -292,6 +295,7 @@ fn enter_win_mode_cursor_lock() {
 fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
+        EDGE_GUARD_UNTIL_MS.store(now_ms() + 300, Ordering::Relaxed);
         *LOCK_POS.lock().unwrap() = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
@@ -367,6 +371,7 @@ unsafe extern "C" fn tap_callback(
         // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
         if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)
             && connected
+            && now_ms() >= EDGE_GUARD_UNTIL_MS.load(Ordering::Relaxed)
         {
             if let Some(w) = SCREEN_W.get() {
                 let probe = CGEventCreate(std::ptr::null_mut());
