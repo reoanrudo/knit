@@ -115,6 +115,7 @@ Tailscale 経続併用も可能(戻す場合は .env の行を削除)。
 | `TSUNAGU_SWITCH_DELAY` | 0 | 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時) |
 | `TSUNAGU_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |
 | `TSUNAGU_CORNER_PX` | 0 | 四隅 N px 内では切替しない(switchCorners/cornerSize) |
+| `TSUNAGU_SWIPE_NAV` | 1 | 2本指横スワイプをブラウザの戻る/進むへ翻訳(XButton)。0 で従来の横ホイール |
 | `TSUNAGU_CLIP` | 1 | クリップボード共有(clipboardSharing)。0 で無効 |
 | `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
 | `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |

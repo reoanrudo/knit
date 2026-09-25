@@ -549,7 +549,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         let win = init(
             alloc,
             sel(c"initWithContentRect:styleMask:backing:defer:"),
-            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 820.0 },
+            NSRect { x: 0.0, y: 0.0, w: 400.0, h: 710.0 },
             1 | 2 | 8 | 0x8000, // +FullSizeContentView
             2,
             0,
@@ -567,7 +567,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         // NSSize(f64×2)のため f64 2 引数の transmute で渡す(NSRect 32byte と混同注意)
         let set_min: unsafe extern "C" fn(ID, SEL, f64, f64) =
             std::mem::transmute(crate::objc_msgSend as usize);
-        set_min(win, sel(c"setContentMinSize:"), 400.0, 820.0);
+        set_min(win, sel(c"setContentMinSize:"), 400.0, 710.0);
         // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
         msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
         let cv = msg0(win, sel(c"contentView"));
@@ -602,7 +602,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
             nsstring("状態: …"),
         );
         if !state_lbl.is_null() {
-            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 820.0 - 56.0, w: 360.0, h: 24.0 });
+            set_frame(state_lbl, sel(c"setFrame:"), NSRect { x: 20.0, y: 710.0 - 56.0, w: 360.0, h: 24.0 });
             let font_cls = objc_getClass(c"NSFont".as_ptr());
             if !font_cls.is_null() {
                 let bold: unsafe extern "C" fn(ID, SEL, f64) -> ID =
@@ -617,7 +617,7 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         }
 
         // ---- チェック項目(y は直接減らす=クロージャ借用だと見出し配置と衝突) ----
-        let mut y = 820.0 - 84.0;
+        let mut y = 710.0 - 84.0;
         let place_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize, yy: f64| {
             let b = check_btn(
                 btn_cls,
@@ -763,7 +763,8 @@ unsafe fn make_prefs_window(target: ID) -> ID {
         place_check("クリップボードを共有(テキスト/画像)", c"sdClipShare:", &PREFS_CHK_CLIP, y);
         y -= 38.0;
 
-        // ---- 操作ボタン(切替 + ファイル送信) ----
+        // ---- 操作ボタン(切替 + ファイル送信)。音量はキーボードの
+        // F10/F11/F12(ミュート/▼/▲)で Windows 側を直接操作できる ----
         let toggle_btn = push_btn(
             btn_cls,
             sel(c"buttonWithTitle:target:action:"),

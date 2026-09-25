@@ -653,6 +653,8 @@ pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
 pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
 /// 端到達の開始時刻(switchDelay の滞在計測用)
 static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+/// 横スワイプ(戻る/進む)の累積量と最終発火時刻
+static SWIPE_ACC: std::sync::Mutex<(f64, u64)> = std::sync::Mutex::new((0.0, 0));
 
 /// 現在の SIDE(0=右/1=左/2=上/3=下)を文字列表現で
 pub fn side_name() -> &'static str {
@@ -954,6 +956,17 @@ unsafe extern "C" fn tap_callback(
     // 分岐が外側条件により到達不能なデッドコードだった(レビュー Wave1-X5)
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
+        // 音量キー(F10/11/12 相当: 74=ミュート/73=下/72=上)は Mac の音量を変えず
+        // Windows 側の音量として転送する(実体は Vol メッセージ+イベント握りつぶし)
+        if event_type == EVT_KEY_DOWN && (72..=74).contains(&kc) && win_mode {
+            let op = match kc {
+                72 => 0u8, // VolumeUp
+                73 => 1,   // VolumeDown
+                _ => 2,    // Mute
+            };
+            send_msg(&Msg::Vol { op });
+            return std::ptr::null_mut(); // Mac 側の音量変更を抑制
+        }
         if kc == hotkey_kc() {
             let pressed = match event_type {
                 EVT_KEY_DOWN => true,
@@ -1218,6 +1231,24 @@ unsafe extern "C" fn tap_callback(
         EVT_SCROLL_WHEEL => {
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
+            // 2本指の横スワイプは「戻る/進む」へ翻訳する(トラックパッド適応の要)。
+            // 横が縦より優勢なスワイプだけをナビゲーションとみなし、累積 150px で
+            // 1 回発火(クールダウン 500ms)。TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ
+            let swipe_nav = envutil::get("TSUNAGU_SWIPE_NAV").as_deref() != Some("0");
+            if swipe_nav && win_mode && dx != 0.0 && dx.abs() > dy.abs() {
+                let mut acc = SWIPE_ACC.lock().unwrap_or_else(|e| e.into_inner());
+                acc.0 += dx;
+                let now = now_ms();
+                if acc.0.abs() >= 150.0 && now.saturating_sub(acc.1) >= 500 {
+                    let btn = if acc.0 < 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
+                    send_msg(&Msg::MouseButton { btn, down: true });
+                    send_msg(&Msg::MouseButton { btn, down: false });
+                    eprintln!("[swipe] {} 送信", if btn == 3 { "戻る" } else { "進む" });
+                    *acc = (0.0, now);
+                }
+                // 横主導のジェスチャはここで完結(縦の僅かな揺れも無視して二重発火を防ぐ)
+                return std::ptr::null_mut();
+            }
             if dx != 0.0 || dy != 0.0 {
                 // ピクセル delta → ノッチ単位へ累積変換。0.05ノッチ(=6 wheel units)刻みで
                 // 送る=Windows のプレシジョンタッチパッドと同じ高解像度スクロール。
@@ -1253,7 +1284,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-001940-7d8c1ce";
+const BUILD_ID: &str = "build-20260926-003723-83910a6";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");

@@ -420,10 +420,16 @@ fn send_input_buf(buf: InputBuf) -> bool {
 }
 
 fn inject_key(vk: u16, up: bool) -> bool {
+    // wScan を必ず付ける: 日本語 IME 等は scan code 無しのキーを無視/不安定に
+    // 扱うことがある(「ー」等の OEM キーで顕著)。vk と scan の併用が最も互換性が高い
+    extern "system" {
+        fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    }
+    let scan = unsafe { MapVirtualKeyW(vk as u32, 0 /*MAPVK_VK_TO_VSC*/) } as u32;
     send_input_buf(InputBuf {
         itype: INPUT_KEYBOARD,
         _pad: 0,
-        body: [vk as u32, if up { KEYEVENTF_KEYUP } else { 0 }, 0, 0, 0, 0],
+        body: [vk as u32, if up { KEYEVENTF_KEYUP } else { 0 }, scan, 0, 0, 0],
         extra: 0,
     })
 }
@@ -469,6 +475,18 @@ fn inject_mouse_btn(btn: u8, down: bool) -> bool {
         itype: INPUT_MOUSE,
         _pad: 0,
         body: [0, 0, 0, flags, 0, 0],
+        extra: 0,
+    })
+}
+
+/// XButton1/2(ブラウザの戻る/進む)。idx: 0=戻る, 1=進む
+fn inject_xbutton(idx: u8, down: bool) -> bool {
+    const XDOWN: u32 = 0x0080;
+    const XUP: u32 = 0x0100;
+    send_input_buf(InputBuf {
+        itype: INPUT_MOUSE,
+        _pad: 0,
+        body: [0, 0, (idx + 1) as u32, if down { XDOWN } else { XUP }, 0, 0],
         extra: 0,
     })
 }
@@ -646,7 +664,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-001722-7d8c1ce";
+const BUILD_ID: &str = "win-20260926-003629-83910a6";
 
 fn main() {
     ensure_stdout();
@@ -1204,7 +1222,12 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 if !hello_done {
                     continue;
                 }
-                inject_mouse_btn(btn, down);
+                if btn >= 3 {
+                    // XButton1/2(トラックパッドの戻る/進むスワイプ)
+                    inject_xbutton(btn - 3, down);
+                } else {
+                    inject_mouse_btn(btn, down);
+                }
             }
             Msg::Scroll { dx, dy } => {
                 if !hello_done {

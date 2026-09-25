@@ -323,6 +323,7 @@ pub mod keymap {
             44 => 0xBF, // /
             50 => 0xC0, // `
             93 => 0xDC, // ¥(Mac JIS)→ Win バックスラッシュ/円記号
+            27 => 0xBD, // -(US)/ー(JIS 長音)→ Win -[OEM_MINUS]
             94 => 0xBD, // _(Mac JIS)→ Win -
             // 制御・編集
             36 => 0x0D, // Return
