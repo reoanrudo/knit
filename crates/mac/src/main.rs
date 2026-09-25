@@ -114,6 +114,10 @@ static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
+/// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
+static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。SEAMLESS_SCROLL_DIV で調整可。
+static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -286,8 +290,18 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
             if dx != 0.0 || dy != 0.0 {
-                // Mac のピクセル delta → Windows detent(120 単位)への概算変換
-                send_msg(&Msg::Scroll { dx: -dx / 40.0, dy: -dy / 40.0 });
+                // ピクセル delta → ノッチ単位へ累積変換。1ノッチ分溜まった時点だけ送る。
+                // 除数を大きくすると遅くなる(従来40は速すぎたので既定120)。端数は持ち越し。
+                let div = SCROLL_DIV.get().copied().unwrap_or(120.0);
+                let mut acc = SCROLL_ACC.lock().unwrap();
+                acc.0 += -dx / div;
+                acc.1 += -dy / div;
+                let (ix, iy) = (acc.0.trunc(), acc.1.trunc());
+                if ix != 0.0 || iy != 0.0 {
+                    acc.0 -= ix;
+                    acc.1 -= iy;
+                    send_msg(&Msg::Scroll { dx: ix, dy: iy });
+                }
             }
         }
         _ => {}
@@ -323,7 +337,15 @@ fn main() {
     };
     let _ = SCREEN_W.set(screen_w);
     let _ = SCREEN_H.set(screen_h);
-    eprintln!("[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode)");
+    if let Some(d) = std::env::var("SEAMLESS_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
+        if d > 0.0 {
+            let _ = SCROLL_DIV.set(d);
+        }
+    }
+    eprintln!(
+        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={}",
+        SCROLL_DIV.get().copied().unwrap_or(120.0)
+    );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
     let (tx, rx) = std::sync::mpsc::channel::<String>();
