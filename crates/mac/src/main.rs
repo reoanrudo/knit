@@ -235,6 +235,9 @@ static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。SEAMLESS_SCROLL_DIV で調整可。
 static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
+/// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
+/// SEAMLESS_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
+static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -411,7 +414,8 @@ unsafe extern "C" fn tap_callback(
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
-                send_msg(&Msg::MouseMove { dx, dy });
+                let sc = MOUSE_SCALE.get().copied().unwrap_or(1.0);
+                send_msg(&Msg::MouseMove { dx: dx * sc, dy: dy * sc });
             }
             // カーソル固定監視: 関連切断の効き始め猶予に漏れた移動を固定位置へ巻き戻す
             if let Some((lx, ly)) = *LOCK_POS.lock().unwrap() {
@@ -482,6 +486,11 @@ fn main() {
     if let Some(d) = std::env::var("SEAMLESS_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
             let _ = SCROLL_DIV.set(d);
+        }
+    }
+    if let Some(m) = std::env::var("SEAMLESS_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
+        if m > 0.0 {
+            let _ = MOUSE_SCALE.set(m);
         }
     }
     eprintln!(
