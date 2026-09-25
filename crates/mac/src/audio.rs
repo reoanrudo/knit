@@ -105,6 +105,17 @@ unsafe extern "C" {
     fn AudioQueueFlush(in_aq: AudioQueueRef) -> OSStatus;
 }
 
+/// リサンプル位相: 前回コールバックの消費端数(フレーム単位、0..1)。
+/// コールバック間で持ち越すことで、読み出し位置が波形上で完全に連続になり
+/// フレーム欠け/重複が構造的に起きない(端数の切り捨てが毎回ノイズになるのを防ぐ)
+static PHASE_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn phase_load() -> f64 {
+    f64::from_bits(PHASE_FRAMES.load(Ordering::Relaxed))
+}
+fn phase_store(v: f64) {
+    PHASE_FRAMES.store(v.to_bits(), Ordering::Relaxed);
+}
+
 /// AudioQueue の出力コールバック: リングから必要分だけ取り出して埋める。
 /// 不足分は無音で埋める。滞留が目標を超えているときは線形補間でわずかに
 /// 速く読み(リサンプル追い込み)、波形を切らないまま遅延を調整する
@@ -139,6 +150,7 @@ unsafe extern "C" fn aq_callback(
                     return;
                 }
                 PRIMED.store(true, Ordering::Relaxed);
+                phase_store(0.0); // 在庫が新鮮なため位相もリセット
             }
             // 緊急クリップ(大バーストのみ): 8 バイト(f32×2ch=1フレーム)境界で
             // 一括間引き。超過は通常この経路を通らず、通った量は diag で見える
@@ -149,47 +161,52 @@ unsafe extern "C" fn aq_callback(
             }
             // 滑らかな追い込み: 滞留が目標を超えている間、読み出し速度を最大 2%
             // 速くする(線形補間)。フレーム欠け(位相ジャンプ=割れ音)ではなく
-            // 波形を連続したまま遅延を目標へ戻す。ピッチ変化 <2% は一時的で
-            // 聴感上ほぼ無害。定常のクロック差(数十ppm)は 1.000x 倍で吸収される
+            // 波形を連続したまま遅延を目標へ戻す。位相はコールバック間で
+            // 持ち越すため、ratio=1.0 のときは素通し=ドロップ・重複ゼロ
             let over = ring.len().saturating_sub(RING_SOFT_TARGET);
             let ratio = 1.0 + (over as f64 / RING_SOFT_TARGET as f64).min(1.0) * 0.02;
-            // 先頭の必要分をスナップショット(VecDeque は添字アクセスが高いため)
-            let need = (cap as f64 * ratio) as usize + 8;
+            let need = (cap as f64 * ratio) as usize + 16;
             let src: Vec<u8> = ring.iter().take(need).copied().collect();
-            let src_samples = src.len() / 4;
-            let out_samples = cap / 4;
-            if src_samples >= 2 {
+            let src_frames = src.len() / 8; // 1フレーム=8バイト(L+R)
+            let out_frames = cap / 8;
+            if src_frames >= 2 {
                 let dst_f = dst as *mut f32;
                 let sample = |i: usize| -> f32 {
                     f32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]])
                 };
-                let mut pos = 0.0f64;
-                let mut written = 0usize; // 書けた f32 サンプル数
-                for o in 0..out_samples {
-                    let i0 = pos as usize;
-                    if i0 + 1 >= src_samples {
-                        // 在庫の終端に到達: 最後のサンプルをホールドして埋める
-                        dst_f.add(o).write(sample(src_samples - 1));
-                        written = o + 1;
-                        break; // 残りは呼び出し元でゼロ埋めされる
+                // sp はフレーム単位の読み出し位置(整数部=フレーム、端数=補間位相)。
+                // L(偶数サンプル)は L 同士、R は R 同士で補間するため L/R は混ざらない
+                let mut sp = phase_load();
+                let mut written_bytes = 0usize;
+                for o in 0..out_frames {
+                    let i0 = sp as usize;
+                    if i0 + 1 >= src_frames {
+                        // 在庫の終端に到達: 最終フレームをホールドして埋める
+                        let base = (src_frames - 1) * 2;
+                        dst_f.add(o * 2).write(sample(base));
+                        dst_f.add(o * 2 + 1).write(sample(base + 1));
+                        written_bytes = (o + 1) * 8;
+                        sp = (src_frames - 1) as f64;
+                        break;
                     }
-                    let frac = (pos - i0 as f64) as f32;
-                    let v = sample(i0) + (sample(i0 + 1) - sample(i0)) * frac;
-                    dst_f.add(o).write(v);
-                    written = o + 1;
-                    pos += ratio;
+                    let frac = (sp - i0 as f64) as f32;
+                    let l = sample(i0 * 2) + (sample(i0 * 2 + 2) - sample(i0 * 2)) * frac;
+                    let r = sample(i0 * 2 + 1) + (sample(i0 * 2 + 3) - sample(i0 * 2 + 1)) * frac;
+                    dst_f.add(o * 2).write(l);
+                    dst_f.add(o * 2 + 1).write(r);
+                    written_bytes = (o + 1) * 8;
+                    sp += ratio;
                 }
-                // 消費は 2 サンプル(8バイト=L+R 1フレーム)境界で切り上げ:
-                // 奇数サンプルで切ると L/R が入れ替わり恒久的に歪む
-                let mut consumed_samples = (pos as usize) + 2;
-                if consumed_samples % 2 == 1 {
-                    consumed_samples += 1;
-                }
-                let consumed = (consumed_samples * 4).min(ring.len());
-                ring.drain(..consumed);
-                filled = (written * 4).min(cap);
+                // 消費 = 読み出し位置の整数部(フレーム単位=自動的に 8 バイト境界)。
+                // 端数は PHASE として次回へ繰り越すため、捨てても重複しても無い
+                let consumed_frames = (sp as usize).min(src_frames);
+                let consumed = consumed_frames * 8;
+                let n = consumed.min(ring.len());
+                ring.drain(..n);
+                phase_store(sp - consumed_frames as f64);
+                filled = written_bytes;
             } else if !ring.is_empty() {
-                // 在庫が 1 サンプル未満(通常ない): そのまま取り出す
+                // 在庫が 1 フレーム未満(通常ない): そのまま取り出す
                 let take = ring.len().min(cap);
                 for i in 0..take {
                     dst.add(i).write(ring.pop_front().unwrap_or(0));
@@ -213,7 +230,8 @@ unsafe extern "C" fn aq_callback(
 fn start_playback(rate: u32) -> bool {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
-        let frame_bytes = rate as usize * bytes_per_frame as usize * 15 / 1000; // 15ms
+        // 15ms 分。奇数サンプルレート環境で L/R が割れないよう 8 バイト境界へ丸める
+        let frame_bytes = (rate as usize * bytes_per_frame as usize * 15 / 1000) & !7usize;
         let desc = AudioStreamBasicDescription {
             mSampleRate: rate as f64,
             mFormatID: KAUDIO_FORMAT_LINEAR_PCM,
@@ -329,6 +347,7 @@ pub fn start(token: String) {
             }
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
             PRIMED.store(false, Ordering::Relaxed);
+            phase_store(0.0);
             eprintln!("[audio] streaming started ({rate}Hz f32/stereo)");
             // PCM フレーム受信: [u32 LE 長][データ]。長さ上限は 128KB
             let mut len_buf = [0u8; 4];
@@ -374,6 +393,7 @@ pub fn start(token: String) {
                     // ミュート明けはプリロールからやり直す(クッション無しの
                     // 即再生で断続音が出るのを防ぐ)
                     PRIMED.store(false, Ordering::Relaxed);
+                    phase_store(0.0);
                 }
                 if last_diag.elapsed() >= std::time::Duration::from_secs(10) {
                     last_diag = std::time::Instant::now();
