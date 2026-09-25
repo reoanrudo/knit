@@ -436,13 +436,15 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_SCROLL_A1) as f64;
             let dx = CGEventGetIntegerValueField(event, FIELD_SCROLL_A2) as f64;
             if dx != 0.0 || dy != 0.0 {
-                // ピクセル delta → ノッチ単位へ累積変換。1ノッチ分溜まった時点だけ送る。
+                // ピクセル delta → ノッチ単位へ累積変換。0.25ノッチ刻みで送る。
+                // 整数ノッチ単位だと遅いスクロールがカクつくため、細かい量子化で滑らかに。
                 // 除数を大きくすると遅くなる(従来40は速すぎたので既定120)。端数は持ち越し。
+                const Q: f64 = 0.25; // 量子化幅(ノッチ)= Windows 側は 30 wheel units 刻み
                 let div = SCROLL_DIV.get().copied().unwrap_or(120.0);
                 let mut acc = SCROLL_ACC.lock().unwrap();
                 acc.0 += -dx / div;
                 acc.1 += -dy / div;
-                let (ix, iy) = (acc.0.trunc(), acc.1.trunc());
+                let (ix, iy) = ((acc.0 / Q).trunc() * Q, (acc.1 / Q).trunc() * Q);
                 if ix != 0.0 || iy != 0.0 {
                     acc.0 -= ix;
                     acc.1 -= iy;
