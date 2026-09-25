@@ -15,16 +15,26 @@ pub static MUTED: AtomicBool = AtomicBool::new(false);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 再生リングバッファ(音声スレッド→AudioQueue コールバック)。
-/// 上限は滞留クリップ(下記)より十分大きい 128KB(≈333ms)とし、
-/// 溢れたら古い方を捨てる。実効的な再生遅延は aq_callback の
-/// クリップ処理で約 60ms に固定される
+/// 溢れたら古い方を捨てる。実効的な滞留は aq_callback の 2 段階クリップで
+/// 「目標 ≈83ms・上限 333ms」に保つ(下記定数参照)
 static RING: Mutex<std::collections::VecDeque<u8>> =
     Mutex::new(std::collections::VecDeque::new());
-const RING_CAP: usize = 128 * 1024;
-/// 滞留クリップ量(48kHz f32/stereo で ≈62ms)。これを超えて溜まった分は
-/// 再生のたびに古い方から捨てる。ネットワークのバーストや送受信クロックの
-/// わずかな差で滞留が育つ(=遅延がだんだん増える)のを防ぐための上限
-const RING_CLIP: usize = 24 * 1024;
+const RING_CAP: usize = 192 * 1024;
+/// プリロール量(48kHz f32/stereo で ≈83ms)。ストリーム開始/ミュート明けに
+/// これだけ溜まるまで再生を始めない。ネットワークの到着むら(バースト)を
+/// このクッションで吸収し、RING 空による断続音(モールス音)を防ぐ
+/// = 全ストリーミング再生の定番構成(遅延はこの分だけ一定に乗る)
+const RING_PRE_ROLL: usize = 32 * 1024;
+/// プリロール完了状態(開始/ミュート明けごとにやり直す)
+static PRIMED: AtomicBool = AtomicBool::new(false);
+/// ソフト追い込みの目標滞留(≈83ms=プリロール量と同値)。これを超えたら
+/// 毎回「超過分の 1/32」だけ捨て、指数的に目標へ戻す。
+/// 1 回あたりのドロップが数サンプル〜数ms 程度に収まるため、
+/// まとめ捨て(位相ジャンプ=プツプツ音)にならない
+const RING_SOFT_TARGET: usize = 32 * 1024;
+/// 緊急クリップの上限(≈333ms)。大バースト(再接続直後等)で一気に溜まった
+/// 場合だけ目標値まで一括で捨てる(恒常的には発動しない)
+const RING_HARD_CLIP: usize = 128 * 1024;
 
 type AudioQueueRef = *mut core::ffi::c_void;
 type AudioQueueBufferRef = *mut AudioQueueBuffer;
@@ -112,12 +122,35 @@ unsafe extern "C" fn aq_callback(
         let mut filled = 0usize;
         if !MUTED.load(Ordering::Relaxed) {
             let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
-            // 遅延クリップ: 滞留が RING_CLIP を超えたら古い方から捨てる。
-            // 溜めたまま再生するとその分まるまる遅延になるため、
-            // 常に「溜め ≤ 約60ms」を維持する(超過分の犠牲で遅延を固定)
-            if ring.len() > RING_CLIP {
-                let excess = ring.len() - RING_CLIP;
+            // プリロール: RING_PRE_ROLL 分溜まるまで再生を始めない(ゼロ埋め)。
+            // 溜まりきる前に鳴らし始めると供給の到着むらがそのまま音切れに
+            // なる(断続音=モールス音の原因)
+            if !PRIMED.load(Ordering::Relaxed) {
+                if ring.len() < RING_PRE_ROLL {
+                    for i in 0..cap {
+                        dst.add(i).write(0);
+                    }
+                    (*buffer).mAudioDataByteSize = cap as u32;
+                    PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);
+                    AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
+                    return;
+                }
+                PRIMED.store(true, Ordering::Relaxed);
+            }
+            // 滞留の追い込み(2 段階)。遅延が育ち続けるのを防ぐ一方、
+            // まとめて捨てすぎると位相ジャンプでプツプツ音になるため、
+            // 日常は超過分の 1/32 ずつ(=数サンプル単位)で滑らかに戻す。
+            //
+            // 【重要】ドロップ量は必ず 8 バイト(f32×2ch = 1フレーム)境界に丸める。
+            // 途中のバイトから読み出し始めると全ストリームの位相が恒久的にずれ、
+            // 元の音源が分からない激しい破壊音として再生され続ける
+            let floor8 = |n: usize| n & !7usize;
+            if ring.len() > RING_HARD_CLIP {
+                let excess = floor8(ring.len() - RING_SOFT_TARGET);
                 ring.drain(..excess);
+            } else if ring.len() > RING_SOFT_TARGET {
+                let drop = floor8(((ring.len() - RING_SOFT_TARGET) / 32).max(1));
+                ring.drain(..drop);
             }
             let take = ring.len().min(cap);
             for i in 0..take {
@@ -135,13 +168,13 @@ unsafe extern "C" fn aq_callback(
     }
 }
 
-/// AudioQueue を起動する(3バッファ x 10ms = 30ms の再生バッファ遅延)。
-/// 低遅延優先: RING の滞留は aq_callback のクリップで約60msに固定され、
-/// 瞬断時に一時的に鳴らせる音もこの範囲で確保される
+/// AudioQueue を起動する(4バッファ x 15ms = 60ms の再生バッファ)。
+/// 低遅延と音切れ防止のバランス点: 供給側の揺らぎ(TCP 到着間隔)を
+/// この余裕で吸収し、滞留はクリップで「目標 ≈78ms」に保つ
 fn start_playback(rate: u32) -> bool {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
-        let frame_bytes = rate as usize * bytes_per_frame as usize / 100; // 10ms
+        let frame_bytes = rate as usize * bytes_per_frame as usize * 15 / 1000; // 15ms
         let desc = AudioStreamBasicDescription {
             mSampleRate: rate as f64,
             mFormatID: KAUDIO_FORMAT_LINEAR_PCM,
@@ -167,7 +200,7 @@ fn start_playback(rate: u32) -> bool {
             eprintln!("[audio] AudioQueueNewOutput 失敗");
             return false;
         }
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
             if AudioQueueAllocateBuffer(aq, frame_bytes, &mut buf) != 0 {
                 eprintln!("[audio] AllocateBuffer 失敗");
@@ -256,6 +289,7 @@ pub fn start(token: String) {
                 playback_started = start_playback(rate);
             }
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            PRIMED.store(false, Ordering::Relaxed);
             eprintln!("[audio] streaming started ({rate}Hz f32/stereo)");
             // PCM フレーム受信: [u32 LE 長][データ]。長さ上限は 128KB
             let mut len_buf = [0u8; 4];
@@ -266,7 +300,10 @@ pub fn start(token: String) {
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
                 if len == 0 {
-                    continue; // キープアライブ(無音期間の死活監視用)
+                    // キープアライブ(無音期間の死活監視用)。
+                    // 無音期間はここがループの唯一の出口のため diag も出す
+                    diag_log(&mut last_diag, rate);
+                    continue;
                 }
                 if len > 128 * 1024 {
                     eprintln!("[audio] invalid frame len={len}. disconnect");
@@ -276,25 +313,35 @@ pub fn start(token: String) {
                 if reader.read_exact(&mut frame).is_err() {
                     break;
                 }
+                // フレーム整合の防御: 8 バイト(f32×2ch)境界に切り詰める。
+                // 送信側はフレーム単位で送るはずだが、万一の途中欠けが
+                // 混入しても破壊音として再生されないようにする
+                frame.truncate(frame.len() & !7usize);
+                if frame.is_empty() {
+                    continue;
+                }
                 RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
                 if !MUTED.load(Ordering::Relaxed) {
                     let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
                     // ミュート明けに古い音を鳴らさない、かつ遅延を溜めない:
-                    // 上限超過分は古い方から捨てる
+                    // 上限超過分は古い方から捨てる(8バイト境界で)
                     if ring.len() + frame.len() > RING_CAP {
-                        let overflow = ring.len() + frame.len() - RING_CAP;
-                        for _ in 0..overflow.min(ring.len()) {
-                            ring.pop_front();
-                        }
+                        let overflow = (ring.len() + frame.len() - RING_CAP) & !7usize;
+                        let n = overflow.min(ring.len());
+                        ring.drain(..n);
                     }
                     ring.extend(frame.iter().copied());
+                } else {
+                    // ミュート明けはプリロールからやり直す(クッション無しの
+                    // 即再生で断続音が出るのを防ぐ)
+                    PRIMED.store(false, Ordering::Relaxed);
                 }
                 if last_diag.elapsed() >= std::time::Duration::from_secs(10) {
                     last_diag = std::time::Instant::now();
                     let rx = RX_BYTES.load(Ordering::Relaxed) / 1024;
                     let play = PLAY_BYTES.load(Ordering::Relaxed) / 1024;
                     let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len();
-                    // 滞留時間(=ここが実効的な追加遅延)。クリップで ≈62ms 以下に保たれる
+                    // 滞留時間(=ここが実効的な追加遅延)。プリロールで ≈83ms に保たれる
                     let lag_ms = queued as u64 * 1000 / (rate as u64 * 8);
                     eprintln!(
                         "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms",
@@ -305,4 +352,21 @@ pub fn start(token: String) {
             eprintln!("[audio] stream ended");
         }
     });
+}
+
+/// 10 秒毎の診断ログ(受信量/再生量/滞留と実効遅延 lag)。無音期間は
+/// キープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる
+fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {
+    if last_diag.elapsed() < std::time::Duration::from_secs(10) {
+        return;
+    }
+    *last_diag = std::time::Instant::now();
+    let rx = RX_BYTES.load(Ordering::Relaxed) / 1024;
+    let play = PLAY_BYTES.load(Ordering::Relaxed) / 1024;
+    let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let lag_ms = queued as u64 * 1000 / (rate as u64 * 8);
+    eprintln!(
+        "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms",
+        queued / 1024
+    );
 }
