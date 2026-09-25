@@ -9,7 +9,16 @@ pub mod proto {
     #[serde(tag = "t")]
     pub enum Msg {
         #[serde(rename = "hello")]
-        Hello { ver: u32, name: String, token: String },
+        Hello {
+            ver: u32,
+            name: String,
+            token: String,
+            /// 送信側の画面幅/高さ(px)。スケール自動算出と絶対座標送信に使う
+            #[serde(default)]
+            w: i32,
+            #[serde(default)]
+            h: i32,
+        },
         #[serde(rename = "hello_ok")]
         HelloOk { name: String, w: i32, h: i32 },
         #[serde(rename = "key")]
@@ -23,6 +32,10 @@ pub mod proto {
         },
         #[serde(rename = "mouse_move")]
         MouseMove { dx: f64, dy: f64 },
+        /// カーソル絶対位置(0..1 正規化)。Windows 側は MOUSEEVENTF_ABSOLUTE で注入し、
+        /// ポインタ加速曲線を通さず Mac の速度感をそのまま再現する
+        #[serde(rename = "mouse_abs")]
+        MouseAbs { nx: f64, ny: f64 },
         #[serde(rename = "mouse_btn")]
         MouseButton { btn: u8, down: bool },
         #[serde(rename = "scroll")]

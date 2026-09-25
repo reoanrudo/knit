@@ -245,6 +245,14 @@ static EDGE_GUARD_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// 自前管理のカーソル位置(delta 積算)。タップ内での毎イベント CGEventCreate は
 /// 負荷としてカクつきに効くため、積算+間欠同期(Deskflow の m_xCursor 方式)にする。
 static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// 接続相手(Windows)の画面サイズ(px)。hello で受信しスケール自動算出に使う
+static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
+/// WIN モード中の Windows 仮想カーソル位置(px)。絶対位置送信モードで使う
+static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// 前回送信した絶対位置(量子化変化検出用)
+static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
+/// 絶対位置送信モード(既定ON。SEAMLESS_MOUSE_MODE=rel で旧・相対移動に戻す)
+static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// ライブカーソル位置を取得(CFRelease まで面倒を見る)
@@ -438,6 +446,12 @@ unsafe extern "C" fn tap_callback(
                     }
                     send_msg(&Msg::Warp { nx: 0.05, ny });
                     eprintln!("[warp] -> win ({:.2},{:.2})", 0.05, ny);
+                    // 絶対位置モードの仮想カーソルを Warp 先で初期化
+                    {
+                        let (ww, wh) = *WIN_SCREEN.lock().unwrap();
+                        *WIN_CUR.lock().unwrap() = (0.05 * ww, ny * wh);
+                        *LAST_ABS_SENT.lock().unwrap() = (-1.0, -1.0);
+                    }
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
                 }
@@ -480,7 +494,30 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
                 let sc = MOUSE_SCALE.get().copied().unwrap_or(1.0);
-                send_msg(&Msg::MouseMove { dx: dx * sc, dy: dy * sc });
+                if MOUSE_ABS_MODE.load(Ordering::Relaxed) {
+                    // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
+                    // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
+                    let (ww, wh) = *WIN_SCREEN.lock().unwrap();
+                    let (mw, mh) = (
+                        SCREEN_W.get().copied().unwrap_or(2056.0),
+                        SCREEN_H.get().copied().unwrap_or(1329.0),
+                    );
+                    let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
+                    let mut wc = WIN_CUR.lock().unwrap();
+                    wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 1.0);
+                    wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 1.0);
+                    let (nx, ny) = (wc.0 / ww, wc.1 / wh);
+                    let mut ls = LAST_ABS_SENT.lock().unwrap();
+                    // 量子化後(1/65535)に変わるときだけ送信する(無駄打ち防止)
+                    if (ls.0 - nx).abs() >= 1.0 / 65535.0 || (ls.1 - ny).abs() >= 1.0 / 65535.0 {
+                        *ls = (nx, ny);
+                        drop(ls);
+                        send_msg(&Msg::MouseAbs { nx, ny });
+                    }
+                } else {
+                    // 相対移動モード(従来互換)
+                    send_msg(&Msg::MouseMove { dx: dx * sc, dy: dy * sc });
+                }
             }
             // カーソル固定の巻き戻しは 200ms 監視スレッドに集約した
             // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
@@ -518,7 +555,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-165011-48f261e";
+const BUILD_ID: &str = "build-20260925-165200-3779a4e";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -566,12 +603,18 @@ fn main() {
             let _ = EDGE_PX.set(e);
         }
     }
+    if let Some(m) = std::env::var("SEAMLESS_MOUSE_MODE").ok() {
+        if m.eq_ignore_ascii_case("rel") {
+            MOUSE_ABS_MODE.store(false, Ordering::Relaxed);
+        }
+    }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB",
+        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={}",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
         MOUSE_SCALE.get().copied().unwrap_or(1.0),
         EDGE_PX.get().copied().unwrap_or(2.0),
-        CLIP_MAX_BYTES / 1024
+        CLIP_MAX_BYTES / 1024,
+        if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" }
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -657,8 +700,13 @@ fn main() {
                 Ok(_) => {}
             }
             let ok = match decode(&line) {
-                Some(Msg::Hello { ver, name, token: t }) if ver == VERSION && t == token => {
+                Some(Msg::Hello { ver, name, token: t, w, h }) if ver == VERSION && t == token => {
                     let _ = name;
+                    // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
+                    if w > 0 && h > 0 {
+                        *WIN_SCREEN.lock().unwrap() = (w as f64, h as f64);
+                        eprintln!("[info] win screen {w}x{h}");
+                    }
                     true
                 }
                 _ => false,

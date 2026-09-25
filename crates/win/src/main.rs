@@ -197,6 +197,18 @@ fn inject_mouse_move_rel(dx: i32, dy: i32) -> bool {
     })
 }
 
+/// 絶対位置移動(0..65535 座標、プライマリ画面)。MOUSEEVENTF_ABSOLUTE は
+/// Windows のポインタ加速曲線を通らないため、Mac の速度感がそのまま再現される
+fn inject_mouse_move_abs(x: i32, y: i32) -> bool {
+    const ABSOLUTE: u32 = 0x8000;
+    send_input_buf(InputBuf {
+        itype: INPUT_MOUSE,
+        _pad: 0,
+        body: [x as u32, y as u32, 0, MOUSEEVENTF_MOVE | ABSOLUTE, 0, 0],
+        extra: 0,
+    })
+}
+
 fn inject_mouse_btn(btn: u8, down: bool) -> bool {
     const LEFTDOWN: u32 = 0x0002;
     const LEFTUP: u32 = 0x0004;
@@ -283,7 +295,7 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-165023-48f261e";
+const BUILD_ID: &str = "win-20260925-165212-3779a4e";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
@@ -360,7 +372,13 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     // クライアントとして hello を送る
     let mut hello_sent = false;
     for _ in 0..3 {
-        let hello = encode(&Msg::Hello { ver: VERSION, name: "desktop".into(), token: token.to_string() });
+        let hello = encode(&Msg::Hello {
+            ver: VERSION,
+            name: "desktop".into(),
+            token: token.to_string(),
+            w,
+            h,
+        });
         if writeln!(writer, "{hello}").and_then(|_| writer.flush()).is_ok() {
             hello_sent = true;
             break;
@@ -493,6 +511,15 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     // 実際にカーソルが動いたときだけ左端到達を判定する
                     maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
                 }
+            }
+            Msg::MouseAbs { nx, ny } => {
+                if !hello_done {
+                    continue;
+                }
+                let x = (nx.clamp(0.0, 1.0) * 65535.0).round() as i32;
+                let y = (ny.clamp(0.0, 1.0) * 65535.0).round() as i32;
+                inject_mouse_move_abs(x, y);
+                maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
