@@ -240,6 +240,21 @@ fn now_ms() -> u64 {
 
 /// 復帰直後は右端判定を一定時間無効化する(再突入チャタリング防止)
 static EDGE_GUARD_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 自前管理のカーソル位置(delta 積算)。タップ内での毎イベント CGEventCreate は
+/// 負荷としてカクつきに効くため、積算+間欠同期(Deskflow の m_xCursor 方式)にする。
+static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// ライブカーソル位置を取得(CFRelease まで面倒を見る)
+unsafe fn live_cursor() -> Option<CGPoint> {
+    let probe = CGEventCreate(std::ptr::null_mut());
+    if probe.is_null() {
+        return None;
+    }
+    let loc = CGEventGetLocation(probe);
+    CFRelease(probe);
+    Some(loc)
+}
 /// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
@@ -296,6 +311,9 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
     // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
         EDGE_GUARD_UNTIL_MS.store(now_ms() + 300, Ordering::Relaxed);
+        if let Some(loc) = live_cursor() {
+            *CUR_POS.lock().unwrap() = (loc.x, loc.y);
+        }
         *LOCK_POS.lock().unwrap() = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
@@ -374,21 +392,31 @@ unsafe extern "C" fn tap_callback(
             && now_ms() >= EDGE_GUARD_UNTIL_MS.load(Ordering::Relaxed)
         {
             if let Some(w) = SCREEN_W.get() {
-                let probe = CGEventCreate(std::ptr::null_mut());
-                if probe.is_null() {
-                    return event;
+                // delta 積算でカーソル位置を追跡(Deskflow の m_xCursor 方式)。
+                // 32イベントに1回ライブ位置へ同期しドリフトを補正する
+                let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
+                let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
+                let n = CUR_SYNC_N.fetch_add(1, Ordering::Relaxed);
+                let mut pos = CUR_POS.lock().unwrap();
+                pos.0 += dx;
+                pos.1 += dy;
+                if n % 32 == 0 {
+                    if let Some(loc) = live_cursor() {
+                        *pos = (loc.x, loc.y);
+                    }
                 }
-                let loc = CGEventGetLocation(probe);
-                CFRelease(probe);
-                if loc.x >= *w - 2.0 {
+                let (px, _py) = *pos;
+                drop(pos);
+                if px >= *w - 2.0 {
+                    // 切替の瞬間はライブ位置で正確な高さを取る
+                    let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
                     WIN_MODE.store(true, Ordering::Relaxed);
-                    eprintln!("[mode] WINDOWS (edge)");
-                    // Windows カーソルを画面左端の対応高さへワープ(連続的な「向こうへ行く」体験)
+                    eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0})", loc.x, loc.y);
                     let mut ny = 0.5;
                     if let Some(sh) = SCREEN_H.get() {
                         ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
                     }
-                    send_msg(&Msg::Warp { nx: 0.02, ny });
+                    send_msg(&Msg::Warp { nx: 0.03, ny });
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
                 }
@@ -430,17 +458,8 @@ unsafe extern "C" fn tap_callback(
                 let sc = MOUSE_SCALE.get().copied().unwrap_or(1.0);
                 send_msg(&Msg::MouseMove { dx: dx * sc, dy: dy * sc });
             }
-            // カーソル固定監視: 関連切断の効き始め猶予に漏れた移動を固定位置へ巻き戻す
-            if let Some((lx, ly)) = *LOCK_POS.lock().unwrap() {
-                let probe = CGEventCreate(std::ptr::null_mut());
-                if !probe.is_null() {
-                    let loc = CGEventGetLocation(probe);
-                    CFRelease(probe);
-                    if (loc.x - lx).abs() > 4.0 || (loc.y - ly).abs() > 4.0 {
-                        CGWarpMouseCursorPosition(CGPoint { x: lx, y: ly });
-                    }
-                }
-            }
+            // カーソル固定の巻き戻しは 200ms 監視スレッドに集約した
+            // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
         }
         EVT_LEFT_DOWN | EVT_LEFT_UP => send_msg(&Msg::MouseButton { btn: 0, down: event_type == EVT_LEFT_DOWN }),
         EVT_RIGHT_DOWN | EVT_RIGHT_UP => send_msg(&Msg::MouseButton { btn: 1, down: event_type == EVT_RIGHT_DOWN }),
@@ -470,7 +489,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-162358-7f022dc";
+const BUILD_ID: &str = "build-20260925-163544-4d0b81b";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -498,6 +517,11 @@ fn main() {
     };
     let _ = SCREEN_W.set(screen_w);
     let _ = SCREEN_H.set(screen_h);
+    unsafe {
+        if let Some(loc) = live_cursor() {
+            *CUR_POS.lock().unwrap() = (loc.x, loc.y);
+        }
+    }
     if let Some(d) = std::env::var("SEAMLESS_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
             let _ = SCROLL_DIV.set(d);
@@ -821,12 +845,7 @@ fn main() {
             }
             let Some((lx, ly)) = *LOCK_POS.lock().unwrap() else { continue };
             unsafe {
-                let probe = CGEventCreate(std::ptr::null_mut());
-                if probe.is_null() {
-                    continue;
-                }
-                let loc = CGEventGetLocation(probe);
-                CFRelease(probe);
+                let Some(loc) = live_cursor() else { continue };
                 if (loc.x - lx).abs() > 1.0 || (loc.y - ly).abs() > 1.0 {
                     CGWarpMouseCursorPosition(CGPoint { x: lx, y: ly });
                     fixes += 1;
