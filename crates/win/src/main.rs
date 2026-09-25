@@ -120,7 +120,7 @@ fn clipboard_read_text() -> Option<String> {
             } else {
                 locked = true;
                 let mut len = 0usize;
-                while *p.add(len) != 0 && len <= CLIP_MAX_CHARS {
+                while *p.add(len) != 0 && len < CLIP_MAX_CHARS {
                     len += 1;
                 }
                 Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, len)))
@@ -332,13 +332,23 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-175252-ca887d1";
+const BUILD_ID: &str = "win-20260925-190103-3717521";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
-    let token = std::env::var("SEAMLESS_DESK_TOKEN")
-        .unwrap_or_else(|_| "seamless-desk-dev".to_string());
+    // トークンは必須(旧既定値 "seamless-desk-dev" での脆弱な稼働を廃止)。
+    // 環境変数 > exe同階層の .env > ~/.config/seamless-desk/env の順で解決する
+    let token = match sd_common::envutil::get("SEAMLESS_DESK_TOKEN") {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "[fatal] SEAMLESS_DESK_TOKEN が未設定です。sd-win.exe と同じフォルダの .env に\
+                 SEAMLESS_DESK_TOKEN=<Mac側と同じ値> を設定してください"
+            );
+            exit(1);
+        }
+    };
     let port: u16 = args
         .iter()
         .position(|a| a == "--port")
@@ -405,8 +415,12 @@ fn main() {
 
 fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
+    // 読み出しタイムアウット: Mac は3秒毎に ping を送るため 12秒無音は経路断。
+    // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
+    stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     let mut writer = stream.try_clone()?;
-    // クライアントとして hello を送る
+    // クライアントとして hello を送る(encode() が行末 \n を持つため write_all で送る)
     let mut hello_sent = false;
     for _ in 0..3 {
         let hello = encode(&Msg::Hello {
@@ -416,7 +430,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
             w,
             h,
         });
-        if writeln!(writer, "{hello}").and_then(|_| writer.flush()).is_ok() {
+        if writer.write_all(hello.as_bytes()).and_then(|_| writer.flush()).is_ok() {
             hello_sent = true;
             break;
         }
@@ -425,6 +439,17 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     if !hello_sent {
         return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "hello send failed"));
     }
+    // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
+    // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
+    // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
+    let (wtx, wrx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        while let Ok(line) = wrx.recv() {
+            if writer.write_all(line.as_bytes()).and_then(|_| writer.flush()).is_err() {
+                break;
+            }
+        }
+    });
     let reader = BufReader::new(stream);
     let mut mods = ModState::new();
     // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
@@ -440,7 +465,8 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     //  接続監視は Mac 側の ping/pong が担うため不要だった)
 
     // クリップボード監視スレッド(Windows→Mac 方向)。起動時点の内容は送らない。
-    let mut cb_writer = writer.try_clone()?;
+    // 送信は単一ライタスレッド(wtx)経由で行う
+    let cb_tx = wtx.clone();
     let cb_running = running.clone();
     std::thread::spawn(move || {
         let mut last_sent = clipboard_read_text();
@@ -453,8 +479,8 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     let b64 = sd_common::b64::encode(&dib);
                     if b64.len() <= 5 * 1024 * 1024 && last_img.as_deref() != Some(b64.as_str()) {
                         last_img = Some(b64.clone());
-                        if writeln!(cb_writer, "{}", encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }))
-                            .and_then(|_| cb_writer.flush())
+                        if cb_tx
+                            .send(encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }))
                             .is_ok()
                         {
                             println!("[clip] win->mac image");
@@ -474,10 +500,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
             if echo {
                 continue;
             }
-            if writeln!(cb_writer, "{}", encode(&Msg::Clip { text: text.clone() }))
-                .and_then(|_| cb_writer.flush())
-                .is_ok()
-            {
+            if cb_tx.send(encode(&Msg::Clip { text: text.clone() })).is_ok() {
                 println!("[clip] win->mac {} bytes", text.len());
                 last_sent = Some(text);
             }
@@ -505,8 +528,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 hello_done = true;
             }
             Msg::Ping => {
-                let _ = writeln!(writer, "{}", encode(&Msg::Pong));
-                let _ = writer.flush();
+                let _ = wtx.send(encode(&Msg::Pong));
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift } => {
                 if !hello_done {
@@ -538,9 +560,11 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     }
                 }
                 // Mac の cmd+Tab(ウィンドウ切替)は Windows の Alt+Tab へ変換する。
-                // Alt は cmd が離されるまで保持し、離した瞬間に切替を確定させる
-                let prev_cmd = mods.cmd_pressed();
-                if ALT_TAB_ACTIVE.load(Ordering::Relaxed) && !cmd && prev_cmd {
+                // Alt は cmd が離されるまで保持し、離した瞬間に切替を確定させる。
+                // 確定条件から prev_cmd 依存を外した: cmd+Tab down の mods.apply(false,...)
+                // が self.cmd 相当を false に落とすため旧条件は恒偽で、VK_MENU up が
+                // 誰にも注入されず Alt が押しっぱなしに残留する実績バグだった
+                if ALT_TAB_ACTIVE.load(Ordering::Relaxed) && !cmd {
                     // cmd 離下 → Alt+Tab 確定
                     inject_key(0x09, true); // VK_TAB up
                     inject_key(VK_MENU, true);
@@ -587,7 +611,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                     accum.1 -= iy;
                     inject_mouse_move_rel(ix as i32, iy as i32);
                     // 実際にカーソルが動いたときだけ左端到達を判定する
-                    maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
+                    maybe_notify_return(&wtx, &mut last_return_notify, h, &mut mods);
                 }
             }
             Msg::MouseAbs { nx, ny } => {
@@ -600,7 +624,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 if DEBUG_KEYS.load(Ordering::Relaxed) {
                     println!("[abs] -> ({x},{y})");
                 }
-                maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
+                maybe_notify_return(&wtx, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
@@ -678,7 +702,7 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
 /// カーソルが画面左端に達したら Mac へ復帰通知(連打防止 1 秒クールダウン)。
 /// カーソル高さも正規化して送り、Mac 側の復帰位置に反映させる(境界の連続性)。
 fn maybe_notify_return(
-    mut writer: &TcpStream,
+    wtx: &std::sync::mpsc::Sender<String>,
     last: &mut Instant,
     h: i32,
     mods: &mut ModState,
@@ -687,7 +711,7 @@ fn maybe_notify_return(
     unsafe { GetCursorPos(&mut p) };
     if p.x <= 1 && last.elapsed() >= Duration::from_millis(700) {
         let ny = if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 };
-        let _ = writeln!(writer, "{}", encode(&Msg::Return { ny }));
+        let _ = wtx.send(encode(&Msg::Return { ny }));
         *last = Instant::now();
         // Mac へ制御を返すため、押しっぱなしの修飾キーを離して後片付けする
         mods.release_all();

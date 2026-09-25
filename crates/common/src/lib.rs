@@ -1,4 +1,61 @@
 // 共通プロトコル定義(JSON Lines over TCP)
+pub mod envutil {
+    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/seamless-desk/env。
+    //! 配布形態(.app バンドル埋め込み / exe 同梱 .env / ホーム設定)のどれでも
+    //! 同一コードで動かすための仕組み。KEY=VALUE 形式(1行1エントリ、# はコメント)。
+
+    use std::sync::OnceLock;
+
+    fn entries() -> &'static Vec<(String, String)> {
+        static E: OnceLock<Vec<(String, String)>> = OnceLock::new();
+        E.get_or_init(|| {
+            let mut v = Vec::new();
+            let mut paths = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(d) = exe.parent() {
+                    paths.push(d.join(".env"));
+                    // .app バンドル配布用: Contents/Resources/.env
+                    // (MacOS/ 内に置くと codesign の署名対象になって失敗するため)
+                    if let Some(res) = d.parent().map(|p| p.join("Resources/.env")) {
+                        paths.push(res);
+                    }
+                }
+            }
+            for key in ["HOME", "USERPROFILE"] {
+                if let Some(home) = std::env::var_os(key) {
+                    paths.push(std::path::Path::new(&home).join(".config/seamless-desk/env"));
+                }
+            }
+            for p in paths {
+                let Ok(s) = std::fs::read_to_string(&p) else { continue };
+                for line in s.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, val)) = line.split_once('=') {
+                        v.push((
+                            k.trim().to_string(),
+                            val.trim().trim_matches('"').to_string(),
+                        ));
+                    }
+                }
+            }
+            v
+        })
+    }
+
+    /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する
+    pub fn get(key: &str) -> Option<String> {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+        entries().iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+}
+
 pub mod proto {
     use serde::{Deserialize, Serialize};
 

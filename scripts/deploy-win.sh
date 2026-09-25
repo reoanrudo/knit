@@ -11,7 +11,17 @@ sed -i '' "s|const BUILD_ID:[^;]*;|const BUILD_ID: \&str = \"$NEW_ID\";|" crates
 echo "[deploy-win] building..."
 touch crates/win/src/main.rs
 cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | grep -E "^error" -A 3 && exit 1 || true
-cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | tail -1
+cargo build --release -p sd-win --target x86_64-pc-windows-gnu 2>&1 | tail -1 >/dev/null
+
+# win-dist の exe も最新化する(install.bat は win-dist からコピーするため)
+cp target/x86_64-pc-windows-gnu/release/sd-win.exe win-dist/sd-win.exe
+
+# トークン(.env)は Mac 側の設定から配布(無いと Windows 側で fatal 停止する)
+TOKEN_SRC="$HOME/.config/seamless-desk/env"
+if [ ! -f "$TOKEN_SRC" ]; then
+  echo "[deploy-win] $TOKEN_SRC がありません。scripts/gen-token.sh を先に実行してください" >&2
+  exit 1
+fi
 
 echo "[deploy-win] deploying (stop -> copy -> start)..."
 # コンソール窓が出ないよう VBS 起動へタスクを更新(冪等)
@@ -20,6 +30,9 @@ ssh -o BatchMode=yes home "schtasks /End /TN seamless_desk_run" >/dev/null 2>&1 
 ssh -o BatchMode=yes home "taskkill /IM sd-win.exe /F" >/dev/null 2>&1 || true
 sleep 2
 scp -o BatchMode=yes target/x86_64-pc-windows-gnu/release/sd-win.exe home:C:/Users/<user>/seamless-desk/sd-win.exe
+# 起動資材(ログローテーション実効化のため bat 経由へ変更)+ トークンも更新
+scp -o BatchMode=yes win-dist/run_sd.vbs win-dist/run_sd.bat home:C:/Users/<user>/seamless-desk/ >/dev/null
+scp -o BatchMode=yes "$TOKEN_SRC" home:C:/Users/<user>/seamless-desk/.env >/dev/null
 ssh -o BatchMode=yes home "schtasks /Run /TN seamless_desk_run" >/dev/null 2>&1
 sleep 3
 

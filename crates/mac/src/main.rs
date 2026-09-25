@@ -2,6 +2,9 @@
 // 画面右端でカーソルが Mac→Windows 切替、Windows カーソル左端(または F13)で復帰。
 #![allow(non_camel_case_types)]
 
+mod gui;
+
+use sd_common::envutil;
 use sd_common::proto::{decode, encode, Msg, PORT, VERSION};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::TcpStream;
@@ -308,19 +311,25 @@ fn clipboard_change_count() -> isize {
 }
 
 /// macOS の通知センターへ表示(接続/切断のユーザー可視化)。
-/// osascript 経由で追加権限なしで出せる。失敗しても本体には影響しない
+/// osascript 経由で追加権限なしで出せる。失敗しても本体には影響しない。
+/// osascript 起動に数百msかかるため別スレッドで発火し、accept/受信スレッドを
+/// ブロックしない(レビュー Wave1 A-M9/D-F3)
 fn notify(title: &str, body: &str) {
-    let out = std::process::Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "display notification \"{}\" with title \"{}\"",
-                body.replace('"', "'"),
-                title.replace('"', "'")
-            ),
-        ])
-        .output();
-    let _ = out;
+    let title = title.to_string();
+    let body = body.to_string();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    body.replace('"', "'"),
+                    title.replace('"', "'")
+                ),
+            ])
+            .output();
+        let _ = out;
+    });
 }
 
 // ---------- 共有状態 ----------
@@ -347,8 +356,9 @@ static LAST_EVENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 境界ダブルタップ切替(Deskflow switchDoubleTap 相当)。
 /// SEAMLESS_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
-/// 切替しないため、境界付近での日常作業と Windows への移動が分離される
-static EDGE_TAPS: OnceLock<u32> = OnceLock::new();
+/// 切替しないため、境界付近での日常作業と Windows への移動が分離される。
+/// GUI から実行中に切り替え可能なため AtomicU32(初期値は起動時に store)
+static EDGE_TAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
 static EDGE_AT_EDGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static EDGE_LAST_HIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -502,7 +512,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         // 誤再突入を防ぐ
         let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
         let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
-        let taps = EDGE_TAPS.get().copied().unwrap_or(2);
+        let taps = EDGE_TAPS.load(Ordering::Relaxed);
         let x = if taps >= 2 { edge_x - 60.0 } else { (main_w - 100.0).min(edge_x - 150.0) };
         // 高さは出口ディスプレイの y 範囲へ対応付ける(Windows 側の高さ比を
         // そのまま出口モニターの範囲へ写像。MacBook 基準だと位置がずれる)
@@ -538,6 +548,31 @@ fn send_msg(msg: &Msg) {
     }
 }
 
+/// ホットキー/メニューバーGUI からの手動トグル(F13 とメニューの共通経路)。
+/// 切替状態遷移はここを含む既存6経路のまま(一元化はモジュール分割 Phase5 で実施)
+fn do_toggle(reason: &str) {
+    if !CONNECTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let next = !WIN_MODE.load(Ordering::Relaxed);
+    WIN_MODE.store(next, Ordering::Relaxed);
+    if next {
+        DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    eprintln!("[mode] {} ({reason})", if next { "WINDOWS" } else { "MAC" });
+    if next {
+        enter_win_mode_cursor_lock();
+    } else {
+        // 戻り先の高さは Windows 側カーソルの現在高さに合わせる
+        let ny = {
+            let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
+            let (_ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+            if wh > 0.0 { (wc.1 / wh).clamp(0.0, 1.0) } else { 0.5 }
+        };
+        leave_win_mode_cursor_unlock(Some(ny));
+    }
+}
+
 // ---------- イベントタップコールバック ----------
 unsafe extern "C" fn tap_callback(
     _proxy: *mut core::ffi::c_void,
@@ -555,35 +590,32 @@ unsafe extern "C" fn tap_callback(
     let win_mode = WIN_MODE.load(Ordering::Relaxed);
     let connected = CONNECTED.load(Ordering::Relaxed);
 
-    // F13 = 手動トグル(常に有効、握る)
-    if event_type == EVT_KEY_DOWN || event_type == EVT_FLAGS_CHANGED {
+    // ホットキー(F13 既定 / SEAMLESS_HOTKEY_KC)= 手動トグル(常に有効、握る)。
+    // 修飾キー(右Cmd=54 等)は flagsChanged として届くため、flags の該当ビットで
+    // 押下/解放を判別し、押下側でのみトグルする(up・解放側は握るだけ)。
+    // 旧実装は KEY_DOWN しかトグルせず(=修飾キー指定が機能しない)、かつ up 把握の
+    // 分岐が外側条件により到達不能なデッドコードだった(レビュー Wave1-X5)
+    if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
         if kc == hotkey_kc() {
-            if event_type == EVT_KEY_UP {
-                return std::ptr::null_mut(); // トグル専用キーのため up も握る
-            }
-        }
-        if kc == hotkey_kc() && event_type == EVT_KEY_DOWN {
-            if connected {
-                let next = !win_mode;
-                WIN_MODE.store(next, Ordering::Relaxed);
-                if next {
-                    DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            let pressed = match event_type {
+                EVT_KEY_DOWN => true,
+                EVT_KEY_UP => false,
+                _ => {
+                    let flags = CGEventGetFlags(event);
+                    match kc {
+                        54 | 55 => flags & FLAG_CMD != 0,
+                        58 | 61 => flags & FLAG_OPT != 0,
+                        59 | 62 => flags & FLAG_CTRL != 0,
+                        56 | 60 => flags & FLAG_SHIFT != 0,
+                        _ => true,
+                    }
                 }
-                eprintln!("[mode] {} (F13)", if next { "WINDOWS" } else { "MAC" });
-                if next {
-                    enter_win_mode_cursor_lock();
-                } else {
-                    // 戻り先の高さは Windows 側カーソルの現在高さに合わせる
-                    let ny = {
-                        let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
-                        let (_ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-                        if wh > 0.0 { (wc.1 / wh).clamp(0.0, 1.0) } else { 0.5 }
-                    };
-                    leave_win_mode_cursor_unlock(Some(ny));
-                }
+            };
+            if pressed && connected {
+                do_toggle("hotkey");
             }
-            return std::ptr::null_mut();
+            return std::ptr::null_mut(); // トグル専用キーのため down/up 両方握る
         }
     }
 
@@ -644,7 +676,7 @@ unsafe extern "C" fn tap_callback(
                     // 500ms 以内の 2回目のヒットでのみ切替する(1回目は素通し)。
                     // カーソルが境界に張り付いたまま出す delta は継続扱いで数えない
                     if !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
-                        let taps = EDGE_TAPS.get().copied().unwrap_or(2);
+                        let taps = EDGE_TAPS.load(Ordering::Relaxed);
                         let now = now_ms();
                         let prev = EDGE_LAST_HIT_MS.swap(now, Ordering::Relaxed);
                         let fire = taps <= 1 || (prev > 0 && now.saturating_sub(prev) <= 700);
@@ -667,9 +699,12 @@ unsafe extern "C" fn tap_callback(
                     if let Some(sh) = SCREEN_H.get() {
                         ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
                     }
-                    // ドラッグ中の切替はボタンを離して持ち込まない(誤ドラッグ防止)
+                    // ドラッグ中の切替は全ボタンを離して持ち込まない(誤ドラッグ防止)。
+                    // 左だけでなく右/中ドラッグの持ち込みも防ぐ(レビュー Wave1 C-S13)
                     if event_type != EVT_MOUSE_MOVED {
-                        send_msg(&Msg::MouseButton { btn: 0, down: false });
+                        for b in 0u8..=2 {
+                            send_msg(&Msg::MouseButton { btn: b, down: false });
+                        }
                     }
                     // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
                     // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
@@ -814,7 +849,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-175859-2a0c056";
+const BUILD_ID: &str = "build-20260925-190901-3717521";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -831,7 +866,18 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(PORT);
-    let token = std::env::var("SEAMLESS_DESK_TOKEN").unwrap_or_else(|_| "seamless-desk-dev".to_string());
+    // トークンは必須(旧既定値 "seamless-desk-dev" での脆弱な稼働を廃止。
+    // 環境変数 > exe同階層.env > ~/.config/seamless-desk/env の順で解決する)
+    let token = match envutil::get("SEAMLESS_DESK_TOKEN") {
+        Some(t) if !t.is_empty() => t,
+        _ => {
+            eprintln!(
+                "[fatal] SEAMLESS_DESK_TOKEN が未設定です。`scripts/gen-token.sh` を実行するか、\
+                 ~/.config/seamless-desk/env に SEAMLESS_DESK_TOKEN=<ランダム値> を設定してください"
+            );
+            std::process::exit(1);
+        }
+    };
 
     let test_mode = args.iter().any(|a| a == "--test");
 
@@ -892,9 +938,9 @@ fn main() {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
     }
-    if let Some(t) = std::env::var("SEAMLESS_EDGE_TAPS").ok().and_then(|v| v.parse::<u32>().ok()) {
+    if let Some(t) = envutil::get("SEAMLESS_EDGE_TAPS").and_then(|v| v.parse::<u32>().ok()) {
         if t >= 1 && t <= 3 {
-            let _ = EDGE_TAPS.set(t);
+            EDGE_TAPS.store(t, Ordering::Relaxed);
         }
     }
     if let Some(k) = std::env::var("SEAMLESS_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
@@ -911,7 +957,7 @@ fn main() {
         if MOUSE_ABS_MODE.load(Ordering::Relaxed) { "abs" } else { "rel" },
         if HOTKEY_ONLY.load(Ordering::Relaxed) { "hotkey(ロック)" } else { "edge" },
         hotkey_kc(),
-        EDGE_TAPS.get().copied().unwrap_or(2)
+        EDGE_TAPS.load(Ordering::Relaxed)
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -929,7 +975,9 @@ fn main() {
                 Ok(line) => {
                     let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = guard.as_mut() {
-                        if writeln!(s, "{line}").and_then(|_| s.flush()).is_err() {
+                        // encode() が行末 \n を持つため writeln! だと二重改行で
+                        // ワイヤが \n\n になる(受信側の空行パースが倍増する)。write_all で送る
+                        if s.write_all(line.as_bytes()).and_then(|_| s.flush()).is_err() {
                             *guard = None; // 書けなくなったら外す(接続ループが検知)
                         }
                     }
@@ -949,7 +997,7 @@ fn main() {
                 }
                 let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = guard.as_mut() {
-                    if writeln!(s, "{}", encode(&Msg::Ping)).and_then(|_| s.flush()).is_err() {
+                    if s.write_all(encode(&Msg::Ping).as_bytes()).and_then(|_| s.flush()).is_err() {
                         *guard = None;
                     }
                 }
@@ -960,8 +1008,15 @@ fn main() {
     // サーバ(受信待ち)スレッド: Windows からの接続を受け入れる
     // (本環境では Mac 発コネクションが不通なため、Windows 発に限定した設計)
     std::thread::spawn(move || {
-        use std::io::{BufRead, Write};
-        let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        use std::io::{BufRead, Read};
+        // 1行の長さ上限(画像base64 5MB 上限に対し余裕を持たせる。
+        // 未認証helloを含む巨大行によるメモリ消費(DoS)対策)
+        const MAX_LINE: u64 = 8 * 1024 * 1024;
+        // 待受アドレス: 既定は Tailscale IF を想定した制限なし設定だが、
+        // restart-mac.sh が SEAMLESS_BIND=$(tailscale ip -4) を渡すため、
+        // 通常運用では Tailscale インタフェース以外で listen しない
+        let bind_ip = envutil::get("SEAMLESS_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("[fatal] listen :{port} failed: {e}");
@@ -979,6 +1034,16 @@ fn main() {
                 }
             };
             eprintln!("[conn] accepted from {peer}");
+            // ピア許可: Tailscale の CGNAT 範囲(100.64.0.0/10)以外は即切断する。
+            // 0.0.0.0 で listen してしまった場合の WiFi/LAN 露出に対する装置的防御
+            let oct = match peer.ip() {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                std::net::IpAddr::V6(_) => [0, 0, 0, 0],
+            };
+            if !(oct[0] == 100 && (64..=127).contains(&oct[1])) {
+                eprintln!("[conn] rejected: {peer} は Tailscale 範囲外です");
+                continue;
+            }
             stream.set_nodelay(true).ok();
             stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
             stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
@@ -988,11 +1053,15 @@ fn main() {
                 Err(_) => continue,
             });
             let mut line = String::new();
-            // 最初の行=hello
+            // 最初の行=hello(この時点では未認証のため、take で読み込み段階から制限する)
             line.clear();
-            match reader.read_line(&mut line) {
+            match (&mut reader).take(MAX_LINE + 1).read_line(&mut line) {
                 Ok(0) | Err(_) => {
                     eprintln!("[conn] closed before hello");
+                    continue;
+                }
+                Ok(_) if line.len() as u64 > MAX_LINE => {
+                    eprintln!("[conn] hello too large. dropped");
                     continue;
                 }
                 Ok(_) => {}
@@ -1028,6 +1097,10 @@ fn main() {
                 line.clear();
                 match reader.read_line(&mut line) {
                     Ok(0) | Err(_) => break,
+                    Ok(_) if line.len() as u64 > MAX_LINE => {
+                        eprintln!("[conn] line too large. dropping connection");
+                        break;
+                    }
                     Ok(_) => {
                         if let Some(msg) = decode(&line) {
                             match msg {
@@ -1037,11 +1110,21 @@ fn main() {
                                         // F13 で戻すまで Windows のまま(ロック状態)
                                         continue;
                                     }
+                                    // abs-left 復帰後に遅延到着した Return で二重に leave
+                                    // され再ワープされるのを防ぐ(既に Mac の場合は無視)
+                                    if !WIN_MODE.load(Ordering::Relaxed) {
+                                        continue;
+                                    }
                                     WIN_MODE.store(false, Ordering::Relaxed);
                                     eprintln!("[mode] MAC (return)");
                                     leave_win_mode_cursor_unlock(Some(ny));
                                 }
                                 Msg::ClipData { kind, data } => {
+                                    // 受信側にも上限を課す(送信側制限のみに依存しない)
+                                    if data.len() > 8 * 1024 * 1024 {
+                                        eprintln!("[clip] win->mac image too large. skipped");
+                                        continue;
+                                    }
                                     if kind == "image/dib" {
                                         if let Some(bytes) = sd_common::b64::decode(&data) {
                                             let bmp = dib_to_bmp(&bytes);
@@ -1082,7 +1165,12 @@ fn main() {
                 *guard = None;
             }
             CONNECTED.store(false, Ordering::Relaxed);
-            WIN_MODE.store(false, Ordering::Relaxed);
+            // WIN モード中の切断は正規の leave 経由で復帰させる(カーソル表示・
+            // EDGE_GUARD・CUR_POS 整合を自己修復スレッドの「たまたま」に任せない)
+            if WIN_MODE.swap(false, Ordering::Relaxed) {
+                eprintln!("[return] -> mac (disconnect)");
+                leave_win_mode_cursor_unlock(None);
+            }
             eprintln!("[conn] lost. waiting for reconnect...");
             notify("seamless-desk", "切断しました(自動再接続中)");
         }
@@ -1278,8 +1366,10 @@ fn main() {
             }
             // ウォッチドッグ: WIN モード中にユーザーがマウスを動かしているのに
             // (直近2秒以内にタップ受信) Windows への転送が5秒止まっている状態は
-            // 異常。強制的に Mac へ復帰させ、操作不能な状態に陥らないようにする
-            if WIN_MODE.load(Ordering::Relaxed) {
+            // 異常。強制的に Mac へ復帰させ、操作不能な状態に陥らないようにする。
+            // LAST_ABS_MS は絶対位置モードしか更新しないため、条件にモードを含めないと
+            // 相対モード(rel)で必ず誤発火する(rel が5秒で強制復帰されていた実績バグ)
+            if WIN_MODE.load(Ordering::Relaxed) && MOUSE_ABS_MODE.load(Ordering::Relaxed) {
                 let now = now_ms();
                 let last_ev = LAST_EVENT_MS.load(Ordering::Relaxed);
                 let last_abs = LAST_ABS_MS.load(Ordering::Relaxed);
@@ -1342,6 +1432,16 @@ fn main() {
         CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
     }
-    eprintln!("[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13 でトグル");
-    unsafe { CFRunLoopRun() };
+    eprintln!("[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13・メニューでトグル");
+    // メニューバー GUI(既定ON。--no-gui / SEAMLESS_NO_GUI=1 で CUI のみ)。
+    // AppKit が使えない環境(ssh 由来のセッション等)では start() が失敗し、
+    // 従来どおり CFRunLoop で継続する(タップはメインRunLoop共通モードのため共存可)
+    let no_gui = args.iter().any(|a| a == "--no-gui")
+        || envutil::get("SEAMLESS_NO_GUI").is_some_and(|v| v == "1");
+    if !no_gui && gui::start() {
+        eprintln!("[gui] メニューバー常駐を開始しました");
+        unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)
+    } else {
+        unsafe { CFRunLoopRun() };
+    }
 }
