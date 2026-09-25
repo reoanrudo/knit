@@ -29,12 +29,12 @@ unsafe extern "system" {
 const WM_TRAY: u32 = WM_APP + 1;
 
 // ---------- ダークテーマ(モダンUI)の色定義(0xRRGGBB) ----------
-const CLR_BG: u32 = 0x1C1C22; // 窓背景
-const CLR_CARD: u32 = 0x2A2A32; // カード面
-const CLR_HEAD: u32 = 0xEDEDF2; // 見出し・状態行(白系)
-const CLR_TEXT: u32 = 0xB4B4BE; // 本文(明るいグレー)
-const CLR_SUB: u32 = 0x7C7C88; // 補足(暗めグレー)
-const CLR_ACCENT: u32 = 0x3D6DF2; // ボタン(青)
+const CLR_BG: u32 = 0x0A0E14; // 窓背景(深い黒+青み=近未来)
+const CLR_CARD: u32 = 0x10161F; // カード面(黒+青)
+const CLR_HEAD: u32 = 0xE8FBFF; // 見出し・状態行(白シアン)
+const CLR_TEXT: u32 = 0x9FB6C6; // 本文(青みグレー)
+const CLR_SUB: u32 = 0x5E7A8A; // 補足(くすんだ青グレー)
+const CLR_ACCENT: u32 = 0x22D3EE; // ボタン・ネオン(シアン)
 const CLR_DANGER: u32 = 0xC2504B; // 終了ボタン(赤系)
 /// 0xRRGGBB → COLORREF(0x00BBGGRR)
 fn rgb(c: u32) -> u32 {
@@ -175,6 +175,7 @@ static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FILES: AtomicUsize = AtomicUsize::new(0);
 static LABEL_MACCFG: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FOOTER: AtomicUsize = AtomicUsize::new(0);
+static LABEL_LOGO: AtomicUsize = AtomicUsize::new(0);
 /// プロセス起動時刻(稼働時間表示用)
 static START_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
@@ -474,6 +475,8 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 let id = GetDlgCtrlID(child);
                 // RTT は値で色分け(緑=快適/黄=やや遅延/赤=遅延)
                 let color = match id as u32 {
+                    1003 => rgb(CLR_ACCENT), // TSUNAGU ロゴ=シアン
+                    ID_LBL_STATE if crate::CONNECTED.load(Ordering::Relaxed) => rgb(CLR_ACCENT),
                     ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT => rgb(CLR_HEAD),
                     ID_LBL_BUILD | 1002 => rgb(CLR_SUB),
                     ID_LBL_RTT => {
@@ -577,7 +580,7 @@ unsafe fn paint_status(hwnd: HWND) {
         // 接続カード(RTT/スピーカー/ファイル を囲む角丸面)
         let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 216 };
         let card_brush = CreateSolidBrush(rgb(CLR_CARD));
-        let card_pen = CreatePen(0, 1, rgb(CLR_CARD));
+        let card_pen = CreatePen(0, 1, rgb(0x1B2735));
         let ob = SelectObject(hdc, card_brush);
         let op = SelectObject(hdc, card_pen);
         RoundRect(hdc, card.left, card.top, card.right, card.bottom, 10, 10);
@@ -585,12 +588,34 @@ unsafe fn paint_status(hwnd: HWND) {
         SelectObject(hdc, op);
         DeleteObject(card_brush);
         DeleteObject(card_pen);
+        // ネオン罫線: 各見出し(接続/サーバー/操作)の下にシアンの細線(Mac と同一意匠)
+        let neon = CreateSolidBrush(rgb(CLR_ACCENT));
+        for y in [96i32, 246, 312] {
+            FillRect(hdc, &Rect { left: 18, top: y, right: rc.right - 18, bottom: y + 1 }, neon);
+        }
+        DeleteObject(neon);
         EndPaint(hwnd, &ps);
     }
 }
 
 /// モダンな見た目のための Segoe UI フォント生成(通常/太字)。
 /// 既定の DEFAULT_GUI_FONT は古いシステムフォントになるため使わない
+/// 近未来ロゴ用の等幅フォント(Consolas)
+unsafe fn segoe_mono(height: i32) -> *mut core::ffi::c_void {
+    unsafe {
+        let mut name: Vec<u16> = "Consolas".encode_utf16().collect();
+        name.push(0);
+        extern "system" {
+            fn CreateFontW(
+                height: i32, width: i32, escapement: i32, orientation: i32, weight: i32,
+                italic: u32, underline: u32, strikeout: u32, charset: u32, outprecision: u32,
+                clipprecision: u32, quality: u32, pitchandfamily: u32, face: *const u16,
+            ) -> *mut core::ffi::c_void;
+        }
+        CreateFontW(height, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr())
+    }
+}
+
 unsafe fn segoe_font(bold: bool, height: i32) -> *mut core::ffi::c_void {
     unsafe {
         let mut name: Vec<u16> = "Segoe UI".encode_utf16().collect();
@@ -687,6 +712,16 @@ unsafe fn open_status_window() {
             }
             child as usize
         };
+        // 右上に TSUNAGU ロゴ(Consolas 等幅・シアン=Mac 設定窓と同一意匠)
+        let logo = make_child("STATIC", "TSUNAGU", 0, 330, 14, 108, 20, 1003 as usize);
+        PostMessageW(logo as _, WM_SETFONT, segoe_mono(11) as usize, 1);
+        let _ = LABEL_LOGO.store(logo, Ordering::Relaxed);
+        // ヘッダー左にアプリアイコン(SS_ICON スタティック)
+        let icon32 = load_tray_icon_size(32);
+        if !icon32.is_null() {
+            let ic = make_child("STATIC", "", 0x3 /*SS_ICON*/, 18, 14, 34, 34, 0);
+            PostMessageW(ic as _, 0x0172 /*STM_SETICON*/, icon32 as usize, 0);
+        }
         // 状態行は太字・大きめで最初に目に入るように。以降は通常行
         let state_h = make_child("STATIC", "状態: …", 0, 18, 16, 420, 26, ID_LBL_STATE as usize);
         PostMessageW(state_h as _, WM_SETFONT, font_bold as usize, 1);
@@ -784,6 +819,31 @@ unsafe fn open_menu(hwnd: HWND) {
 }
 
 /// exe と同じフォルダの app.ico を読む(無ければ既定アイコン)
+/// 指定サイズのアプリアイコン(exe 横の app.ico。無ければ既定)
+unsafe fn load_tray_icon_size(size: i32) -> *mut core::ffi::c_void {
+    unsafe {
+        if let Ok(exe) = std::env::current_exe() {
+            let ico = exe.parent().map(|d| d.join("app.ico"));
+            if let Some(path) = ico.filter(|p| p.exists()) {
+                let mut w: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+                w.push(0);
+                let h = LoadImageW(
+                    std::ptr::null_mut(),
+                    w.as_ptr(),
+                    IMAGE_ICON,
+                    size,
+                    size,
+                    LR_LOADFROMFILE,
+                );
+                if !h.is_null() {
+                    return h;
+                }
+            }
+        }
+        LoadIconW(std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::IDI_APPLICATION)
+    }
+}
+
 unsafe fn load_tray_icon() -> *mut core::ffi::c_void {
     if let Ok(exe) = std::env::current_exe() {
         let ico = exe.parent().map(|d| d.join("app.ico"));
