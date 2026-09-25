@@ -379,7 +379,9 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                 }
                 None => 400.0,
             };
-            CGWarpMouseCursorPosition(CGPoint { x: w - 80.0, y });
+            // 注意: この復帰位置は再武装閾値(edge-100)より必ず内側にすること。
+            // 内側になっていないと復帰後にアームされず Windows へ行けなくなる
+            CGWarpMouseCursorPosition(CGPoint { x: w - 120.0, y });
         }
     }
 }
@@ -616,7 +618,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-172212-8716a5d";
+const BUILD_ID: &str = "build-20260925-172511-dd377e5";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
