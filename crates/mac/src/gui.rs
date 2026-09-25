@@ -115,6 +115,7 @@ static GUI_TAPS_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_AUDIO_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_CMD_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SCROLL_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_SPK_ITEM: AtomicUsize = AtomicUsize::new(0);
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
 
@@ -165,7 +166,20 @@ unsafe extern "C" fn imp_cmd_map(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::CMD_ALT.load(Ordering::Relaxed);
     crate::CMD_ALT.store(next, Ordering::Relaxed);
     eprintln!("[cfg] ⌘キー -> {}", if next { "Alt" } else { "Ctrl" });
-    crate::send_msg(&crate::Msg::Cfg { cmd_alt: next });
+    crate::send_msg(&crate::Msg::Cfg {
+        cmd_alt: next,
+        spk_mute: crate::SPK_MUTE.load(Ordering::Relaxed),
+    });
+    refresh_status();
+}
+unsafe extern "C" fn imp_spk_mute(_s: ID, _c: SEL, _n: ID) {
+    let next = !crate::SPK_MUTE.load(Ordering::Relaxed);
+    crate::SPK_MUTE.store(next, Ordering::Relaxed);
+    eprintln!("[cfg] 接続中スピーカーミュート -> {}", if next { "ON" } else { "OFF" });
+    crate::send_msg(&crate::Msg::Cfg {
+        cmd_alt: crate::CMD_ALT.load(Ordering::Relaxed),
+        spk_mute: next,
+    });
     refresh_status();
 }
 unsafe extern "C" fn imp_scroll_flip(_s: ID, _c: SEL, _n: ID) {
@@ -336,6 +350,15 @@ fn refresh_status() {
             };
             msg1_void_id(scroll_item, sel(c"setTitle:"), nsstring(t));
         }
+        let spk_item = GUI_SPK_ITEM.load(Ordering::Relaxed) as ID;
+        if !spk_item.is_null() {
+            let t = if crate::SPK_MUTE.load(Ordering::Relaxed) {
+                "Windowsスピーカー: 接続中ミュート(Macのみ発音)"
+            } else {
+                "Windowsスピーカー: 常時鳴らす"
+            };
+            msg1_void_id(spk_item, sel(c"setTitle:"), nsstring(t));
+        }
     }
 }
 
@@ -438,6 +461,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
         (c"sdCmdMap:", imp_cmd_map as *const () as usize),
         (c"sdScroll:", imp_scroll_flip as *const () as usize),
+        (c"sdSpkMute:", imp_spk_mute as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
@@ -559,6 +583,15 @@ pub fn start() -> bool {
         msg1_void_sel(scroll_item, sel(c"setAction:"), sel(c"sdScroll:"));
         let _ = GUI_SCROLL_ITEM.store(scroll_item as usize, Ordering::Relaxed);
         add_item(menu, scroll_item);
+
+        let spk_item = menu_item("Windowsスピーカー: 接続中ミュート(Macのみ発音)", Some(c"sdSpkMute:"), "");
+        if spk_item.is_null() {
+            return false;
+        }
+        msg1_void_id(spk_item, sel(c"setTarget:"), target);
+        msg1_void_sel(spk_item, sel(c"setAction:"), sel(c"sdSpkMute:"));
+        let _ = GUI_SPK_ITEM.store(spk_item as usize, Ordering::Relaxed);
+        add_item(menu, spk_item);
 
         add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
 

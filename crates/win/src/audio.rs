@@ -68,6 +68,32 @@ const CLSID_MMDEVICE_ENUMERATOR: windows_sys::core::GUID = windows_sys::core::GU
 const IID_IMMDEVICE_ENUMERATOR: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
 const IID_IAUDIO_CLIENT: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x1CB9AD4C_DBFA_4C32_B178_C2F568A703B2);
 const IID_IAUDIO_CAPTURE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0xC8ADBD64_E71E_48A0_A4DE_185C395CD317);
+const IID_IAUDIO_ENDPOINT_VOLUME: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x5CDF2C82_841E_4546_9722_0CF74078229A);
+
+/// IAudioEndpointVolume(エンドポイントのマスター音量/ミュート操作)。
+/// base(IUnknown) 3つの後、13個のメソッドが続いて SetMute=14 / GetMute=15
+#[repr(C)]
+struct IAudioEndpointVolumeVtbl {
+    base: IUnknownVtbl,
+    RegisterControlChangeNotify: usize,
+    UnregisterControlChangeCallback: usize,
+    GetChannelCount: usize,
+    SetMasterVolumeLevel: usize,
+    SetMasterVolumeLevelScalar: usize,
+    GetMasterVolumeLevel: usize,
+    GetMasterVolumeLevelScalar: usize,
+    SetChannelVolumeLevel: usize,
+    SetChannelVolumeLevelScalar: usize,
+    GetChannelVolumeLevel: usize,
+    GetChannelVolumeLevelScalar: usize,
+    SetMute: unsafe extern "system" fn(*mut core::ffi::c_void, i32, *const windows_sys::core::GUID) -> HRESULT,
+    GetMute: unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> HRESULT,
+    GetVolumeStepInfo: usize,
+    VolumeStepUp: usize,
+    VolumeStepDown: usize,
+    QueryHardwareSupport: usize,
+    GetVolumeRange: usize,
+}
 
 /// トレイ/設定から ON/OFF できる(既定 ON)
 pub static AUDIO_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -314,5 +340,116 @@ fn audio_run(host: String, token: String) {
 
 /// 音声送信を開始(別スレッド)
 pub fn start(host: String, token: String) {
+    AUDIO_ACTIVE.store(true, Ordering::Relaxed);
     std::thread::spawn(move || audio_run(host, token));
+}
+
+// ---------- スピーカーミュート(音声出力の集中) ----------
+// 接続中は Windows 側スピーカーをミュートし、Mac のみで鳴らす。
+// エンドポイントミュートは WASAPI ループバックの取り出し点(ポストミックス)に
+// は効かない環境が多く、ミュート中もキャプチャは継続する(環境依存の注意は docs 記載)
+
+/// 音声転送が稼働している(=ミュート制御が意味を持つ)か
+pub static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// ミュート適用前のユーザー設定(切断時に元へ戻すため)。None=まだ記録していない
+static SPK_WAS_MUTED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// 既定レンダリングデバイスの IAudioEndpointVolume を Activate して返す
+unsafe fn open_endpoint_volume() -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>, String> {
+    unsafe {
+        // 呼び出し元スレッドで COM 未初期化の可能性がある(本体セッションのスレッド)
+        CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
+        let mut enumerator: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_MMDEVICE_ENUMERATOR,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDEVICE_ENUMERATOR,
+            &mut enumerator,
+        );
+        if hr < 0 || enumerator.is_null() {
+            return Err("MMDeviceEnumerator 作成失敗".into());
+        }
+        let evt = &*(*(enumerator as *mut ObjVt<IMMDeviceEnumeratorVtbl>)).lpVtbl;
+        let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
+        let _ = (evt.base.Release)(enumerator); // enumerator はもう要らない
+        if hr < 0 || device.is_null() {
+            return Err("既定オーディオデバイス取得失敗".into());
+        }
+        let dvt = &*(*(device as *mut ObjVt<IMMDeviceVtbl>)).lpVtbl;
+        let mut vol: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = (dvt.Activate)(
+            device,
+            &IID_IAUDIO_ENDPOINT_VOLUME,
+            CLSCTX_ALL,
+            std::ptr::null_mut(),
+            &mut vol,
+        );
+        let _ = (dvt.base.Release)(device); // IMMDevice ももう要らない
+        if hr < 0 || vol.is_null() {
+            return Err(format!("IAudioEndpointVolume 取得失敗 hr={hr:08x}"));
+        }
+        Ok(vol as *mut ObjVt<IAudioEndpointVolumeVtbl>)
+    }
+}
+
+/// 接続確立時: ミュートモードが ON なら現在のミュート状態を記録してからミュートする。
+/// 音声転送が無効(AUDIO_ACTIVE=false)のときは何もしない(音がどこにも行かなくなるため)
+pub fn speaker_connect_mute(mode_on: bool) {
+    if !mode_on || !AUDIO_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    unsafe {
+        let Ok(vol) = open_endpoint_volume() else {
+            println!("[spk] エンドポイント取得失敗。ミュートせず継続します");
+            return;
+        };
+        let vt = &*(*vol).lpVtbl;
+        let mut now: i32 = 0;
+        let got = (vt.GetMute)(vol as *mut core::ffi::c_void, &mut now);
+        if got >= 0 {
+            let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = Some(now != 0));
+            let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, 1, std::ptr::null());
+            println!("[spk] 接続中ミュートを適用 (was_muted={})", now != 0);
+            if hr < 0 {
+                println!("[spk] SetMute 失敗 hr={hr:08x}");
+            }
+        } else {
+            println!("[spk] GetMute 失敗 hr={got:08x}");
+        }
+        (vt.base.Release)(vol as *mut core::ffi::c_void);
+    }
+}
+
+/// 切断時: ミュートを適用した際の元状態へ戻す(元がミュートでなければ鳴らす)
+pub fn speaker_disconnect() {
+    let was = SPK_WAS_MUTED.lock().ok().and_then(|g| *g);
+    let Some(was) = was else { return }; // ミュートを適用していない
+    let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = None);
+    unsafe {
+        let Ok(vol) = open_endpoint_volume() else {
+            println!("[spk] 復元時のエンドポイント取得失敗");
+            return;
+        };
+        let vt = &*(*vol).lpVtbl;
+        let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, was as i32, std::ptr::null());
+        println!("[spk] 切断。ミュートを元へ戻しました (muted={was})");
+        if hr < 0 {
+            println!("[spk] SetMute(復元) 失敗 hr={hr:08x}");
+        }
+        (vt.base.Release)(vol as *mut core::ffi::c_void);
+    }
+}
+
+/// 接続中のモード切替(メニューから): ON=記録してミュート / OFF=元へ戻す
+pub fn speaker_set_mode(on: bool, connected: bool) {
+    if !connected {
+        return; // 未接続なら確立時に適用される
+    }
+    if on {
+        speaker_connect_mute(true);
+    } else {
+        speaker_disconnect();
+    }
 }

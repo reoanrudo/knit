@@ -135,6 +135,9 @@ static ALT_TAB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。Mac から Cfg で同期される
 static CMD_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
+/// Mac から Cfg で同期される(SEAMLESS_MUTE_SPK=0 で初期無効化)
+static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// Mac が測定した RTT(ms)。Mac から Stat で届く(ステータス窓の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
@@ -519,7 +522,7 @@ fn detach_if_console() {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-203943-52a8f6c";
+const BUILD_ID: &str = "win-20260925-205601-8a9d68e";
 
 fn main() {
     ensure_stdout();
@@ -583,6 +586,11 @@ fn main() {
     // (通常ネットワークの配布先向け)
     let role_server = args.iter().any(|a| a == "--listen")
         || sd_common::envutil::get("SEAMLESS_ROLE").as_deref() == Some("server");
+
+    // 接続中スピーカーミュートの初期値(既定 ON=Mac のみ発音)
+    if sd_common::envutil::get("SEAMLESS_MUTE_SPK").as_deref() == Some("0") {
+        SPK_MUTE_MODE.store(false, Ordering::Relaxed);
+    }
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
@@ -711,8 +719,10 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         CONNECTED.store(true, Ordering::Relaxed);
         println!("[conn] established");
         tray::notify("seamless-desk", "接続しました");
+        audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
         let _ = session(stream, w, h);
         CONNECTED.store(false, Ordering::Relaxed);
+        audio::speaker_disconnect();
         println!("[conn] lost. waiting for reconnect...");
         tray::notify("seamless-desk", "切断しました(待機中)");
     }
@@ -754,8 +764,10 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     }
     CONNECTED.store(true, Ordering::Relaxed);
     tray::notify("seamless-desk", "接続しました");
+    audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(stream, w, h);
     CONNECTED.store(false, Ordering::Relaxed);
+    audio::speaker_disconnect();
     tray::notify("seamless-desk", "切断しました(自動再接続中)");
     r
 }
@@ -863,9 +875,13 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             Msg::Ping { ts } => {
                 let _ = wtx.send(encode(&Msg::Pong { ts }));
             }
-            Msg::Cfg { cmd_alt } => {
+            Msg::Cfg { cmd_alt, spk_mute } => {
                 CMD_ALT.store(cmd_alt, Ordering::Relaxed);
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
+                if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
+                    println!("[cfg] 接続中スピーカーミュート -> {}", if spk_mute { "ON" } else { "OFF" });
+                    audio::speaker_set_mode(spk_mute, true);
+                }
             }
             Msg::Vol { op } => {
                 // VK_VOLUME_UP(0xAF)/DOWN(0xAE)/MUTE(0xAD)。up/down は2回送って調整幅を稼ぐ

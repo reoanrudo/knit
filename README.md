@@ -2,7 +2,7 @@
 
 Deskflow 快適版。MacBook のキーボード/トラックパッドで Windows デスクトップを操作する。
 **v0.7: ファイル送信(Mac ⌘C → Windows Ctrl+V)・完全常駐化(ターミナル消去に強い)・
-RTT 表示・Windows 音量制御・⌘キー/スクロール方向の切替**
+音声出力の集中(接続中はMacのみ発音)・RTT 表示・Windows 音量制御・⌘キー/スクロール方向の切替**
 
 設計: [docs/design.md](docs/design.md) / 配布手順: [docs/distribution.md](docs/distribution.md)
 
@@ -47,6 +47,8 @@ RTT 表示・Windows 音量制御・⌘キー/スクロール方向の切替**
 - **ファイル送信**: Mac でファイルを ⌘C → 画面端で切替 → Windows で Ctrl+V。
   Windows 側は `Downloads\SeamlessDesk` に受信しクリップボード(CF_HDROP)へ載せる。
   メニュー「Windows へファイルを送る…」(ファイル選択ダイアログ)からも送れる(合計200MBまで)
+- **音声出力の集中(既定 ON)**: 接続中は Windows のスピーカーを自動ミュートし
+  **Mac のみで発音**(切断で自動復元)。メニューで「常時鳴らす」へ切替可
 - **ショートカット**: Mac の Cmd は Windows の Ctrl に自動変換(Cmd+C→Ctrl+C。
   メニューで Alt 行きに切替可)、かな/英数キーで Windows の IME を開閉
 

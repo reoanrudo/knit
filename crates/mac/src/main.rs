@@ -502,6 +502,9 @@ static WIN_MODE: AtomicBool = AtomicBool::new(false);
 static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。トグル時に Windows へ Cfg で同期
 static CMD_ALT: AtomicBool = AtomicBool::new(false);
+/// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
+/// トグル時に Windows へ Cfg で同期(SEAMLESS_MUTE_SPK=0 で初期無効化)
+static SPK_MUTE: AtomicBool = AtomicBool::new(true);
 /// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
 static SCROLL_FLIP: AtomicBool = AtomicBool::new(false);
 /// Windows との RTT(ms)。ping/pong 往復で測定(メニュー状態行の表示用)
@@ -1026,7 +1029,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-204725-52a8f6c";
+const BUILD_ID: &str = "build-20260925-205838-8a9d68e";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -1131,6 +1134,9 @@ fn main() {
     }
     if envutil::get("SEAMLESS_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
+    }
+    if envutil::get("SEAMLESS_MUTE_SPK").as_deref() == Some("0") {
+        SPK_MUTE.store(false, Ordering::Relaxed);
     }
     eprintln!(
         "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
@@ -1695,7 +1701,10 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         // hello_ok 送信は送信スレッド経由で確実に
         send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
         // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
-        send_msg(&Msg::Cfg { cmd_alt: CMD_ALT.load(Ordering::Relaxed) });
+        send_msg(&Msg::Cfg {
+            cmd_alt: CMD_ALT.load(Ordering::Relaxed),
+            spk_mute: SPK_MUTE.load(Ordering::Relaxed),
+        });
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         eprintln!("[conn] established");
@@ -1755,7 +1764,10 @@ fn client_attempt(
     CONNECTED.store(true, Ordering::Relaxed);
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     // 現在の ⌘キー設定を同期(クライアントモードの確立時)
-    send_msg(&Msg::Cfg { cmd_alt: CMD_ALT.load(Ordering::Relaxed) });
+    send_msg(&Msg::Cfg {
+            cmd_alt: CMD_ALT.load(Ordering::Relaxed),
+            spk_mute: SPK_MUTE.load(Ordering::Relaxed),
+        });
     eprintln!("[conn] established");
     notify("seamless-desk", "Windows に接続しました");
     session_receive_loop(&mut reader);

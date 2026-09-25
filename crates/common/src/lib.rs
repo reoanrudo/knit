@@ -127,10 +127,15 @@ pub mod proto {
             #[serde(default)]
             ts: u64,
         },
-        /// 設定同期: ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。
+        /// 設定同期: ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)と
+        /// Windows スピーカーのミュート(true=接続中ミュート=Mac のみ発音)。
         /// 接続確立時とメニュー切替時に Mac→Windows へ送る
         #[serde(rename = "cfg")]
-        Cfg { cmd_alt: bool },
+        Cfg {
+            cmd_alt: bool,
+            #[serde(default)]
+            spk_mute: bool,
+        },
         /// Windows の音量制御(0=up / 1=down / 2=ミュート)。Mac メニューから送る
         #[serde(rename = "vol")]
         Vol { op: u8 },

@@ -76,6 +76,7 @@ static LABEL_STATE: AtomicUsize = AtomicUsize::new(0);
 static LABEL_BUILD: AtomicUsize = AtomicUsize::new(0);
 static LABEL_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static LABEL_RTT: AtomicUsize = AtomicUsize::new(0);
+static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
 
 fn wide_into(buf: &mut [u16], s: &str) {
     for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
@@ -103,6 +104,19 @@ fn rtt_line() -> String {
         "遅延: 計測中…".to_string()
     } else {
         format!("遅延: {ms}ms")
+    }
+}
+/// この PC のスピーカー状態(接続中ミュート=Mac のみ発音 の表示)
+fn spk_line() -> String {
+    if !crate::audio::AUDIO_ACTIVE.load(Ordering::Relaxed) {
+        return "スピーカー: --(音声転送なし)".to_string();
+    }
+    let mode = crate::SPK_MUTE_MODE.load(Ordering::Relaxed);
+    let conn = crate::CONNECTED.load(Ordering::Relaxed);
+    match (mode, conn) {
+        (true, true) => "スピーカー: ミュート中(Mac のみ発音)".to_string(),
+        (true, false) => "スピーカー: 接続時にミュート".to_string(),
+        _ => "スピーカー: 常時鳴らす".to_string(),
     }
 }
 fn set_text(h: usize, s: &str) {
@@ -256,13 +270,13 @@ unsafe fn open_status_window() {
             lpszClassName: class.as_ptr(),
         };
         RegisterClassW(&wc);
-        // タイトルバー+枠で 380x220 のクライアント領域になるよう補正は省略(十分実用)
+        // タイトルバー+枠で十分なクライアント領域になるよう補正は省略(十分実用)
         let hwnd = CreateWindowExW(
             0,
             class.as_ptr(),
             wide("seamless-desk").as_ptr(),
             WS_OVERLAPPEDWINDOW,
-            60, 60, 396, 250,
+            60, 60, 396, 284,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             hinst,
@@ -295,9 +309,10 @@ unsafe fn open_status_window() {
         let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 14, 42, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 14, 70, 350, 22, 0), Ordering::Relaxed);
         let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 14, 98, 350, 22, 0), Ordering::Relaxed);
-        make_child("BUTTON", "ログを開く", 0, 14, 130, 112, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 136, 130, 112, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "終了", 0, 258, 130, 112, 36, MENU_QUIT as usize);
+        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 14, 126, 350, 22, 0), Ordering::Relaxed);
+        make_child("BUTTON", "ログを開く", 0, 14, 160, 112, 36, MENU_OPENLOG as usize);
+        make_child("BUTTON", "音声 ON/OFF", 0, 136, 160, 112, 36, MENU_AUDIO as usize);
+        make_child("BUTTON", "終了", 0, 258, 160, 112, 36, MENU_QUIT as usize);
         ShowWindow(hwnd, SW_SHOW);
         windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
         update_labels();
@@ -310,6 +325,7 @@ unsafe fn update_labels() {
     set_text(LABEL_BUILD.load(Ordering::Relaxed), &build_line());
     set_text(LABEL_AUDIO.load(Ordering::Relaxed), &audio_line());
     set_text(LABEL_RTT.load(Ordering::Relaxed), &rtt_line());
+    set_text(LABEL_SPK.load(Ordering::Relaxed), &spk_line());
 }
 
 unsafe fn open_menu(hwnd: HWND) {
