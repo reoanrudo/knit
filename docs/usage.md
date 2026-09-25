@@ -91,6 +91,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 - 起動ログに `switch_mode=hotkey(ロック) hotkey_kc=105` の形式で反映状況が出ます
 
 | 変数 | 既定 | 説明 |
+| `SEAMLESS_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
 | `SEAMLESS_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
 | `SEAMLESS_DESK_TOKEN` | seamless-desk-dev | 両側共通の認証トークン |
 

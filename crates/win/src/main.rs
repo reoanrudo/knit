@@ -332,7 +332,7 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-171835-008964c";
+const BUILD_ID: &str = "win-20260925-175252-ca887d1";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
