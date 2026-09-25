@@ -15,10 +15,16 @@ pub static MUTED: AtomicBool = AtomicBool::new(false);
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 再生リングバッファ(音声スレッド→AudioQueue コールバック)。
-/// 上限 1.5MB(≈4秒)。溢れたら古い方を捨てる(遅延を優先)
+/// 上限は滞留クリップ(下記)より十分大きい 128KB(≈333ms)とし、
+/// 溢れたら古い方を捨てる。実効的な再生遅延は aq_callback の
+/// クリップ処理で約 60ms に固定される
 static RING: Mutex<std::collections::VecDeque<u8>> =
     Mutex::new(std::collections::VecDeque::new());
-const RING_CAP: usize = 1_536 * 1024;
+const RING_CAP: usize = 128 * 1024;
+/// 滞留クリップ量(48kHz f32/stereo で ≈62ms)。これを超えて溜まった分は
+/// 再生のたびに古い方から捨てる。ネットワークのバーストや送受信クロックの
+/// わずかな差で滞留が育つ(=遅延がだんだん増える)のを防ぐための上限
+const RING_CLIP: usize = 24 * 1024;
 
 type AudioQueueRef = *mut core::ffi::c_void;
 type AudioQueueBufferRef = *mut AudioQueueBuffer;
@@ -106,6 +112,13 @@ unsafe extern "C" fn aq_callback(
         let mut filled = 0usize;
         if !MUTED.load(Ordering::Relaxed) {
             let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
+            // 遅延クリップ: 滞留が RING_CLIP を超えたら古い方から捨てる。
+            // 溜めたまま再生するとその分まるまる遅延になるため、
+            // 常に「溜め ≤ 約60ms」を維持する(超過分の犠牲で遅延を固定)
+            if ring.len() > RING_CLIP {
+                let excess = ring.len() - RING_CLIP;
+                ring.drain(..excess);
+            }
             let take = ring.len().min(cap);
             for i in 0..take {
                 dst.add(i).write(ring.pop_front().unwrap_or(0));
@@ -122,11 +135,13 @@ unsafe extern "C" fn aq_callback(
     }
 }
 
-/// AudioQueue を起動する(4バッファ x 20ms ≒ 80ms の再生遅延)
+/// AudioQueue を起動する(3バッファ x 10ms = 30ms の再生バッファ遅延)。
+/// 低遅延優先: RING の滞留は aq_callback のクリップで約60msに固定され、
+/// 瞬断時に一時的に鳴らせる音もこの範囲で確保される
 fn start_playback(rate: u32) -> bool {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
-        let frame_bytes = rate as usize * bytes_per_frame as usize / 50; // 20ms
+        let frame_bytes = rate as usize * bytes_per_frame as usize / 100; // 10ms
         let desc = AudioStreamBasicDescription {
             mSampleRate: rate as f64,
             mFormatID: KAUDIO_FORMAT_LINEAR_PCM,
@@ -152,7 +167,7 @@ fn start_playback(rate: u32) -> bool {
             eprintln!("[audio] AudioQueueNewOutput 失敗");
             return false;
         }
-        for _ in 0..4 {
+        for _ in 0..3 {
             let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
             if AudioQueueAllocateBuffer(aq, frame_bytes, &mut buf) != 0 {
                 eprintln!("[audio] AllocateBuffer 失敗");
@@ -278,8 +293,13 @@ pub fn start(token: String) {
                     last_diag = std::time::Instant::now();
                     let rx = RX_BYTES.load(Ordering::Relaxed) / 1024;
                     let play = PLAY_BYTES.load(Ordering::Relaxed) / 1024;
-                    let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len() / 1024;
-                    eprintln!("[audio] diag rx={rx}KB played={play}KB queued={queued}KB");
+                    let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    // 滞留時間(=ここが実効的な追加遅延)。クリップで ≈62ms 以下に保たれる
+                    let lag_ms = queued as u64 * 1000 / (rate as u64 * 8);
+                    eprintln!(
+                        "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms",
+                        queued / 1024
+                    );
                 }
             }
             eprintln!("[audio] stream ended");

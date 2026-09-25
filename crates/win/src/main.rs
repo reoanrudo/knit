@@ -522,7 +522,7 @@ fn detach_if_console() {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-205601-8a9d68e";
+const BUILD_ID: &str = "win-20260925-210349-79ba8f1";
 
 fn main() {
     ensure_stdout();

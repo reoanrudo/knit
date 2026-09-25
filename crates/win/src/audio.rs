@@ -170,12 +170,13 @@ unsafe fn capture_open() -> Result<Capture, String> {
         // float(3=WAVE_FORMAT_IEEE_FLOAT / 0xFFFE=Extensible+32bit) か s16 か
         let float_fmt = (*fmt).tag == 3 || ((*fmt).tag == 0xFFFE && bits == 32);
         let bytes_per_frame = channels * (bits / 8);
-        // ループバック(再生音を取り込む)で 200ms バッファを初期化
+        // ループバック(再生音を取り込む)で初期化。バッファ指定は共有モードの
+        // エンジン周期に近い 50ms を指定(低遅延: 大きいと取得側の滞留が増える)
         let hr = (cvt.Initialize)(
             client as *mut _,
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_LOOPBACK,
-            2_000_000, // hnsBufferDuration(100ns単位)
+            500_000, // hnsBufferDuration(100ns単位)=50ms
             0,
             fmt,
             std::ptr::null(),
@@ -306,7 +307,9 @@ fn audio_run(host: String, token: String) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 continue;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // 8ms 間隔でポーリング(低遅延: WASAPI のエンジン周期 10ms に対し
+            // 取得側の追加滞留を平均 4ms 程に抑える)
+            std::thread::sleep(std::time::Duration::from_millis(8));
             let Some(frame) = (unsafe { capture_read(&mut cap) }) else {
                 // 無音が続いても1秒毎に長さ0のキープアライブを送る:
                 // 相手の再起動等で死んだ接続を無音期間中に検知するため
