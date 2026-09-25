@@ -94,6 +94,27 @@ else
   warn_msg "IMEは未検証(実機でかな/英数キーを押した実績なし)"
 fi
 
+echo "[verify] Win→Mac ファイル送信:"
+if [ "$WIN_OK" -eq 1 ]; then
+  rm -f "$HOME/Downloads/Tsunagu/win_verify_file.txt"
+  cat > /tmp/clip_file_set.bat <<BAT
+@echo off
+powershell -NoProfile -Command "Set-Content -Path C:\\Users\\<user>\\tsunagu\\win_verify_file.txt -Value 'verify-wf-$TS'; Set-Clipboard -Path C:\\Users\\<user>\\tsunagu\\win_verify_file.txt"
+BAT
+  sed -e 's/$/\r/' /tmp/clip_file_set.bat > /tmp/clip_file_set_crlf.bat && mv /tmp/clip_file_set_crlf.bat /tmp/clip_file_set.bat
+  if $SCP /tmp/clip_file_set.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null; then
+    $SSH 'schtasks /Create /TN tsunagu_clip_file /TR "cmd /c C:\Users\<user>\tsunagu\clip_file_set.bat" /SC ONCE /ST 23:59 /F' >/dev/null 2>&1
+    $SSH "schtasks /Run /TN tsunagu_clip_file" >/dev/null 2>&1
+    sleep 8
+    GOT_FILE=$(cat "$HOME/Downloads/Tsunagu/win_verify_file.txt" 2>/dev/null | tr -d '\r\n')
+    check "Win→Mac ファイル内容一致" "verify-wf-$TS" "$GOT_FILE"
+  else
+    warn_msg "clip_file_set.bat 転送失敗のため検証スキップ"
+  fi
+else
+  warn_msg "Win→Mac ファイル送信検証スキップ(接続失敗)"
+fi
+
 echo "[verify] 配布物(リブランド後の一式):"
 [ -f LICENSE ] && { echo "  OK  LICENSE"; pass=$((pass+1)); } || { echo "  NG  LICENSE 不在"; fail=$((fail+1)); }
 [ -f CHANGELOG.md ] && { echo "  OK  CHANGELOG.md"; pass=$((pass+1)); } || { echo "  NG  CHANGELOG.md 不在"; fail=$((fail+1)); }

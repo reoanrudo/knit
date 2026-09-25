@@ -51,6 +51,18 @@ unsafe extern "system" {
     fn SetClipboardData(uFormat: u32, hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
 }
 
+// CF_HDROP からファイルパス群を列挙する(shell32)
+#[link(name = "shell32")]
+unsafe extern "system" {
+    /// ifile=0xFFFFFFFF でファイル個数、それ以外はパス長(文字数・NUL 除外)
+    fn DragQueryFileW(
+        hdrop: *mut core::ffi::c_void,
+        ifile: u32,
+        lpszfile: *mut u16,
+        cch: u32,
+    ) -> u32;
+}
+
 // ---------- Win32 直宣言(グローバルメモリ) ----------
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -142,6 +154,8 @@ static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
 static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
+static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 /// ファイル送信 1 チャンクの生バイト上限(b64 後 4MB = プロトコル行上限 8MB 未満)
 const FILE_CHUNK_RAW: usize = 3 * 1024 * 1024;
@@ -276,6 +290,108 @@ fn clipboard_write_files(paths: &[String]) -> bool {
         }
         CloseClipboard();
         true
+    }
+}
+
+/// クリップボードからファイル参照(CF_HDROP)のパス群を読む。
+/// エクスプローラーでファイルをコピー(Ctrl+C)した際に載る形式
+fn clipboard_read_files() -> Option<Vec<String>> {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return None;
+        }
+        let mut out = None;
+        let h = GetClipboardData(CF_HDROP);
+        if !h.is_null() {
+            const COUNT: u32 = 0xFFFF_FFFF; // iFile=-1 で個数問い合わせ
+            let n = DragQueryFileW(h, COUNT, std::ptr::null_mut(), 0);
+            let mut v = Vec::new();
+            for i in 0..n.min(64) {
+                let len = DragQueryFileW(h, i, std::ptr::null_mut(), 0);
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len as usize + 1];
+                DragQueryFileW(h, i, buf.as_mut_ptr(), buf.len() as u32);
+                v.push(String::from_utf16_lossy(&buf[..len as usize]));
+            }
+            if !v.is_empty() {
+                out = Some(v);
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+/// ファイル群の指紋(パス+サイズ)。同一コピーの再検出・エコーバック判定に使う
+fn files_key(paths: &[String]) -> String {
+    let sizes: u64 = paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    format!("{}|{sizes}", paths.join("\u{1}"))
+}
+
+/// ファイル群を Mac へ送る(エクスプローラーのコピー検出から呼ぶ)。
+/// テキスト同期と同じ単一ライタチャネル(wtx)へ流すためロック不要
+fn send_files_to_mac(tx: &std::sync::mpsc::Sender<String>, paths: &[String]) {
+    const MAX_TOTAL: u64 = 200 * 1024 * 1024; // Mac 側の受信上限と同じ
+    const CHUNK: usize = FILE_CHUNK_RAW;
+    let mut total = 0u64;
+    for p in paths {
+        if let Ok(m) = std::fs::metadata(p) {
+            if m.is_file() {
+                total += m.len();
+            }
+        }
+    }
+    if total == 0 || total > MAX_TOTAL {
+        println!("[file] win->mac skip(total={total} bytes)");
+        return;
+    }
+    let mut sent = 0usize;
+    for p in paths {
+        let Ok(meta) = std::fs::metadata(p) else { continue };
+        if !meta.is_file() {
+            continue; // フォルダは対象外(ファイルのみ)
+        }
+        let name = std::path::Path::new(p)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        if tx.send(encode(&Msg::FileBegin { name, size: meta.len() })).is_err() {
+            return;
+        }
+        let Ok(mut f) = std::fs::File::open(p) else {
+            let _ = tx.send(encode(&Msg::FileEnd));
+            continue;
+        };
+        use std::io::Read as _;
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = match f.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if tx
+                .send(encode(&Msg::FileChunk {
+                    data: tsunagu_common::b64::encode(&buf[..n]),
+                }))
+                .is_err()
+            {
+                return;
+            }
+        }
+        if tx.send(encode(&Msg::FileEnd)).is_err() {
+            return;
+        }
+        sent += 1;
+    }
+    if sent > 0 {
+        let _ = tx.send(encode(&Msg::FileBatchEnd));
+        println!("[file] win->mac {sent} 件送信完了");
     }
 }
 
@@ -522,7 +638,7 @@ fn detach_if_console() {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-220318-66f43a1";
+const BUILD_ID: &str = "win-20260925-223013-46e09e6";
 
 fn main() {
     ensure_stdout();
@@ -817,6 +933,8 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     std::thread::spawn(move || {
         let mut last_sent = clipboard_read_text();
         let mut last_img: Option<String> = None;
+        let mut last_files: Option<String> = None;
+        println!("[clip] watch thread started");
         while cb_running.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(200));
             let Some(text) = clipboard_read_text() else {
@@ -831,6 +949,22 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                         {
                             println!("[clip] win->mac image");
                         }
+                    }
+                    continue;
+                }
+                // 画像も無いときはファイル参照(CF_HDROP)を送る:
+                // エクスプローラーで Ctrl+C → 切替 → Mac で ⌘V のファイル渡し
+                if let Some(files) = clipboard_read_files() {
+                    let key = files_key(&files);
+                    let dup = last_files.as_deref() == Some(key.as_str());
+                    let echo = LAST_RECV_FILES
+                        .lock()
+                        .map(|g| g.as_deref() == Some(key.as_str()))
+                        .unwrap_or(false);
+                    if !dup && !echo {
+                        println!("[file] CF_HDROP detected: {} files", files.len());
+                        last_files = Some(key);
+                        send_files_to_mac(&cb_tx, &files);
                     }
                 }
                 continue;
@@ -939,8 +1073,10 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 }
             }
             Msg::FileEnd => {
-                recv_file = None; // File の drop で閉じる
+                recv_file = None; // File の drop で閉じる(掲載は FileBatchEnd で一括)
                 recv_remain = 0;
+            }
+            Msg::FileBatchEnd => {
                 let files = PENDING_FILES
                     .lock()
                     .map(|g| g.clone())
@@ -949,6 +1085,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     let n = files.len();
                     println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
                     tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+                    // 自分が載せた CF_HDROP を監視スレッドが検出しても送り返さない
+                    *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(files_key(&files));
                 }
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift } => {

@@ -7,14 +7,30 @@ source $HOME/.cargo/env 2>/dev/null || true
 echo "[deploy-win] stamping BUILD_ID..."
 NEW_ID="win-$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
 sed -i '' "s|const BUILD_ID:[^;]*;|const BUILD_ID: \&str = \"$NEW_ID\";|" crates/win/src/main.rs
+sleep 1
 
 echo "[deploy-win] building..."
 touch crates/win/src/main.rs
 cargo build --release -p tsunagu-win --target x86_64-pc-windows-gnu 2>&1 | grep -E "^error" -A 3 && exit 1 || true
 cargo build --release -p tsunagu-win --target x86_64-pc-windows-gnu 2>&1 | tail -1 >/dev/null
 
+# 産物検証: exe 内の BUILD_ID がスタンプと一致することを確認する。
+# cargo の差分検知が同秒 mtime で miss し「古い exe を配って実機が更新されない」
+# 事故が実績があるため、不一致時は fingerprint を消して強制再ビルドする
+EXE=target/x86_64-pc-windows-gnu/release/tsunagu-win.exe
+verify_build() {
+  strings -a "$EXE" 2>/dev/null | grep -q "$NEW_ID"
+}
+if ! verify_build; then
+  echo "[deploy-win] BUILD_ID 不一致(古い産物)。クリーン再ビルドします..."
+  rm -rf target/x86_64-pc-windows-gnu/release/.fingerprint/tsunagu-win*
+  rm -f "$EXE"
+  cargo build --release -p tsunagu-win --target x86_64-pc-windows-gnu 2>&1 | grep -E "^error" -A3 && exit 1 || true
+  verify_build || { echo "[deploy-win] 再ビルドしても BUILD_ID が一致しません" >&2; exit 1; }
+fi
+
 # win-dist の exe も最新化する(install.bat は win-dist からコピーするため)
-cp target/x86_64-pc-windows-gnu/release/tsunagu-win.exe win-dist/tsunagu-win.exe
+cp "$EXE" win-dist/tsunagu-win.exe
 
 # トークン(.env)は Mac 側の設定から配布(無いと Windows 側で fatal 停止する)
 TOKEN_SRC="$HOME/.config/tsunagu/env"
@@ -30,6 +46,8 @@ if [ ! -f "$TOKEN_SRC" ]; then
 fi
 
 echo "[deploy-win] deploying (stop -> copy -> start)..."
+# 配布中の自動復帰(watch)を一時停止し、配布完了後に再有効化する
+ssh -o BatchMode=yes home "schtasks /Change /TN tsunagu_watch /DISABLE" >/dev/null 2>&1 || true
 # 旧名称(v0.7)のタスクとプロセスを掃除する(二重常駐・混在を防ぐ移行処理)
 for t in seamless_desk seamless_desk_run seamless_desk_watch; do
   ssh -o BatchMode=yes home "schtasks /End /TN $t; schtasks /Delete /TN $t /F" >/dev/null 2>&1 || true
@@ -52,6 +70,8 @@ scp -o BatchMode=yes "$TOKEN_SRC" home:C:/Users/<user>/tsunagu/.env >/dev/null
 ssh -o BatchMode=yes home 'schtasks /Create /TN tsunagu_watch /TR "wscript.exe C:\Users\<user>\tsunagu\run_tsunagu.vbs" /SC MINUTE /MO 1 /F' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /Run /TN tsunagu_run" >/dev/null 2>&1
 sleep 3
+# 配布の隙間に watch が旧 exe を起こしてミューテックスで新 exe をはじく事故を防ぐ
+ssh -o BatchMode=yes home "schtasks /Change /TN tsunagu_watch /ENABLE" >/dev/null 2>&1 || true
 
 echo "[deploy-win] status:"
 ssh -o BatchMode=yes home "tasklist | findstr tsunagu-win" 2>&1 | grep -v "^\*\*" | head -1

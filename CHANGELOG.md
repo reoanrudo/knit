@@ -2,6 +2,26 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
+## [0.9.0] - 2026-09-25
+
+### 追加
+- **逆方向(Windows→Mac)ファイル送信**: エクスプローラーでファイルを Ctrl+C →
+  切替 → Mac で ⌘V。Windows 側は CF_HDROP(DragQueryFileW)を監視し、
+  Mac 側は ~/Downloads/Tsunagu へ保存して NSPasteboard へファイル参照を載せる。
+  双方向でエコーバック防止(受信したクリップ内容は送り返さない)
+- **Mac 設定ウィンドウ**: メニュー「設定…」でチェックボックス形式の設定パネル
+  (境界切替/ダブルタップ/音声転送/⌘キー/スクロール方向/スピーカーミュート+
+  ファイル送信ボタン+バージョン表示)
+- `Msg::FileBatchEnd`(一括送信の終了合語。プロトコル VERSION 5)を追加、
+  通知の一括化
+- `scripts/package-win.sh`(Windows 配布 zip 生成)と `win-dist/README-win.txt`(導入手順書)
+
+### 変更
+- ファイル受信のクリップボード掲載を FileEnd 毎→FileBatchEnd の一括へ統一(通知の連打を解消)
+- deploy-win.sh を強化: ビルド産物の BUILD_ID 検証(差分検知ミスの防御)、
+  配布中の自動復帰タスク一時停止(watch 競合の防御)、v0.7 旧タスクの自動掃除
+- verify.sh に Win→Mac ファイル送信の E2E を追加(14 項目)
+
 ## [0.8.0] - 2026-09-25
 
 ### 追加

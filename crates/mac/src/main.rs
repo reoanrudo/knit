@@ -400,6 +400,98 @@ unsafe fn mac_clipboard_files() -> Option<Vec<std::path::PathBuf>> {
     (!out.is_empty()).then_some(out)
 }
 
+/// NSPasteboard へファイル参照を書き込む(Finder の ⌘C 相当)。
+/// Windows からのファイル受信完了時に呼ぶ。writeObjects: が file URL を
+/// 載せるため、Finder への ⌘V がそのまま動く
+unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
+    let pb = general_pasteboard();
+    if pb.is_null() || paths.is_empty() {
+        return false;
+    }
+    let url_cls = objc_getClass(c"NSURL".as_ptr());
+    if url_cls.is_null() {
+        return false;
+    }
+    let make_url: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+        std::mem::transmute(objc_msgSend as usize);
+    let mut urls = Vec::new();
+    for p in paths {
+        let s = nsstring(&p.to_string_lossy());
+        if s.is_null() {
+            continue;
+        }
+        let url = make_url(url_cls, sel_registerName(c"fileURLWithPath:".as_ptr()), s);
+        if !url.is_null() {
+            urls.push(url);
+        }
+    }
+    if urls.is_empty() {
+        return false;
+    }
+    msg0(pb, sel_registerName(c"clearContents".as_ptr()));
+    let make_arr: unsafe extern "C" fn(ID, SEL, *const ID, usize) -> ID =
+        std::mem::transmute(objc_msgSend as usize);
+    let arr = make_arr(
+        objc_getClass(c"NSArray".as_ptr()),
+        sel_registerName(c"arrayWithObjects:count:".as_ptr()),
+        urls.as_ptr(),
+        urls.len(),
+    );
+    let write: unsafe extern "C" fn(ID, SEL, ID) -> u8 =
+        std::mem::transmute(objc_msgSend as usize);
+    write(pb, sel_registerName(c"writeObjects:".as_ptr()), arr) != 0
+}
+
+/// ファイル群の指紋(パス+合計サイズ)。同一コピーの再検出・エコーバック判定に使う
+fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
+    let sizes: u64 = paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+        .sum();
+    format!(
+        "{}|{sizes}",
+        paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\u{1}")
+    )
+}
+
+/// Windows からのファイル受信を ~/Downloads/Tsunagu へ新規作成する。
+/// 同名との衝突は "名前 (n).拡張子" として回避。1ファイル 200MB 上限
+fn mac_file_begin(name: &str, size: u64) -> Option<(std::fs::File, std::path::PathBuf)> {
+    const MAX_FILE: u64 = 200 * 1024 * 1024;
+    if size == 0 || size > MAX_FILE {
+        eprintln!("[file] win->mac skip(name={name:?} size={size})");
+        return None;
+    }
+    let bad = name.is_empty()
+        || name.len() > 255
+        || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
+        || name.starts_with('.');
+    let base = if bad { "file".to_string() } else { name.to_string() };
+    let dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join("Downloads/Tsunagu"))
+        .filter(|d| std::fs::create_dir_all(d).is_ok())?;
+    let p = std::path::Path::new(&base);
+    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    for i in 0..1000u32 {
+        let cand = if i == 0 {
+            dir.join(&base)
+        } else {
+            dir.join(format!("{stem} ({i}){ext}"))
+        };
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            Ok(f) => return Some((f, cand)),
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
@@ -469,6 +561,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
             send_msg(&Msg::FileEnd);
             eprintln!("[file] 送信: {name} ({size} bytes)");
         }
+        send_msg(&Msg::FileBatchEnd);
         eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
         notify("tsunagu", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
@@ -1029,7 +1122,9 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-220506-66f43a1";
+/// 表示用のリリースバージョン(設定ウィンドウ等)
+pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
+const BUILD_ID: &str = "build-20260925-223137-46e09e6";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1376,18 +1471,7 @@ fn main() {
             let Some(text) = text else {
                 if let Some(files) = (unsafe { mac_clipboard_files() }) {
                     // 同じ選択の再 ⌘C で何度も流れないよう指紋で抜く
-                    let sizes: u64 = files
-                        .iter()
-                        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-                        .sum();
-                    let key = format!(
-                        "{}|{sizes}",
-                        files
-                            .iter()
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .collect::<Vec<_>>()
-                            .join("\u{1}")
-                    );
+                    let key = mac_files_key(&files);
                     let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
                     if !dup {
                         *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
@@ -1527,6 +1611,13 @@ const MAX_LINE: u64 = 8 * 1024 * 1024;
 /// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)
 fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
     use std::io::BufRead;
+    // ファイル受信の途中状態(FileBegin → FileChunk… → FileEnd)。
+    // 受信ループはシングルスレッドのためローカル変数で持つ
+    let mut recv_file: Option<std::fs::File> = None;
+    let mut recv_remain: u64 = 0;
+    let mut recv_name = String::new();
+    let mut recv_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut last_notified_key = String::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -1584,6 +1675,63 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                                     Some(text.clone());
                                 unsafe { mac_set_clipboard(&text) };
                                 eprintln!("[clip] win->mac {} bytes", text.len());
+                            }
+                        }
+                        Msg::FileBegin { name, size } => {
+                            recv_file = None;
+                            recv_remain = 0;
+                            if let Some((f, path)) = mac_file_begin(&name, size) {
+                                recv_name = path.to_string_lossy().into_owned();
+                                recv_paths.push(path);
+                                recv_file = Some(f);
+                                recv_remain = size;
+                            }
+                        }
+                        Msg::FileChunk { data } => {
+                            if recv_file.is_none() {
+                                continue;
+                            }
+                            let mut ok = false;
+                            if let Some(bytes) = tsunagu_common::b64::decode(&data) {
+                                if !bytes.is_empty() && bytes.len() as u64 <= recv_remain {
+                                    use std::io::Write as _;
+                                    let written = recv_file
+                                        .as_mut()
+                                        .map(|f| f.write_all(&bytes).is_ok())
+                                        .unwrap_or(false);
+                                    if written {
+                                        recv_remain -= bytes.len() as u64;
+                                        ok = true;
+                                    }
+                                }
+                            }
+                            if !ok {
+                                eprintln!("[file] chunk 失敗。このファイルを破棄します");
+                                recv_file = None;
+                                recv_remain = 0;
+                            }
+                        }
+                        Msg::FileEnd => {
+                            recv_file = None; // File の drop で閉じる
+                            recv_remain = 0;
+                            recv_name.clear();
+                        }
+                        Msg::FileBatchEnd => {
+                            // 一括送信の終了: 受け取った全ファイルをクリップボードへ
+                            if !recv_paths.is_empty() {
+                                let key = mac_files_key(&recv_paths);
+                                let n = recv_paths.len();
+                                let ok = unsafe { mac_clipboard_write_files(&recv_paths) };
+                                // 自分が載せたファイルを監視スレッドが Windows へ
+                                // 送り返さないよう指紋を登録(ループ防止)
+                                *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                                if ok {
+                                    eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
+                                    notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
+                                } else {
+                                    eprintln!("[file] win->mac 受信: {n} 件(クリップボード載せ失敗)");
+                                }
+                                recv_paths.clear();
                             }
                         }
                         Msg::Pong { ts } => {

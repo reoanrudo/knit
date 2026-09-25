@@ -98,7 +98,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 4; // 4: Tsunagu へ改名(旧 seamless-desk v0.7 との混在早期検知)
+    pub const VERSION: u32 = 5; // 5: 双方向ファイル送信(FileBatchEnd 追加)
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -180,14 +180,18 @@ pub mod proto {
         /// 接続品質通知: Mac が測定した RTT(ms)を Windows 側の表示へ回す
         #[serde(rename = "stat")]
         Stat { rtt: u64 },
-        /// ファイル送信(Mac→Win)。begin → chunk(base64, 生3MB以下) → end の順。
-        /// Windows 側は Downloads\Tsunagu へ保存し CF_HDROP をクリップボードへ
+        /// ファイル送信(双方向)。begin → chunk(base64, 生3MB以下) → end の順。
+        /// 受信側は Downloads\Tsunagu へ保存しファイル参照をクリップボードへ
         #[serde(rename = "file_begin")]
         FileBegin { name: String, size: u64 },
         #[serde(rename = "file_chunk")]
         FileChunk { data: String },
         #[serde(rename = "file_end")]
         FileEnd,
+        /// ファイル一括送信の終了合図(全ファイルの FileEnd 後に 1 回)。
+        /// 受信側はこの時点でクリップボードへファイル参照を載せ通知する
+        #[serde(rename = "file_batch_end")]
+        FileBatchEnd,
         #[serde(rename = "bye")]
         Bye,
     }

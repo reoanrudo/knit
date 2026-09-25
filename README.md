@@ -7,7 +7,9 @@ MacBook のキーボード/トラックパッドで Windows デスクトップ�
 キーボード/マウス/クリップボード/ファイル/音声を「つなぐ」ことから命名(Deskflow 等の
 既存ソフトとは無関係の独立開発。方式は画面端での切り替え式)。
 
-**v0.8: Tsunagu へ改名・配布基盤整備(LICENSE/CHANGELOG/アンインストーラ/v0.7 からの自動移行)**
+**v0.9: 逆方向ファイル送信(エクスプローラーCtrl+C → Mac ⌘V)・Mac 設定ウィンドウ・
+Windows 配布 zip 生成**
+v0.8: Tsunagu へ改名・配布基盤整備(LICENSE/CHANGELOG/アンインストーラ/v0.7 からの自動移行)
 v0.7 までの機能: ファイル送信(Mac ⌘C → Windows Ctrl+V)・完全常駐化・音声出力の集中・
 低遅延音声転送(ビットパーフェクト主体)・RTT 表示・Windows 音量制御・⌘キー/スクロール方向の切替
 
@@ -54,9 +56,11 @@ v0.7(旧 seamless-desk)からの乗り換えは上記をそのまま実行する
   手動切替・切替方式(境界+ダブルタップ ⇄ ホットキーロック)・境界到達回数・
   音声転送・⌘キー(Ctrl ⇄ Alt)・スクロール方向(Windows準拠 ⇄ 反転)・
   Windowsへのファイル送信…・Windowsの音量 ▲▼/ミュート・ログを開く・再起動・終了
-- **ファイル送信**: Mac でファイルを ⌘C → 画面端で切替 → Windows で Ctrl+V。
+- **ファイル送信(双方向)**: Mac でファイルを ⌘C → 画面端で切替 → Windows で Ctrl+V。
+  逆方向も同様: エクスプローラーで Ctrl+C → 切替 → Mac で ⌘V。
+  Mac 側は `~/Downloads/Tsunagu` へ受信しクリップボードへファイル参照を載せる。
   Windows 側は `Downloads\Tsunagu` に受信しクリップボード(CF_HDROP)へ載せる。
-  メニュー「Windows へファイルを送る…」(ファイル選択ダイアログ)からも送れる(合計200MBまで)
+  メニュー/設定ウィンドウの「Windows へファイルを送る…」からも送れる(合計200MBまで)
 - **音声出力の集中(既定 ON)**: 接続中は Windows のスピーカーを自動ミュートし
   **Mac のみで発音**(切断で自動復元)。メニューで「常時鳴らす」へ切替可
 - **ショートカット**: Mac の Cmd は Windows の Ctrl に自動変換(Cmd+C→Ctrl+C。
@@ -67,6 +71,7 @@ v0.7(旧 seamless-desk)からの乗り換えは上記をそのまま実行する
 ```bash
 ./scripts/package-mac.sh   # dist/Tsunagu.app + zip を作成(トークン封入)
 ./scripts/install-mac.sh   # このMacへインストール(ログイン時自動起動の LaunchAgent 登録)
+./scripts/package-win.sh   # dist/Tsunagu-win-<ver>.zip(Windows 配布 zip。exe+導入書+トークン)
 ```
 
 Windows への新規配布は `win-dist/`(tsunagu-win.exe・install.bat・run_tsunagu.vbs/bat・.env)一式を

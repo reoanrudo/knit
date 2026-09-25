@@ -117,6 +117,25 @@ static GUI_CMD_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SCROLL_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SPK_ITEM: AtomicUsize = AtomicUsize::new(0);
 
+// ---------- 設定ウィンドウ(メニュー「設定…」で開く) ----------
+static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_MODE: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_TAPS: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_AUDIO: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_CMD: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_SCROLL: AtomicUsize = AtomicUsize::new(0);
+static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
+
+/// NSRect(f64 x4)。NSWindow 初期化など by-value 渡しに使う
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NSRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
 
 unsafe extern "C" fn imp_toggle(_s: ID, _c: SEL, _n: ID) {
@@ -252,6 +271,146 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
         crate::send_files_to_win(pb);
     }
 }
+/// 設定ウィンドウを開く(初回のみ生成。以降は同一ウィンドウを前面化)
+unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
+    unsafe {
+        let app = msg0(objc_getClass(c"NSApplication".as_ptr()), sel(c"sharedApplication"));
+        if !app.is_null() {
+            // メニューバー常駐型は非アクティブなので明示的に前面化する
+            msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+        }
+        let existing = PREFS_WIN.load(Ordering::Relaxed) as ID;
+        if existing.is_null() {
+            let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+            let win = make_prefs_window(target);
+            if win.is_null() {
+                eprintln!("[gui] 設定ウィンドウの生成に失敗");
+                return;
+            }
+            PREFS_WIN.store(win as usize, Ordering::Relaxed);
+        }
+        let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
+        msg1_void_id(win, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
+        sync_prefs_state();
+    }
+}
+
+/// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)
+fn sync_prefs_state() {
+    unsafe {
+        let set = |slot: &AtomicUsize, on: bool| {
+            let b = slot.load(Ordering::Relaxed) as ID;
+            if !b.is_null() {
+                msg1_void_u8(b, sel(c"setState:"), on as u8);
+            }
+        };
+        set(&PREFS_CHK_MODE, !crate::HOTKEY_ONLY.load(Ordering::Relaxed));
+        set(&PREFS_CHK_TAPS, crate::EDGE_TAPS.load(Ordering::Relaxed) >= 2);
+        set(&PREFS_CHK_AUDIO, !crate::audio::MUTED.load(Ordering::Relaxed));
+        set(&PREFS_CHK_CMD, crate::CMD_ALT.load(Ordering::Relaxed));
+        set(&PREFS_CHK_SCROLL, crate::SCROLL_FLIP.load(Ordering::Relaxed));
+        set(&PREFS_CHK_SPK, crate::SPK_MUTE.load(Ordering::Relaxed));
+    }
+}
+
+/// 設定ウィンドウを組み立てる。トグルの action はメニュー項目と同じ IMP を
+/// 共用し(sender を見ないトグル)、チェック状態は毎秒の同期で保ち直す
+unsafe fn make_prefs_window(target: ID) -> ID {
+    unsafe {
+        let init: unsafe extern "C" fn(ID, SEL, NSRect, u64, u64, u8) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let set_frame: unsafe extern "C" fn(ID, SEL, NSRect) =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let label: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let check_btn: unsafe extern "C" fn(ID, SEL, ID, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+        let push_btn: unsafe extern "C" fn(ID, SEL, ID, ID, SEL) -> ID =
+            std::mem::transmute(crate::objc_msgSend as usize);
+
+        // titled(1) | closable(2) | resizable(8)、backing=Buffered(2)、defer=NO
+        let alloc = msg0(objc_getClass(c"NSWindow".as_ptr()), sel(c"alloc"));
+        let win = init(
+            alloc,
+            sel(c"initWithContentRect:styleMask:backing:defer:"),
+            NSRect { x: 0.0, y: 0.0, w: 360.0, h: 400.0 },
+            1 | 2 | 8,
+            2,
+            0,
+        );
+        if win.is_null() {
+            return std::ptr::null_mut();
+        }
+        msg1_void_id(win, sel(c"setTitle:"), nsstring("Tsunagu 設定"));
+        // 閉じてもオブジェクトを保持し、次回は同一ウィンドウを再表示する
+        msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
+        let cv = msg0(win, sel(c"contentView"));
+        if cv.is_null() {
+            return std::ptr::null_mut();
+        }
+        let btn_cls = objc_getClass(c"NSButton".as_ptr());
+
+        // チェック項目(タイトル, action, static 保存先)。y は下から積む
+        let mut y = 400.0 - 44.0;
+        let mut add_check = |title: &str, action: &std::ffi::CStr, slot: &AtomicUsize| {
+            let b = check_btn(
+                btn_cls,
+                sel(c"checkWithTitle:target:action:"),
+                nsstring(title),
+                target,
+                sel(action),
+            );
+            if !b.is_null() {
+                set_frame(b, sel(c"setFrame:"), NSRect { x: 20.0, y, w: 320.0, h: 28.0 });
+                msg1_void_id(cv, sel(c"addSubview:"), b);
+                slot.store(b as usize, Ordering::Relaxed);
+            }
+            y -= 36.0;
+        };
+        add_check("境界での切替を有効化(オフ: ホットキーロック)", c"sdSwitchMode:", &PREFS_CHK_MODE);
+        add_check("境界到達はダブルタップ(オフ: 1回で切替)", c"sdEdgeTaps:", &PREFS_CHK_TAPS);
+        add_check("Windows の音声を Mac で再生", c"sdAudio:", &PREFS_CHK_AUDIO);
+        add_check("⌘キーを Alt に割当て(既定: Ctrl)", c"sdCmdMap:", &PREFS_CHK_CMD);
+        add_check("スクロール方向を反転(Mac 準拠)", c"sdScroll:", &PREFS_CHK_SCROLL);
+        add_check("接続中は Windows スピーカーをミュート", c"sdSpkMute:", &PREFS_CHK_SPK);
+
+        // ファイル送信ボタン(押しボタン型)
+        let send = push_btn(
+            btn_cls,
+            sel(c"buttonWithTitle:target:action:"),
+            nsstring("Windows へファイルを送る…"),
+            target,
+            sel(c"sdSendFile:"),
+        );
+        if !send.is_null() {
+            set_frame(send, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 6.0, w: 200.0, h: 32.0 });
+            msg1_void_id(cv, sel(c"addSubview:"), send);
+        }
+        y -= 48.0;
+
+        // バージョン/状態の情報行(選択不可ラベル)
+        let info = label(
+            objc_getClass(c"NSTextField".as_ptr()),
+            sel(c"labelWithTitle:"),
+            nsstring(&format!("Tsunagu {} ・ {}", crate::VERSION_STR, crate::BUILD_ID)),
+        );
+        if !info.is_null() {
+            set_frame(info, sel(c"setFrame:"), NSRect { x: 20.0, y: y - 4.0, w: 320.0, h: 22.0 });
+            let f = msg0(info, sel(c"font"));
+            if !f.is_null() {
+                let small: unsafe extern "C" fn(ID, SEL, f64) -> ID =
+                    std::mem::transmute(crate::objc_msgSend as usize);
+                let sf = small(f, sel(c"fontWithSize:"), 11.0);
+                if !sf.is_null() {
+                    msg1_void_id(info, sel(c"setFont:"), sf);
+                }
+            }
+            msg1_void_id(cv, sel(c"addSubview:"), info);
+        }
+        win
+    }
+}
+
 unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     eprintln!("[gui] メニューから終了しました");
     std::process::exit(0);
@@ -359,6 +518,8 @@ fn refresh_status() {
             };
             msg1_void_id(spk_item, sel(c"setTitle:"), nsstring(t));
         }
+        // 設定ウィンドウが開いていればチェック状態も保ち直す
+        sync_prefs_state();
     }
 }
 
@@ -464,6 +625,7 @@ unsafe fn make_target() -> ID {    let super_cls = objc_getClass(c"NSObject".as_
         (c"sdSpkMute:", imp_spk_mute as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
+        (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
     ];
@@ -617,6 +779,14 @@ pub fn start() -> bool {
         }
 
         add_item(menu, msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")));
+
+        let prefs = menu_item("設定…", Some(c"sdShowPrefs:"), ",");
+        if prefs.is_null() {
+            return false;
+        }
+        msg1_void_id(prefs, sel(c"setTarget:"), target);
+        msg1_void_sel(prefs, sel(c"setAction:"), sel(c"sdShowPrefs:"));
+        add_item(menu, prefs);
 
         for (title, action) in [
             ("ログを開く…", c"sdOpenLog:"),
