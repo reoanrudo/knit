@@ -64,18 +64,30 @@ unsafe extern "system" {
 
 /// フォアグラウンドウィンドウの IME を開(かな)/閉じ(英数)する。
 /// キーエミュレート(VK_KANJI 等)と違い方向指定が確実。
+/// IME コンテキストが取れないウィンドウでは半角/全角キー相当の
+/// VK_KANJI 注入へフォールバックする(トグル動作)。
 fn ime_set_open(open: bool) {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd.is_null() {
-            return;
+        if !hwnd.is_null() {
+            let himc = ImmGetContext(hwnd);
+            if !himc.is_null() {
+                let ok = ImmSetOpenStatus(himc, open as i32);
+                ImmReleaseContext(hwnd, himc);
+                if ok != 0 {
+                    println!("[ime] ImmSetOpenStatus({open}) ok");
+                    return;
+                }
+                println!("[ime] ImmSetOpenStatus({open}) failed -> fallback");
+            } else {
+                println!("[ime] ImmGetContext=null -> fallback");
+            }
+        } else {
+            println!("[ime] no foreground window -> fallback");
         }
-        let himc = ImmGetContext(hwnd);
-        if himc.is_null() {
-            return; // IME 非対応ウィンドウ(コンソール等)
-        }
-        ImmSetOpenStatus(himc, open as i32);
-        ImmReleaseContext(hwnd, himc);
+        // フォールバック: 半角/全角キー(VK_KANJI)の押し離し
+        inject_key(0xF4, false);
+        inject_key(0xF4, true);
     }
 }
 
