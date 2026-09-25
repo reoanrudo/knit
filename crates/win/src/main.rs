@@ -357,6 +357,10 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
     }
     let reader = BufReader::new(stream);
     let mut mods = ModState::new();
+    // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
+    // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
+    // 端数は次イベントへ持ち越す。
+    let mut accum = (0.0f64, 0.0f64);
     let mut hello_done = false;
     let mut last_return_notify = Instant::now() - Duration::from_secs(10);
     let running = Arc::new(AtomicBool::new(true));
@@ -470,7 +474,14 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 if !hello_done {
                     continue;
                 }
-                inject_mouse_move_rel(dx.round() as i32, dy.round() as i32);
+                accum.0 += dx;
+                accum.1 += dy;
+                let (ix, iy) = (accum.0.trunc(), accum.1.trunc());
+                if ix != 0.0 || iy != 0.0 {
+                    accum.0 -= ix;
+                    accum.1 -= iy;
+                    inject_mouse_move_rel(ix as i32, iy as i32);
+                }
                 maybe_notify_return(&writer, &mut last_return_notify, h, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
