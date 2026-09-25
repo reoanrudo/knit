@@ -33,6 +33,9 @@ pub mod proto {
         Focus { title: String },
         #[serde(rename = "minimize")]
         Minimize { title: String },
+        /// カーソル絶対ワープ(0..1 正規化。切替時に相手画面の対応位置へ飛ばす)
+        #[serde(rename = "warp")]
+        Warp { nx: f64, ny: f64 },
         #[serde(rename = "ping")]
         Ping,
         #[serde(rename = "pong")]

@@ -100,6 +100,7 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
 static SCREEN_W: OnceLock<f64> = OnceLock::new();
+static SCREEN_H: OnceLock<f64> = OnceLock::new();
 
 fn send_msg(msg: &Msg) {
     if let Some(tx) = TX.get() {
@@ -141,6 +142,11 @@ unsafe extern "C" fn tap_callback(
                 if loc.x >= *w - 2.0 {
                     WIN_MODE.store(true, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge)");
+                    // Windows カーソルを画面左端の対応高さへワープ(連続的な「向こうへ行く」体験)
+                    if let Some(sh) = SCREEN_H.get() {
+                        let ny = (1.0 - (loc.y / *sh)).clamp(0.0, 1.0);
+                        send_msg(&Msg::Warp { nx: 0.02, ny });
+                    }
                     return std::ptr::null_mut();
                 }
             }
@@ -221,6 +227,7 @@ fn main() {
         (b.size.w, b.size.h)
     };
     let _ = SCREEN_W.set(screen_w);
+    let _ = SCREEN_H.set(screen_h);
     eprintln!("[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode)");
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -470,7 +477,7 @@ fn main() {
         CGEventTapCreate(
             0, // kCGSessionEventTap
             0, // kCGHeadInsertEventTap
-            1, // kCGEventTapOptionDefault(抑制可)
+            0, // kCGEventTapOptionDefault = 0(抑制可)。1はListenOnlyで抑制不可
             mask,
             tap_callback,
             std::ptr::null_mut(),

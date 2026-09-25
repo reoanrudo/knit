@@ -21,7 +21,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetSystemMetrics, GetWindowTextW, IsWindowVisible,
-    SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
+    SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE,
 };
 
 const INPUT_MOUSE: u32 = 0;
@@ -342,6 +342,14 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 } else {
                     println!("[focus] window not found: {title}");
                 }
+            }
+            Msg::Warp { nx, ny } => {
+                if !hello_done {
+                    continue;
+                }
+                let x = (nx.clamp(0.0, 1.0) * w as f64) as i32;
+                let y = (ny.clamp(0.0, 1.0) * h as f64) as i32;
+                unsafe { SetCursorPos(x, y) };
             }
             Msg::Minimize { title } => {
                 if !hello_done {
