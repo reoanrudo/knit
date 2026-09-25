@@ -284,6 +284,8 @@ static EDGE_PX: OnceLock<f64> = OnceLock::new();
 /// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
 /// 仮想画面全体の右端で判定する
 static UNION_MAX_X: OnceLock<f64> = OnceLock::new();
+/// カーソル非表示状態の管理(hide/show の対称性を保証し、復帰時に必ず表示する)
+static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -309,7 +311,11 @@ fn enter_win_mode_cursor_lock() {
     unsafe {
         set_cursor_in_background();
         let d = CGMainDisplayID();
-        CGDisplayHideCursor(d);
+        // hide が多重に積もると show が追いつかずカーソルが消えたままになるため
+        // フラグで 1 回だけ隠す
+        if !CURSOR_HIDDEN.swap(true, Ordering::Relaxed) {
+            CGDisplayHideCursor(d);
+        }
         CGSetLocalEventsSuppressionInterval(0.0001);
         CGAssociateMouseAndMouseCursorPosition(false);
         // 関連切断は非同期で効き始めるため、切替直後の漏れ移動が数ピクセル出る。
@@ -349,7 +355,13 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
         let d = CGMainDisplayID();
-        CGDisplayShowCursor(d);
+        // カーソルの再表示漏れ(透明のまま戻るバグ)を防ぐため、フラグが立って
+        // いるときは show を複数回呼んで確実に表示する(呼び過ぎても無害)
+        if CURSOR_HIDDEN.swap(false, Ordering::Relaxed) {
+            for _ in 0..3 {
+                CGDisplayShowCursor(d);
+            }
+        }
         CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
         let edge_x = UNION_MAX_X.get().copied().or(SCREEN_W.get().copied());
         if let Some(w) = edge_x {
