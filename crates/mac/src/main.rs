@@ -101,6 +101,8 @@ unsafe extern "C" {
 }
 
 // ---------- ObjC ランタイム直宣言(NSPasteboard 操作) ----------
+// NSPasteboard は AppKit のクラスのため、リンクしてクラス登録を発生させる必要がある
+#[link(name = "AppKit", kind = "framework")]
 #[link(name = "objc", kind = "dylib")]
 unsafe extern "C" {
     fn objc_getClass(name: *const core::ffi::c_char) -> *mut core::ffi::c_void;
@@ -116,41 +118,71 @@ unsafe extern "C" {
 static LAST_RECV_CLIP: Mutex<Option<String>> = Mutex::new(None);
 const CLIP_MAX_BYTES: usize = 512 * 1024;
 
-unsafe fn nsstring(s: &str) -> *mut core::ffi::c_void {
+type ID = *mut core::ffi::c_void;
+type SEL = *mut core::ffi::c_void;
+
+// objc_msgSend は可変引数宣言のまま呼ぶと引数の渡りが壊れる(SIGSEGV実績あり)ため、
+// 呼び出しシグネチャごとに transmute した固定シグネチャで呼ぶ(rust-objc 界の定番方式)
+unsafe fn msg0(target: ID, sel: SEL) -> ID {
+    let f: unsafe extern "C" fn(ID, SEL) -> ID = std::mem::transmute(objc_msgSend as usize);
+    f(target, sel)
+}
+unsafe fn msg1_id(target: ID, sel: SEL, a: ID) -> ID {
+    let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+    f(target, sel, a)
+}
+unsafe fn msg1_cstr(target: ID, sel: SEL, p: *const core::ffi::c_char) -> ID {
+    let f: unsafe extern "C" fn(ID, SEL, *const core::ffi::c_char) -> ID =
+        std::mem::transmute(objc_msgSend as usize);
+    f(target, sel, p)
+}
+unsafe fn msg2_bool(target: ID, sel: SEL, a: ID, b: ID) -> u8 {
+    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 =
+        std::mem::transmute(objc_msgSend as usize);
+    f(target, sel, a, b)
+}
+unsafe fn msg0_isize(target: ID, sel: SEL) -> isize {
+    let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as usize);
+    f(target, sel)
+}
+unsafe fn msg0_cstr(target: ID, sel: SEL) -> *const core::ffi::c_char {
+    let f: unsafe extern "C" fn(ID, SEL) -> *const core::ffi::c_char =
+        std::mem::transmute(objc_msgSend as usize);
+    f(target, sel)
+}
+
+unsafe fn nsstring(s: &str) -> ID {
     let mut buf = s.as_bytes().to_vec();
     buf.push(0);
-    objc_msgSend(
+    msg1_cstr(
         objc_getClass(c"NSString".as_ptr()),
         sel_registerName(c"stringWithUTF8String:".as_ptr()),
-        buf.as_ptr(),
+        buf.as_ptr() as *const core::ffi::c_char,
     )
 }
 
-unsafe fn general_pasteboard() -> *mut core::ffi::c_void {
-    objc_msgSend(
+unsafe fn general_pasteboard() -> ID {
+    msg0(
         objc_getClass(c"NSPasteboard".as_ptr()),
         sel_registerName(c"generalPasteboard".as_ptr()),
     )
-}
-
-/// 戻り値が NSInteger のメソッド用に objc_msgSend を呼ぶ
-unsafe fn msg_isize(obj: *mut core::ffi::c_void, sel: *mut core::ffi::c_void) -> isize {
-    let f: unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> isize =
-        std::mem::transmute(objc_msgSend as *const core::ffi::c_void);
-    f(obj, sel)
 }
 
 /// NSPasteboard へテキストを書き込む(Windows→Mac 受信時)
 unsafe fn mac_set_clipboard(text: &str) -> bool {
     let pb = general_pasteboard();
     if pb.is_null() {
+        eprintln!("[clip] set: pasteboard=null");
         return false;
     }
-    objc_msgSend(pb, sel_registerName(c"clearContents".as_ptr()));
+    msg0(pb, sel_registerName(c"clearContents".as_ptr()));
     let s = nsstring(text);
     let uti = nsstring("public.utf8-plain-text");
-    objc_msgSend(pb, sel_registerName(c"setString:forType:".as_ptr()), s, uti);
-    true
+    let ok = msg2_bool(pb, sel_registerName(c"setString:forType:".as_ptr()), s, uti);
+    if ok == 0 {
+        eprintln!("[clip] set failed: str={} uti={}", !s.is_null(), !uti.is_null());
+    }
+    ok != 0
 }
 
 /// NSPasteboard からテキストを読む(Mac→Windows 送信時)
@@ -160,12 +192,11 @@ unsafe fn mac_get_clipboard() -> Option<String> {
         return None;
     }
     let uti = nsstring("public.utf8-plain-text");
-    let s = objc_msgSend(pb, sel_registerName(c"stringForType:".as_ptr()), uti);
+    let s = msg1_id(pb, sel_registerName(c"stringForType:".as_ptr()), uti);
     if s.is_null() {
         return None;
     }
-    let utf8 =
-        objc_msgSend(s, sel_registerName(c"UTF8String".as_ptr())) as *const core::ffi::c_char;
+    let utf8 = msg0_cstr(s, sel_registerName(c"UTF8String".as_ptr()));
     if utf8.is_null() {
         return None;
     }
@@ -173,7 +204,7 @@ unsafe fn mac_get_clipboard() -> Option<String> {
 }
 
 fn clipboard_change_count() -> isize {
-    unsafe { msg_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
+    unsafe { msg0_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
 }
 
 // ---------- 共有状態 ----------
@@ -385,7 +416,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-155251-ded2553";
+const BUILD_ID: &str = "build-20260925-162358-7f022dc";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");

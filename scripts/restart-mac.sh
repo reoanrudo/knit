@@ -4,6 +4,10 @@ set -e
 cd "$(dirname "$0")/.."
 source $HOME/.cargo/env 2>/dev/null || true
 
+echo "[restart-mac] stamping BUILD_ID..."
+NEW_ID="build-$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
+sed -i '' "s|const BUILD_ID:[^;]*;|const BUILD_ID: \&str = \"$NEW_ID\";|" crates/mac/src/main.rs
+
 echo "[restart-mac] building..."
 touch crates/mac/src/main.rs
 cargo build --release 2>&1 | grep -E "^error" -A 3 && exit 1 || true
