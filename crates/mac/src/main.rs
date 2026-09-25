@@ -1194,6 +1194,12 @@ unsafe extern "C" fn tap_callback(
                         125 => { send(119, down, false, false, true, false); true }
                         // ⌘M/⌘H = 最小化(Win+Down = ctrl フラグ)
                         43 | 4 => { send(125, down, true, false, false, false); true }
+                        // ⌘] / ⌘[ = ブラウザの次/前タブ(Ctrl(+Shift)+Tab)
+                        // Mac と同じく ⌘⇧[ も「前タブ」(shift 状態は見ない)
+                        30 => { send(48, down, false, false, true, false); true }
+                        33 => { send(48, down, false, false, true, true); true }
+                        // ⌘⇧4 / ⌘⇧3 = スクリーンショット(Win+Shift+S の切取り)
+                        23 | 21 if shift => { send(1, down, true, false, false, true); true }
                         // ⌘Q = ウィンドウを閉じる(Alt+F4 = opt フラグ+F4)
                         12 => { send(118, down, false, true, false, false); true }
                         // ⌘Space = IME/言語切替(Win+Space = ctrl フラグ)
@@ -1266,7 +1272,11 @@ unsafe extern "C" fn tap_callback(
             // カーソル固定の巻き戻しは 200ms 監視スレッドに集約した
             // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
         }
-        EVT_LEFT_DOWN | EVT_LEFT_UP => send_msg(&Msg::MouseButton { btn: 0, down: event_type == EVT_LEFT_DOWN }),
+        EVT_LEFT_DOWN | EVT_LEFT_UP => {
+            // Mac 流「Ctrl+クリック=右クリック」を Windows でもそのまま再現
+            let btn = if ctrl { 1u8 } else { 0 };
+            send_msg(&Msg::MouseButton { btn, down: event_type == EVT_LEFT_DOWN });
+        }
         EVT_RIGHT_DOWN | EVT_RIGHT_UP => send_msg(&Msg::MouseButton { btn: 1, down: event_type == EVT_RIGHT_DOWN }),
         EVT_OTHER_DOWN | EVT_OTHER_UP => send_msg(&Msg::MouseButton { btn: 2, down: event_type == EVT_OTHER_DOWN }),
         EVT_SCROLL_WHEEL => {
@@ -1341,7 +1351,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-005029-c3512a5";
+const BUILD_ID: &str = "build-20260926-005419-e03e790";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
