@@ -230,6 +230,7 @@ static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_ms() -> u64 {
@@ -265,6 +266,8 @@ static SCROLL_DIV: OnceLock<f64> = OnceLock::new();
 /// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
 /// SEAMLESS_MOUSE_SCALE で指定(例: 0.7 で遅く、1.5 で速く)。
 static MOUSE_SCALE: OnceLock<f64> = OnceLock::new();
+/// 右端切替の判定閾値(px、画面右端からの距離)。SEAMLESS_EDGE_PX で調整可。
+static EDGE_PX: OnceLock<f64> = OnceLock::new();
 
 /// Windows モード開始: カーソル移動とマウス入力の関連を切断し、
 /// Mac カーソルを画面右端の固定位置へ置く(Synergy/Deskflow 方式)
@@ -418,7 +421,8 @@ unsafe extern "C" fn tap_callback(
                 }
                 let (px, _py) = *pos;
                 drop(pos);
-                if px >= *w - 2.0 {
+                let edge = EDGE_PX.get().copied().unwrap_or(2.0);
+                if px >= *w - edge {
                     // 切替の瞬間はライブ位置で正確な高さを取る
                     let loc = live_cursor().unwrap_or(CGPoint { x: *w, y: 400.0 });
                     WIN_MODE.store(true, Ordering::Relaxed);
@@ -496,10 +500,15 @@ unsafe extern "C" fn tap_callback(
                 let mut acc = SCROLL_ACC.lock().unwrap();
                 acc.0 += -dx / div;
                 acc.1 += -dy / div;
+                // 異常な残高(1e6超)は何かの暴発なので捨てる
+                if acc.0.abs() > 1.0e6 || acc.1.abs() > 1.0e6 {
+                    *acc = (0.0, 0.0);
+                }
                 let (ix, iy) = ((acc.0 / Q).trunc() * Q, (acc.1 / Q).trunc() * Q);
                 if ix != 0.0 || iy != 0.0 {
                     acc.0 -= ix;
                     acc.1 -= iy;
+                    DIAG_SCROLL_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::Scroll { dx: ix, dy: iy });
                 }
             }
@@ -509,7 +518,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-163544-4d0b81b";
+const BUILD_ID: &str = "build-20260925-164754-d44552b";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
@@ -552,10 +561,17 @@ fn main() {
             let _ = MOUSE_SCALE.set(m);
         }
     }
+    if let Some(e) = std::env::var("SEAMLESS_EDGE_PX").ok().and_then(|v| v.parse::<f64>().ok()) {
+        if e >= 0.0 && e < 100.0 {
+            let _ = EDGE_PX.set(e);
+        }
+    }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={}",
+        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB",
         SCROLL_DIV.get().copied().unwrap_or(120.0),
-        MOUSE_SCALE.get().copied().unwrap_or(1.0)
+        MOUSE_SCALE.get().copied().unwrap_or(1.0),
+        EDGE_PX.get().copied().unwrap_or(2.0),
+        CLIP_MAX_BYTES / 1024
     );
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
@@ -812,20 +828,21 @@ fn main() {
             let mut last_cursor = (0.0f64, 0.0f64);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd, wp, mc) = (
+                let (mode, mv, kd, sd, wp, mc, sc) = (
                     WIN_MODE.load(Ordering::Relaxed),
                     DIAG_MOVE_COUNT.load(Ordering::Relaxed),
                     DIAG_KEY_COUNT.load(Ordering::Relaxed),
                     DIAG_SEND_COUNT.load(Ordering::Relaxed),
                     DIAG_WARP_COUNT.load(Ordering::Relaxed),
                     DIAG_MODE_COUNT.load(Ordering::Relaxed),
+                    DIAG_SCROLL_COUNT.load(Ordering::Relaxed),
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
                     let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
-                        "[diag] mode={} moves={mv} keys={kd} sent={sd} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
+                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} warp_fixed={wp} switches={mc} cursor=({:.0},{:.0}) moving={}",
                         if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
                     );
                     last_cursor = (p.x, p.y);

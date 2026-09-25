@@ -480,6 +480,11 @@ fn serve(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> 
                 }
                 accum.0 += dx;
                 accum.1 += dy;
+                // 異常な残高(1e6超)は何かの暴発なので捨てる
+                if accum.0.abs() > 1.0e6 || accum.1.abs() > 1.0e6 {
+                    accum.0 = 0.0;
+                    accum.1 = 0.0;
+                }
                 let (ix, iy) = (accum.0.trunc(), accum.1.trunc());
                 if ix != 0.0 || iy != 0.0 {
                     accum.0 -= ix;

@@ -114,6 +114,8 @@ pub mod keymap {
             47 => 0xBE, // .
             44 => 0xBF, // /
             50 => 0xC0, // `
+            93 => 0xDC, // ¥(Mac JIS)→ Win バックスラッシュ/円記号
+            94 => 0xBD, // _(Mac JIS)→ Win -
             // 制御・編集
             36 => 0x0D, // Return
             48 => 0x09, // Tab
