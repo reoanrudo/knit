@@ -761,18 +761,19 @@ fn main() {
             let mut last_cursor = (0.0f64, 0.0f64);
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd) = (
+                let (mode, mv, kd, sd, wp) = (
                     WIN_MODE.load(Ordering::Relaxed),
                     DIAG_MOVE_COUNT.load(Ordering::Relaxed),
                     DIAG_KEY_COUNT.load(Ordering::Relaxed),
                     DIAG_SEND_COUNT.load(Ordering::Relaxed),
+                    DIAG_WARP_COUNT.load(Ordering::Relaxed),
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
                     let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
-                        "[diag] mode={} move_recv={mv} key_recv={kd} sent={sd} cursor=({:.0},{:.0}) cursor_moving={}",
+                        "[diag] mode={} move_recv={mv} key_recv={kd} sent={sd} warp_fixed={wp} cursor=({:.0},{:.0}) cursor_moving={}",
                         if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
                     );
                     last_cursor = (p.x, p.y);
