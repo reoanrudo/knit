@@ -323,12 +323,19 @@ unsafe extern "C" fn tap_callback(
     }
 
     if !win_mode {
-        // Mac モード: 右端到達で Windows モードへ
+        // Mac モード: 右端到達で Windows モードへ。
+        // Deskflow onMouseMove 準拠: イベント位置はキュー滞留で数フレーム遅れるため、
+        // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
         if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)
             && connected
         {
             if let Some(w) = SCREEN_W.get() {
-                let loc = CGEventGetLocation(event);
+                let probe = CGEventCreate(std::ptr::null_mut());
+                if probe.is_null() {
+                    return event;
+                }
+                let loc = CGEventGetLocation(probe);
+                CFRelease(probe);
                 if loc.x >= *w - 2.0 {
                     WIN_MODE.store(true, Ordering::Relaxed);
                     eprintln!("[mode] WINDOWS (edge)");
