@@ -1,0 +1,19 @@
+[package]
+name = "sd-win"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sd-common = { path = "../common" }
+serde_json = { workspace = true }
+
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+] }
+
+[profile.release]
+strip = true
