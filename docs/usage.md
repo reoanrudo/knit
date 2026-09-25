@@ -83,7 +83,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | ⌘⌥Esc | タスクマネージャ(Ctrl+Shift+Esc) |
 | ⌘Ctrl+Q | 画面ロック(Win+L) |
 | fn+F11 | デスクトップ表示(Win+D) |
-| Ctrl+クリック | 右クリック(Mac 流の操作をそのまま再現) |
+| Ctrl+クリック | 右クリック(`TSUNAGU_CTRL_CLICK=1` のみ有効。既定は 2本指クリックで右クリック) |
 | ⌘Space | Win+Space(IME/言語の切替) |
 | ⌘C/⌘V/⌘A 等 | Ctrl+C/V/A(⌘→Ctrl 自動変換、従来どおり) |
 

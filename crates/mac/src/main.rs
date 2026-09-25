@@ -658,6 +658,10 @@ static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
 /// ドラッグ中切替(TSUNAGU_DRAG_SWITCH=1): 押したまま境界を越えられる
 pub static DRAG_SWITCH: AtomicBool = AtomicBool::new(false);
+/// Ctrl+クリック=右クリック翻訳(TSUNAGU_CTRL_CLICK=1 で有効。既定 OFF:
+/// 2本指クリックで右クリックできるため不要であり、修飾フラグの混入で
+/// 意図しない右クリックメニューが出る事故の温床になった)
+pub static CTRL_CLICK: AtomicBool = AtomicBool::new(false);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
 static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
@@ -1358,8 +1362,9 @@ unsafe extern "C" fn tap_callback(
             // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
         }
         EVT_LEFT_DOWN | EVT_LEFT_UP => {
-            // Mac 流「Ctrl+クリック=右クリック」を Windows でもそのまま再現
-            let btn = if ctrl { 1u8 } else { 0 };
+            // Mac 流「Ctrl+クリック=右クリック」は TSUNAGU_CTRL_CLICK=1 のみ
+            // (既定 OFF。右クリックは 2本指クリックが本体操作)
+            let btn = if ctrl && CTRL_CLICK.load(Ordering::Relaxed) { 1u8 } else { 0 };
             let d = event_type == EVT_LEFT_DOWN;
             BTN_DOWN[0].store(d, Ordering::Relaxed);
             send_msg(&Msg::MouseButton { btn, down: d });
@@ -1446,7 +1451,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-014208-a17f37a";
+const BUILD_ID: &str = "build-20260926-015011-509434c";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1580,6 +1585,9 @@ fn main() {
     }
     if envutil::get("TSUNAGU_DRAG_SWITCH").as_deref() == Some("1") {
         DRAG_SWITCH.store(true, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_CTRL_CLICK").as_deref() == Some("1") {
+        CTRL_CLICK.store(true, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
