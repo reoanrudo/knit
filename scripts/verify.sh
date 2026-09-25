@@ -97,6 +97,9 @@ DIAG_WIN=$(tail -50 /tmp/sd-mac-run.log 2>/dev/null | grep '\[diag\]' | grep -c 
 DIAG_WARP=$(tail -50 /tmp/sd-mac-run.log 2>/dev/null | grep '\[diag\]' | grep -c 'warp_fixed=[1-9]')
 echo "  diag行数=$DIAG_ALL mode=WIN=$DIAG_WIN warp_fixed>0=$DIAG_WARP"
 
+echo "[verify] 切替モード:"
+grep -o "switch_mode=[a-z]*" /tmp/sd-mac-run.log 2>/dev/null | tail -1 || echo "  (switch_mode 未表示)"
+
 echo "[verify] 直近 diag:"
 grep '\[diag\]' /tmp/sd-mac-run.log 2>/dev/null | tail -3
 
