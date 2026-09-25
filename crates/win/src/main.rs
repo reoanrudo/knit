@@ -21,8 +21,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
-    IsWindowVisible, SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
-    SW_RESTORE,
+    IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN,
+    SM_CYSCREEN, SW_RESTORE,
 };
 
 const INPUT_MOUSE: u32 = 0;
@@ -60,7 +60,12 @@ unsafe extern "system" {
     fn ImmGetContext(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn ImmSetOpenStatus(himc: *mut core::ffi::c_void, fOpen: i32) -> i32;
     fn ImmReleaseContext(hwnd: *mut core::ffi::c_void, himc: *mut core::ffi::c_void) -> i32;
+    /// ウィンドウのデフォルトIMEウィンドウを取得(他プロセスのウィンドウでも可)
+    fn ImmGetDefaultIMEWnd(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
 }
+
+const WM_IME_CONTROL: u32 = 0x283;
+const IMC_SETOPENSTATUS: usize = 0x0006;
 
 /// フォアグラウンドウィンドウの IME を開(かな)/閉じ(英数)する。
 /// キーエミュレート(VK_KANJI 等)と違い方向指定が確実。
@@ -70,22 +75,20 @@ fn ime_set_open(open: bool) {
     unsafe {
         let hwnd = GetForegroundWindow();
         if !hwnd.is_null() {
-            let himc = ImmGetContext(hwnd);
-            if !himc.is_null() {
-                let ok = ImmSetOpenStatus(himc, open as i32);
-                ImmReleaseContext(hwnd, himc);
-                if ok != 0 {
-                    println!("[ime] ImmSetOpenStatus({open}) ok");
-                    return;
-                }
-                println!("[ime] ImmSetOpenStatus({open}) failed -> fallback");
-            } else {
-                println!("[ime] ImmGetContext=null -> fallback");
+            // 自ウィンドウを持たないプロセスは ImmGetContext が他プロセスの
+            // ウィンドウに対して null を返すため、デフォルトIMEウィンドウへ
+            // WM_IME_CONTROL(IMC_SETOPENSTATUS) を送る(方向指定が確実な定番手法)
+            let ime_wnd = ImmGetDefaultIMEWnd(hwnd);
+            if !ime_wnd.is_null() {
+                SendMessageW(ime_wnd, WM_IME_CONTROL, IMC_SETOPENSTATUS, open as isize);
+                println!("[ime] WM_IME_CONTROL open={open} -> sent");
+                return;
             }
+            println!("[ime] default IME wnd=null -> fallback");
         } else {
             println!("[ime] no foreground window -> fallback");
         }
-        // フォールバック: 半角/全角キー(VK_KANJI)の押し離し
+        // フォールバック: 半角/全角キー(VK_KANJI)の押し離し(トグル動作)
         inject_key(0xF4, false);
         inject_key(0xF4, true);
     }
@@ -295,7 +298,7 @@ impl ModState {
     }
 }
 
-const BUILD_ID: &str = "win-20260925-165212-3779a4e";
+const BUILD_ID: &str = "win-20260925-170150-67d944f";
 
 fn main() {
     println!("[info] sd-win {BUILD_ID}");
