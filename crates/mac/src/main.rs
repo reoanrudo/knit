@@ -228,6 +228,7 @@ static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// WIN モード中のカーソル固定位置(右端内側, y)。漏れ移動を warp で巻き戻す基準。
 static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
@@ -768,6 +769,34 @@ fn main() {
             }
             eprintln!("[clip] mac->win {} bytes", text.len());
             send_msg(&Msg::Clip { text });
+        }
+    });
+
+    // WIN モード中のカーソル固定監視(改善ループ4):
+    // イベントタップ経由の巻き戻しは移動イベントが来た時しか働かない。
+    // 慣性や関連切断の効き遅れでカーソルが動いたままになる場合に備え、
+    // 常時 200ms ごとに固定位置へ巻き戻す(境界の同時移動抑止の最終防衛)
+    std::thread::spawn(|| {
+        let mut fixes: u64 = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(200));
+            if !WIN_MODE.load(Ordering::Relaxed) {
+                continue;
+            }
+            let Some((lx, ly)) = *LOCK_POS.lock().unwrap() else { continue };
+            unsafe {
+                let probe = CGEventCreate(std::ptr::null_mut());
+                if probe.is_null() {
+                    continue;
+                }
+                let loc = CGEventGetLocation(probe);
+                CFRelease(probe);
+                if (loc.x - lx).abs() > 1.0 || (loc.y - ly).abs() > 1.0 {
+                    CGWarpMouseCursorPosition(CGPoint { x: lx, y: ly });
+                    fixes += 1;
+                    DIAG_WARP_COUNT.store(fixes, Ordering::Relaxed);
+                }
+            }
         }
     });
 
