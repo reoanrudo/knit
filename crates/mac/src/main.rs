@@ -208,7 +208,8 @@ fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     if dib.len() < 40 {
         return Vec::new();
     }
-    let header_size = u32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]) as usize;
+    // BITMAPINFOHEADER: biSize は先頭4バイト(旧実装は誤って biWidth を読んでいた)
+    let header_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
     let bpp = u16::from_le_bytes([dib[14], dib[15]]) as usize;
     let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]) as usize;
     let palette = if clr_used > 0 {
@@ -246,6 +247,7 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
         )
     };
     if data.is_null() {
+        eprintln!("[clip] image FAILED at NSData");
         return false;
     }
     // NSBitmapImageRep imageRepWithData:
@@ -258,17 +260,28 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
         )
     };
     if rep.is_null() {
+        eprintln!("[clip] image FAILED at imageRepWithData (BMP 不整合の可能性)");
         return false;
     }
     // [rep TIFFRepresentation]
     let tiff = msg0(rep, sel_registerName(c"TIFFRepresentation".as_ptr()));
     if tiff.is_null() {
+        eprintln!("[clip] image FAILED at TIFFRepresentation");
         return false;
     }
     msg0(pb, sel_registerName(c"clearContents".as_ptr()));
     let uti = nsstring("public.tiff");
     let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 = std::mem::transmute(objc_msgSend as usize);
     let ok = f(pb, sel_registerName(c"setData:forType:".as_ptr()), tiff, uti);
+    if ok == 0 {
+        eprintln!(
+            "[clip] image FAILED at setData (data={} rep={} tiff={} bmp={}B)",
+            !data.is_null(),
+            !rep.is_null(),
+            !tiff.is_null(),
+            bmp.len()
+        );
+    }
     ok != 0
 }
 
@@ -772,7 +785,7 @@ unsafe extern "C" fn tap_callback(
     std::ptr::null_mut() // 握りつぶす
 }
 
-const BUILD_ID: &str = "build-20260925-174322-6ba4d34";
+const BUILD_ID: &str = "build-20260925-175440-ca887d1";
 
 fn main() {
     eprintln!("[info] sd-mac {BUILD_ID}");
