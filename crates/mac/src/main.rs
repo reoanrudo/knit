@@ -1944,7 +1944,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-234834-0da65e5";
+const BUILD_ID: &str = "build-20260926-235319-51f0769";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -1972,7 +1972,12 @@ fn main() {
     let no_gui = args.iter().any(|a| a == "--no-gui")
         || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v|v=="1");
     let mut registered_now = false;
-    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()) { t } else {
+    // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
+    // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
+    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32) { t } else if envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
+        eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
+        std::process::exit(1);
+    } else {
         match tsunagu_common::credentials::load() {
             Ok(Some(t))=>t,
             Ok(None) if !no_gui=>match gui::setup::first_run(false){Some(t)=>{registered_now=true;t},None=>return},

@@ -1059,7 +1059,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-234858-0da65e5";
+const BUILD_ID: &str = "win-20260926-235342-51f0769";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1105,7 +1105,12 @@ fn main() {
         }
     }
 
-    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()){t}else{
+    // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
+    // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
+    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32){t}else if tsunagu_common::envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
+        eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
+        exit(1);
+    }else{
         match tsunagu_common::credentials::load() {
             Ok(Some(t))=>t,
             Ok(None) if args.iter().any(|a|a=="--background")=>return,
