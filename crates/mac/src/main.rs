@@ -1459,38 +1459,26 @@ unsafe extern "C" fn tap_callback(
     // 分岐が外側条件により到達不能なデッドコードだった(レビュー Wave1-X5)
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE);
-        // 音量キー(F10/11/12 相当: 74=ミュート/73=下/72=上)は Mac の音量を変えず
-        // Windows 側の音量として転送する(実体は Vol メッセージ+イベント握りつぶし)。
-        // FN フラグ付き(=本体の音量キー操作)のみ。F11 全画面など F キーとしての
-        // 使用は Windows へ素通しさせ、誤転送(意図しない音量变化)を防ぐ
+        // 本体キーボードの音量(F10-12)とメディア(F7-F9)キーは fn フラグ付きで届く。
+        // Windows 側の音量・メディア操作として転送し、Mac 側の操作は握る。
+        // fn 無しは F キーとしての使用のため素通り(誤転送防止)
         if event_type == EVT_KEY_DOWN
-            && (72..=74).contains(&kc)
-            && CGEventGetFlags(event) & FLAG_FN != 0
             && win_mode
+            && CGEventGetFlags(event) & FLAG_FN != 0
         {
             let op = match kc {
-                72 => 0u8, // VolumeUp
-                73 => 1,   // VolumeDown
-                _ => 2,    // Mute
+                72 => Some(0u8), // F12 音量 up
+                73 => Some(1),   // F11 音量 down
+                74 => Some(2),   // F10 ミュート
+                100 => Some(3),  // F7 前の曲へ
+                101 => Some(4),  // F8 再生・一時停止
+                103 => Some(5),  // F9 次の曲へ
+                _ => None,
             };
-            send_msg(&Msg::Vol { op });
-            return std::ptr::null_mut(); // Mac 側の音量変更を抑制
-        }
-        // メディアキー(F7=巻き戻し 100 / F8=再生切替 101 / F9=早送り 103)も fn フラグ
-        // 付きで本体操作として届く。Windows 側のメディアキーとして転送し Mac 側は握る。
-        // fn 無しの F7-F9 は従来どおり F キーとして転送される
-        if event_type == EVT_KEY_DOWN
-            && matches!(kc, 100 | 101 | 103)
-            && CGEventGetFlags(event) & FLAG_FN != 0
-            && win_mode
-        {
-            let op = match kc {
-                100 => 3u8, // 前へ
-                101 => 4,   // 再生/一時停止
-                _ => 5,     // 次へ
-            };
-            send_msg(&Msg::Vol { op });
-            return std::ptr::null_mut();
+            if let Some(op) = op {
+                send_msg(&Msg::Vol { op });
+                return std::ptr::null_mut(); // Mac 側の音量・再生変更を抑制
+            }
         }
         if kc == hotkey_kc() {
             let pressed = match event_type {
