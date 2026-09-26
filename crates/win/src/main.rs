@@ -217,6 +217,10 @@ fn clipboard_is_excluded() -> bool {
 /// force=true はトレイの「今すぐ Mac へ送る」用
 pub(crate) fn sync_clipboard_to_mac(force: bool) {
     if !CLIP_SHARE_W.load(Ordering::Relaxed) {
+        if force {
+            println!("[clip] 送信できません(クリップボード共有が OFF)");
+            tray::notify("tsunagu", "クリップボードを送れません(共有が OFF)");
+        }
         return;
     }
     let seq = clipboard_seq();

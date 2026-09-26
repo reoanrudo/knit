@@ -185,6 +185,12 @@ static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::Atom
 /// 秘匿除外・エコーバック防止はそのまま効く
 pub(crate) fn sync_clipboard_to_win(force: bool) {
     if !CLIP_SHARE.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
+        // メニューからの明示操作なら、何も起きなかった理由を伝える
+        if force {
+            let why = if !CONNECTED.load(Ordering::Relaxed) { "未接続" } else { "クリップボード共有が OFF" };
+            eprintln!("[clip] 送信できません({why})");
+            notify("tsunagu", &format!("クリップボードを送れません({why})"));
+        }
         return;
     }
     // 貼り付け元アプリの遅延提供データ読み出しでタップを止めないよう別スレッドで行う

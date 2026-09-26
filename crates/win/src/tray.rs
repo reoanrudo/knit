@@ -445,6 +445,9 @@ unsafe fn handle_command(id: u32) {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(crate::proto_return());
                 println!("[tray] Mac へ戻る");
+            } else {
+                println!("[tray] Mac へ戻る: 未接続のため何も起きません");
+                notify("tsunagu", "未接続のため戻れません");
             }
         }
         MENU_SENDCLIP => {
@@ -526,14 +529,7 @@ unsafe fn handle_command(id: u32) {
             }
         }
         MENU_REGISTER => {
-            if UI_PREVIEW.load(Ordering::Relaxed) {return;}
-            if !crate::SAVE_REGISTRATION.load(Ordering::Relaxed) {
-                notify("登録済みです", "現在の接続キーを保持しています。");return;
-            }
-            if let Ok(exe)=std::env::current_exe() {
-                if std::process::Command::new(exe).arg("--retry-setup").spawn().is_ok(){std::process::exit(0);}
-            }
-            notify("登録画面を開けませんでした", "Tsunaguを終了して、もう一度起動してください。");
+            notify("このWindowsは登録済みです", "暗号化キーはアプリが管理しています。接続先を探せない場合はIPを設定してください。");
         }
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
@@ -975,7 +971,7 @@ unsafe fn tray_loop() {
     eprintln!("[tray] タスクトレイに常駐しました");
     // デバッグ/スクリーンショット検証用: TSUNAGU_STATUS_SHOW=1 で起動時に窓を開く
     if UI_PREVIEW.load(Ordering::Relaxed)
-        || crate::SAVE_REGISTRATION.load(Ordering::Relaxed)
+        || crate::JUST_REGISTERED.load(Ordering::Relaxed)
         || tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1")
     {
         open_status_window();
