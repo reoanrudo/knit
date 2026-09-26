@@ -802,6 +802,11 @@ pub mod bulk {
             if !meta.is_file() {
                 continue;
             }
+            // 受信側の上限(files::MAX_FILE)を超えるファイルは送らない
+            //(受信側で必ず破棄されるため、転送時間と進捗表示が無駄になる)
+            if meta.len() > crate::files::MAX_FILE {
+                continue;
+            }
             let Ok(mut f) = std::fs::File::open(p) else { continue };
             let head = serde_json::json!({ "name": name, "size": meta.len() }).to_string();
             write_frame(w, FILE_BEGIN, head.as_bytes())?;
@@ -1422,6 +1427,35 @@ mod tests {
         rx.feed(FILE_END, &[]);
         assert!(rx.feed(BATCH_END, &[]).is_none());
         assert!(!base.join("x.bin").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bulk_sender_skips_files_over_the_limit() {
+        use super::bulk::*;
+        // 上限を超えるファイルは送信段階で飛ばす(受信側で破棄されるだけの
+        // 無駄転送をしない)。超過ファイルはスパース(実データなし)で作る
+        let base = std::env::temp_dir().join(format!("tsunagu-bulk-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("ok.txt"), b"ok").unwrap();
+        let huge = std::fs::File::create(base.join("huge.bin")).unwrap();
+        huge.set_len(crate::files::MAX_FILE + 1).unwrap();
+        drop(huge);
+
+        let mut wire = Vec::new();
+        let paths = vec![base.join("huge.bin"), base.join("ok.txt")];
+        assert_eq!(send_files(&mut wire, &paths, false).unwrap(), 1);
+
+        let mut rx = Receiver::new(&base.join("dst"));
+        let mut r = std::io::Cursor::new(&wire);
+        let mut buf = Vec::new();
+        let mut events = Vec::new();
+        while let Ok(k) = read_frame(&mut r, &mut buf) {
+            if let Some(e) = rx.feed(k, &buf) {
+                events.push(e);
+            }
+        }
+        assert_eq!(events.len(), 1, "超過ファイルは送られず 1 件だけ届く");
         let _ = std::fs::remove_dir_all(base);
     }
 
