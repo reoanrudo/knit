@@ -28,7 +28,18 @@ MacBook のキーボード/トラックパッドで Windows デスクトップ�
   流れない)。受け入れるのは LAN・有線直結・Tailscale のアドレスのみ
 - 接続方向は .env で選択可(既定: Mac=サーバ/Win=クライアント。逆方向も実機検証済み)
 
-## セットアップ(初回)
+## アプリから初回接続する
+
+1. MacでTsunaguを起動し、「接続キーを作成」を選びます。
+2. 表示されたキーを自分のWindowsへ渡し、WindowsのTsunaguに貼り付けます。
+3. Macの案内画面を完了し、求められたアクセシビリティ権限を許可します。
+4. Windowsは同じネットワークのMacを探します。認証に成功した後にキーを保存します。
+
+初回のキーの受け渡しは手動です。まだ接続されていない2台間ではTsunaguのクリップボード共有を使えないため、キーは自分が信頼する転送手段で渡してください。両画面の短い確認コードだけで登録する方式は今後の工程です。
+新規の接続キーはMacのキーチェーンとWindowsユーザー単位の暗号化ファイルに保存します。既存のenv設定は優先し、上書きしません。
+詳しい仕様・保存先・検証範囲は [初回登録](docs/first-connection.md) を参照してください。
+
+## 開発用セットアップ（既存env方式）
 
 ```bash
 # 1. 共有トークン生成(Mac で 1 回。~/.config/tsunagu/env に保存される)
@@ -63,10 +74,13 @@ v0.7(旧 seamless-desk)からの乗り換えは上記をそのまま実行する
 
 ## アプリとしてのインストールと配布
 
+公開用ZIPには開発者の設定・認証トークンを含めません。現状は初回の接続キーの受け渡しが必要な開発候補版です。商品化の品質基準と未達項目は [商品化計画](docs/product-readiness.md) を参照してください。
+
+
 ```bash
-./scripts/package-mac.sh   # dist/Tsunagu.app + zip を作成(トークン封入)
+./scripts/package-mac.sh   # dist/Tsunagu.app + zip を作成(設定・トークン非同梱)
 ./scripts/install-mac.sh   # このMacへインストール(ログイン時自動起動の LaunchAgent 登録)
-./scripts/package-win.sh   # dist/Tsunagu-win-<ver>.zip(Windows 配布 zip。exe+導入書+トークン)
+./scripts/package-win.sh   # dist/Tsunagu-win-<ver>.zip(設定・トークン非同梱)
 ```
 
 Windows への新規配布は `win-dist/`(tsunagu-win.exe・install.bat・run_tsunagu.vbs/bat・.env)一式を

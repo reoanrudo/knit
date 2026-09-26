@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 mod preferences;
 mod settings_ui;
+pub mod setup;
 static UI_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn preview() {
     UI_PREVIEW.store(true, Ordering::Relaxed);
@@ -138,6 +139,7 @@ const MENU_BACKMAC: u32 = 1007;
 const MENU_OPENFOLDER: u32 = 1008;
 const MENU_SENDCLIP: u32 = 1009;
 const MENU_OPENLAST: u32 = 1010;
+const MENU_REGISTER: u32 = 1012;
 // ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
 const ID_LBL_STATE: u32 = 210;
 const ID_HEAD_CONN: u32 = 211;
@@ -515,6 +517,16 @@ unsafe fn handle_command(id: u32) {
                     std::process::exit(0);
                 }
             }
+        }
+        MENU_REGISTER => {
+            if UI_PREVIEW.load(Ordering::Relaxed) {return;}
+            if !crate::SAVE_REGISTRATION.load(Ordering::Relaxed) {
+                notify("登録済みです", "現在の接続キーを保持しています。");return;
+            }
+            if let Ok(exe)=std::env::current_exe() {
+                if std::process::Command::new(exe).arg("--retry-setup").spawn().is_ok(){std::process::exit(0);}
+            }
+            notify("登録画面を開けませんでした", "Tsunaguを終了して、もう一度起動してください。");
         }
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
@@ -954,6 +966,7 @@ unsafe fn tray_loop() {
     eprintln!("[tray] タスクトレイに常駐しました");
     // デバッグ/スクリーンショット検証用: TSUNAGU_STATUS_SHOW=1 で起動時に窓を開く
     if UI_PREVIEW.load(Ordering::Relaxed)
+        || crate::SAVE_REGISTRATION.load(Ordering::Relaxed)
         || tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1")
     {
         open_status_window();

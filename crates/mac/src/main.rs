@@ -582,7 +582,15 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
         }
         eprintln!("[file] 送信開始: {} 件 / 合計 {}KB{}", paths.len(), total / 1024, if drop { "(掴みドラッグ)" } else { "" });
         let t0 = std::time::Instant::now();
-        match BULK_LINK.send(|w| bulk::send_files(w, &paths, drop)) {
+        // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓(最大約 5 秒)で起きる。
+        // ユーザー操作がログ 1 行で失われるのを防ぐため、少し待って 1 回だけやり直す
+        let mut r = BULK_LINK.send(|w| bulk::send_files(w, &paths, drop));
+        if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
+            eprintln!("[file] bulk 経路の再接続を待って再試行します");
+            std::thread::sleep(Duration::from_millis(2500));
+            r = BULK_LINK.send(|w| bulk::send_files(w, &paths, drop));
+        }
+        match r {
             Ok(n) => {
                 let secs = t0.elapsed().as_secs_f64().max(0.001);
                 eprintln!(
@@ -1920,15 +1928,17 @@ fn main() {
     // 既存のenvを優先。新規利用者だけOS保護の接続キーと初回導入を使用する。
     let no_gui = args.iter().any(|a| a == "--no-gui")
         || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v|v=="1");
+    let mut registered_now = false;
     let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()) { t } else {
         match tsunagu_common::credentials::load() {
             Ok(Some(t))=>t,
-            Ok(None) if !no_gui=>match gui::setup::first_run(false){Some(t)=>t,None=>return},
+            Ok(None) if !no_gui=>match gui::setup::first_run(false){Some(t)=>{registered_now=true;t},None=>return},
             Ok(None)=>{eprintln!("[setup] 接続キー未設定。GUIで初回登録を完了してください。");return;},
             Err(_)=>{if !no_gui{gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
         }
     };
 
+    if !no_gui && !gui::setup::ensure_permission() { return; }
     refresh_geo();
     let (screen_w, screen_h) = { let g = geo(); (g.main_w, g.main_h) };
     unsafe { CGDisplayRegisterReconfigurationCallback(display_reconfigured, std::ptr::null_mut()) };
@@ -2421,7 +2431,7 @@ fn main() {
         eprintln!("[gui] メニューバー常駐を開始しました");
         // --show-prefs: 起動直後に設定ウィンドウを開く(スクリーンショット検証用)。
         // 実際の生成は NSApp.run 後のタイマー初回で行う
-        if args.iter().any(|a| a == "--show-prefs") {
+        if registered_now || args.iter().any(|a| a == "--show-prefs") {
             gui::SHOW_AT_START.store(true, Ordering::Relaxed);
         }
         unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)

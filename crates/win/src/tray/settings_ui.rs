@@ -253,9 +253,10 @@ pub(super) unsafe fn build() {
     );
     btn(0, "保存して再接続", 562, 407, 190, MENU_SAVEHOST);
     LABEL_RTT.store(
-        label(0, &rtt_line(), 236, 480, 200, ID_LBL_RTT),
+        label(0, &rtt_line(), 236, 480, 150, ID_LBL_RTT),
         Ordering::Relaxed,
     );
+    btn(0, "キーを再入力", 400, 476, 136, MENU_REGISTER);
     btn(0, "ログ", 548, 476, 96, MENU_OPENLOG);
     btn(0, "再起動", 656, 476, 96, MENU_RESTART);
     LABEL_MACCFG.store(

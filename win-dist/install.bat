@@ -40,8 +40,10 @@ REM kill old instance and start fresh
 taskkill /IM tsunagu-win.exe /F >nul 2>&1
 timeout /t 1 /nobreak >nul
 schtasks /Run /TN tsunagu_run
+REM 初回導入だけは登録画面を開く。自動復帰からは繰り返し表示しない。
+start "" "%DIR%\tsunagu-win.exe" --retry-setup
 if not exist %DIR%\.env (
-  echo WARN: .env がありません。TSUNAGU_TOKEN を %DIR%\.env に設定してください
+  echo SETUP: Tsunaguの画面にMacの接続キーを貼り付けてください
 ) else (
   echo INSTALL_DONE
 )

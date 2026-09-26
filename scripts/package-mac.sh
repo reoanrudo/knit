@@ -1,66 +1,44 @@
 #!/bin/bash
-# 配布用 .app バンドルと zip を dist/ に作成する(配布の単位)。
-# トークン設定(~/.config/tsunagu/env)があればバンドル内の .env へ封入する
-set -e
+# 公開用の配布物を作成する。利用者固有の設定・認証情報は同梱しない。
+set -euo pipefail
 cd "$(dirname "$0")/.."
-source $HOME/.cargo/env 2>/dev/null || true
-
+if [ -f "$HOME/.cargo/env" ]; then source "$HOME/.cargo/env"; fi
 VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-APP="Tsunagu.app"
-ROOT="dist"
-
-echo "[package-mac] BUILD_ID スタンプ..."
-NEW_ID="build-$(date +%Y%m%d-%H%M%S)-$(git rev-parse --short HEAD)"
-sed -i '' "s|const BUILD_ID:[^;]*;|const BUILD_ID: \&str = \"$NEW_ID\";|" crates/mac/src/main.rs
-
-echo "[package-mac] building..."
-cargo build --release 2>&1 | grep -E "^error" -A 3 && exit 1 || true
-cargo build --release 2>&1 | tail -1 >/dev/null
-
-rm -rf "$ROOT/$APP"
-mkdir -p "$ROOT/$APP/Contents/MacOS"
-cp target/release/tsunagu-mac "$ROOT/$APP/Contents/MacOS/Tsunagu"
-
-cat > "$ROOT/$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>Tsunagu</string>
-  <key>CFBundleDisplayName</key><string>Tsunagu</string>
-  <key>CFBundleIdentifier</key><string>local.tsunagu</string>
-  <key>CFBundleExecutable</key><string>Tsunagu</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>$VER</string>
-  <key>CFBundleVersion</key><string>$NEW_ID</string>
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>LSUIElement</key><true/>
-  <key>NSSupportsAutomaticTermination</key><false/>
-  <key>NSSupportsSuddenTermination</key><false/>
-</dict>
-</plist>
-PLIST
-
-# アプリアイコン(icns)を Resources へ
-mkdir -p "$ROOT/$APP/Contents/Resources"
-if [ -f assets/AppIcon.icns ]; then
-  cp assets/AppIcon.icns "$ROOT/$APP/Contents/Resources/AppIcon.icns"
-else
-  echo "[package-mac] WARN: assets/AppIcon.icns が無い(scripts/gen-icons.sh を実行)"
-fi
-
-# トークン設定をバンドル内へ封入(配布先で最初から接続可能にする。
-# 不要な場合はこのブロックを削除し、配布先で ~/.config/tsunagu/env を設定する)
-if [ -f "$HOME/.config/tsunagu/env" ]; then
-  cp "$HOME/.config/tsunagu/env" "$ROOT/$APP/Contents/Resources/.env"
-  chmod 600 "$ROOT/$APP/Contents/Resources/.env"
-  echo "[package-mac] トークン設定を Resources/.env に封入しました"
-else
-  echo "[package-mac] WARN: トークン未設定のため .env は封入されない(初回起動が fatal で停止する)"
-fi
-
-codesign --force --sign - "$ROOT/$APP" >/dev/null 2>&1 || echo "[package-mac] WARN: codesign 失敗(未署名で継続)"
-
-rm -f "$ROOT/Tsunagu-$VER.zip"
-ditto -c -k --keepParent "$ROOT/$APP" "$ROOT/Tsunagu-$VER.zip"
-echo "[package-mac] 完了: $ROOT/$APP / $ROOT/Tsunagu-$VER.zip (v$VER, $NEW_ID)"
+[ -n "$VER" ] || { echo '[package-mac] version が取得できません' >&2; exit 1; }
+mkdir -p dist
+STAGE=$(mktemp -d dist/.package-mac.XXXXXX)
+trap 'rm -rf "$STAGE"' EXIT
+PACKAGE="$STAGE/Tsunagu-$VER"
+APP="$PACKAGE/Tsunagu.app"
+echo '[package-mac] building...'
+cargo build --locked --release -p tsunagu-mac --bin tsunagu-mac
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp target/release/tsunagu-mac "$APP/Contents/MacOS/Tsunagu"
+cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
+lipo "$APP/Contents/MacOS/Tsunagu" -verify_arch arm64
+python3 - "$APP" "$VER" <<'PY'
+import pathlib, plistlib, sys
+app = pathlib.Path(sys.argv[1]); version = sys.argv[2]
+with (app / 'Contents/Info.plist').open('wb') as f:
+    plistlib.dump(dict(CFBundleName='Tsunagu', CFBundleDisplayName='Tsunagu', CFBundleIdentifier='local.tsunagu', CFBundleExecutable='Tsunagu', CFBundlePackageType='APPL', CFBundleShortVersionString=version, CFBundleVersion=version, CFBundleIconFile='AppIcon', LSUIElement=True, NSHighResolutionCapable=True, NSSupportsAutomaticTermination=False, NSSupportsSuddenTermination=False), f)
+PY
+# アドホック署名の失敗も配布失敗として扱う。公証済み製品の署名とは異なる。
+codesign --force --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+# 署名後のハッシュを記録する。マニフェストは.appの外へ置き、署名対象を変更しない。
+python3 - "$APP" "$VER" <<'PY'
+import datetime, hashlib, json, pathlib, subprocess, sys
+app=pathlib.Path(sys.argv[1]); binary=app/'Contents/MacOS/Tsunagu'
+data=dict(schema_version=1, version=sys.argv[2], platform='macos-arm64', source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(), working_tree_modified=bool(subprocess.check_output(['git','status','--porcelain'],text=True)), built_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), distribution='development-candidate')
+(app.parent/'release-manifest.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
+PY
+codesign --verify --deep --strict "$APP"
+ditto -c -k --keepParent "$PACKAGE" "$STAGE/Tsunagu-$VER.zip"
+python3 scripts/check-release.py "$STAGE/Tsunagu-$VER.zip"
+# 検査がすべて通るまで、既存の配布物には触れない。
+rm -rf dist/Tsunagu.app
+mv "$APP" dist/Tsunagu.app
+mv "$STAGE/Tsunagu-$VER.zip" "dist/Tsunagu-$VER.zip"
+(cd dist && shasum -a 256 "Tsunagu-$VER.zip" > "Tsunagu-$VER.zip.sha256")
+echo "[package-mac] 完了: dist/Tsunagu-$VER.zip (設定・トークン非同梱、開発候補版)"

@@ -451,7 +451,15 @@ fn send_files_to_mac(paths: &[String]) {
         println!("[file] win->mac skip(件数 {} / 合計 {total} bytes)", paths.len());
         return;
     }
-    match BULK_LINK.send(|w| bulk::send_files(w, &paths, false)) {
+    // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓で起きるため、
+    // 少し待って 1 回だけやり直す(呼び出し元はすべてバックグラウンドスレッド)
+    let mut r = BULK_LINK.send(|w| bulk::send_files(w, &paths, false));
+    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
+        println!("[file] bulk 経路の再接続を待って再試行します");
+        std::thread::sleep(Duration::from_millis(2500));
+        r = BULK_LINK.send(|w| bulk::send_files(w, &paths, false));
+    }
+    match r {
         Ok(n) => println!("[file] win->mac {n} 件送信完了"),
         Err(e) => println!("[file] win->mac 送信失敗: {e}"),
     }
@@ -899,10 +907,10 @@ fn acquire_single_instance() -> bool {
         let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if windows_sys::Win32::Foundation::GetLastError() == 183 {
             // ERROR_ALREADY_EXISTS = 既に起動している(自動復帰タスクからの起動等)
-            let _ = h;
+            if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); }
             return false;
         }
-        true // ミューテックスはプロセス終了まで保持(明示解放しない)
+        !h.is_null() // ミューテックスはプロセス終了まで保持(明示解放しない)
     }
 }
 
@@ -989,26 +997,38 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = "win-20260926-171359-f561628";
 
+static SAVE_REGISTRATION: AtomicBool = AtomicBool::new(false);
+fn registration_authenticated(token:&str) {
+    if SAVE_REGISTRATION.swap(false,Ordering::Relaxed) {
+        match tsunagu_common::credentials::save(token) {
+            Ok(())=>tray::notify("登録が完了しました","次回から、このMacへ自動で接続します。"),
+            Err(_)=>{SAVE_REGISTRATION.store(true,Ordering::Relaxed);tray::notify("接続キーを保存できませんでした","現在は接続できます。次回起動時に登録をやり直してください。");eprintln!("[setup] credential save failed");},
+        }
+    }
+}
 fn main() {
+    if std::env::args().any(|a| a == "--preview-setup") { let _=tray::setup::first_run(true); return; }
     if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
     ensure_stdout();
     // コンソール付き起動なら DETACHED な自分へ置き換わって終了(常駐性の根保証)
     detach_if_console();
-    if !acquire_single_instance() {
-        return; // 既に起動している(トレイの既存インスタンスが稼働中)
+    let retry_setup=std::env::args().any(|a|a=="--retry-setup");
+    let mut acquired=acquire_single_instance();
+    if !acquired && retry_setup {
+        for _ in 0..20 {std::thread::sleep(Duration::from_millis(100));acquired=acquire_single_instance();if acquired{break;}}
     }
+    if !acquired {return;}
+
     println!("[info] tsunagu-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
-    // トークンは必須(旧既定値 "tsunagu-dev" での脆弱な稼働を廃止)。
-    // 環境変数 > exe同階層の .env > ~/.config/tsunagu/env の順で解決する
-    let token = match tsunagu_common::envutil::get("TSUNAGU_TOKEN") {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!(
-                "[fatal] TSUNAGU_TOKEN が未設定です。tsunagu-win.exe と同じフォルダの .env に\
-                 TSUNAGU_TOKEN=<Mac側と同じ値> を設定してください"
-            );
-            exit(1);
+    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()){t}else{
+        match tsunagu_common::credentials::load() {
+            Ok(Some(t))=>t,
+            Ok(None) if args.iter().any(|a|a=="--background")=>return,
+            Ok(None)=>match tray::setup::first_run(false) {
+                Some(t)=>{SAVE_REGISTRATION.store(true,Ordering::Relaxed);t},None=>return,
+            },
+            Err(_)=>{if !args.iter().any(|a|a=="--background"){tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
         }
     };
     let port: u16 = args
@@ -1227,6 +1247,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         }
         *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         CONNECTED.store(true, Ordering::Relaxed);
+        registration_authenticated(token);
         println!("[conn] established");
         tray::notify("tsunagu", "接続しました");
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
@@ -1266,6 +1287,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hello_ok")),
     }
     CONNECTED.store(true, Ordering::Relaxed);
+        registration_authenticated(token);
     tray::notify("tsunagu", "接続しました");
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(pre, writer);

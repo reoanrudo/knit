@@ -584,6 +584,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
             h: 32.0,
         },
     );
+    button(p,target,"Windowsを登録…",c"sdRegistration:",NSRect{x:380.0,y:47.0,w:192.0,h:32.0});
     let p = pages[1];
     let lay = make_layout_view(p);
     frame(

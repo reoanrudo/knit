@@ -1,20 +1,24 @@
-# tsunagu 配布手順書(v0.7)
+# Tsunagu 配布手順書
 
-作成日: 2026-09-25 / 対象バージョン: 0.6.0(音声転送・Windowsステータスウィンドウ・トレイ常駐・接続方向の選択)
+更新日: 2026-09-26。公開用パッケージと、自分の2台へ設定を配る開発運用を分けます。
 
-## 1. 配布物の単位
+## 1. 公開用パッケージ
 
-| 対象 | 配布物 | 生成方法 |
+| 対象 | 生成 | 出力 |
 |---|---|---|
-| Mac | `dist/Tsunagu-<ver>.zip`(Tsunagu.app、アイコン・トークン同梱) | `scripts/package-mac.sh` |
-| Windows | `win-dist/` 一式(tsunagu-win.exe・app.ico・install.bat・run_tsunagu.bat/vbs・.env) | `scripts/deploy-win.sh` 実行後に win-dist を zip 等 |
+| Mac | `bash scripts/package-mac.sh` | `dist/Tsunagu-<ver>.zip` と SHA-256 |
+| Windows | `bash scripts/package-win.sh` | `dist/Tsunagu-win-<ver>.zip` と SHA-256 |
 
-tsunagu-win.exe にはアプリケーションアイコンが埋め込まれ(windres)、トレイ用に
-`app.ico` も同梱される(exe と同じフォルダに置くとトレイが使う)。
+両スクリプトは `.env`・個人設定・認証トークンを同梱しません。`NO_TOKEN` の指定は不要です。
+ビルドは `--locked` で1回実行し、失敗すると終了します。検査に成功するまでは既存ZIPを保持します。
+パッケージ内の `release-manifest.json` にバージョン、コミット、未コミット変更の有無、ビルド時刻、実行ファイルのSHA-256を記録します。
+`python3 scripts/check-release.py <zip>` で構成、設定・鍵・ログのファイル名、実行ファイルのハッシュを検査できます。
+この検査は暗号実装の監査や、あらゆる秘密情報を検出する検査の代替ではありません。
 
-トークンの扱い: `~/.config/tsunagu/env` の `TSUNAGU_TOKEN` が
-Mac は .app 内 `.env` に封入、Windows は `win-dist/.env` として配布される。
-**zip を持つ者は誰でも接続できる**ため、配布範囲=信頼範囲であること(自tailnet内の想定)。
+**現状は開発候補版です。** 初回はアプリの画面で接続キーを登録します（キーの受け渡しは手動）。Macはアドホック署名、Windowsは未署名で、一般販売向けの初回導入と署名・更新経路は未完成です。
+商品化の完了条件は [商品化計画](product-readiness.md) を参照してください。
+
+`deploy-win.sh` は自分のWindowsへ認証設定を転送して再起動する開発専用コマンドです。公開配布物の作成には使いません。既存の古いZIPや `win-dist/.env` を第三者に配布しないでください。
 
 ## 2. 前提(配布先の環境)
 
@@ -54,7 +58,7 @@ Mac は .app 内 `.env` に封入、Windows は `win-dist/.env` として配布�
   コンソールから独立したプロセスへ自動置換されるため、ターミナルを閉じても接続は維持される**
 - 接続/切断はバルーン通知で可視化される
 - ログ: `C:\Users\<user>\tsunagu\tsunagu-win.log`(1世代ローテーション)
-- **.env がないと起動が fatal 停止する**(トークン必須化のため)
+- 新規環境では登録画面が開きます。自動復帰・ログオン用の `--background` 起動では、未登録なら静かに終了します。初回はアプリを直接起動してください。
 
 ## 5. トークン運用
 
