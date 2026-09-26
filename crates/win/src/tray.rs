@@ -514,6 +514,7 @@ unsafe fn handle_command(id: u32) {
                         return;
                     }
                     eprintln!("[tray] サーバーを {host} へ変更し再起動します");
+                    crate::release_all_input();
                     std::process::exit(0);
                 }
             }
@@ -531,10 +532,12 @@ unsafe fn handle_command(id: u32) {
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
             eprintln!("[tray] 再起動します(自動復帰タスクが起こします)");
+            crate::release_all_input();
             std::process::exit(0);
         }
         MENU_QUIT => {
             eprintln!("[tray] メニューから終了しました");
+            crate::release_all_input();
             std::process::exit(0);
         }
         _ => {}

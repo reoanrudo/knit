@@ -434,6 +434,29 @@ fn clipboard_read_files() -> Option<Vec<String>> {
     }
 }
 
+/// 終了・再起動前の後片付け: 押下中の入力を離す。セッションの ModState は
+/// トレイ経路の終了から届かないため、追跡済み static と主要修飾キーで代用する
+pub(crate) fn release_all_input() {
+    for b in 0u8..=2 {
+        if BTN_W[b as usize].swap(false, Ordering::Relaxed) {
+            inject_mouse_btn(b, false);
+        }
+    }
+    for i in 0u8..=1 {
+        if XBTN_W[i as usize].swap(false, Ordering::Relaxed) {
+            inject_xbutton(i, false);
+        }
+    }
+    // 修飾は押下追跡の外(物理キーと重なる)ため無条件 up(未押下の up は無害)
+    for vk in [VK_CONTROL, VK_MENU, VK_LWIN, VK_SHIFT] {
+        inject_key(vk, true);
+    }
+    if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
+        inject_key(0x09, true);
+        inject_key(VK_MENU, true);
+    }
+}
+
 /// ファイル群の指紋(パス+サイズ)。同一コピーの再検出・エコーバック判定に使う
 fn files_key(paths: &[String]) -> String {
     let sizes: u64 = paths
