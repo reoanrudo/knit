@@ -429,10 +429,10 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         let mut last_diag = std::time::Instant::now();
         let mut last_send = std::time::Instant::now();
         loop {
-            if !AUDIO_ENABLED.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-                continue;
-            }
+            // 無効中もループは回し続ける: keepalive(下の None 分岐)だけは送る。
+            // ここで continue すると keepalive も止まり、Mac 側の受信タイムアウト
+            // (12 秒)で接続が切れて、トグルを戻した時に再接続待ちが発生する
+            let enabled = AUDIO_ENABLED.load(Ordering::Relaxed);
             // 8ms 間隔でポーリング(低遅延: WASAPI のエンジン周期 10ms に対し
             // 取得側の追加滞留を平均 4ms 程に抑える)
             std::thread::sleep(std::time::Duration::from_millis(8));
@@ -444,7 +444,12 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
                     break;
                 }
             }
-            let read = unsafe { capture_read(&mut cap) };
+            let read = if enabled {
+                unsafe { capture_read(&mut cap) }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(None)
+            };
             let read = match read {
                 Ok(r) => r,
                 Err(hr) => {
