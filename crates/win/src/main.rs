@@ -1082,7 +1082,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-023615-3c3468f";
+const BUILD_ID: &str = "win-20260927-023848-1e87106";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1738,12 +1738,12 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 }
                 *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
                 // 書き込みは、クリップボードマネージャ等の他プロセスが掴んでいる間は
-                // 開けない。150ms の即時再試行だけでは救えない実績があり、ここで待つと
-                // 受信ループ(マウス・キー)まで止まるため、別スレッドで徐々に間隔を
-                // 広げながら再試行する(合計 最大1.3秒)
+                // 開けない。掴みが数秒続く実測があるため、ここで待つと受信ループ
+                //(マウス・キー)まで止まるため、別スレッドで徐々に間隔を広げて
+                // 再試行する(合計 最大4秒)
                 std::thread::spawn(move || {
                     let mut ok = false;
-                    for wait in [50u64, 100, 150, 200, 300, 500] {
+                    for wait in [100u64, 200, 400, 700, 1100, 1600] {
                         if clipboard_write_text(&text) {
                             ok = true;
                             break;

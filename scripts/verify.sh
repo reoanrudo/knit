@@ -94,7 +94,14 @@ elif [ "$WIN_OK" -eq 1 ]; then
     round_trip
     sleep 2
     GOT=$(pbpaste 2>/dev/null | tr -d '\r\n')
-    check "Win→Mac ペースト一致" "verify-wm-$TS" "$GOT"
+    if [ -z "$GOT" ]; then
+      # Windows 側の掴まれ(Set-Clipboard 自体が err=5 で失敗)でも空になる。
+      # その場合は本体不良と区別する(Windows の tsunagu-win.log に
+      # busy clipboard の行が出ているかで切り分けられる)
+      warn_msg "Win→Mac ペースト空(Windows 側クリップボードが掴まれている疑い。win ログの busy 行で切り分け)"
+    else
+      check "Win→Mac ペースト一致" "verify-wm-$TS" "$GOT"
+    fi
   else
     warn_msg "clip_set.bat 転送失敗のため検証スキップ"
   fi
