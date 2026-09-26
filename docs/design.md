@@ -59,19 +59,38 @@ hello は Win が送り、Mac が hello_ok で応答する。
 - Mac keycode(HIToolbox)→ Windows VK 変換テーブル(common に保持)
 - 修飾キー置換により Cmd+C → Ctrl+C 等が自動的に成立
 
-## プロトコル(common crate, JSON Lines)
+## プロトコル(common crate, JSON Lines・版 11)
 
-| 型 | 方向 | フィールド |
-|---|---|---|
-| hello | W→M | ver, name, token |
-| hello_ok | M→W | name, w, h |
-| key | M→W | kc(u16), down, ctrl, opt, cmd, shift |
-| mouse_move | M→W | dx, dy(相対移動量) |
-| mouse_btn | M→W | btn(0/1/2), down |
-| scroll | M→W | dx, dy |
-| r#return | W→M | (なし。Mac モード復帰) |
-| ping / pong | 双方 | - |
-| bye | 双方 | - |
+本線 TCP 24900。全経路 Noise NNpsk0 で暗号化(ラベル main/audio/bulk で経路識別)。
+
+| 型 | 方向 | フィールド | 用途 |
+|---|---|---|---|
+| hello | W→M | ver, name, token(版11は空), w, h | 接続時の版交渉と画面サイズ交換 |
+| hello_ok | M→W | name, w, h | 受理 |
+| screen | W→M | w, h | 解像度・モニター構成の変化通知 |
+| rel | W→M | on | ゲームモード(相対移動切替)要求 |
+| lock | M→W | - | Mac の画面ロック連動 |
+| key | M→W | kc, down, ctrl, opt, cmd, shift, tr | キー(tr=翻訳済み) |
+| mouse_move / mouse_abs | M→W | dx,dy / nx,ny | 相対移動 / 絶対位置(0..1) |
+| mouse_btn | M→W | btn(0-2、3/4=戻る/進む), down | ボタン |
+| scroll | M→W | dx, dy | スクロール |
+| return | W→M | ny | Windows 側境界到達での復帰 |
+| clip | 双方向 | text | クリップボード同期(画面を移る時) |
+| leave | M→W | - | Mac へ戻った(全入力解放と Win→Mac 同期の合図) |
+| warp | M→W | nx, ny | 切替時のカーソル位置引継ぎ |
+| ping / pong | 双方 | ts | 生存確認・RTT 測定(3 秒毎) |
+| cfg | M→W | cmd_alt, spk_mute, side, clip | 設定同期 |
+| vol | M→W | op(0-2 音量/3-5 メディア) | 音量・メディアキー転送 |
+| stat | M→W | rtt | 接続品質の表示用 |
+| ime | M→W | kana | IME 状態引継ぎ(IME Follow Cursor) |
+| open_url | M→W | url | Continue Here(⌥⌘T) |
+| bye | 双方 | - | 終了 |
+
+**拡張ポリシー(後方互換)**: 新しいメッセージ型を足しても旧側は decode に
+失敗した行を無視するだけで壊れない(版番号を上げない拡張は片側配備が可能。
+ime/open_url はこの方式)。既存型へのフィールド追加は `#[serde(default)]`
+付きのみ(旧側の送信を新側が読める)。画像・ファイルは本線を経由せず
+bulk 24902 へ、音声は 24901 へ分離(本線の入力遅延を守る)。
 
 ## 再接続・安定性
 
