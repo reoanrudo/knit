@@ -170,7 +170,7 @@ unsafe fn pb_is_concealed(pb: ID) -> bool {
     ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"]
         .iter()
         .any(|t| {
-            let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 = std::mem::transmute(objc_msgSend as usize);
+            let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 = std::mem::transmute(objc_msgSend as *const () as usize);
             f(types, sel_registerName(c"containsObject:".as_ptr()), nsstring(t)) != 0
         })
 }
@@ -257,30 +257,30 @@ type SEL = *mut core::ffi::c_void;
 // objc_msgSend は可変引数宣言のまま呼ぶと引数の渡りが壊れる(SIGSEGV実績あり)ため、
 // 呼び出しシグネチャごとに transmute した固定シグネチャで呼ぶ(rust-objc 界の定番方式)
 unsafe fn msg0(target: ID, sel: SEL) -> ID {
-    let f: unsafe extern "C" fn(ID, SEL) -> ID = std::mem::transmute(objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel)
 }
 unsafe fn msg1_id(target: ID, sel: SEL, a: ID) -> ID {
-    let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel, a)
 }
 unsafe fn msg1_cstr(target: ID, sel: SEL, p: *const core::ffi::c_char) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, *const core::ffi::c_char) -> ID =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel, p)
 }
 unsafe fn msg2_bool(target: ID, sel: SEL, a: ID, b: ID) -> u8 {
     let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel, a, b)
 }
 unsafe fn msg0_isize(target: ID, sel: SEL) -> isize {
-    let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel)
 }
 unsafe fn msg0_cstr(target: ID, sel: SEL) -> *const core::ffi::c_char {
     let f: unsafe extern "C" fn(ID, SEL) -> *const core::ffi::c_char =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel)
 }
 
@@ -366,7 +366,7 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
     // NSData dataWithBytes:length:
     let data = {
         let f: unsafe extern "C" fn(ID, SEL, *const u8, usize) -> ID =
-            std::mem::transmute(objc_msgSend as usize);
+            std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             objc_getClass(c"NSData".as_ptr()),
             sel_registerName(c"dataWithBytes:length:".as_ptr()),
@@ -380,7 +380,7 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
     }
     // NSBitmapImageRep imageRepWithData:
     let rep = {
-        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             objc_getClass(c"NSBitmapImageRep".as_ptr()),
             sel_registerName(c"imageRepWithData:".as_ptr()),
@@ -399,7 +399,7 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
     }
     msg0(pb, sel_registerName(c"clearContents".as_ptr()));
     let uti = nsstring("public.tiff");
-    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 = std::mem::transmute(objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 = std::mem::transmute(objc_msgSend as *const () as usize);
     let ok = f(pb, sel_registerName(c"setData:forType:".as_ptr()), tiff, uti);
     if ok == 0 {
         eprintln!(
@@ -448,7 +448,7 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
     }
     let classes = {
         let f: unsafe extern "C" fn(ID, SEL, ID) -> ID =
-            std::mem::transmute(objc_msgSend as usize);
+            std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             objc_getClass(c"NSArray".as_ptr()),
             sel_registerName(c"arrayWithObject:".as_ptr()),
@@ -458,7 +458,7 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
     let options = {
         let yes = {
             let f: unsafe extern "C" fn(ID, SEL, u8) -> ID =
-                std::mem::transmute(objc_msgSend as usize);
+                std::mem::transmute(objc_msgSend as *const () as usize);
             f(
                 objc_getClass(c"NSNumber".as_ptr()),
                 sel_registerName(c"numberWithBool:".as_ptr()),
@@ -466,7 +466,7 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
             )
         };
         let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
-            std::mem::transmute(objc_msgSend as usize);
+            std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             objc_getClass(c"NSDictionary".as_ptr()),
             sel_registerName(c"dictionaryWithObject:forKey:".as_ptr()),
@@ -476,7 +476,7 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
     };
     let urls = {
         let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
-            std::mem::transmute(objc_msgSend as usize);
+            std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             pb,
             sel_registerName(c"readObjectsForClasses:options:".as_ptr()),
@@ -496,7 +496,7 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
         eprintln!("[clip] ファイル参照 {n} 件のうち先頭 64 件のみ扱います");
     }
     let at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     let mut out = Vec::new();
     for i in 0..n.min(64) {
         let url = at(urls, sel_registerName(c"objectAtIndex:".as_ptr()), i as usize);
@@ -537,7 +537,7 @@ unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
         return false;
     }
     let make_url: unsafe extern "C" fn(ID, SEL, ID) -> ID =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     let mut urls = Vec::new();
     for p in paths {
         let s = nsstring(&p.to_string_lossy());
@@ -554,7 +554,7 @@ unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
     }
     msg0(pb, sel_registerName(c"clearContents".as_ptr()));
     let make_arr: unsafe extern "C" fn(ID, SEL, *const ID, usize) -> ID =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     let arr = make_arr(
         objc_getClass(c"NSArray".as_ptr()),
         sel_registerName(c"arrayWithObjects:count:".as_ptr()),
@@ -562,7 +562,7 @@ unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
         urls.len(),
     );
     let write: unsafe extern "C" fn(ID, SEL, ID) -> u8 =
-        std::mem::transmute(objc_msgSend as usize);
+        std::mem::transmute(objc_msgSend as *const () as usize);
     write(pb, sel_registerName(c"writeObjects:".as_ptr()), arr) != 0
 }
 
@@ -659,7 +659,7 @@ unsafe fn mac_clipboard_image_dib() -> Option<Vec<u8>> {
         return None;
     }
     let props = msg0(objc_getClass(c"NSDictionary".as_ptr()), sel_registerName(c"dictionary".as_ptr()));
-    let repr: unsafe extern "C" fn(ID, SEL, usize, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+    let repr: unsafe extern "C" fn(ID, SEL, usize, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
     // NSBitmapImageFileTypeBMP = 1
     let bmp = repr(rep, sel_registerName(c"representationUsingType:properties:".as_ptr()), 1, props);
     if bmp.is_null() {

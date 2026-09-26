@@ -52,15 +52,11 @@ unsafe extern "C" {
     fn CGBitmapContextCreateImage(ctx: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
     fn CGContextRelease(ctx: *mut core::ffi::c_void);
     fn CGImageRelease(img: *mut core::ffi::c_void);
-    fn CGContextSetRGBFillColor(ctx: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
     fn CGContextSetRGBStrokeColor(ctx: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
     fn CGContextSetLineWidth(ctx: *mut core::ffi::c_void, w: f64);
     fn CGContextSetLineCap(ctx: *mut core::ffi::c_void, cap: u32);
     fn CGContextBeginPath(ctx: *mut core::ffi::c_void);
     fn CGContextMoveToPoint(ctx: *mut core::ffi::c_void, x: f64, y: f64);
-    fn CGContextAddLineToPoint(ctx: *mut core::ffi::c_void, x: f64, y: f64);
-    fn CGContextClosePath(ctx: *mut core::ffi::c_void);
-    fn CGContextFillPath(ctx: *mut core::ffi::c_void);
     fn CGContextStrokePath(ctx: *mut core::ffi::c_void);
     fn CFRelease(cf: *mut core::ffi::c_void);
 }
@@ -68,43 +64,43 @@ unsafe extern "C" {
 // ---------- 固定シグネチャ呼び出しヘルパ(この画面で必要なものだけ) ----------
 
 unsafe fn msg0_void(target: ID, cmd: SEL) {
-    let f: unsafe extern "C" fn(ID, SEL) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd)
 }
 unsafe fn msg1_void_id(target: ID, cmd: SEL, a: ID) {
-    let f: unsafe extern "C" fn(ID, SEL, ID) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, ID) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_sel(target: ID, cmd: SEL, a: SEL) {
-    let f: unsafe extern "C" fn(ID, SEL, SEL) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, SEL) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_u8(target: ID, cmd: SEL, a: u8) {
-    let f: unsafe extern "C" fn(ID, SEL, u8) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, u8) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_i64(target: ID, cmd: SEL, a: i64) {
-    let f: unsafe extern "C" fn(ID, SEL, i64) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, i64) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg2_void_id_id(target: ID, cmd: SEL, a: ID, b: ID) {
     let f: unsafe extern "C" fn(ID, SEL, ID, ID) =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a, b)
 }
 unsafe fn msg1_id_f64(target: ID, cmd: SEL, a: f64) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, f64) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg3_id(target: ID, cmd: SEL, a: ID, b: SEL, c: ID) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, ID, SEL, ID) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a, b, c)
 }
 unsafe fn msg5_timer(target: ID, cmd: SEL, t: f64, a: ID, b: SEL, c: ID, r: u8) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, f64, ID, SEL, ID, u8) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, t, a, b, c, r)
 }
 
@@ -162,7 +158,7 @@ struct NSRect {
 unsafe extern "C" fn imp_scroll_gain(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::set_scroll_div(v);
         let lbl = PREFS_GAIN_LABEL.load(Ordering::Relaxed) as ID;
@@ -263,7 +259,7 @@ unsafe extern "C" fn imp_spk_mute(_s: ID, _c: SEL, _n: ID) {
 unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> isize =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let idx = get(sender, sel(c"indexOfSelectedItem"));
         crate::set_side(idx.clamp(0, 7) as u8);
         *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
@@ -275,7 +271,7 @@ unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
 unsafe extern "C" fn imp_switch_delay(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::SWITCH_DELAY_MS.store(v as u64, Ordering::Relaxed);
         let lbl = PREFS_DELAY_LBL.load(Ordering::Relaxed) as ID;
@@ -295,7 +291,7 @@ unsafe extern "C" fn imp_switch_delay(_s: ID, _c: SEL, sender: ID) {
 unsafe extern "C" fn imp_dbl_tap(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::DOUBLE_TAP_MS.store(v.max(100.0) as u64, Ordering::Relaxed);
         let lbl = PREFS_DBL_LBL.load(Ordering::Relaxed) as ID;
@@ -314,7 +310,7 @@ unsafe extern "C" fn imp_dbl_tap(_s: ID, _c: SEL, sender: ID) {
 unsafe extern "C" fn imp_mouse_scale(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::set_mouse_scale(v);
         let lbl = PREFS_MSCALE_LBL.load(Ordering::Relaxed) as ID;
@@ -333,7 +329,7 @@ unsafe extern "C" fn imp_mouse_scale(_s: ID, _c: SEL, sender: ID) {
 unsafe extern "C" fn imp_edge_px(_s: ID, _c: SEL, sender: ID) {
     unsafe {
         let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::set_edge_px(v);
         let lbl = PREFS_EDGE_LBL.load(Ordering::Relaxed) as ID;
@@ -404,7 +400,7 @@ unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
     // 3 つのメニュー項目(▲/▼/ミュート)から送信元 tag で判別する
     let tag: isize = {
         let f: unsafe extern "C" fn(ID, SEL) -> isize =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         f(sender, sel(c"tag"))
     };
     let op = match tag {
@@ -469,7 +465,7 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
     }
     let n = crate::msg0_isize(urls, sel(c"count")).max(0);
     let at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let mut paths = Vec::new();
     for i in 0..n.min(64) {
         let url = at(urls, sel(c"objectAtIndex:"), i as usize);
@@ -565,7 +561,7 @@ fn sync_prefs_state() {
         let pop = PREFS_SIDE_POP.load(Ordering::Relaxed) as ID;
         if !pop.is_null() {
             let select: unsafe extern "C" fn(ID, SEL, isize) =
-                std::mem::transmute(crate::objc_msgSend as usize);
+                std::mem::transmute(crate::objc_msgSend as *const () as usize);
             select(
                 pop,
                 sel(c"selectItemAtIndex:"),
@@ -601,7 +597,7 @@ fn sync_prefs_state() {
             let color_cls = objc_getClass(c"NSColor".as_ptr());
             if !color_cls.is_null() {
                 let get_color: unsafe extern "C" fn(ID, SEL) -> ID =
-                    std::mem::transmute(crate::objc_msgSend as usize);
+                    std::mem::transmute(crate::objc_msgSend as *const () as usize);
                 let color = get_color(
                     color_cls,
                     sel(if connected {
@@ -718,9 +714,9 @@ struct CGPoint2 {
 unsafe fn lay_point_in_view(_self: ID, ev: ID) -> CGPoint2 {
     unsafe {
         let loc: unsafe extern "C" fn(ID, SEL) -> CGPoint2 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let conv: unsafe extern "C" fn(ID, SEL, CGPoint2, ID) -> CGPoint2 =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let p = loc(ev, sel(c"locationInWindow"));
         conv(
             _self,
@@ -819,7 +815,7 @@ unsafe extern "C" fn lay_dragged(_self: ID, _cmd: SEL, ev: ID) {
         let ny = (p.y - g.1).clamp(wh / 2.0 + 2.0, LAY_VH - wh / 2.0 - 2.0);
         *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         snd(_self, sel(c"setNeedsDisplay:"), 1);
     }
 }
@@ -875,7 +871,7 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) =
             (start, end.max(start + 0.05).min(1.0));
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         snd(_self, sel(c"setNeedsDisplay:"), 1);
         eprintln!(
             "[lay] 配置を更新: {}(範囲 {:.2}〜{:.2})",
@@ -935,7 +931,7 @@ unsafe fn make_layout_view(target_frame_host: ID) -> ID {
             return std::ptr::null_mut();
         }
         let init: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         init(
             msg0(cls as ID, sel(c"alloc")),
             sel(c"initWithFrame:"),
@@ -1148,7 +1144,7 @@ unsafe fn make_menu_icon() -> ID {
     }
     // NSImage initWithCGImage:size: (NSSize は arm64 で d0/d1 レジスタ渡し)
     let f: unsafe extern "C" fn(ID, SEL, ID, f64, f64) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let nsimg = f(
         msg0(objc_getClass(c"NSImage".as_ptr()), sel(c"alloc")),
         sel(c"initWithCGImage:size:"),
