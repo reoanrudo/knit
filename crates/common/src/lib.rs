@@ -98,7 +98,17 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 8; // 8: ファイル掴みドラッグ越境(FileDropBegin/End)追加
+    /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入
+    pub const VERSION: u32 = 9;
+    /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
+    /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
+    /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
+    pub const MIN_VERSION: u32 = 9;
+
+    /// 相手の版を受け入れてよいか
+    pub fn compatible(peer: u32) -> bool {
+        peer >= MIN_VERSION
+    }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -151,10 +161,11 @@ pub mod proto {
         /// クリップボード同期(バイナリ、base64)。kind 例: "image/dib"
         #[serde(rename = "clip_data")]
         ClipData { kind: String, data: String },
-        #[serde(rename = "focus")]
-        Focus { title: String },
-        #[serde(rename = "minimize")]
-        Minimize { title: String },
+        /// Mac が制御を取り戻した(Windows を離れた)。Windows は押下中の全キー・
+        /// ボタン・Alt+Tab を解放する。ホットキー/Mac 内完結の左端復帰/切断など
+        /// Windows が自力で検知できない離脱経路のための後片付け合図
+        #[serde(rename = "leave")]
+        Leave,
         /// カーソル絶対ワープ(0..1 正規化。切替時に相手画面の対応位置へ飛ばす)
         #[serde(rename = "warp")]
         Warp { nx: f64, ny: f64 },
@@ -220,6 +231,61 @@ pub mod proto {
 
     pub fn decode(line: &str) -> Option<Msg> {
         serde_json::from_str(line.trim()).ok()
+    }
+}
+
+pub mod files {
+    //! 受信ファイルの保存(Mac/Windows 共通)。名前の無害化と同名回避を一箇所に置き、
+    //! 両側で規則が食い違う(Windows だけ上書きしていた)事故を防ぐ
+    use std::path::{Path, PathBuf};
+
+    /// 1 ファイルの受信上限(送信側の合計上限と同じ)
+    pub const MAX_FILE: u64 = 200 * 1024 * 1024;
+
+    /// 相手から届いたファイル名を、どちらの OS でも安全な単一の名前へ変換する。
+    /// パス区切り・予約文字・制御文字は '_'、先頭末尾の '.' と空白は除去、
+    /// Windows の予約デバイス名(CON/NUL/COM1 等)は先頭に '_' を付ける
+    pub fn sanitize(name: &str) -> String {
+        let mut s: String = name
+            .chars()
+            .map(|c| match c {
+                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+                c if c.is_control() => '_',
+                c => c,
+            })
+            .collect();
+        s = s.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_string();
+        if s.chars().count() > 200 {
+            s = s.chars().take(200).collect();
+        }
+        if s.is_empty() {
+            return "file".into();
+        }
+        let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+                && stem.len() == 4
+                && stem.as_bytes()[3].is_ascii_digit());
+        if reserved {
+            s.insert(0, '_');
+        }
+        s
+    }
+
+    /// dir 内に新規ファイルを作る。同名があれば「名前 (n).拡張子」で回避する
+    pub fn create_unique(dir: &Path, name: &str) -> Option<(std::fs::File, PathBuf)> {
+        std::fs::create_dir_all(dir).ok()?;
+        let base = sanitize(name);
+        let p = Path::new(&base);
+        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
+        let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        for i in 0..1000u32 {
+            let cand = if i == 0 { dir.join(&base) } else { dir.join(format!("{stem} ({i}){ext}")) };
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+                return Some((f, cand));
+            }
+        }
+        None
     }
 }
 
@@ -383,6 +449,18 @@ pub mod keymap {
             78 => 0x6D, // Num -
             75 => 0x6F, // Num /
             71 => 0x0C, // Clear
+            76 => 0x0D, // テンキー Enter(Win 側で拡張キーフラグを付けて区別する)
+            57 => 0x14, // Caps Lock(Mac 側は押下ごとに down+up の組で送る)
+            114 => 0x2D, // Help(Mac の Ins 位置)→ Insert
+            // F13〜F20(F13 は既定ホットキーのため通常は Mac 側で握られる)
+            105 => 0x7C,
+            107 => 0x7D,
+            113 => 0x7E,
+            106 => 0x7F,
+            64 => 0x80,
+            79 => 0x81,
+            80 => 0x82,
+            90 => 0x83,
             _ => return None,
         };
         Some(vk)
@@ -404,5 +482,60 @@ pub mod charmap {
             _ => return None,
         };
         Some(c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::keymap::mac_kc_to_win_vk;
+    use super::proto::*;
+
+    #[test]
+    fn keymap_covers_full_keyboard_and_numpad_enter() {
+        assert_eq!(mac_kc_to_win_vk(76), Some(0x0D));
+        assert_eq!(mac_kc_to_win_vk(57), Some(0x14));
+        assert_eq!(mac_kc_to_win_vk(114), Some(0x2D));
+        assert_eq!(mac_kc_to_win_vk(90), Some(0x83));
+        // 数字row の取り違え実績(21=4, 23=5)の回帰防止
+        assert_eq!(mac_kc_to_win_vk(21), Some(0x34));
+        assert_eq!(mac_kc_to_win_vk(23), Some(0x35));
+        assert_eq!(mac_kc_to_win_vk(200), None);
+    }
+
+    #[test]
+    fn received_file_names_are_neutralized() {
+        use super::files::sanitize;
+        assert_eq!(sanitize("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize("a\\b:c.txt"), "a_b_c.txt");
+        assert_eq!(sanitize("  .hidden  "), "hidden");
+        assert_eq!(sanitize("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize("com1"), "_com1");
+        assert_eq!(sanitize("console.txt"), "console.txt");
+        assert_eq!(sanitize(""), "file");
+        assert_eq!(sanitize("報告書.pdf"), "報告書.pdf");
+    }
+
+    #[test]
+    fn same_name_is_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("tsunagu-files-{}", std::process::id()));
+        let (_, a) = super::files::create_unique(&dir, "x.txt").unwrap();
+        let (_, b) = super::files::create_unique(&dir, "x.txt").unwrap();
+        assert_ne!(a, b);
+        assert!(b.to_string_lossy().ends_with("x (1).txt"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_negotiation_accepts_same_or_newer() {
+        assert!(compatible(VERSION));
+        assert!(compatible(VERSION + 5));
+        assert!(!compatible(MIN_VERSION - 1));
+    }
+
+    #[test]
+    fn unknown_message_is_ignored_not_fatal() {
+        assert!(decode("{\"t\":\"future_feature\",\"x\":1}").is_none());
+        assert!(matches!(decode(&encode(&Msg::Leave)), Some(Msg::Leave)));
+        assert!(matches!(decode("{\"t\":\"return\"}"), Some(Msg::Return { .. })));
     }
 }

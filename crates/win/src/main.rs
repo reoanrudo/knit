@@ -12,7 +12,7 @@ mod tray;
 use tsunagu_common::keymap::mac_kc_to_win_vk;
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-use tsunagu_common::proto::{decode, encode, Msg, PORT, VERSION};
+use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::exit;
@@ -27,9 +27,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_SHIFT, VK_LWIN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowTextW,
-    IsWindowVisible, SendMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SM_CXSCREEN,
-    SM_CYSCREEN, SW_RESTORE,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, SendMessageW, SetCursorPos, SM_CXSCREEN,
+    SM_CYSCREEN,
 };
 
 const INPUT_MOUSE: u32 = 0;
@@ -451,7 +450,17 @@ fn send_input_buf(buf: InputBuf) -> bool {
     }
 }
 
+/// 拡張キー(E0 プレフィクス付き scan)の VK。scan code を併記して注入するため、
+/// この区別を付けないと矢印キー等がテンキーの 4/6/8/2 と同じ scan で届く
+fn is_extended_vk(vk: u16) -> bool {
+    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x6F | 0x5B | 0x5C | 0xA3 | 0xA5)
+}
+
 fn inject_key(vk: u16, up: bool) -> bool {
+    inject_key_ex(vk, up, is_extended_vk(vk))
+}
+
+fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
     // wScan を必ず付ける: 日本語 IME 等は scan code 無しのキーを無視/不安定に
     // 扱うことがある(「ー」等の OEM キーで顕著)。vk と scan の併用が最も互換性が高い
     extern "system" {
@@ -463,7 +472,14 @@ fn inject_key(vk: u16, up: bool) -> bool {
     send_input_buf(InputBuf {
         itype: INPUT_KEYBOARD,
         _pad: 0,
-        body: [vk_scan, if up { KEYEVENTF_KEYUP } else { 0 }, 0, 0, 0, 0],
+        body: [
+            vk_scan,
+            (if up { KEYEVENTF_KEYUP } else { 0 }) | if extended { 0x0001 /*EXTENDEDKEY*/ } else { 0 },
+            0,
+            0,
+            0,
+            0,
+        ],
         extra: 0,
     })
 }
@@ -560,10 +576,38 @@ struct ModState {
     alt: bool,
     win: bool,
     shift: bool,
+    /// 注入して押下中のキー((vk, 拡張))。離脱・切断時に全部 up を注入する
+    /// (修飾だけ解放していた旧実装では、切替の瞬間に押していた矢印キー等が
+    /// Windows 側で押下扱いのまま残った)
+    pressed: Vec<(u16, bool)>,
 }
 impl ModState {
     fn new() -> Self {
-        Self { ctrl: false, alt: false, win: false, shift: false }
+        Self { ctrl: false, alt: false, win: false, shift: false, pressed: Vec::new() }
+    }
+    /// 通常キーの注入(押下状態を追跡する)
+    fn key(&mut self, vk: u16, down: bool, extended: bool) -> bool {
+        self.pressed.retain(|&(v, e)| !(v == vk && e == extended));
+        if down {
+            self.pressed.push((vk, extended));
+        }
+        inject_key_ex(vk, !down, extended)
+    }
+    /// 離脱時の後片付け: 押下中の通常キー・修飾・マウスボタン・Alt+Tab を全て離す
+    fn release_everything(&mut self) {
+        for (vk, ext) in std::mem::take(&mut self.pressed) {
+            inject_key_ex(vk, true, ext);
+        }
+        self.release_all();
+        for b in 0u8..=2 {
+            if BTN_W[b as usize].swap(false, Ordering::Relaxed) {
+                inject_mouse_btn(b, false);
+            }
+        }
+        if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
+            inject_key(0x09, true);
+            inject_key(VK_MENU, true);
+        }
     }
     fn apply(&mut self, ctrl: bool, opt: bool, cmd: bool, shift: bool) {
         // Mac: cmd→Win Ctrl(既定)/ Alt(Cfg で切替可), option→もう一方, ctrl→Winキー, shift→Shift
@@ -878,7 +922,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             continue;
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, name, token: t, .. }) if ver == VERSION && t == token => {
+            Some(Msg::Hello { ver, name, token: t, .. }) if compatible(ver) && t == token => {
                 println!("[hello] from {name}");
                 true
             }
@@ -933,7 +977,8 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     if !hello_sent {
         return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "hello send failed"));
     }
-    // hello_ok を待つ
+    // hello_ok を待つ(Mac が accept 後に応答しない場合に再接続ループへ戻れるよう期限を切る)
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut pre = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     pre.read_line(&mut line)?;
@@ -1057,6 +1102,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
         let line = match line {
             Ok(l) => l,
             Err(e) => {
+                mods.release_everything();
                 running_w.store(false, Ordering::Relaxed);
                 return Err(e);
             }
@@ -1249,7 +1295,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 }
                 mods.apply(ctrl, opt, cmd, shift);
                 if let Some(vk) = mac_kc_to_win_vk(kc) {
-                    let ok = inject_key(vk, !down);
+                    // テンキー Enter(76)は通常 Enter と同じ VK で拡張フラグだけが違う
+                    let ext = kc == 76 || is_extended_vk(vk);
+                    let ok = mods.key(vk, down, ext);
                     if DEBUG_KEYS.load(Ordering::Relaxed) && !ok {
                         println!("[key] INJECT FAILED kc={kc}");
                     }
@@ -1305,20 +1353,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 }
                 inject_scroll(dx, dy);
             }
-            Msg::Focus { title } => {
-                if !hello_done {
-                    continue;
-                }
-                let hwnd = find_window_by_title(&title);
-                if !hwnd.is_null() {
-                    unsafe {
-                        ShowWindow(hwnd, SW_RESTORE);
-                        SetForegroundWindow(hwnd);
-                    }
-                    println!("[focus] {title} -> focused");
-                } else {
-                    println!("[focus] window not found: {title}");
-                }
+            Msg::Leave => {
+                // Mac が制御を取り戻した: 押しっぱなしを残さない
+                mods.release_everything();
             }
             Msg::Warp { nx, ny } => {
                 if !hello_done {
@@ -1328,18 +1365,6 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 let y = (ny.clamp(0.0, 1.0) * h as f64) as i32;
                 unsafe { SetCursorPos(x, y) };
                 last_return_notify = Instant::now();
-            }
-            Msg::Minimize { title } => {
-                if !hello_done {
-                    continue;
-                }
-                let hwnd = find_window_by_title(&title);
-                if !hwnd.is_null() {
-                    unsafe { ShowWindow(hwnd, 6); } // SW_MINIMIZE
-                    println!("[minimize] {title}");
-                } else {
-                    println!("[minimize] window not found: {title}");
-                }
             }
             Msg::Clip { text } => {
                 if text.len() > CLIP_MAX_CHARS {
@@ -1361,7 +1386,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             _ => {}
         }
     }
-    mods.release_all();
+    mods.release_everything();
     running_w.store(false, Ordering::Relaxed);
     Ok(())
 }
@@ -1369,20 +1394,8 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
 /// ファイル受信の開始: Downloads\Tsunagu へ新規作成し書き込みハンドルを返す。
 /// サイズ上限 200MB。ファイル名はパス区切り・Windows 禁止文字・先頭 '.' を無害化
 fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> {
-    const MAX_FILE: u64 = 200 * 1024 * 1024;
-    if size == 0 || size > MAX_FILE {
+    if size == 0 || size > tsunagu_common::files::MAX_FILE {
         println!("[file] 拒否: {name} ({size} bytes)");
-        return None;
-    }
-    let safe: String = name
-        .chars()
-        .map(|c| match c {
-            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => c,
-        })
-        .collect();
-    let safe = safe.trim_matches('.').trim().to_string();
-    if safe.is_empty() {
         return None;
     }
     let dir = std::env::var_os("USERPROFILE")
@@ -1390,34 +1403,24 @@ fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> 
         .unwrap_or_default()
         .join("Downloads")
         .join("Tsunagu");
-    if std::fs::create_dir_all(&dir).is_err() {
-        println!("[file] 保存先フォルダ作成失敗");
+    let Some((f, path)) = tsunagu_common::files::create_unique(&dir, name) else {
+        println!("[file] 作成失敗: {name}");
         return None;
-    }
-    let path = dir.join(&safe);
-    match std::fs::File::create(&path) {
-        Ok(f) => {
-            *remain = size;
-            let full = path.to_string_lossy().into_owned();
-            println!("[file] begin: {safe} ({size} bytes)");
-            PENDING_FILES
-                .lock()
-                .map(|mut g| {
-                    g.push(full);
-                    // クリップボードに載せるのは直近 16 件まで(無制限増加を防ぐ)
-                    if g.len() > 16 {
-                        let excess = g.len() - 16;
-                        g.drain(..excess);
-                    }
-                })
-                .ok();
-            Some(f)
-        }
-        Err(_) => {
-            println!("[file] 作成失敗: {safe}");
-            None
-        }
-    }
+    };
+    *remain = size;
+    println!("[file] begin: {} ({size} bytes)", path.display());
+    PENDING_FILES
+        .lock()
+        .map(|mut g| {
+            g.push(path.to_string_lossy().into_owned());
+            // クリップボードに載せるのは直近 16 件まで(無制限増加を防ぐ)
+            if g.len() > 16 {
+                let excess = g.len() - 16;
+                g.drain(..excess);
+            }
+        })
+        .ok();
+    Some(f)
 }
 
 /// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
@@ -1453,45 +1456,6 @@ fn maybe_notify_return(
         // Mac へ制御を返すための後片付け: 押しっぱなしの修飾キーに加え、
         // (a) ドラッグ中のマウスボタンを離す(選択ドラッグの残留防止)
         // (b) Alt+Tab 変換が未確定なら確定する(スイッチャー残留防止)
-        mods.release_all();
-        for b in 0u8..=2 {
-            if BTN_W[b as usize].swap(false, Ordering::Relaxed) {
-                inject_mouse_btn(b, false); // 押下中のボタンだけ確実に離す
-            }
-        }
-        if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
-            inject_key(0x09, true); // VK_TAB up
-            inject_key(VK_MENU, true);
-        }
+        mods.release_everything();
     }
-}
-
-
-// ---------- タイトル部分一致でメインウィンドウを検索 ----------
-struct EnumCtx {
-    needle: String,
-    hwnd: *mut core::ffi::c_void,
-}
-
-unsafe extern "system" fn enum_cb(hwnd: *mut core::ffi::c_void, lparam: isize) -> i32 {
-    let ctx = &mut *(lparam as *mut EnumCtx);
-    let mut buf = [0u16; 256];
-    let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), 256);
-    let title = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
-    if IsWindowVisible(hwnd) != 0 && title.to_lowercase().contains(&ctx.needle.to_lowercase()) {
-        ctx.hwnd = hwnd;
-        return 0; // 列挙停止
-    }
-    1
-}
-
-fn find_window_by_title(needle: &str) -> *mut core::ffi::c_void {
-    let mut ctx = EnumCtx {
-        needle: needle.to_string(),
-        hwnd: std::ptr::null_mut(),
-    };
-    unsafe {
-        EnumWindows(Some(enum_cb), &mut ctx as *mut _ as isize);
-    }
-    ctx.hwnd
 }

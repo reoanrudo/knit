@@ -6,7 +6,7 @@ mod audio;
 mod gui;
 
 use tsunagu_common::envutil;
-use tsunagu_common::proto::{decode, encode, Msg, PORT, VERSION};
+use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::net::TcpStream;
 use std::sync::mpsc::Sender;
@@ -477,35 +477,12 @@ fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
 /// Windows からのファイル受信を ~/Downloads/Tsunagu へ新規作成する。
 /// 同名との衝突は "名前 (n).拡張子" として回避。1ファイル 200MB 上限
 fn mac_file_begin(name: &str, size: u64) -> Option<(std::fs::File, std::path::PathBuf)> {
-    const MAX_FILE: u64 = 200 * 1024 * 1024;
-    if size == 0 || size > MAX_FILE {
+    if size == 0 || size > tsunagu_common::files::MAX_FILE {
         eprintln!("[file] win->mac skip(name={name:?} size={size})");
         return None;
     }
-    let bad = name.is_empty()
-        || name.len() > 255
-        || name.contains(['/', '\\', ':', '*', '?', '"', '<', '>', '|'])
-        || name.starts_with('.');
-    let base = if bad { "file".to_string() } else { name.to_string() };
-    let dir = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join("Downloads/Tsunagu"))
-        .filter(|d| std::fs::create_dir_all(d).is_ok())?;
-    let p = std::path::Path::new(&base);
-    let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-    let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    for i in 0..1000u32 {
-        let cand = if i == 0 {
-            dir.join(&base)
-        } else {
-            dir.join(format!("{stem} ({i}){ext}"))
-        };
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
-            Ok(f) => return Some((f, cand)),
-            Err(_) => continue,
-        }
-    }
-    None
+    let dir = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join("Downloads/Tsunagu");
+    tsunagu_common::files::create_unique(&dir, name)
 }
 
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
@@ -697,10 +674,11 @@ static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
 /// ドラッグ中切替(TSUNAGU_DRAG_SWITCH=1): 押したまま境界を越えられる
 pub static DRAG_SWITCH: AtomicBool = AtomicBool::new(false);
-/// Ctrl+クリック=右クリック翻訳(TSUNAGU_CTRL_CLICK=1 で有効。既定 OFF:
-/// 2本指クリックで右クリックできるため不要であり、修飾フラグの混入で
-/// 意図しない右クリックメニューが出る事故の温床になった)
-pub static CTRL_CLICK: AtomicBool = AtomicBool::new(false);
+/// Mac 流ショートカット翻訳(TSUNAGU_MAC_KEYS=0 で無効)。タップ内で毎イベント
+/// 設定を引かないよう起動時にキャッシュする
+static MAC_KEYS: AtomicBool = AtomicBool::new(true);
+/// 2本指横スワイプ→戻る/進む(TSUNAGU_SWIPE_NAV=0 で横ホイールのまま)
+static SWIPE_NAV: AtomicBool = AtomicBool::new(true);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
 static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
@@ -760,11 +738,12 @@ pub fn set_side(v: u8) {
 }
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// 単調時計の ms。壁時計(SystemTime)は NTP 補正やスリープ復帰で飛び、
+/// ダブルタップ判定・復帰ガード・pong 監視を誤動作させるため使わない。
+/// 0 を「未設定」の意味で使う箇所があるため 1 秒のオフセットを足す
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1_000
 }
 
 /// 復帰直後は右端判定を一定時間無効化する(再突入チャタリング防止)
@@ -924,6 +903,9 @@ fn enter_win_mode_cursor_lock() {
 /// Windows モード終了: 関連を復元し、右端の内側へカーソルを戻す。
 /// ny は Windows 側カーソルの高さ(0..1)。与えられた場合は同じ高さへ戻す(境界連続性)。
 fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
+    // Windows が自力で検知できない離脱(ホットキー/Mac 内完結の左端/ウォッチドッグ)でも
+    // 押下中のキー・ボタンが Windows に残らないよう、必ず後片付けを依頼する
+    send_msg(&Msg::Leave);
     // Deskflow enter() 相当: 関連復元 → showCursor(プロパティ付き) → suppression解除 → 位置復帰
     unsafe {
         // 次回の切替で同じ場所へ戻れるよう、Windows 画面内の現在地を記憶する
@@ -1348,7 +1330,7 @@ unsafe extern "C" fn tap_callback(
                 // flagsChanged は「その修飾が押された」イベントのみ来る(離す時は flags から消える)
                 // 押下状態は flags から判定
                 match kc {
-                    55 => cmd,
+                    54 | 55 => cmd,
                     56 | 60 => shift,
                     58 | 61 => opt,
                     59 | 62 => ctrl,
@@ -1360,14 +1342,20 @@ unsafe extern "C" fn tap_callback(
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
             }
+            // Caps Lock は Mac では押すたびに flagsChanged が 1 回だけ来る(押下/解放の
+            // 区別がない)。Windows はキーの押し離しでトグルするため 1 回を down+up に展開する
+            if event_type == EVT_FLAGS_CHANGED && kc == 57 {
+                for d in [true, false] {
+                    send_msg(&Msg::Key { kc, down: d, ctrl, opt, cmd, shift, tr: false });
+                }
+                return std::ptr::null_mut();
+            }
             // ---- Mac 流ショートカットの Windows 翻訳(指癖をそのまま通す) ----
             // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
             //   cmd→Win Ctrl / opt→Win Alt / ctrl→Win キー(既定マップ)
             // 注意: flagsChanged(mod キー単体)は翻訳しない。
             // 常時有効(マスト機能)。TSUNAGU_MAC_KEYS=0 でのみオフ
-            if event_type != EVT_FLAGS_CHANGED
-                && envutil::get("TSUNAGU_MAC_KEYS").as_deref() != Some("0")
-            {
+            if event_type != EVT_FLAGS_CHANGED && MAC_KEYS.load(Ordering::Relaxed) {
                 // 翻訳先の修飾は「既定マップ(cmd→Ctrl / opt→Alt)」で解釈させる。
                 // CMD_ALT=true でも翻訳の意味が変わらないよう、cmd/opt を差し替える
                 let swap = crate::CMD_ALT.load(Ordering::Relaxed);
@@ -1500,12 +1488,9 @@ unsafe extern "C" fn tap_callback(
                 BTN_DOWN[0].store(false, Ordering::Relaxed);
                 return event;
             }
-            // Mac 流「Ctrl+クリック=右クリック」は TSUNAGU_CTRL_CLICK=1 のみ
-            // (既定 OFF。右クリックは 2本指クリックが本体操作)
-            let btn = if ctrl && CTRL_CLICK.load(Ordering::Relaxed) { 1u8 } else { 0 };
             let d = event_type == EVT_LEFT_DOWN;
             BTN_DOWN[0].store(d, Ordering::Relaxed);
-            send_msg(&Msg::MouseButton { btn, down: d });
+            send_msg(&Msg::MouseButton { btn: 0, down: d });
         }
         EVT_RIGHT_DOWN | EVT_RIGHT_UP => {
             let d = event_type == EVT_RIGHT_DOWN;
@@ -1525,7 +1510,7 @@ unsafe extern "C" fn tap_callback(
             // みなし、その間の発火は 1 回だけ(指を離した後の慣性 delta が届いても
             // 再発火しない=2段階戻りの防止)。閾値 60px・横優勢(|dx|*2>|dy|)のみ。
             // TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ戻せる
-            let swipe_nav = envutil::get("TSUNAGU_SWIPE_NAV").as_deref() != Some("0");
+            let swipe_nav = SWIPE_NAV.load(Ordering::Relaxed);
             if swipe_nav && win_mode && dx != 0.0 && dx.abs() * 2.0 > dy.abs() {
                 let now = now_ms();
                 let mut acc = SWIPE_ACC.lock().unwrap_or_else(|e| e.into_inner());
@@ -1606,12 +1591,6 @@ fn main() {
     }
     gui::restore_preferences();
 
-    let _host = args
-        .iter()
-        .position(|a| a == "--host")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "100.84.0.2".to_string());
     let port: u16 = args
         .iter()
         .position(|a| a == "--port")
@@ -1630,8 +1609,6 @@ fn main() {
             std::process::exit(1);
         }
     };
-
-    let test_mode = args.iter().any(|a| a == "--test");
 
     let (screen_w, screen_h) = unsafe {
         let d = CGMainDisplayID();
@@ -1665,27 +1642,27 @@ fn main() {
             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
     }
-    if let Some(d) = std::env::var("TSUNAGU_SCROLL_DIV").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(d) = envutil::get("TSUNAGU_SCROLL_DIV").and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
             set_scroll_div(d);
         }
     }
-    if let Some(m) = std::env::var("TSUNAGU_MOUSE_SCALE").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(m) = envutil::get("TSUNAGU_MOUSE_SCALE").and_then(|v| v.parse::<f64>().ok()) {
         if m > 0.0 {
             set_mouse_scale(m);
         }
     }
-    if let Some(e) = std::env::var("TSUNAGU_EDGE_PX").ok().and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(e) = envutil::get("TSUNAGU_EDGE_PX").and_then(|v| v.parse::<f64>().ok()) {
         if e >= 0.0 && e < 100.0 {
             set_edge_px(e);
         }
     }
-    if let Some(m) = std::env::var("TSUNAGU_MOUSE_MODE").ok() {
+    if let Some(m) = envutil::get("TSUNAGU_MOUSE_MODE") {
         if m.eq_ignore_ascii_case("rel") {
             MOUSE_ABS_MODE.store(false, Ordering::Relaxed);
         }
     }
-    if let Some(m) = std::env::var("TSUNAGU_SWITCH_MODE").ok() {
+    if let Some(m) = envutil::get("TSUNAGU_SWITCH_MODE") {
         if m.eq_ignore_ascii_case("hotkey") {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
@@ -1695,7 +1672,7 @@ fn main() {
             EDGE_TAPS.store(t, Ordering::Relaxed);
         }
     }
-    if let Some(k) = std::env::var("TSUNAGU_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
+    if let Some(k) = envutil::get("TSUNAGU_HOTKEY_KC").and_then(|v| v.parse::<i64>().ok()) {
         if (1..=127).contains(&k) {
             HOTKEY_KC.store(k, Ordering::Relaxed);
         }
@@ -1740,8 +1717,11 @@ fn main() {
     if envutil::get("TSUNAGU_DRAG_SWITCH").as_deref() == Some("1") {
         DRAG_SWITCH.store(true, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_CTRL_CLICK").as_deref() == Some("1") {
-        CTRL_CLICK.store(true, Ordering::Relaxed);
+    if envutil::get("TSUNAGU_MAC_KEYS").as_deref() == Some("0") {
+        MAC_KEYS.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_SWIPE_NAV").as_deref() == Some("0") {
+        SWIPE_NAV.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);
@@ -1860,105 +1840,6 @@ fn main() {
         std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
     } else {
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
-    }
-
-    // 実機E2E: notepadへ入力して Ctrl+S → ファイル名 → Enter で保存
-    if args.iter().any(|a| a == "--test2") {
-        std::thread::spawn(|| {
-            for _ in 0..100 {
-                if CONNECTED.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !CONNECTED.load(Ordering::Relaxed) {
-                eprintln!("[test2] NOT CONNECTED");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(800));
-            WIN_MODE.store(true, Ordering::Relaxed);
-            send_msg(&Msg::Minimize { title: "Windows Terminal".into() });
-            send_msg(&Msg::Minimize { title: "terminal".into() });
-            std::thread::sleep(Duration::from_millis(500));
-            send_msg(&Msg::Focus { title: "メモ帳".into() });
-            std::thread::sleep(Duration::from_millis(800));
-            eprintln!("[test2] typing into notepad...");
-            let type_str = |pairs: &[(u16, bool)]| {
-                for &(kc, shift) in pairs {
-                    send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift, tr: false });
-                    send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift, tr: false });
-                    std::thread::sleep(Duration::from_millis(25));
-                }
-            };
-            // "tsunagu e2e ok" (Mac keycode)
-            let body: Vec<(u16, bool)> = "tsunagu e2e ok".chars().filter_map(|c| {
-                let kc = match c {
-                    'a' => 0, 'b' => 11, 'c' => 8, 'd' => 2, 'e' => 14, 'f' => 3, 'g' => 5,
-                    'h' => 4, 'i' => 34, 'j' => 38, 'k' => 40, 'l' => 37, 'm' => 46, 'n' => 45,
-                    'o' => 31, 'p' => 35, 'q' => 12, 'r' => 15, 's' => 1, 't' => 17, 'u' => 32,
-                    'v' => 9, 'w' => 13, 'x' => 7, 'y' => 16, 'z' => 6, ' ' => 49,
-                    _ => return None,
-                };
-                Some((kc, false))
-            }).collect();
-            type_str(&body);
-            std::thread::sleep(Duration::from_millis(300));
-            // Cmd+S -> Win Ctrl+S(保存ダイアログ)
-            send_msg(&Msg::Key { kc: 1, down: true, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
-            send_msg(&Msg::Key { kc: 1, down: false, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
-            std::thread::sleep(Duration::from_millis(800));
-            // ファイル名欄: Cmd+A(全選択)して上書き
-            send_msg(&Msg::Key { kc: 0, down: true, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
-            send_msg(&Msg::Key { kc: 0, down: false, ctrl: false, opt: false, cmd: true, shift: false, tr: false });
-            std::thread::sleep(Duration::from_millis(200));
-            // "e2eok.txt"
-            let name: Vec<(u16, bool)> = "e2eok.txt".chars().filter_map(|c| {
-                let kc = match c {
-                    'a' => 0, 'e' => 14, 'k' => 40, 'o' => 31, 't' => 17, 'x' => 7,
-                    '.' => 47, '2' => 19,
-                    _ => return None,
-                };
-                Some((kc, false))
-            }).collect();
-            type_str(&name);
-            std::thread::sleep(Duration::from_millis(200));
-            // Enter(36)
-            send_msg(&Msg::Key { kc: 36, down: true, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
-            send_msg(&Msg::Key { kc: 36, down: false, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
-            std::thread::sleep(Duration::from_millis(500));
-            eprintln!("[test2] done (typed + saved)");
-            WIN_MODE.store(false, Ordering::Relaxed);
-        });
-    }
-
-    // テストモード: 接続確立後にキー列を自動送信(E2E検証用)
-    if test_mode {
-        std::thread::spawn(|| {
-            for _ in 0..100 {
-                if CONNECTED.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !CONNECTED.load(Ordering::Relaxed) {
-                eprintln!("[test] NOT CONNECTED");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            WIN_MODE.store(true, Ordering::Relaxed);
-            eprintln!("[test] sending key sequence...");
-            // "SDEOK" の Mac keycode 列
-            for kc in [1u16, 2, 14, 31, 40] {
-                send_msg(&Msg::Key { kc, down: true, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
-                send_msg(&Msg::Key { kc, down: false, ctrl: false, opt: false, cmd: false, shift: false, tr: false });
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            send_msg(&Msg::MouseMove { dx: 120.0, dy: 60.0 });
-            send_msg(&Msg::Scroll { dx: 0.0, dy: 1.0 });
-            std::thread::sleep(Duration::from_millis(300));
-            eprintln!("[test] sent all");
-            WIN_MODE.store(false, Ordering::Relaxed);
-        });
     }
 
     // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録
@@ -2345,6 +2226,7 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             RTT_MS.store(rtt, Ordering::Relaxed);
                             send_msg(&Msg::Stat { rtt });
                         }
+                        Msg::Ping { ts } => send_msg(&Msg::Pong { ts }),
                         Msg::Bye => break,
                         _ => {}
                     }
@@ -2429,7 +2311,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             Ok(_) => {}
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, name, token: t, w, h }) if ver == VERSION && t == token => {
+            Some(Msg::Hello { ver, name, token: t, w, h }) if compatible(ver) && t == token => {
                 let _ = name;
                 // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
                 if w > 0 && h > 0 {
