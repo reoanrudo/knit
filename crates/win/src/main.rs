@@ -161,6 +161,9 @@ pub static SIDE_W: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::ne
 pub static WTX: std::sync::Mutex<Option<std::sync::mpsc::Sender<String>>> =
     std::sync::Mutex::new(None);
 
+/// 本線を外から張り直す合図(トレイ/昇格監視 → writer スレッド)。ワイヤには出ない
+pub(crate) const MAIN_SHUTDOWN: &str = "\u{0}MAIN-SHUTDOWN";
+
 /// 「Mac へ戻る」用の Return 行(高さは画面中央相当)
 pub fn proto_return() -> String {
     encode(&Msg::Return { ny: 0.5 })
@@ -1230,6 +1233,30 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
                 println!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
                 *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
+                // 起動一発目は LAN 発見が間に合わず Tailscale へ落ちることがある
+                //(発見は 600ms で諦めるため)。Tailscale 接続の間は 30 秒毎に LAN を
+                // 探し直し、見つかれば本線を張り直して次の再接続で LAN 直へ昇格する
+                if tsunagu_common::net::is_tailscale(a.ip()) {
+                    let tk = token.to_string();
+                    std::thread::spawn(move || loop {
+                        std::thread::sleep(Duration::from_secs(30));
+                        if !CONNECTED.load(Ordering::Relaxed) {
+                            return; // セッション終了済み(次セッションで改めて起こる)
+                        }
+                        match peer_ip() {
+                            Some(p) if !tsunagu_common::net::is_tailscale(p) => return, // 昇格済み
+                            None => return,
+                            _ => {}
+                        }
+                        if let Some(ip) = tsunagu_common::discover::seek_first_lan(port, &tk) {
+                            println!("[conn] LAN 直の相手を発見({ip})。経路昇格のため張り直します");
+                            if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                                let _ = tx.send(MAIN_SHUTDOWN.to_string());
+                            }
+                            return;
+                        }
+                    });
+                }
                 // TCP だけ繋がる相手(LAN 発見で拾った旧版・別トークンの応答者)はハンドシェイクで
                 // 失敗する。セッション失敗まで backoff をリセットすると高頻度の無限再試行に
                 // なるため、リセットはセッションが最後まで成功した時のみ
@@ -1386,6 +1413,11 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
     *WTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(wtx.clone());
     std::thread::spawn(move || {
         while let Ok(line) = wrx.recv() {
+            if line == MAIN_SHUTDOWN {
+                // 経路昇格などで外から本線を張り直す時の合図(read 側も err で終了)
+                writer.shutdown();
+                break;
+            }
             if writer.write_all(line.as_bytes()).and_then(|_| writer.flush()).is_err() {
                 writer.shutdown();
                 break;
