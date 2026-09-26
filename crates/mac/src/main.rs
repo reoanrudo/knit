@@ -1094,21 +1094,32 @@ fn compute_geo() -> Geo {
             for id in &ids[..(n as usize).min(16)] {
                 let b = CGDisplayBounds(*id);
                 let (l, r, t, btm) = (b.origin.x, b.origin.x + b.size.w, b.origin.y, b.origin.y + b.size.h);
+                // 同じ辺を複数のディスプレイが共有する(縦に並べた外部モニター等)場合は
+                // 出口の範囲を合算する
+                let widen = |e: &mut (f64, f64), lo: f64, hi: f64| *e = (e.0.min(lo), e.1.max(hi));
                 if r > g.max_x {
                     g.max_x = r;
                     g.exit[0] = (t, btm);
+                } else if r == g.max_x {
+                    widen(&mut g.exit[0], t, btm);
                 }
                 if l < g.min_x {
                     g.min_x = l;
                     g.exit[1] = (t, btm);
+                } else if l == g.min_x {
+                    widen(&mut g.exit[1], t, btm);
                 }
                 if t < g.min_y {
                     g.min_y = t;
                     g.exit[2] = (l, r);
+                } else if t == g.min_y {
+                    widen(&mut g.exit[2], l, r);
                 }
                 if btm > g.max_y {
                     g.max_y = btm;
                     g.exit[3] = (l, r);
+                } else if btm == g.max_y {
+                    widen(&mut g.exit[3], l, r);
                 }
             }
         }
@@ -2061,7 +2072,7 @@ fn main() {
             }
             if ping_at.elapsed() >= Duration::from_secs(3) {
                 ping_at = std::time::Instant::now();
-                // 15 秒 pong が無ければ実質切断扱いでストリームを外す
+                // 10 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う)
                 if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 10_000 {
                     drop_stream("pong が 10 秒途絶");
@@ -2539,6 +2550,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             eprintln!("[conn] invalid hello");
             continue;
         }
+        LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         {
             let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(w);
@@ -2599,6 +2611,7 @@ fn client_attempt(
         }
         _ => return Err("invalid hello_ok".into()),
     }
+    LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     {
         let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(hw);
