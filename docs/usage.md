@@ -146,6 +146,27 @@ Windows 画面を操作している間、Mac 本体キーボードの音量キ�
 
 fn を押さない F7〜F12 は従来どおり F キーとして渡ります。
 
+## 実機での確認手順(IME 引継ぎ・Continue Here)
+
+どちらも「画面を移る時だけ」動く機能のため、次の手順で確認します:
+
+**IME 引継ぎ(IME Follow Cursor)**
+
+1. Mac を日本語入力(かなモード)にしてから Windows 画面へ移る
+   → Windows 側が日本語入力になっている(Windows のログに
+   `[ime] mac の状態へ同期: かな(ON)`)
+2. Mac 側で英数キーを押してから Windows 画面へ移る
+   → Windows 側が英字入力になっている(`英数(OFF)` のログ)
+3. Mac を英字レイアウト(日本語入力ではない)にして Windows へ移る
+   → Windows 側の IME は変化しない(ログも出ない)
+
+**Continue Here(⌥⌘T)**
+
+1. Mac の Safari/Chrome/Edge/Brave で任意のページを開く
+2. Windows 画面へ移り、⌥⌘T を押す
+3. Windows の既定ブラウザで同じページが開く(Mac 側ログに `[url] Continue Here: 送信しました`)
+   - Firefox は Mac 側の読み取り対象外(開く側は Windows の既定ブラウザなら何でも可)
+
 ## 接続の挙動
 
 - 経路: 本線 TCP 24900(入力・制御)/ 音声 TCP 24901 / ファイル・画像 TCP 24902 /
