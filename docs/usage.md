@@ -64,8 +64,11 @@ WiFi の瞬間的な揺らぎがカーソルのカクつきの原因になる場
 (例: `TSUNAGU_HOST=169.254.10.2,100.100.10.9`)。起動のたびに全候補へ同時に接続を試み、
 最初に繋がった経路(=遅延の小さい経路)を使うため、直結を抜いても Tailscale へ自動で戻ります。
 Mac の IP は `ifconfig` で確認(Thunderbolt ブリッジは bridge0、USB-LAN は en*)。
-`TSUNAGU_HOST` を省略すると、同じ LAN にいる Mac を自動で探します(UDP 24903。
-AP 隔離や Tailscale 越しではブロードキャストが届かないため、その場合は指定が必要)。
+接続先は **LAN 自動発見(UDP 24903)と `TSUNAGU_HOST` の併用**です。接続のたびにまず同じ
+LAN の Mac を探し(最初の応答 or 600ms)、見つかった LAN IP を先頭に `TSUNAGU_HOST` の
+候補を並べて同時接続レースへかけます。つまり **同じ LAN では Tailscale の状態に
+関係なく常時 LAN 直**、LAN 外(AP 隔離・外出先)では `TSUNAGU_HOST` の Tailscale IP へ
+自動フォールバックします。
 
 ## Mac 流ショートカットの自動翻訳(Windows 画面操作中)
 
@@ -158,7 +161,8 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
 | `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
 | `TSUNAGU_TOKEN` | (必須) | 両側共通の秘密。暗号化の鍵の元になる。未設定だと起動しない |
-| `TSUNAGU_HOST` | (未設定=LAN 自動発見) | Windows 側の接続先。カンマ区切りで複数指定すると同時に試し最速の経路を使う |
+| `TSUNAGU_BIND` | 0.0.0.0 | Mac 側の待受アドレス。既定は全インターフェース(LAN 直を受け入れる) |
+| `TSUNAGU_HOST` | (未設定) | Windows 側の接続先(フォールバック候補)。LAN 自動発見とは併用で、見つかった LAN IP が優先される |
 | `TSUNAGU_ALLOW_ANY` | 0 | 1 で LAN・直結・Tailscale 以外のアドレスからの接続も受け入れる |
 | `TSUNAGU_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
 | `TSUNAGU_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
