@@ -1052,13 +1052,10 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = "win-20260926-171359-f561628";
 
-static SAVE_REGISTRATION: AtomicBool = AtomicBool::new(false);
-fn registration_authenticated(token:&str) {
-    if SAVE_REGISTRATION.swap(false,Ordering::Relaxed) {
-        match tsunagu_common::credentials::save(token) {
-            Ok(())=>tray::notify("登録が完了しました","次回から、このMacへ自動で接続します。"),
-            Err(_)=>{SAVE_REGISTRATION.store(true,Ordering::Relaxed);tray::notify("接続キーを保存できませんでした","現在は接続できます。次回起動時に登録をやり直してください。");eprintln!("[setup] credential save failed");},
-        }
+static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
+fn registration_authenticated(_token: &str) {
+    if JUST_REGISTERED.swap(false, Ordering::Relaxed) {
+        tray::notify("接続を確認しました", "登録したMacへ、次回から自動で接続します。");
     }
 }
 fn main() {
@@ -1076,23 +1073,6 @@ fn main() {
 
     println!("[info] tsunagu-win {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
-    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()){t}else{
-        match tsunagu_common::credentials::load() {
-            Ok(Some(t))=>t,
-            Ok(None) if args.iter().any(|a|a=="--background")=>return,
-            Ok(None)=>match tray::setup::first_run(false) {
-                Some(t)=>{SAVE_REGISTRATION.store(true,Ordering::Relaxed);t},None=>return,
-            },
-            Err(_)=>{if !args.iter().any(|a|a=="--background"){tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
-        }
-    };
-    let port: u16 = args
-        .iter()
-        .position(|a| a == "--port")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(PORT);
-
     // 対話デスクトップへ接続(SSH 起動では失敗する。schtasks/スタートアップ起動を使う)
     unsafe {
         let desk = OpenInputDesktop(0, false, 0x01FF);
@@ -1106,6 +1086,23 @@ fn main() {
             exit(1);
         }
     }
+
+    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()){t}else{
+        match tsunagu_common::credentials::load() {
+            Ok(Some(t))=>t,
+            Ok(None) if args.iter().any(|a|a=="--background")=>return,
+            Ok(None)=>match tray::setup::first_run(false) {
+                Some(t)=>{JUST_REGISTERED.store(true, Ordering::Relaxed);t},None=>return,
+            },
+            Err(_)=>{if !args.iter().any(|a|a=="--background"){tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
+        }
+    };
+    let port: u16 = args
+        .iter()
+        .position(|a| a == "--port")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(PORT);
 
     let (_, _, w, h) = refresh_vscreen();
     println!("[info] desktop attached. screen {w}x{h}. listening on :{port}");
@@ -1170,7 +1167,9 @@ fn main() {
         std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed));
         let tk = token.clone();
         std::thread::spawn(move || {
-            tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed)
+            if let Err(e) = tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed) {
+                println!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
+            }
         });
         server_loop(&token, port, w, h);
         return;

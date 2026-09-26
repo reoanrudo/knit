@@ -2270,7 +2270,9 @@ fn main() {
         // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
         let tk = token.clone();
         std::thread::spawn(move || {
-            tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed)
+            if let Err(e) = tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed) {
+                eprintln!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
+            }
         });
         std::thread::spawn(move || {
             bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed)

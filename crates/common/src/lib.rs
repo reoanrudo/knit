@@ -1,3 +1,4 @@
+pub mod pairing;
 pub mod credentials;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
@@ -561,9 +562,10 @@ pub mod discover {
         h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える
-    pub fn respond(bind: &str, port: u16, token: &str, allow: fn(IpAddr) -> bool) {
-        let Ok(sock) = UdpSocket::bind((bind, port)) else { return };
+    /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える。
+    /// 戻り値は bind 失敗のみ(待受に入ったら戻らない)。呼び出し側でログに出す
+    pub fn respond(bind: &str, port: u16, token: &str, allow: fn(IpAddr) -> bool) -> std::io::Result<()> {
+        let sock = UdpSocket::bind((bind, port))?;
         let ask = format!("TSUNAGU?{}", room_id(token));
         let ans = format!("TSUNAGU!{}", room_id(token));
         let mut buf = [0u8; 128];
@@ -572,6 +574,7 @@ pub mod discover {
                 let _ = sock.send_to(ans.as_bytes(), from);
             }
         }
+        Ok(())
     }
 
     /// 問い合わせ側(早期終了版)。最初の応答が届いた時点で返る。
@@ -644,7 +647,13 @@ pub mod connect {
     /// 同じ LAN にいれば発見=LAN 直が最速で、いなければ指定(Tailscale 等)へフォールバックする
     pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
         let found = crate::discover::seek_first_lan(port, token).into_iter().collect::<Vec<_>>();
-        merge_candidates(found, hosts, port)
+        let mut candidates = merge_candidates(found, hosts, port);
+        if hosts.is_none() {
+            if let Some(peer) = crate::credentials::load_peer() {
+                if !candidates.contains(&peer) { candidates.push(peer); }
+            }
+        }
+        candidates
     }
 
     pub fn first_reachable(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
