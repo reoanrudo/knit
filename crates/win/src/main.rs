@@ -963,7 +963,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-155013-a8390bb";
+const BUILD_ID: &str = "win-20260926-171359-f561628";
 
 fn main() {
     if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
@@ -1103,17 +1103,25 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
     loop {
         let addrs = tsunagu_common::connect::resolve(hosts.as_deref(), port, token);
         if addrs.is_empty() {
+            // 候補が空なら first_reachable を呼ばない(スレッド 0 のまま 3.5 秒待つだけの
+            // 無駄。発見 600ms と合算して再接続が遅れる)
             println!("[conn] 接続先が見つかりません(LAN の Mac を発見できず TSUNAGU_HOST の候補も空です)");
+            std::thread::sleep(Duration::from_millis(backoff));
+            backoff = (backoff * 2).min(3000);
+            continue;
         }
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 println!("[conn] connected ({a})");
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
                 *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
-                if let Err(e) = client_session(s, token, w, h) {
-                    println!("[disc] {e}");
+                // TCP だけ繋がる相手(LAN 発見で拾った旧版・別トークンの応答者)はハンドシェイクで
+                // 失敗する。セッション失敗まで backoff をリセットすると高頻度の無限再試行に
+                // なるため、リセットはセッションが最後まで成功した時のみ
+                match client_session(s, token, w, h) {
+                    Ok(()) => backoff = 500,
+                    Err(e) => println!("[disc] {e}"),
                 }
-                backoff = 500;
             }
             None => println!("[conn] failed: どの接続先にも繋がりません"),
         }
@@ -1198,8 +1206,11 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         println!("[conn] established");
         tray::notify("tsunagu", "接続しました");
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
-        let _ = session(pre, wr);
+        if let Err(e) = session(pre, wr) {
+            println!("[disc] {e}");
+        }
         CONNECTED.store(false, Ordering::Relaxed);
+        *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
         BULK_LINK.clear();
         audio::speaker_disconnect();
         println!("[conn] lost. waiting for reconnect...");
@@ -1235,6 +1246,8 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(pre, writer);
     CONNECTED.store(false, Ordering::Relaxed);
+    // 旧セッションの送信チャネルを外す(切断中にトレイ等が旧ソケットへ書き込むのを防ぐ)
+    *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
     BULK_LINK.clear();
     audio::speaker_disconnect();
     tray::notify("tsunagu", "切断しました(自動再接続中)");

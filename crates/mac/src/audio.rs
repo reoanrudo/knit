@@ -325,6 +325,9 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
             let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
             if AudioQueueAllocateBuffer(aq, frame_bytes, &mut buf) != 0 {
                 eprintln!("[audio] AllocateBuffer 失敗");
+                // 生成済みの AudioQueue(内部スレッド・バッファ)を解放せず返ると、
+                // 接続のたびに ensure_playback が再試行して蓄積する
+                AudioQueueDispose(aq, 1);
                 return None;
             }
             (*buf).mAudioDataByteSize = frame_bytes as u32;
@@ -339,6 +342,7 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
         let st = AudioQueueStart(aq, std::ptr::null());
         if st != 0 {
             eprintln!("[audio] AudioQueueStart 失敗 st={st}");
+            AudioQueueDispose(aq, 1);
             return None;
         }
         eprintln!("[audio] AudioQueueStart ok ({rate}Hz, frame_bytes={frame_bytes})");

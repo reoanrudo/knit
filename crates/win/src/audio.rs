@@ -354,25 +354,36 @@ fn audio_run(fixed_host: Option<String>, token: String) {
                 }
             }
         };
-        let addr = match &fixed_host {
+        // 接続先: fixed_host 優先、無ければ本線(PEER)が選んだ Mac へ追従。
+        // 接続に失敗するたび PEER を引き直す(本線の再接続で Mac の IP が変わった後、
+        // 旧アドレスへ無言で無限リトライして音声だけ復帰しないのを防ぐ)
+        let fixed_addr = match &fixed_host {
             Some(h) => match (h.as_str(), 24901u16).to_socket_addrs().ok().and_then(|mut it| it.next()) {
-                Some(a) => a,
+                Some(a) => Some(a),
                 None => {
                     println!("[audio] ホスト解決失敗: {h}");
                     return;
                 }
             },
-            None => loop {
-                if let Some(ip) = crate::peer_ip() {
-                    break std::net::SocketAddr::new(ip, 24901);
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            },
+            None => None,
         };
         let stream = loop {
+            let addr = match fixed_addr {
+                Some(a) => a,
+                None => match crate::peer_ip() {
+                    Some(ip) => std::net::SocketAddr::new(ip, 24901),
+                    None => {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        continue;
+                    }
+                },
+            };
             match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) {
                 Ok(s) => break s,
-                Err(_) => std::thread::sleep(std::time::Duration::from_secs(1)),
+                Err(_) => {
+                    println!("[audio] 接続失敗({addr})。1秒後に再試行");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
             }
         };
         stream.set_nodelay(true).ok();
