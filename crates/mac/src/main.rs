@@ -1036,6 +1036,16 @@ static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 pub(crate) static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
 /// WIN モード中の Windows 仮想カーソル位置(px)。絶対位置送信モードで使う
 static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+
+/// Windows の解像度が変わった(Screen)とき、仮想カーソルを旧画面内の比率の
+/// 位置へ写し直す。補正しないと旧サイズの絶対 px のまま残り、縮小時は境界へ
+/// 張り付いて side=1(右配置)の誤帰還、拡大時は位置が飛ぶ
+fn rescale_win_cur(wc: (f64, f64), old: (f64, f64), new: (f64, f64)) -> (f64, f64) {
+    if old.0 <= 0.0 || old.1 <= 0.0 || new.0 <= 0.0 || new.1 <= 0.0 {
+        return wc;
+    }
+    (wc.0 * new.0 / old.0, wc.1 * new.1 / old.1)
+}
 /// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
 static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 絶対位置送信モード(既定ON。TSUNAGU_MOUSE_MODE=rel で旧・相対移動に戻す)
@@ -1919,7 +1929,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-002812-39ac2c8";
+const BUILD_ID: &str = "build-20260927-003552-3d3f452";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -2561,7 +2571,13 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
                             }
                         }
                         Msg::Screen { w, h } if w > 0 && h > 0 => {
-                            *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
+                            // WIN_SCREEN と WIN_CUR はこの順で保持する(他箇所は
+                            // 同時保持しないため順序固定でデッドロックなし)
+                            let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut ws = WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+                            let old = *ws;
+                            *ws = (w as f64, h as f64);
+                            *wc = rescale_win_cur(*wc, old, *ws);
                             eprintln!("[info] win screen changed {w}x{h}");
                         }
                         Msg::Bye => break,
@@ -2867,5 +2883,27 @@ mod geo_tests {
         assert_eq!(g.along_ratio(0, 4616.0, 520.0), 0.5);
         // 上下の辺は横位置で測る
         assert_eq!(g.along_ratio(3, 1028.0, 1329.0), 0.5);
+    }
+}
+
+#[cfg(test)]
+mod win_cur_tests {
+    use super::rescale_win_cur as rs;
+
+    #[test]
+    fn rescale_keeps_ratio_on_shrink_and_grow() {
+        // 2560x1440 → 1920x1080: 画面内の同じ比率位置へ写す(張り付かせない)
+        assert_eq!(rs((2000.0, 1000.0), (2560.0, 1440.0), (1920.0, 1080.0)), (1500.0, 750.0));
+        // 拡大時も比率維持(位置が飛ばない)
+        assert_eq!(rs((960.0, 540.0), (1920.0, 1080.0), (2560.0, 1440.0)), (1280.0, 720.0));
+        // 同一サイズなら不変
+        assert_eq!(rs((123.0, 456.0), (1920.0, 1080.0), (1920.0, 1080.0)), (123.0, 456.0));
+    }
+
+    #[test]
+    fn rescale_ignores_invalid_sizes() {
+        // 初期値(0x0)や不正値はそのまま(0 除算・暴発写像の防止)
+        assert_eq!(rs((10.0, 20.0), (0.0, 0.0), (1920.0, 1080.0)), (10.0, 20.0));
+        assert_eq!(rs((10.0, 20.0), (1920.0, 1080.0), (0.0, 1080.0)), (10.0, 20.0));
     }
 }
