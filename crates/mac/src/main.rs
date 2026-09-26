@@ -207,6 +207,11 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
                     eprintln!("[file] クリップボードのファイル {} 件を渡します", files.len());
                     send_files_to_win(files, false);
                 }
+            } else if !force && now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
+                // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る。
+                // 明示送信(force)は意図が明確なためそのまま送る
+                eprintln!("[clip] 画像受信直後のため同期を控えます");
+                return;
             } else if let Some(dib) = mac_clipboard_image_dib() {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
                     Ok(()) => {
@@ -234,6 +239,10 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
 
 /// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
 static LAST_RECV_CLIP: Mutex<Option<String>> = Mutex::new(None);
+/// 最後の画像受信時刻(ms)。受信画像のクリップボード載せ→changeCount 更新の
+/// 間に切替同期が走ると画像を送り返してしまう(最大 64MB の無駄転送)ため、
+/// 直近の受信では画像送信を 1 回控える(changeCount 保護の二重ガード)
+static LAST_IMG_RX_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const CLIP_MAX_BYTES: usize = 1024 * 1024; // 1MB(Win側と同じ上限)
 
 type ID = *mut core::ffi::c_void;
@@ -689,6 +698,7 @@ fn mac_on_bulk(e: bulk::Event) {
             if !CLIP_SHARE.load(Ordering::Relaxed) {
                 return;
             }
+            LAST_IMG_RX_MS.store(now_ms(), Ordering::Relaxed);
             let ok = unsafe { mac_set_clipboard_image_bmp(&dib_to_bmp(&dib)) };
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
             eprintln!("[clip] win->mac image {}KB {}", dib.len() / 1024, if ok { "ok" } else { "FAILED" });
