@@ -69,6 +69,12 @@
 16. **windows-sys に COM インターフェースの vtbl は無い**→自前定義
     (crates/win/src/dragdrop.rs の IDataObject/IDropSource/IEnumFORMATETC)。
     vtbl の並びは MSDN のメソッド順どおり。並びを間違えると即クラッシュ
+17. **static Mutex の guard を保持したまま、同じ Mutex を取る関数を呼ぶと
+    自己デッドロック**(std::sync::Mutex は再入不可。実績: 受信履歴テストが
+    guard 保持中に push_recent_rx を呼び、テストが永久ブロック)。テストでは
+    scope を切って guard を確実に落としてから関数を呼ぶ
+18. **Link::send はクロージャを消費する(FnOnce)**。再試行で同じクロージャを
+    2 回使いたい時は生成を関数化/macro で書く(転送の進捗ログの実績)
 
 ## コード規約(このプロジェクト固有)
 
