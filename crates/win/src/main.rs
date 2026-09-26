@@ -1208,9 +1208,10 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
             backoff = (backoff * 2).min(3000);
             continue;
         }
+        let t0 = Instant::now();
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
-                println!("[conn] connected ({a})");
+                println!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
                 *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
                 // TCP だけ繋がる相手(LAN 発見で拾った旧版・別トークンの応答者)はハンドシェイクで

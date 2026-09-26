@@ -2767,9 +2767,10 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
             backoff = (backoff * 2).min(3000);
             continue;
         }
+        let t0 = std::time::Instant::now();
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
-                eprintln!("[conn] connected ({a})");
+                eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
                 match client_attempt(s, &token, screen_w, screen_h) {
                     Ok(()) => backoff = 500,
