@@ -668,6 +668,63 @@ fn mac_on_bulk(e: bulk::Event) {
     })
 }
 
+/// ゲームモード(Windows 側がカーソルの閉じ込め等を検知して要求)。true の間は
+/// 絶対位置ではなく相対移動で送る(FPS・3D ソフトの視点回転のため)
+static GAME_REL: AtomicBool = AtomicBool::new(false);
+/// 画面ロックの連動(TSUNAGU_LOCK_SYNC=0 で無効)
+static LOCK_SYNC: AtomicBool = AtomicBool::new(true);
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
+}
+
+/// Secure Input(パスワード欄等でキー入力の横取りを OS が止める状態)の原因アプリ名。
+/// この間はキーボードを Windows へ送れないため、切替時に知らせる(Deskflow と同じ配慮)
+fn secure_input_app() -> Option<String> {
+    if unsafe { IsSecureEventInputEnabled() } == 0 {
+        return None;
+    }
+    let out = std::process::Command::new("ioreg").args(["-l", "-w", "0", "-d", "1"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let pid = text
+        .split("kCGSSessionSecureInputPID\"=")
+        .nth(1)
+        .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|s| !s.is_empty());
+    let name = pid.and_then(|pid| {
+        let o = std::process::Command::new("ps").args(["-p", pid, "-o", "comm="]).output().ok()?;
+        let n = String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next()?.to_string();
+        (!n.is_empty()).then_some(n)
+    });
+    Some(name.unwrap_or_else(|| "不明なアプリ".into()))
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGSessionCopyCurrentDictionary() -> *const core::ffi::c_void;
+    fn CFDictionaryGetValue(d: *const core::ffi::c_void, key: *const core::ffi::c_void) -> *const core::ffi::c_void;
+    fn CFBooleanGetValue(b: *const core::ffi::c_void) -> u8;
+}
+
+/// Mac の画面がロックされているか
+fn screen_locked() -> bool {
+    unsafe {
+        let d = CGSessionCopyCurrentDictionary();
+        if d.is_null() {
+            return false;
+        }
+        let key = CFStringCreateWithCString(std::ptr::null_mut(), c"CGSSessionScreenIsLocked".as_ptr(), 0x0800_0100);
+        let v = if key.is_null() { std::ptr::null() } else { CFDictionaryGetValue(d, key as *const _) };
+        let locked = !v.is_null() && CFBooleanGetValue(v) != 0;
+        if !key.is_null() {
+            CFRelease(key as *mut _);
+        }
+        CFRelease(d as *mut _);
+        locked
+    }
+}
+
 /// 本線がいま繋がっている Windows のアドレス(大容量経路の接続先・経路診断に使う)
 static PEER_IP: Mutex<Option<std::net::IpAddr>> = Mutex::new(None);
 
@@ -1112,6 +1169,19 @@ unsafe fn set_cursor_in_background() {
 
 fn enter_win_mode_cursor_lock() {
     sync_clipboard_to_win();
+    std::thread::spawn(|| {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        if let Some(app) = secure_input_app() {
+            eprintln!("[secure] Secure Input 有効(原因: {app})。キーボードは Windows へ届きません");
+            let now = now_ms();
+            if now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) > 60_000 {
+                notify(
+                    "tsunagu",
+                    &format!("「{app}」がパスワード入力等の保護を有効にしているため、キーボードを Windows へ送れません。そのアプリの入力欄から離れてください"),
+                );
+            }
+        }
+    });
     // 持ち越していたスクロール残量を切替時に捨てる(切替直後の意図しないスクロール防止)
     *SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
     // Deskflow leave() 相当: hideCursor(プロパティ付き) → suppression間隔最小化 → 関連切断 → warp固定
@@ -1644,7 +1714,7 @@ unsafe extern "C" fn tap_callback(
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
                 let sc = mouse_scale();
-                if MOUSE_ABS_MODE.load(Ordering::Relaxed) {
+                if MOUSE_ABS_MODE.load(Ordering::Relaxed) && !GAME_REL.load(Ordering::Relaxed) {
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
                     let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -1915,6 +1985,9 @@ fn main() {
     if envutil::get("TSUNAGU_SWIPE_NAV").as_deref() == Some("0") {
         SWIPE_NAV.store(false, Ordering::Relaxed);
     }
+    if envutil::get("TSUNAGU_LOCK_SYNC").as_deref() == Some("0") {
+        LOCK_SYNC.store(false, Ordering::Relaxed);
+    }
     if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);
     }
@@ -2019,6 +2092,26 @@ fn main() {
                     }
                 }
             }
+        }
+    });
+
+    // 画面ロックの連動(1 秒毎)。Mac がロックされたら Windows 操作中でも制御を
+    // Mac へ戻し(ロック中の入力を Windows へ流さない)、Windows もロックする
+    std::thread::spawn(|| {
+        let mut was = false;
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let now = screen_locked();
+            if now && !was {
+                eprintln!("[lock] Mac がロックされました");
+                if WIN_MODE.swap(false, Ordering::Relaxed) {
+                    leave_win_mode_cursor_unlock(None);
+                }
+                if LOCK_SYNC.load(Ordering::Relaxed) && CONNECTED.load(Ordering::Relaxed) {
+                    send_msg(&Msg::Lock);
+                }
+            }
+            was = now;
         }
     });
 
@@ -2208,7 +2301,10 @@ fn main() {
             // 異常。強制的に Mac へ復帰させ、操作不能な状態に陥らないようにする。
             // LAST_ABS_MS は絶対位置モードしか更新しないため、条件にモードを含めないと
             // 相対モード(rel)で必ず誤発火する(rel が5秒で強制復帰されていた実績バグ)
-            if WIN_MODE.load(Ordering::Relaxed) && MOUSE_ABS_MODE.load(Ordering::Relaxed) {
+            if WIN_MODE.load(Ordering::Relaxed)
+                && MOUSE_ABS_MODE.load(Ordering::Relaxed)
+                && !GAME_REL.load(Ordering::Relaxed)
+            {
                 let now = now_ms();
                 let last_ev = LAST_EVENT_MS.load(Ordering::Relaxed);
                 let last_abs = LAST_ABS_MS.load(Ordering::Relaxed);
@@ -2354,6 +2450,11 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             send_msg(&Msg::Stat { rtt });
                         }
                         Msg::Ping { ts } => send_msg(&Msg::Pong { ts }),
+                        Msg::Rel { on } => {
+                            if GAME_REL.swap(on, Ordering::Relaxed) != on {
+                                eprintln!("[game] ゲームモード -> {}", if on { "ON(相対移動)" } else { "OFF(絶対位置)" });
+                            }
+                        }
                         Msg::Screen { w, h } if w > 0 && h > 0 => {
                             *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
                             eprintln!("[info] win screen changed {w}x{h}");

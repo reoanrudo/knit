@@ -660,6 +660,117 @@ fn inject_scroll(dx: f64, dy: f64) -> bool {
     ok
 }
 
+// ---------- 前面アプリに応じたキー配置(ターミナルでは Control → Ctrl) ----------
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowThreadProcessId(hwnd: *mut core::ffi::c_void, pid: *mut u32) -> u32;
+    fn GetCursorInfo(info: *mut CursorInfo) -> i32;
+    fn GetClipCursor(rect: *mut RectL) -> i32;
+    fn GetWindowRect(hwnd: *mut core::ffi::c_void, rect: *mut RectL) -> i32;
+    fn LockWorkStation() -> i32;
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+    fn QueryFullProcessImageNameW(h: *mut core::ffi::c_void, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+}
+#[repr(C)]
+#[derive(Default, Clone, Copy, PartialEq)]
+struct RectL {
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+}
+#[repr(C)]
+struct CursorInfo {
+    size: u32,
+    flags: u32,
+    cursor: *mut core::ffi::c_void,
+    x: i32,
+    y: i32,
+}
+
+/// Mac の Control を Windows の Ctrl として送るアプリ(実行ファイル名、小文字)。
+/// 既定のキー配置では Control→Win キーのため、ターミナルの Ctrl+A/E/R/C が
+/// Win+A 等に化けて使えない。TSUNAGU_CTRL_APPS(カンマ区切り)で置き換えられる
+fn ctrl_apps() -> &'static Vec<String> {
+    static APPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    APPS.get_or_init(|| {
+        let list = tsunagu_common::envutil::get("TSUNAGU_CTRL_APPS").unwrap_or_else(|| {
+            "windowsterminal.exe,cmd.exe,powershell.exe,pwsh.exe,wsl.exe,conhost.exe,mintty.exe,\
+             alacritty.exe,wezterm-gui.exe,putty.exe,kitty.exe,tabby.exe,hyper.exe"
+                .into()
+        });
+        list.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()
+    })
+}
+
+fn foreground_exe(hwnd: *mut core::ffi::c_void) -> Option<String> {
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return None;
+        }
+        let h = OpenProcess(0x1000 /*PROCESS_QUERY_LIMITED_INFORMATION*/, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let mut n = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut n);
+        windows_sys::Win32::Foundation::CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let path = String::from_utf16_lossy(&buf[..n as usize]);
+        path.rsplit('\\').next().map(|s| s.to_ascii_lowercase())
+    }
+}
+
+/// 前面がターミナル系アプリか(ウィンドウが変わった時だけ調べ直す)
+fn terminal_profile() -> bool {
+    static CACHE: std::sync::Mutex<(usize, bool)> = std::sync::Mutex::new((0, false));
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut c = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if c.0 != hwnd as usize {
+        let exe = foreground_exe(hwnd);
+        let on = exe.as_ref().is_some_and(|e| ctrl_apps().contains(e));
+        if on != c.1 {
+            println!("[keys] 前面 {:?}: Control → {}", exe.as_deref().unwrap_or("?"), if on { "Ctrl" } else { "Win" });
+        }
+        *c = (hwnd as usize, on);
+    }
+    c.1
+}
+
+/// ゲームモード判定: カーソルが画面の一部に閉じ込められている(ClipCursor)、または
+/// 全画面ウィンドウでカーソルが隠れ続けている。絶対座標の注入では FPS や 3D ソフトの
+/// 視点回転が効かないため、この間は Mac に相対移動で送ってもらう
+fn game_like() -> bool {
+    unsafe {
+        let (vx, vy, vw, vh) = vscreen();
+        let mut clip = RectL::default();
+        let clipped = GetClipCursor(&mut clip) != 0
+            && clip != RectL { l: vx, t: vy, r: vx + vw, b: vy + vh }
+            && (clip.r - clip.l) < vw;
+        if clipped {
+            return true;
+        }
+        let mut ci = CursorInfo { size: std::mem::size_of::<CursorInfo>() as u32, flags: 0, cursor: std::ptr::null_mut(), x: 0, y: 0 };
+        let hidden = GetCursorInfo(&mut ci) != 0 && ci.flags & 1 /*CURSOR_SHOWING*/ == 0;
+        if !hidden {
+            return false;
+        }
+        let fg = GetForegroundWindow();
+        let mut r = RectL::default();
+        GetWindowRect(fg, &mut r) != 0
+            && (r.r - r.l) >= GetSystemMetrics(SM_CXSCREEN)
+            && (r.b - r.t) >= GetSystemMetrics(SM_CYSCREEN)
+    }
+}
+
 // ---------- 修飾キー状態管理(Mac mods → Win VK) ----------
 struct ModState {
     ctrl: bool,
@@ -706,7 +817,9 @@ impl ModState {
         } else {
             (VK_CONTROL, VK_MENU)
         };
-        let want = [(cmd_vk, cmd), (opt_vk, opt), (VK_LWIN, ctrl), (VK_SHIFT, shift)];
+        // ターミナル系アプリでは Mac の Control を Windows の Ctrl として送る
+        let ctrl_vk = if ctrl && terminal_profile() { VK_CONTROL } else { VK_LWIN };
+        let want = [(cmd_vk, cmd), (opt_vk, opt), (ctrl_vk, ctrl), (VK_SHIFT, shift)];
         let mut state = [
             (VK_CONTROL, &mut self.ctrl),
             (VK_MENU, &mut self.alt),
@@ -714,7 +827,8 @@ impl ModState {
             (VK_SHIFT, &mut self.shift),
         ];
         for (vk, cur) in &mut state {
-            let target = want.iter().find(|(v, _)| *v == *vk).map(|(_, t)| *t).unwrap_or(false);
+            // 複数の Mac 修飾が同じ VK に対応し得るため、いずれかが押されていれば押下
+            let target = want.iter().any(|(v, t)| *v == *vk && *t);
             if **cur != target {
                 inject_key(*vk, !target);
             }
@@ -1194,6 +1308,33 @@ fn session(stream: TcpStream) -> std::io::Result<()> {
         });
     }
 
+    // ゲームモード監視(250ms 毎)。隠れカーソルは「入力中にポインタを隠す」設定等でも
+    // 起きるため、全画面かつ 1.5 秒継続した時だけ採用する。TSUNAGU_GAME_MODE=0 で無効
+    if tsunagu_common::envutil::get("TSUNAGU_GAME_MODE").as_deref() != Some("0") {
+        let tx = wtx.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            let mut on = false;
+            let mut since: Option<Instant> = None;
+            while running.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(250));
+                let now = if game_like() {
+                    since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_millis(1500)
+                } else {
+                    since = None;
+                    false
+                };
+                if now != on {
+                    on = now;
+                    println!("[game] ゲームモード -> {}", if on { "ON(相対移動)" } else { "OFF(絶対位置)" });
+                    if tx.send(encode(&Msg::Rel { on })).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     // 画面構成(解像度・モニター抜き差し)の変化を 2 秒毎に確認し Mac へ知らせる
     // (Mac 側の速度換算と端の判定が古い大きさのままになるのを防ぐ)
     {
@@ -1394,6 +1535,11 @@ fn session(stream: TcpStream) -> std::io::Result<()> {
                     continue;
                 }
                 inject_scroll(dx, dy);
+            }
+            Msg::Lock => {
+                println!("[lock] Mac がロックされたため Windows もロックします");
+                mods.release_everything();
+                unsafe { LockWorkStation() };
             }
             Msg::Leave => {
                 // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で

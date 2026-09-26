@@ -130,6 +130,13 @@ pub mod proto {
         /// 画面構成の変化(Windows→Mac)。解像度変更・モニター抜き差しで送る
         #[serde(rename = "screen")]
         Screen { w: i32, h: i32 },
+        /// ゲームモード(Windows→Mac)。カーソルが閉じ込められた/全画面で隠れた間は
+        /// 相対移動で送ってほしい(絶対座標では視点回転が効かない)
+        #[serde(rename = "rel")]
+        Rel { on: bool },
+        /// 画面ロックの連動(Mac→Windows)。Mac がロックされたら Windows もロックする
+        #[serde(rename = "lock")]
+        Lock,
         #[serde(rename = "key")]
         Key {
             kc: u16,
