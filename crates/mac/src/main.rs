@@ -209,7 +209,12 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
                 }
             } else if let Some(dib) = mac_clipboard_image_dib() {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => eprintln!("[clip] mac->win image {}KB", dib.len() / 1024),
+                    Ok(()) => {
+                        eprintln!("[clip] mac->win image {}KB", dib.len() / 1024);
+                        if force {
+                            notify("tsunagu", "クリップボードの画像を Windows へ送りました");
+                        }
+                    }
                     Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
                 }
             }
@@ -221,6 +226,9 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
         }
         eprintln!("[clip] mac->win {} bytes", text.len());
         send_msg(&Msg::Clip { text });
+        if force {
+            notify("tsunagu", "クリップボードを Windows へ送りました");
+        }
     }));
 }
 

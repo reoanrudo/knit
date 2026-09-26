@@ -231,13 +231,21 @@ pub(crate) fn sync_clipboard_to_mac(force: bool) {
             if !text.is_empty() && text.len() <= CLIP_MAX_CHARS && !echo {
                 println!("[clip] win->mac {} bytes", text.len());
                 let _ = tx.send(encode(&Msg::Clip { text }));
+                if force {
+                    tray::notify("tsunagu", "クリップボードを Mac へ送りました");
+                }
             }
             return;
         }
         if let Some(dib) = clipboard_read_dib() {
             if dib.len() <= bulk::MAX_IMAGE {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => println!("[clip] win->mac image {}KB", dib.len() / 1024),
+                    Ok(()) => {
+                        println!("[clip] win->mac image {}KB", dib.len() / 1024);
+                        if force {
+                            tray::notify("tsunagu", "クリップボードの画像を Mac へ送りました");
+                        }
+                    }
                     Err(e) => println!("[clip] win->mac image 送信失敗: {e}"),
                 }
             }
