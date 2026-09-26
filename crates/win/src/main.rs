@@ -929,14 +929,21 @@ fn detach_if_console() {
             Ok(p) => p,
             Err(_) => return,
         };
-        // コマンドラインを "exeパス" 引数… の形で組み立てる
+        // コマンドラインを "exeパス" 引数… の形で組み立てる。
+        // 空白入りの引数が割れないよう、含む時だけクォートする(" は \" へ)
         let mut cmd = String::new();
         cmd.push('"');
         cmd.push_str(&exe.to_string_lossy());
         cmd.push('"');
         for a in std::env::args().skip(1) {
             cmd.push(' ');
-            cmd.push_str(&a);
+            if a.is_empty() || a.chars().any(char::is_whitespace) {
+                cmd.push('"');
+                cmd.push_str(&a.replace('"', "\\\""));
+                cmd.push('"');
+            } else {
+                cmd.push_str(&a);
+            }
         }
         let mut cmdw: Vec<u16> = cmd.encode_utf16().collect();
         cmdw.push(0);
