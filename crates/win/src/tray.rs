@@ -136,6 +136,8 @@ const MENU_RESTART: u32 = 1005;
 const MENU_SAVEHOST: u32 = 1006;
 const MENU_BACKMAC: u32 = 1007;
 const MENU_OPENFOLDER: u32 = 1008;
+const MENU_SENDCLIP: u32 = 1009;
+const MENU_OPENLAST: u32 = 1010;
 // ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
 const ID_LBL_STATE: u32 = 210;
 const ID_HEAD_CONN: u32 = 211;
@@ -435,6 +437,32 @@ unsafe fn handle_command(id: u32) {
             if let Some(tx) = guard.as_ref() {
                 let _ = tx.send(crate::proto_return());
                 println!("[tray] Mac へ戻る");
+            }
+        }
+        MENU_SENDCLIP => {
+            // 画面を切り替えずに今のクリップボードを Mac へ渡す
+            // (通常の同期は画面を移る時だけのため、明示送信の経路)
+            crate::sync_clipboard_to_mac(true);
+            println!("[tray] クリップボードを今すぐ Mac へ送ります");
+        }
+        MENU_OPENLAST => {
+            // 最新の受信ファイルを規定アプリで開く(履歴は新しい順)
+            let last = crate::RECENT_RX_W.lock().unwrap_or_else(|e| e.into_inner()).first().cloned();
+            match last {
+                Some(p) => {
+                    let mut w: Vec<u16> = p.encode_utf16().collect();
+                    w.push(0);
+                    let verb = wide("open");
+                    ShellExecuteW(
+                        std::ptr::null_mut(),
+                        verb.as_ptr(),
+                        w.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        5, /*SW_SHOW*/
+                    );
+                }
+                None => notify("tsunagu", "まだファイルを受信していません"),
             }
         }
         MENU_OPENFOLDER => {
@@ -791,6 +819,10 @@ unsafe fn open_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
     let mut bm = wide("Mac へ戻る");
     AppendMenuW(menu, MF_STRING, MENU_BACKMAC as usize, bm.as_ptr());
+    let mut sc = wide("クリップボードを今すぐ Mac へ");
+    AppendMenuW(menu, MF_STRING, MENU_SENDCLIP as usize, sc.as_ptr());
+    let mut ol = wide("最新の受信ファイルを開く");
+    AppendMenuW(menu, MF_STRING, MENU_OPENLAST as usize, ol.as_ptr());
     let mut fo = wide("受信フォルダを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
     let mut log_w = wide("ログを開く");

@@ -180,15 +180,17 @@ static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::Atom
 
 /// Windows へ入る時に Mac のクリップボードを渡す(Deskflow と同じ「画面を離れる時に
 /// 同期」方式)。コピーのたびに送る旧方式は、Mac 内だけのコピペでも最大 200MB の
-/// ファイルを流し、パスワード等も即座に相手へ渡っていた
-fn sync_clipboard_to_win() {
+/// ファイルを流し、パスワード等も即座に相手へ渡っていた。
+/// force=true はメニューの「今すぐ Windows へ送る」用: 変化チェックだけを飛ばし、
+/// 秘匿除外・エコーバック防止はそのまま効く
+pub(crate) fn sync_clipboard_to_win(force: bool) {
     if !CLIP_SHARE.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
         return;
     }
     // 貼り付け元アプリの遅延提供データ読み出しでタップを止めないよう別スレッドで行う
-    std::thread::spawn(|| with_pool(|| unsafe {
+    std::thread::spawn(move || with_pool(|| unsafe {
         let cnt = clipboard_change_count();
-        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt {
+        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt && !force {
             return;
         }
         if pb_is_concealed(general_pasteboard()) {
@@ -643,6 +645,7 @@ fn mac_on_bulk(e: bulk::Event) {
             // 自分が載せたファイルを Windows へ送り返さない
             *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = mac_files_key(&paths);
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+            push_recent_rx(&paths);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
@@ -806,6 +809,17 @@ static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
 /// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
 static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
+/// 最近 Windows から受信したファイル(メニューの「最新の受信を開く」用。新しい順に最大 10 件)
+pub(crate) static RECENT_RX: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+
+/// 受信履歴へ追加(新しい順で先頭に挿入し、10 件で打ち切る。バッチ内の元順は保つ)
+pub(crate) fn push_recent_rx(paths: &[std::path::PathBuf]) {
+    let mut r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
+    for p in paths.iter().rev() {
+        r.insert(0, p.clone());
+    }
+    r.truncate(10);
+}
 static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<secure::Writer>>>> = OnceLock::new();
 static TAP_PORT: OnceLock<usize> = OnceLock::new();
@@ -1173,7 +1187,7 @@ unsafe fn set_cursor_in_background() {
 }
 
 fn enter_win_mode_cursor_lock() {
-    sync_clipboard_to_win();
+    sync_clipboard_to_win(false);
     std::thread::spawn(|| {
         static LAST: AtomicU64 = AtomicU64::new(0);
         if let Some(app) = secure_input_app() {
@@ -1359,6 +1373,22 @@ unsafe extern "C" fn tap_callback(
             };
             send_msg(&Msg::Vol { op });
             return std::ptr::null_mut(); // Mac 側の音量変更を抑制
+        }
+        // メディアキー(F7=巻き戻し 100 / F8=再生切替 101 / F9=早送り 103)も fn フラグ
+        // 付きで本体操作として届く。Windows 側のメディアキーとして転送し Mac 側は握る。
+        // fn 無しの F7-F9 は従来どおり F キーとして転送される
+        if event_type == EVT_KEY_DOWN
+            && matches!(kc, 100 | 101 | 103)
+            && CGEventGetFlags(event) & FLAG_FN != 0
+            && win_mode
+        {
+            let op = match kc {
+                100 => 3u8, // 前へ
+                101 => 4,   // 再生/一時停止
+                _ => 5,     // 次へ
+            };
+            send_msg(&Msg::Vol { op });
+            return std::ptr::null_mut();
         }
         if kc == hotkey_kc() {
             let pressed = match event_type {
@@ -1870,6 +1900,7 @@ const BUILD_ID: &str = "build-20260926-171337-f561628";
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--preview-setup") { let _=gui::setup::first_run(true); return; }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
         if gui::start() {
@@ -1886,16 +1917,15 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|v| v.parse().ok())
         .unwrap_or(PORT);
-    // トークンは必須(旧既定値 "tsunagu-dev" での脆弱な稼働を廃止。
-    // 環境変数 > exe同階層.env > ~/.config/tsunagu/env の順で解決する)
-    let token = match envutil::get("TSUNAGU_TOKEN") {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!(
-                "[fatal] TSUNAGU_TOKEN が未設定です。`scripts/gen-token.sh` を実行するか、\
-                 ~/.config/tsunagu/env に TSUNAGU_TOKEN=<ランダム値> を設定してください"
-            );
-            std::process::exit(1);
+    // 既存のenvを優先。新規利用者だけOS保護の接続キーと初回導入を使用する。
+    let no_gui = args.iter().any(|a| a == "--no-gui")
+        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v|v=="1");
+    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t|!t.is_empty()) { t } else {
+        match tsunagu_common::credentials::load() {
+            Ok(Some(t))=>t,
+            Ok(None) if !no_gui=>match gui::setup::first_run(false){Some(t)=>t,None=>return},
+            Ok(None)=>{eprintln!("[setup] 接続キー未設定。GUIで初回登録を完了してください。");return;},
+            Err(_)=>{if !no_gui{gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
         }
     };
 
@@ -2678,6 +2708,41 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);
+    }
+}
+
+#[cfg(test)]
+mod recent_tests {
+    use super::{push_recent_rx, RECENT_RX};
+    use std::path::PathBuf;
+
+    /// 履歴は新しい順・10 件で打ち切り・バッチ内の元順は保存
+    #[test]
+    fn recent_rx_keeps_newest_first_and_caps_at_10() {
+        let mk = |i: usize| PathBuf::from(format!("/tmp/tsunagu-recent-{i}.txt"));
+        {
+            let mut r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
+            r.clear();
+        }
+        push_recent_rx(&[mk(0), mk(1)]); // 古いバッチ(2 件)
+        for i in 2..12 {
+            push_recent_rx(&[mk(i)]);
+        }
+        {
+            let r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(r.len(), 10, "10 件で打ち切る: {:?}", r);
+            assert_eq!(r[0], mk(11), "最新が先頭");
+            assert_eq!(r[9], mk(2), "最古は 2(0/1 は押し出される");
+        }
+        // バッチ内の元順(バッチ先頭が先頭に来る)。guard は push 前に必ず解放する
+        // (push_recent_rx が同じ Mutex を取り、保持したまま呼ぶと自己デッドロック)
+        {
+            RECENT_RX.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        push_recent_rx(&[mk(20), mk(21)]);
+        let r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(r[0], mk(20));
+        assert_eq!(r[1], mk(21));
     }
 }
 

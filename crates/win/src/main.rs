@@ -179,6 +179,8 @@ static XBTN_W: [std::sync::atomic::AtomicBool; 2] = [
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// 累計ファイル受信数(ステータス窓の表示用)
 pub static FILES_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 最近 Mac から受信したファイル(トレイの「最新の受信を開く」用。新しい順に最大 10 件)
+pub(crate) static RECENT_RX_W: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 /// Mac のクリップボード共有設定(Cfg で同期)。OFF の間は Windows からも送らない
 static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
@@ -204,13 +206,14 @@ fn clipboard_is_excluded() -> bool {
 /// Mac へ制御が戻る時に Windows のクリップボードを渡す(Deskflow と同じ「画面を
 /// 離れる時に同期」方式)。旧方式は 200ms ごとに本文と画像全体を読み、画像は毎回
 /// base64 化して比較していた(常時の CPU・メモリ負荷。レビュー D-F1)。
-/// シーケンス番号が変わっていない限りクリップボードを開きもしない
-fn sync_clipboard_to_mac() {
+/// シーケンス番号が変わっていない限りクリップボードを開きもしない。
+/// force=true はトレイの「今すぐ Mac へ送る」用
+pub(crate) fn sync_clipboard_to_mac(force: bool) {
     if !CLIP_SHARE_W.load(Ordering::Relaxed) {
         return;
     }
     let seq = clipboard_seq();
-    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq {
+    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq && !force {
         return;
     }
     let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
@@ -493,6 +496,13 @@ fn win_on_bulk(e: bulk::Event) {
             let files: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
             let n = files.len();
             FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
+            {
+                let mut r = RECENT_RX_W.lock().unwrap_or_else(|e| e.into_inner());
+                for f in files.iter().rev() {
+                    r.insert(0, f.clone());
+                }
+                r.truncate(10);
+            }
             // 自分が渡す CF_HDROP を Mac へ送り返さない
             *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) = Some(files_key(&files));
             if drop && BTN_W[0].load(Ordering::Relaxed) {
@@ -1398,29 +1408,36 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 }
             }
             Msg::Vol { op } => {
-                // VK_VOLUME_UP(0xAF)/DOWN(0xAE)/MUTE(0xAD)。up/down は2回送って調整幅を稼ぐ
+                // VK_VOLUME_UP(0xAF)/DOWN(0xAE)/MUTE(0xAD)。up/down は2回送って調整幅を稼ぐ。
+                // op 3-5 はメディア制御(前へ/再生切替/次へ)= Mac の F7/F8/F9 転送
                 const VK_VOL_UP: u16 = 0xAF;
                 const VK_VOL_DOWN: u16 = 0xAE;
                 const VK_VOL_MUTE: u16 = 0xAD;
-                match op {
-                    0 => {
-                        for _ in 0..2 {
-                            inject_key(VK_VOL_UP, false);
-                            inject_key(VK_VOL_UP, true);
+                if let Some(vk) = tsunagu_common::proto::media_vk(op) {
+                    inject_key(vk, false);
+                    inject_key(vk, true);
+                    println!("[vol] media op={op}");
+                } else {
+                    match op {
+                        0 => {
+                            for _ in 0..2 {
+                                inject_key(VK_VOL_UP, false);
+                                inject_key(VK_VOL_UP, true);
+                            }
+                        }
+                        1 => {
+                            for _ in 0..2 {
+                                inject_key(VK_VOL_DOWN, false);
+                                inject_key(VK_VOL_DOWN, true);
+                            }
+                        }
+                        _ => {
+                            inject_key(VK_VOL_MUTE, false);
+                            inject_key(VK_VOL_MUTE, true);
                         }
                     }
-                    1 => {
-                        for _ in 0..2 {
-                            inject_key(VK_VOL_DOWN, false);
-                            inject_key(VK_VOL_DOWN, true);
-                        }
-                    }
-                    _ => {
-                        inject_key(VK_VOL_MUTE, false);
-                        inject_key(VK_VOL_MUTE, true);
-                    }
+                    println!("[vol] op={op}");
                 }
-                println!("[vol] op={op}");
             }
             Msg::Stat { rtt } => {
                 RTT_MS.store(rtt, Ordering::Relaxed);
@@ -1539,7 +1556,7 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で
                 // コピーされた内容があれば Mac へ渡す
                 mods.release_everything();
-                sync_clipboard_to_mac();
+                sync_clipboard_to_mac(false);
             }
             Msg::Warp { nx, ny } => {
                 let (vx, vy, vw, vh) = vscreen();

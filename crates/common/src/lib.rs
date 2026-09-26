@@ -1,3 +1,4 @@
+pub mod credentials;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
     //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env。
@@ -224,6 +225,18 @@ pub mod proto {
         let mut s = serde_json::to_string(msg).unwrap_or_default();
         s.push('\n');
         s
+    }
+
+    /// Vol の op のうちメディア制御(3=前へ/4=再生・一時停止/5=次へ)に対応する
+    /// Windows のメディア VK。op 0-2(音量)は None。両側で意味の対応を
+    /// 1 箇所で保証するためにここへ置く
+    pub fn media_vk(op: u8) -> Option<u16> {
+        Some(match op {
+            3 => 0xB1, // VK_MEDIA_PREV_TRACK
+            4 => 0xB3, // VK_MEDIA_PLAY_PAUSE
+            5 => 0xB0, // VK_MEDIA_NEXT_TRACK
+            _ => return None,
+        })
     }
 
     pub fn decode(line: &str) -> Option<Msg> {
@@ -1301,6 +1314,18 @@ mod tests {
         );
         assert!(t0.elapsed() >= Duration::from_millis(250), "タイムアウト前に返った: {:?}", t0.elapsed());
         drop(quiet);
+    }
+
+    /// media_vk: Vol のメディア拡張 op と Windows VK の対応の固定
+    #[test]
+    fn media_vk_maps_ops_to_windows_media_keys() {
+        use super::proto::media_vk;
+        assert_eq!(media_vk(3), Some(0xB1)); // 前へ
+        assert_eq!(media_vk(4), Some(0xB3)); // 再生・一時停止
+        assert_eq!(media_vk(5), Some(0xB0)); // 次へ
+        assert_eq!(media_vk(0), None); // 音量 up は対象外
+        assert_eq!(media_vk(2), None);
+        assert_eq!(media_vk(6), None);
     }
 
     /// resolve の併合: 発見結果を先頭に、手動指定を重複排除して並べる
