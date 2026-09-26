@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crate::{do_toggle, msg0, msg0_cstr, nsstring, objc_getClass};
+use crate::{msg0, msg0_cstr, nsstring, objc_getClass};
 
 type ID = *mut core::ffi::c_void;
 type SEL = *mut core::ffi::c_void;
@@ -109,7 +109,6 @@ unsafe fn msg5_timer(target: ID, cmd: SEL, t: f64, a: ID, b: SEL, c: ID, r: u8) 
 static GUI_TARGET: AtomicUsize = AtomicUsize::new(0);
 static GUI_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static GUI_STATE_ITEM: AtomicUsize = AtomicUsize::new(0);
-static GUI_TOGGLE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_MODE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_TAPS_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_AUDIO_ITEM: AtomicUsize = AtomicUsize::new(0);
@@ -180,10 +179,6 @@ unsafe extern "C" fn imp_scroll_gain(_s: ID, _c: SEL, sender: ID) {
     preferences::save();
 }
 
-unsafe extern "C" fn imp_toggle(_s: ID, _c: SEL, _n: ID) {
-    do_toggle("menu");
-    refresh_status();
-}
 unsafe extern "C" fn imp_switch_mode(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::HOTKEY_ONLY.load(Ordering::Relaxed);
     crate::HOTKEY_ONLY.store(next, Ordering::Relaxed);
@@ -1023,15 +1018,6 @@ fn refresh_status() {
             let text = format!("{conn} ・ {mode}{rtt_s}{route_s}");
             msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
         }
-        let toggle = GUI_TOGGLE_ITEM.load(Ordering::Relaxed) as ID;
-        if !toggle.is_null() {
-            let t = if win {
-                "Mac へ戻る"
-            } else {
-                "Windows へ切替"
-            };
-            msg1_void_id(toggle, sel(c"setTitle:"), nsstring(t));
-        }
         let mode_item = GUI_MODE_ITEM.load(Ordering::Relaxed) as ID;
         if !mode_item.is_null() {
             let hotkey = crate::HOTKEY_ONLY.load(Ordering::Relaxed);
@@ -1181,7 +1167,6 @@ unsafe fn make_target() -> ID {
         (c"sdReturnMac:", prefs::return_mac as *const () as usize),
         (c"sdRegistration:", setup::show_registration as *const () as usize),
         (c"sdScrollSpeed:", prefs::scroll_speed as *const () as usize),
-        (c"sdToggle:", imp_toggle as *const () as usize),
         (c"sdSwitchMode:", imp_switch_mode as *const () as usize),
         (c"sdEdgeTaps:", imp_edge_taps as *const () as usize),
         (c"sdOpenLog:", imp_open_log as *const () as usize),
@@ -1276,15 +1261,6 @@ pub fn start() -> bool {
             menu,
             msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
         );
-
-        let toggle = menu_item("Windows へ切替", Some(c"sdToggle:"), "");
-        if toggle.is_null() {
-            return false;
-        }
-        msg1_void_id(toggle, sel(c"setTarget:"), target);
-        msg1_void_sel(toggle, sel(c"setAction:"), sel(c"sdToggle:"));
-        let _ = GUI_TOGGLE_ITEM.store(toggle as usize, Ordering::Relaxed);
-        add_item(menu, toggle);
 
         // 画面を切り替えずにクリップボードを渡す(通常の同期は画面を移る時だけのため)
         let send_clip = menu_item("クリップボードを今すぐ Windows へ", Some(c"sdSendClip:"), "");
