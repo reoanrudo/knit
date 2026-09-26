@@ -79,8 +79,14 @@ else
 fi
 
 TS=$(date +%s)
+# toggle(toggle を一時ファイルへ書く)を監視するのは --diag 起動の mac だけ。
+# --diag でない起動のまま検証すると「同期しない」と誤 NG になるため先に判定する
+if tail -50 /tmp/tsunagu-mac.log 2>/dev/null | grep -q '\[diag\]'; then DIAG_OK=1; else DIAG_OK=0; fi
+
 echo "[verify] Win→Mac クリップボード:"
-if [ "$WIN_OK" -eq 1 ]; then
+if [ "$WIN_OK" -eq 1 ] && [ "$DIAG_OK" -eq 0 ]; then
+  warn_msg "mac が --diag 起動でないため省略(./scripts/restart-mac.sh --diag で再起動)"
+elif [ "$WIN_OK" -eq 1 ]; then
   printf '@echo off\r\npowershell -NoProfile -Command "Set-Clipboard -Value '\''verify-wm-%s'\''"\r\n' "$TS" > /tmp/clip_set.bat
   if $SCP /tmp/clip_set.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null; then
     $SSH "schtasks /Run /TN tsunagu_clip_set" >/dev/null 2>&1
@@ -97,7 +103,9 @@ else
 fi
 
 echo "[verify] Mac→Win クリップボード:"
-if [ "$WIN_OK" -eq 1 ]; then
+if [ "$WIN_OK" -eq 1 ] && [ "$DIAG_OK" -eq 0 ]; then
+  warn_msg "mac が --diag 起動でないため省略(./scripts/restart-mac.sh --diag で再起動)"
+elif [ "$WIN_OK" -eq 1 ]; then
   # 検証用 bat を都度生成・配置(検証の自己完結化: 手動前提をなくす)
   printf '@echo off\r\npowershell -NoProfile -Command "Get-Clipboard | Out-File -Encoding utf8 C:\\Users\\<user>\\tsunagu\\clip_get.txt"\r\n' > /tmp/clip_get.bat
   $SCP /tmp/clip_get.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null
@@ -131,7 +139,9 @@ else
 fi
 
 echo "[verify] Win→Mac ファイル送信:"
-if [ "$WIN_OK" -eq 1 ]; then
+if [ "$WIN_OK" -eq 1 ] && [ "$DIAG_OK" -eq 0 ]; then
+  warn_msg "mac が --diag 起動でないため省略(./scripts/restart-mac.sh --diag で再起動)"
+elif [ "$WIN_OK" -eq 1 ]; then
   # ファイル名にタイムスタンプを含める(同名同サイズだと Win 側の指紋チェックが
   # 同一コピーの再検出とみなし再送しないため、毎回別物にする)
   rm -f "$HOME/Downloads/Tsunagu/"win_verify_*.txt
@@ -156,7 +166,9 @@ else
 fi
 
 echo "[verify] Mac→Win ファイル送信:"
-if [ "$WIN_OK" -eq 1 ]; then
+if [ "$WIN_OK" -eq 1 ] && [ "$DIAG_OK" -eq 0 ]; then
+  warn_msg "mac が --diag 起動でないため省略(./scripts/restart-mac.sh --diag で再起動)"
+elif [ "$WIN_OK" -eq 1 ]; then
   printf 'verify-mf-%s' "$TS" > "/tmp/mac_verify_$TS.txt"
   # osascript の「set the clipboard to (POSIX file …)」は型ゼロの空ペーストボードに
   # なることがある(2026-09-26 実測: 5 回中 3 回。changeCount は増えるが型が宣言されず、
@@ -173,7 +185,14 @@ SWIFTEOF
     osascript -e "set the clipboard to (POSIX file \"/tmp/mac_verify_$TS.txt\")" >/dev/null 2>&1
   fi
   toggle; sleep 4; toggle
-  RAWF=$($SSH "type C:\\Users\\<user>\\Downloads\\Tsunagu\\mac_verify_$TS.txt" 2>/dev/null); RC=$?
+  # bulk 経路の転送完了が type より遅れる実測があるため、一致するまで再試行する
+  RAWF=""
+  for _i in 1 2 3 4; do
+    RAWF=$($SSH "type C:\\Users\\<user>\\Downloads\\Tsunagu\\mac_verify_$TS.txt" 2>/dev/null)
+    [ "$(printf '%s' "$RAWF" | tr -d '\r\n')" = "verify-mf-$TS" ] && break
+    sleep 2
+  done
+  RC=$?
   if [ "$RC" -eq 255 ]; then
     warn_msg "ssh エラーのため Mac→Win ファイル結果取得不能"
   else
