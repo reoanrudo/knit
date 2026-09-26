@@ -325,11 +325,19 @@ fn clipboard_read_dib() -> Option<Vec<u8>> {
     }
 }
 
+/// 直近の OpenClipboard 失敗の GetLastError(診断用。5=ACCESS_DENIED は
+/// 他プロセスが開いている=「busy clipboard」の正体)
+static CLIP_OPEN_ERR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 fn clipboard_write_text(s: &str) -> bool {
     let mut utf16: Vec<u16> = s.encode_utf16().collect();
     utf16.push(0);
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
+            CLIP_OPEN_ERR.store(
+                windows_sys::Win32::Foundation::GetLastError(),
+                Ordering::Relaxed,
+            );
             return false;
         }
         EmptyClipboard();
@@ -1045,7 +1053,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-003145-7ce0525";
+const BUILD_ID: &str = "win-20260927-015233-b92f90a";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1700,14 +1708,29 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                     continue;
                 }
                 *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
-                let ok = clipboard_write_text(&text)
-                    || (std::thread::sleep(Duration::from_millis(150)), clipboard_write_text(&text)).1;
-                if ok {
-                    LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
-                    println!("[clip] mac->win {} bytes", text.len());
-                } else {
-                    println!("[clip] mac->win write failed (busy clipboard)");
-                }
+                // 書き込みは、クリップボードマネージャ等の他プロセスが掴んでいる間は
+                // 開けない。150ms の即時再試行だけでは救えない実績があり、ここで待つと
+                // 受信ループ(マウス・キー)まで止まるため、別スレッドで徐々に間隔を
+                // 広げながら再試行する(合計 最大1.3秒)
+                std::thread::spawn(move || {
+                    let mut ok = false;
+                    for wait in [50u64, 100, 150, 200, 300, 500] {
+                        if clipboard_write_text(&text) {
+                            ok = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(wait));
+                    }
+                    if ok {
+                        LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+                        println!("[clip] mac->win {} bytes", text.len());
+                    } else {
+                        println!(
+                            "[clip] mac->win write failed (busy clipboard, err=0x{:08x})",
+                            CLIP_OPEN_ERR.load(Ordering::Relaxed)
+                        );
+                    }
+                });
             }
             Msg::Bye => {
                 running_w.store(false, Ordering::Relaxed);
