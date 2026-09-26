@@ -125,7 +125,15 @@ elif [ "$WIN_OK" -eq 1 ]; then
     warn_msg "ssh エラーのため Mac→Win 結果取得不能"
   else
     GOT2=$(printf '%s' "$RAW" | tail -1 | tr -d '\r\n' | sed $'s/^\xEF\xBB\xBF//')
-    check "Mac→Win ペースト一致" "verify-mw-$TS" "$GOT2"
+    # Windows ログに busy 失敗がある時は「本体の同期不良」でなく掴まれが原因
+    BUSY_N=$($SSH "type C:\\Users\\<user>\\tsunagu\\tsunagu-win.log" 2>/dev/null | grep -c 'write failed (busy')
+    if [ "$GOT2" = "verify-mw-$TS" ]; then
+      check "Mac→Win ペースト一致" "verify-mw-$TS" "$GOT2"
+    elif [ "${BUSY_N:-0}" -gt 0 ]; then
+      warn_msg "Mac→Win 不一致(Windows 側の掴まれ(busy ×${BUSY_N})が原因の疑い)"
+    else
+      check "Mac→Win ペースト一致" "verify-mw-$TS" "$GOT2"
+    fi
   fi
 else
   warn_msg "Mac→Win クリップボード検証スキップ(接続失敗)"
