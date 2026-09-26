@@ -214,6 +214,10 @@ pub mod proto {
         /// 接続品質通知: Mac が測定した RTT(ms)を Windows 側の表示へ回す
         #[serde(rename = "stat")]
         Stat { rtt: u64 },
+        /// IME 状態同期(Mac→Windows、画面を移る時に送る)。Mac のかな/英数を
+        /// Windows 側 IME の開閉へ反映する(ビジョン§7 IME Follow Cursor)
+        #[serde(rename = "ime")]
+        Ime { kana: bool },
         #[serde(rename = "bye")]
         Bye,
     }

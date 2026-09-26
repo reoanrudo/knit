@@ -1053,7 +1053,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-015233-b92f90a";
+const BUILD_ID: const BUILD_ID: &str = "win-20260927-020513-7a817a6";str = "win-20260927-015233-b92f90a";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1731,6 +1731,12 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                         );
                     }
                 });
+            }
+            Msg::Ime { kana } => {
+                // Mac の IME 状態(かな/英数)を画面切替時に反映(IME Follow Cursor)。
+                // かな/英数キー単体の押下(トグル)とは違い、方向指定の設定
+                ime_set_open(kana);
+                println!("[ime] mac の状態へ同期: {}", if kana { "かな(ON)" } else { "英数(OFF)" });
             }
             Msg::Bye => {
                 running_w.store(false, Ordering::Relaxed);

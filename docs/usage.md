@@ -28,6 +28,10 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
   (Win 側では「Mac と同じ修飾の組合せ」になるよう差分で押し替え、復帰時に全解放)
 - **かなキー**(Mac keycode 104)→ Windows 側の IME を ON(ひらがな入力)
 - **英数キー**(Mac keycode 102)→ Windows 側の IME を OFF(英字入力)
+- **切替時に Mac の IME 状態を引き継ぐ**(IME Follow Cursor): Windows へ画面を
+  移る瞬間、Mac がかな入力中なら Windows の IME を ON、英数モードなら OFF へ
+  合わせる。日本語入力以外(英字レイアウト)の間は Windows 側を変えない
+  (`TSUNAGU_IME_SYNC=0` で無効化)
   - フォアグラウンドウィンドウのデフォルト IME ウィンドウへ
     `WM_IME_CONTROL`(IMC_SETOPENSTATUS)を送る(方向指定が確実な定番手法)
   - IME ウィンドウが取れない場合は半角/全角相当のキー注入
@@ -183,6 +187,7 @@ fn を押さない F7〜F12 は従来どおり F キーとして渡ります。
 | `TSUNAGU_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
 | `TSUNAGU_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
 | `TSUNAGU_LOCK_SYNC` | 1 | Mac の画面ロックで Windows もロックする。0 で無効 |
+| `TSUNAGU_IME_SYNC` | 1 | Windows へ入る時の IME 状態引継ぎ(かな=ON/英数=OFF)。0 で無効 |
 
 ## 機能別品質向上(開発者用)
 
@@ -235,9 +240,10 @@ fn を押さない F7〜F12 は従来どおり F キーとして渡ります。
 ## 既知の制限
 
 - リッチテキスト(書式付き)のコピーは未対応(プレーンテキストとして渡る)
-- Mac 側の IME 状態とは独立(かな/英数キーで Windows 側だけ切替)
 - IME コンテキストが取れないウィンドウでのみ、IME フォールバックがトグル動作のため
   開閉の方向が保証されない
+- Mac→Windows 方向のみ自動引継ぎ。Windows で変えた IME 状態は Mac へ戻る時に
+  Mac へは反映されない(かな/英数キーで手動切替)
 - UAC 昇格中のプロセスには UIPI により SendInput が弾かれる
   (design.md「残リスク」参照)
 - Windows のロック画面・UAC の確認画面は操作できない(SendInput が保護デスクトップに届かない)

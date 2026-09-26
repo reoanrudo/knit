@@ -750,10 +750,61 @@ pub(crate) fn mac_shortcut_translation(
 static GAME_REL: AtomicBool = AtomicBool::new(false);
 /// 画面ロックの連動(TSUNAGU_LOCK_SYNC=0 で無効)
 static LOCK_SYNC: AtomicBool = AtomicBool::new(true);
+/// IME 状態同期: Windows へ入る時に Mac のかな/英数を相手の IME 開閉へ反映
+///(TSUNAGU_IME_SYNC=0 で無効)
+static IME_SYNC: AtomicBool = AtomicBool::new(true);
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
     fn IsSecureEventInputEnabled() -> u8;
+    static kTISPropertyInputModeID: CFStringRef;
+    fn TISCopyCurrentKeyboardInputSource() -> *mut core::ffi::c_void;
+    fn TISGetInputSourceProperty(
+        source: *mut core::ffi::c_void,
+        key: CFStringRef,
+    ) -> *mut core::ffi::c_void;
+    fn CFStringGetCString(
+        s: *const core::ffi::c_void,
+        buf: *mut core::ffi::c_char,
+        size: usize,
+        encoding: u32,
+    ) -> u8;
+}
+
+/// 入力モード ID(InputModeID)から Windows の IME 開閉に対応する状態を引く。
+/// 日本語入力の Roman(英数)のみ OFF、他の日本語系(ひらがな/カタカナ/半角カナ/
+/// 全角英数)は ON。日本語入力以外(英字レイアウト等)は None=同期しない
+/// (Mac で IME を使っていない時に Windows 側を勝手に閉じないため)
+fn ime_mode_state(mode: &str) -> Option<bool> {
+    if !mode.contains("Japanese") {
+        return None;
+    }
+    Some(!mode.ends_with(".Roman"))
+}
+
+/// 現在の入力ソースの IME 状態。取得失敟(nil・変換失敗)は None=送らない
+fn current_ime_state() -> Option<bool> {
+    unsafe {
+        let src = TISCopyCurrentKeyboardInputSource();
+        if src.is_null() {
+            return None;
+        }
+        let v = TISGetInputSourceProperty(src, kTISPropertyInputModeID);
+        let mut buf = [0u8; 128];
+        let ok = !v.is_null()
+            && CFStringGetCString(
+                v,
+                buf.as_mut_ptr() as *mut core::ffi::c_char,
+                buf.len(),
+                0x0800_0100, // kCFStringEncodingUTF8
+            ) != 0;
+        CFRelease(src);
+        if !ok {
+            return None;
+        }
+        let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        ime_mode_state(&String::from_utf8_lossy(&buf[..n]))
+    }
 }
 
 /// Secure Input(パスワード欄等でキー入力の横取りを OS が止める状態)の原因アプリ名。
@@ -1281,6 +1332,15 @@ unsafe fn set_cursor_in_background() {
 
 fn enter_win_mode_cursor_lock() {
     sync_clipboard_to_win();
+    // IME Follow Cursor(ビジョン§7): Mac のかな/英数の状態を Windows 側の
+    // IME 開閉へ乗せていく。「画面を移る時だけ同期」の原則どおりここでだけ送る。
+    // 日本語入力以外(英字レイアウト)は送らない=Windows 側は現状維持
+    if IME_SYNC.load(Ordering::Relaxed) {
+        if let Some(on) = current_ime_state() {
+            send_msg(&Msg::Ime { kana: on });
+            eprintln!("[ime] Mac の状態を Windows へ同期: {}", if on { "かな(ON)" } else { "英数(OFF)" });
+        }
+    }
     std::thread::spawn(|| {
         static LAST: AtomicU64 = AtomicU64::new(0);
         if let Some(app) = secure_input_app() {
@@ -1929,7 +1989,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-003552-3d3f452";
+const BUILD_ID: &str = "build-20260927-015453-b92f90a";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -2063,6 +2123,9 @@ fn main() {
     }
     if envutil::get("TSUNAGU_LOCK_SYNC").as_deref() == Some("0") {
         LOCK_SYNC.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_IME_SYNC").as_deref() == Some("0") {
+        IME_SYNC.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);
@@ -2905,5 +2968,27 @@ mod win_cur_tests {
         // 初期値(0x0)や不正値はそのまま(0 除算・暴発写像の防止)
         assert_eq!(rs((10.0, 20.0), (0.0, 0.0), (1920.0, 1080.0)), (10.0, 20.0));
         assert_eq!(rs((10.0, 20.0), (1920.0, 1080.0), (0.0, 1080.0)), (10.0, 20.0));
+    }
+}
+
+#[cfg(test)]
+mod ime_tests {
+    use super::ime_mode_state as st;
+
+    #[test]
+    fn japanese_modes_map_to_ime_open_state() {
+        // ひらがな/カタカナ/半角カナ/全角英数は ON
+        assert_eq!(st("com.apple.inputmethod.Japanese.Hiragana"), Some(true));
+        assert_eq!(st("com.apple.inputmethod.Japanese.Katakana"), Some(true));
+        assert_eq!(st("com.apple.inputmethod.Japanese.HalfWidthKana"), Some(true));
+        assert_eq!(st("com.apple.inputmethod.Japanese.FullWidthRoman"), Some(true));
+        // 日本語入力の英数モードは OFF
+        assert_eq!(st("com.apple.inputmethod.Japanese.Roman"), Some(false));
+        // サードパーティ IME(Google 日本語入力等)も "Japanese" を含む慣行に追従
+        assert_eq!(st("com.google.inputmethod.Japanese.base.Roman"), Some(false));
+        assert_eq!(st("com.google.inputmethod.Japanese.base"), Some(true));
+        // 日本語入力以外は None=同期しない(Windows 側を勝手に閉じない)
+        assert_eq!(st("com.apple.keylayout.ABC"), None);
+        assert_eq!(st("com.apple.keylayout.US"), None);
     }
 }
