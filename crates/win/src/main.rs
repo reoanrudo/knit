@@ -452,13 +452,29 @@ fn send_files_to_mac(paths: &[String]) {
         println!("[file] win->mac skip(件数 {} / 合計 {total} bytes)", paths.len());
         return;
     }
+    // 進捗は 10% 刻みでログへ(巨大転送中に固まって見えるのを防ぐ)。
+    // クロージャは send で消費されるため、再試行側にも同じ形を書く
+    macro_rules! send_with_progress {
+        () => { BULK_LINK.send(|w| {
+            let mut last_step = 0u64;
+            bulk::send_files_with_progress(w, &paths, false, |sent, total| {
+                if total > 0 {
+                    let step = sent * 10 / total.max(1);
+                    if step > last_step {
+                        last_step = step;
+                        println!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+                    }
+                }
+            })
+        }) };
+    }
     // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓で起きるため、
     // 少し待って 1 回だけやり直す(呼び出し元はすべてバックグラウンドスレッド)
-    let mut r = BULK_LINK.send(|w| bulk::send_files(w, &paths, false));
+    let mut r = send_with_progress!();
     if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
         println!("[file] bulk 経路の再接続を待って再試行します");
         std::thread::sleep(Duration::from_millis(2500));
-        r = BULK_LINK.send(|w| bulk::send_files(w, &paths, false));
+        r = send_with_progress!();
     }
     match r {
         Ok(n) => println!("[file] win->mac {n} 件送信完了"),

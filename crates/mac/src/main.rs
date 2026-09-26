@@ -582,13 +582,29 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
         }
         eprintln!("[file] 送信開始: {} 件 / 合計 {}KB{}", paths.len(), total / 1024, if drop { "(掴みドラッグ)" } else { "" });
         let t0 = std::time::Instant::now();
+        // 進捗は 10% 刻みでログへ(巨大転送中に固まって見えるのを防ぐ)。
+        // クロージャは send で消費されるため、再試行側にも同じ形を書く
+        macro_rules! send_with_progress {
+            () => { BULK_LINK.send(|w| {
+                let mut last_step = 0u64;
+                bulk::send_files_with_progress(w, &paths, drop, |sent, total| {
+                    if total > 0 {
+                        let step = sent * 10 / total.max(1);
+                        if step > last_step {
+                            last_step = step;
+                            eprintln!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+                        }
+                    }
+                })
+            }) };
+        }
         // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓(最大約 5 秒)で起きる。
         // ユーザー操作がログ 1 行で失われるのを防ぐため、少し待って 1 回だけやり直す
-        let mut r = BULK_LINK.send(|w| bulk::send_files(w, &paths, drop));
+        let mut r = send_with_progress!();
         if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
             eprintln!("[file] bulk 経路の再接続を待って再試行します");
             std::thread::sleep(Duration::from_millis(2500));
-            r = BULK_LINK.send(|w| bulk::send_files(w, &paths, drop));
+            r = send_with_progress!();
         }
         match r {
             Ok(n) => {

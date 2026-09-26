@@ -723,8 +723,32 @@ pub mod bulk {
     }
 
     /// ファイル群を送る。drop=true は「掴んだまま境界越え」(受信側は OLE ドラッグで渡す)。
-    /// 戻り値は送った件数
+    /// 戻り値は送った件数。on_progress は (送信済みバイト, 宣言済み合計) がチャンク毎に呼ばれる
+    pub fn send_files_with_progress(
+        w: &mut impl Write,
+        paths: &[PathBuf],
+        drop: bool,
+        mut on_progress: impl FnMut(u64, u64),
+    ) -> std::io::Result<usize> {
+        let declared: u64 = paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len()))
+            .sum();
+        let n = send_files_inner(w, paths, drop, &mut |sent| on_progress(sent, declared))?;
+        Ok(n)
+    }
+
+    /// ファイル群を送る(進捗不要版)
     pub fn send_files(w: &mut impl Write, paths: &[PathBuf], drop: bool) -> std::io::Result<usize> {
+        send_files_inner(w, paths, drop, &mut |_| {})
+    }
+
+    fn send_files_inner(
+        w: &mut impl Write,
+        paths: &[PathBuf],
+        drop: bool,
+        on_progress: &mut dyn FnMut(u64),
+    ) -> std::io::Result<usize> {
         if drop {
             write_frame(w, DROP_BEGIN, &[])?;
         }
@@ -740,6 +764,7 @@ pub mod bulk {
             let head = serde_json::json!({ "name": name, "size": meta.len() }).to_string();
             write_frame(w, FILE_BEGIN, head.as_bytes())?;
             let mut remain = meta.len();
+            let mut sent_this = 0u64;
             while remain > 0 {
                 let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
                 if n == 0 {
@@ -747,6 +772,8 @@ pub mod bulk {
                 }
                 write_frame(w, DATA, &buf[..n])?;
                 remain -= n as u64;
+                sent_this += n as u64;
+                on_progress(sent_this);
             }
             write_frame(w, FILE_END, &[])?;
             sent += 1;
@@ -1326,6 +1353,31 @@ mod tests {
         assert_eq!(media_vk(0), None); // 音量 up は対象外
         assert_eq!(media_vk(2), None);
         assert_eq!(media_vk(6), None);
+    }
+
+    /// 進捗コールバック: 単調非減少・最終値が合計に一致・チャンク毎に呼ばれる
+    #[test]
+    fn send_files_progress_is_monotonic_and_reaches_total() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-prog-{}", std::process::id()));
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // 1.5 チャンク分のファイル(複数チャンクをまたぐ)
+        let data: Vec<u8> = (0..(CHUNK + CHUNK / 2)).map(|i| (i % 97) as u8).collect();
+        std::fs::write(src.join("p.bin"), &data).unwrap();
+        let mut wire = Vec::new();
+        let mut log: Vec<(u64, u64)> = Vec::new();
+        send_files_with_progress(&mut wire, &[src.join("p.bin")], false, |s, t| log.push((s, t))).unwrap();
+        let (last_s, last_t) = *log.last().unwrap();
+        assert_eq!(last_t, data.len() as u64, "宣言合計=ファイルサイズ");
+        assert_eq!(last_s, data.len() as u64, "最終送信済み=合計");
+        let mut prev = 0;
+        for (s, _) in &log {
+            assert!(*s >= prev, "進捗は単調非減少: {log:?}");
+            prev = *s;
+        }
+        assert!(log.len() >= 2, "チャンク毎に呼ばれる: {}", log.len());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// resolve の併合: 発見結果を先頭に、手動指定を重複排除して並べる
