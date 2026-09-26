@@ -209,6 +209,11 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
     }
+    // 終了と同じ理由で、再起動(スクリプトが自分を kill する)の前にも
+    // 正規の leave を経由させる
+    if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
+        crate::leave_win_mode_cursor_unlock(None);
+    }
     match restart_script() {
         Some(script) => {
             eprintln!("[gui] restart-mac.sh を起動します");
@@ -844,16 +849,16 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
             (f0, f1)
         };
         let start = start.clamp(0.0, 0.95);
-        *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) =
-            (start, end.max(start + 0.05).min(1.0));
+        let range = (start, end.max(start + 0.05).min(1.0));
+        *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = range;
         let snd: unsafe extern "C" fn(ID, SEL, u8) =
             std::mem::transmute(crate::objc_msgSend as *const () as usize);
         snd(_self, sel(c"setNeedsDisplay:"), 1);
         eprintln!(
-            "[lay] 配置を更新: {}(範囲 {:.2}〜{:.2})",
+            "[lay] 配置を更新: {}(接続範囲 {:.2}〜{:.2})",
             crate::side_name(),
-            f0,
-            f1
+            range.0,
+            range.1
         );
     }
     preferences::save();
@@ -928,6 +933,12 @@ unsafe fn make_prefs_window(target: ID) -> ID {
 
 unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     eprintln!("[gui] メニューから終了しました");
+    // Windows 画面を操作したまま終了すると、カーソルの関連切断・非表示が
+    // システムへ残る。正規の leave(カーソル復帰+Windows 側の後片付け)を
+    // 経由してから終了する
+    if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
+        crate::leave_win_mode_cursor_unlock(None);
+    }
     std::process::exit(0);
 }
 unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
