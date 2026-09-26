@@ -368,37 +368,35 @@ pub fn start(token: String) {
                     continue;
                 }
             };
-            // 本線と同じピア制限(Tailscale CGNAT 範囲外は拒否)
-            if let std::net::IpAddr::V4(v4) = peer.ip() {
-                let o = v4.octets();
-                if !(o[0] == 100 && (64..=127).contains(&o[1])) {
-                    eprintln!("[audio] rejected: {peer}");
-                    continue;
-                }
-            } else {
+            // 本線と同じ接続元制限と暗号化(トークン不一致はハンドシェイクで弾かれる)
+            if !tsunagu_common::net::is_allowed(peer.ip()) {
+                eprintln!("[audio] rejected: {peer}");
                 continue;
             }
             eprintln!("[audio] accepted from {peer}");
             stream.set_nodelay(true).ok();
             stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
-            let Ok(sr) = stream.try_clone() else { continue };
-            let mut reader = std::io::BufReader::new(sr);
-            let mut w = stream;
-            // ハンドシェイク: "SDAUDIO2 <token> <rate> s16\n"(16bit 整数)または
-            // 旧 "SDAUDIO1 <token> <rate>\n"(f32) → "ok\n"
+            let (r, mut w) = match tsunagu_common::secure::accept(stream, &token, b"tsunagu-audio") {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");
+                    continue;
+                }
+            };
+            let mut reader = std::io::BufReader::new(r);
+            // 形式の申告: "SDAUDIO3 <rate> s16\n" → "ok\n"(認証は暗号化で済んでいる)
             let mut line = String::new();
             if (&mut reader).take(512).read_line(&mut line).unwrap_or(0) == 0 {
                 continue;
             }
             let parts: Vec<&str> = line.trim().split_whitespace().collect();
-            let s16 = parts.len() == 4 && parts[0] == "SDAUDIO2" && parts[3] == "s16";
-            let f32_legacy = parts.len() == 3 && parts[0] == "SDAUDIO1";
-            if !(s16 || f32_legacy) || parts[1] != token {
+            let s16 = parts.len() == 3 && parts[0] == "SDAUDIO3" && parts[2] == "s16";
+            if !s16 {
                 eprintln!("[audio] invalid handshake");
                 let _ = w.write_all(b"ng\n");
                 continue;
             }
-            let Ok(rate) = parts[2].parse::<u32>() else { continue };
+            let Ok(rate) = parts[1].parse::<u32>() else { continue };
             if !(4000..=192_000).contains(&rate) {
                 continue;
             }
@@ -410,7 +408,7 @@ pub fn start(token: String) {
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
             PRIMED.store(false, Ordering::Relaxed);
             phase_store(0.0);
-            eprintln!("[audio] streaming started ({rate}Hz {}/stereo)", if s16 { "s16" } else { "f32" });
+            eprintln!("[audio] streaming started ({rate}Hz s16/stereo, 暗号化)");
             // PCM フレーム受信: [u32 LE 長][データ]。長さ上限は 128KB
             let mut len_buf = [0u8; 4];
             let mut last_diag = std::time::Instant::now();

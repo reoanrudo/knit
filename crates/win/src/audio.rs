@@ -376,13 +376,20 @@ fn audio_run(fixed_host: Option<String>, token: String) {
             }
         };
         stream.set_nodelay(true).ok();
-        let Ok(mut w) = stream.try_clone() else { continue };
-        let hs = format!("SDAUDIO2 {token} {} s16\n", cap.sample_rate);
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        let (r, mut w) = match tsunagu_common::secure::connect(stream, &token, b"tsunagu-audio") {
+            Ok(x) => x,
+            Err(e) => {
+                println!("[audio] 暗号化ハンドシェイク失敗: {e}");
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
+        };
+        let hs = format!("SDAUDIO3 {} s16\n", cap.sample_rate);
         if w.write_all(hs.as_bytes()).and_then(|_| w.flush()).is_err() {
             continue;
         }
-        let Ok(sr) = stream.try_clone() else { continue };
-        let mut r = std::io::BufReader::new(sr);
+        let mut r = std::io::BufReader::new(r);
         let mut reply = String::new();
         if r.read_line(&mut reply).unwrap_or(0) == 0 || !reply.starts_with("ok") {
             println!("[audio] ハンドシェイク拒否: {}", reply.trim());

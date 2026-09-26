@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 通信の暗号化と相互認証(Noise プロトコル。WireGuard と同系統)。必要な暗号方式のみ有効化
+snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
+blake2 = "0.10"

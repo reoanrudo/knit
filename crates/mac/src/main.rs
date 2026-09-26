@@ -5,7 +5,7 @@
 mod audio;
 mod gui;
 
-use tsunagu_common::{bulk, envutil};
+use tsunagu_common::{bulk, envutil, secure};
 use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::net::TcpStream;
@@ -737,7 +737,7 @@ fn drop_stream(reason: &str) {
     let taken = STREAM_SLOT.get().and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(s) = taken {
         eprintln!("[conn] {reason}。接続を張り直します");
-        let _ = s.shutdown(std::net::Shutdown::Both);
+        s.shutdown();
     }
 }
 
@@ -811,7 +811,7 @@ static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
 /// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
 static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
 static TX: OnceLock<Sender<String>> = OnceLock::new();
-static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
+static STREAM_SLOT: OnceLock<Arc<Mutex<Option<secure::Writer>>>> = OnceLock::new();
 static TAP_PORT: OnceLock<usize> = OnceLock::new();
 static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2012,7 +2012,7 @@ fn main() {
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     let _ = TX.set(tx);
-    let slot: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
+    let slot: Arc<Mutex<Option<secure::Writer>>> = Arc::new(Mutex::new(None));
     let _ = STREAM_SLOT.set(slot.clone());
 
     // 単一の送信スレッド(チャネル→ストリーム差し替え方式)
@@ -2067,7 +2067,7 @@ fn main() {
                         // ワイヤが \n\n になる(受信側の空行パースが倍増する)。write_all で送る
                         if s.write_all(buf.as_bytes()).and_then(|_| s.flush()).is_err() {
                             if let Some(s) = guard.take() {
-                                let _ = s.shutdown(std::net::Shutdown::Both);
+                                s.shutdown();
                             }
                         }
                     }
@@ -2087,7 +2087,7 @@ fn main() {
                 if let Some(s) = guard.as_mut() {
                     if s.write_all(encode(&Msg::Ping { ts: now_ms() }).as_bytes()).and_then(|_| s.flush()).is_err() {
                         if let Some(s) = guard.take() {
-                            let _ = s.shutdown(std::net::Shutdown::Both);
+                            s.shutdown();
                         }
                     }
                 }
@@ -2181,7 +2181,7 @@ fn main() {
     } else {
         let bind = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         std::thread::spawn(move || {
-            bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_tailscale)
+            bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed)
         });
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
     }
@@ -2393,7 +2393,7 @@ fn main() {
 const MAX_LINE: u64 = 8 * 1024 * 1024;
 
 /// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)
-fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
+fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
     use std::io::BufRead;
     let mut line = String::new();
     loop {
@@ -2512,24 +2512,23 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             }
         };
         eprintln!("[conn] accepted from {peer}");
-        // ピア許可: Tailscale の CGNAT 範囲(100.64.0.0/10)以外は即切断する。
-        // 0.0.0.0 で listen してしまった場合の WiFi/LAN 露出に対する装置的防御
-        let oct = match peer.ip() {
-            std::net::IpAddr::V4(v4) => v4.octets(),
-            std::net::IpAddr::V6(_) => [0, 0, 0, 0],
-        };
-        if !(oct[0] == 100 && (64..=127).contains(&oct[1])) {
-            eprintln!("[conn] rejected: {peer} は Tailscale 範囲外です");
+        // 接続元の制限(LAN・有線直結・Tailscale のみ)。認証は暗号化ハンドシェイクで行う
+        if !tsunagu_common::net::is_allowed(peer.ip()) {
+            eprintln!("[conn] rejected: {peer} は許可範囲外です(TSUNAGU_ALLOW_ANY=1 で許可)");
             continue;
         }
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let (r, w) = match secure::accept(stream, &token, b"tsunagu-main") {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
+                continue;
+            }
+        };
         // hello を待つ(検証して hello_ok を返す)
-        let mut reader = std::io::BufReader::new(match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
-        });
+        let mut reader = std::io::BufReader::new(r);
         let mut line = String::new();
         // 最初の行=hello(この時点では未認証のため、take で読み込み段階から制限する)
         match (&mut reader).take(MAX_LINE + 1).read_line(&mut line) {
@@ -2544,8 +2543,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             Ok(_) => {}
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, name, token: t, w, h }) if compatible(ver) && t == token => {
-                let _ = name;
+            Some(Msg::Hello { ver, w, h, .. }) if compatible(ver) => {
                 // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
                 if w > 0 && h > 0 {
                     *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
@@ -2561,7 +2559,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         }
         {
             let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(stream);
+            *guard = Some(w);
         }
         *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         // hello_ok 送信は送信スレッド経由で確実に
@@ -2589,12 +2587,13 @@ fn client_attempt(
     eprintln!("[conn] connected");
     s.set_nodelay(true).ok();
     s.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    let (r, mut hw) = secure::connect(s, token, b"tsunagu-main")
+        .map_err(|e| format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"))?;
     // hello(自画面サイズを相手へ伝える。相手は hello_ok で自画面を返す)
-    let mut hw = s.try_clone().map_err(|e| format!("clone failed: {e}"))?;
     let hello = encode(&Msg::Hello {
         ver: VERSION,
         name: "macbook".into(),
-        token: token.to_string(),
+        token: String::new(),
         w: screen_w as i32,
         h: screen_h as i32,
     });
@@ -2602,8 +2601,7 @@ fn client_attempt(
         .and_then(|_| hw.flush())
         .map_err(|_| "hello send failed".to_string())?;
     // hello_ok を待つ(行長制限付き)
-    let sr = s.try_clone().map_err(|e| format!("clone failed: {e}"))?;
-    let mut reader = std::io::BufReader::new(sr);
+    let mut reader = std::io::BufReader::new(r);
     let mut line = String::new();
     (&mut reader)
         .take(MAX_LINE + 1)
@@ -2621,7 +2619,7 @@ fn client_attempt(
     }
     {
         let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(s);
+        *guard = Some(hw);
     }
     CONNECTED.store(true, Ordering::Relaxed);
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);

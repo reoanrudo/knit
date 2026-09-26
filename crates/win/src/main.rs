@@ -9,7 +9,7 @@ mod audio;
 mod dragdrop;
 mod tray;
 
-use tsunagu_common::bulk;
+use tsunagu_common::{bulk, secure};
 use tsunagu_common::keymap::mac_kc_to_win_vk;
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1076,7 +1076,7 @@ fn main() {
         println!("[info] server mode. screen {w}x{h}");
         let bind = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let ep = bulk_ep;
-        std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_tailscale));
+        std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed));
         server_loop(&token, port, w, h);
         return;
     }
@@ -1150,23 +1150,23 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             }
         };
         println!("[conn] accepted from {peer}");
-        // Tailscale CGNAT(100.64.0.0/10)外は即拒否(0.0.0.0 待受時の装置的防御)
-        if let std::net::IpAddr::V4(v4) = peer.ip() {
-            let o = v4.octets();
-            if !(o[0] == 100 && (64..=127).contains(&o[1])) {
-                println!("[conn] rejected: {peer} は Tailscale 範囲外です");
-                continue;
-            }
-        } else {
-            println!("[conn] rejected: {peer} (IPv6)");
+        // 接続元の制限(LAN・有線直結・Tailscale のみ)。認証は暗号化ハンドシェイクで行う
+        if !tsunagu_common::net::is_allowed(peer.ip()) {
+            println!("[conn] rejected: {peer} は許可範囲外です(TSUNAGU_ALLOW_ANY=1 で許可)");
             continue;
         }
         stream.set_nodelay(true).ok();
-        // hello を待つ(未認証のため 8MB の行長制限付き)
-        let mut pre = match stream.try_clone() {
-            Ok(s) => std::io::BufReader::new(s),
-            Err(_) => continue,
+        stream.set_read_timeout(Some(Duration::from_secs(9))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+        let (r, mut wr) = match secure::accept(stream, token, b"tsunagu-main") {
+            Ok(x) => x,
+            Err(e) => {
+                println!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
+                continue;
+            }
         };
+        // hello を待つ(行長制限付き)
+        let mut pre = std::io::BufReader::new(r);
         let mut line = String::new();
         match (&mut pre).take(8 * 1024 * 1024 + 1).read_line(&mut line) {
             Ok(0) | Err(_) => {
@@ -1180,7 +1180,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             continue;
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, name, token: t, .. }) if compatible(ver) && t == token => {
+            Some(Msg::Hello { ver, name, .. }) if compatible(ver) => {
                 println!("[hello] from {name}");
                 true
             }
@@ -1191,19 +1191,19 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             continue;
         }
         // hello_ok(相手=Mac が画面サイズを得られるよう自画面 w/h を含める)
-        let mut wr = match stream.try_clone() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let _ = wr
+        if wr
             .write_all(encode(&Msg::HelloOk { name: "desktop".into(), w, h }).as_bytes())
-            .and_then(|_| wr.flush());
-        drop(wr);
+            .and_then(|_| wr.flush())
+            .is_err()
+        {
+            continue;
+        }
+        *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         CONNECTED.store(true, Ordering::Relaxed);
         println!("[conn] established");
         tray::notify("tsunagu", "接続しました");
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
-        let _ = session(stream);
+        let _ = session(pre, wr);
         CONNECTED.store(false, Ordering::Relaxed);
         BULK_LINK.clear();
         audio::speaker_disconnect();
@@ -1216,29 +1216,17 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
 fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let mut writer = stream.try_clone()?;
-    // クライアントとして hello を送る(encode() が行末 \n を持つため write_all で送る)
-    let mut hello_sent = false;
-    for _ in 0..3 {
-        let hello = encode(&Msg::Hello {
-            ver: VERSION,
-            name: "desktop".into(),
-            token: token.to_string(),
-            w,
-            h,
-        });
-        if writer.write_all(hello.as_bytes()).and_then(|_| writer.flush()).is_ok() {
-            hello_sent = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    if !hello_sent {
-        return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "hello send failed"));
-    }
-    // hello_ok を待つ(Mac が accept 後に応答しない場合に再接続ループへ戻れるよう期限を切る)
+    // 暗号化ハンドシェイクと hello_ok 待ちに期限を切る(Mac が accept 後に応答しない場合に
+    // 再接続ループへ戻れるように)。本体の受信タイムアウトは session で設定し直す
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut pre = BufReader::new(stream.try_clone()?);
+    let (r, mut writer) = secure::connect(stream, token, b"tsunagu-main").map_err(|e| {
+        std::io::Error::new(e.kind(), format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"))
+    })?;
+    let hello = encode(&Msg::Hello { ver: VERSION, name: "desktop".into(), token: String::new(), w, h });
+    writer.write_all(hello.as_bytes()).and_then(|_| writer.flush())?;
+    // hello_ok と後続(Cfg 等)を同じ受信器で読む。旧実装は hello_ok 用と本体用で
+    // BufReader を別々に作り、直後に届いた Cfg を前者のバッファに取り残して失っていた
+    let mut pre = BufReader::new(r);
     let mut line = String::new();
     pre.read_line(&mut line)?;
     match decode(line.trim()) {
@@ -1250,7 +1238,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     CONNECTED.store(true, Ordering::Relaxed);
     tray::notify("tsunagu", "接続しました");
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
-    let r = session(stream);
+    let r = session(pre, writer);
     CONNECTED.store(false, Ordering::Relaxed);
     BULK_LINK.clear();
     audio::speaker_disconnect();
@@ -1259,26 +1247,23 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
 }
 
 /// 認証済みストリームの本体処理(接続/待受 両モード共通)
-fn session(stream: TcpStream) -> std::io::Result<()> {
-    stream.set_nodelay(true).ok();
-    // 読み出しタイムアウト: Mac は3秒毎に ping を送るため 12秒無音は経路断。
+fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std::io::Result<()> {
+    // 読み出しタイムアウト: Mac は 3 秒毎に ping を送るため 9 秒(3 回分)無音は経路断。
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
-    stream.set_read_timeout(Some(Duration::from_secs(9))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+    reader.get_ref().set_read_timeout(Some(Duration::from_secs(9)));
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
     let (wtx, wrx) = std::sync::mpsc::channel::<String>();
     *WTX.lock().unwrap_or_else(|e| e.into_inner()) = Some(wtx.clone());
-    let mut writer = stream.try_clone()?;
     std::thread::spawn(move || {
         while let Ok(line) = wrx.recv() {
             if writer.write_all(line.as_bytes()).and_then(|_| writer.flush()).is_err() {
+                writer.shutdown();
                 break;
             }
         }
     });
-    let reader = BufReader::new(stream);
     let mut mods = ModState::new();
     // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し

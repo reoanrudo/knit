@@ -99,12 +99,13 @@ pub mod proto {
 
     pub const PORT: u16 = 24900;
     /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入。
-    /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除
-    pub const VERSION: u32 = 10;
+    /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除。
+    /// 11: 全経路を Noise で暗号化(認証はハンドシェイクで行い hello のトークンは空)
+    pub const VERSION: u32 = 11;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
-    pub const MIN_VERSION: u32 = 10;
+    pub const MIN_VERSION: u32 = 11;
 
     /// 相手の版を受け入れてよいか
     pub fn compatible(peer: u32) -> bool {
@@ -118,6 +119,8 @@ pub mod proto {
         Hello {
             ver: u32,
             name: String,
+            /// 版 11 以降は空(認証は暗号化ハンドシェイクで済んでいる)
+            #[serde(default)]
             token: String,
             /// 送信側の画面幅/高さ(px)。スケール自動算出と絶対座標送信に使う
             #[serde(default)]
@@ -329,9 +332,190 @@ pub mod files {
     }
 }
 
+pub mod secure {
+    //! 全経路(本線・音声・大容量)の暗号化と相互認証。
+    //! Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s: 両者が同じトークンを知っている時だけ
+    //! ハンドシェイクが成立し(トークン自体は回線に流れない)、接続ごとの使い捨て鍵で
+    //! 暗号化する(前方秘匿性)。旧方式は平文 TCP にトークンを平文で載せ、
+    //! 盗聴・改ざん耐性を Tailscale に全面依存していた
+    use std::io::{self, Read, Write};
+    use std::net::TcpStream;
+    use std::sync::Arc;
+
+    const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
+    const MAX_MSG: usize = 65535;
+    const TAG: usize = 16;
+    const MAX_PLAIN: usize = MAX_MSG - TAG;
+
+    fn psk(token: &str) -> [u8; 32] {
+        use blake2::Digest;
+        let mut h = blake2::Blake2s256::new();
+        h.update(b"tsunagu-psk-v1\0");
+        h.update(token.as_bytes());
+        h.finalize().into()
+    }
+
+    fn invalid(e: impl std::fmt::Display) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+    }
+
+    fn write_rec(w: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+        let mut out = Vec::with_capacity(2 + data.len());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        w.write_all(&out)
+    }
+
+    fn read_rec(r: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<()> {
+        let mut len = [0u8; 2];
+        r.read_exact(&mut len)?;
+        buf.resize(u16::from_be_bytes(len) as usize, 0);
+        r.read_exact(buf)
+    }
+
+    /// 復号側(Read)。1 レコードずつ復号して返す
+    pub struct Reader {
+        s: TcpStream,
+        st: Arc<snow::StatelessTransportState>,
+        nonce: u64,
+        cipher: Vec<u8>,
+        plain: Vec<u8>,
+        pos: usize,
+    }
+
+    impl Read for Reader {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            while self.pos >= self.plain.len() {
+                read_rec(&mut self.s, &mut self.cipher)?;
+                self.plain.resize(MAX_MSG, 0);
+                let n = self.st.read_message(self.nonce, &self.cipher, &mut self.plain).map_err(invalid)?;
+                self.nonce += 1;
+                self.plain.truncate(n);
+                self.pos = 0;
+            }
+            let n = out.len().min(self.plain.len() - self.pos);
+            out[..n].copy_from_slice(&self.plain[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// 暗号化側(Write)。flush で溜めた平文をレコードにして送る(送り手は必ず flush する)
+    pub struct Writer {
+        s: TcpStream,
+        st: Arc<snow::StatelessTransportState>,
+        nonce: u64,
+        buf: Vec<u8>,
+        cipher: Vec<u8>,
+    }
+
+    impl Writer {
+        fn emit(&mut self, n: usize) -> io::Result<()> {
+            self.cipher.resize(n + TAG, 0);
+            let len = self.st.write_message(self.nonce, &self.buf[..n], &mut self.cipher).map_err(invalid)?;
+            self.nonce += 1;
+            write_rec(&mut self.s, &self.cipher[..len])?;
+            self.buf.drain(..n);
+            Ok(())
+        }
+        pub fn shutdown(&self) {
+            let _ = self.s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    impl Reader {
+        /// 受信タイムアウトの設定(相手の生存確認の周期に合わせる)
+        pub fn set_read_timeout(&self, d: Option<std::time::Duration>) {
+            let _ = self.s.set_read_timeout(d);
+        }
+    }
+
+    impl Write for Writer {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            while self.buf.len() >= MAX_PLAIN {
+                self.emit(MAX_PLAIN)?;
+            }
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if !self.buf.is_empty() {
+                let n = self.buf.len();
+                self.emit(n)?;
+            }
+            self.s.flush()
+        }
+    }
+
+    fn split(s: TcpStream, hs: snow::HandshakeState) -> io::Result<(Reader, Writer)> {
+        let st = Arc::new(hs.into_stateless_transport_mode().map_err(invalid)?);
+        let w = s.try_clone()?;
+        Ok((
+            Reader { s, st: st.clone(), nonce: 0, cipher: Vec::new(), plain: Vec::new(), pos: 0 },
+            Writer { s: w, st, nonce: 0, buf: Vec::new(), cipher: Vec::new() },
+        ))
+    }
+
+    fn builder<'a>(label: &'a [u8], key: &'a [u8; 32]) -> io::Result<snow::Builder<'a>> {
+        snow::Builder::new(PATTERN.parse().map_err(invalid)?)
+            .prologue(label)
+            .map_err(invalid)?
+            .psk(0, key)
+            .map_err(invalid)
+    }
+
+    /// 接続した側(TCP クライアント)のハンドシェイク。label は経路ごとの識別子
+    /// (本線の通信を音声経路へ差し込む等の取り違えを防ぐ)
+    pub fn connect(mut s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
+        let key = psk(token);
+        let mut hs = builder(label, &key)?.build_initiator().map_err(invalid)?;
+        let mut buf = vec![0u8; MAX_MSG];
+        let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
+        write_rec(&mut s, &buf[..n])?;
+        let mut rec = Vec::new();
+        read_rec(&mut s, &mut rec)?;
+        hs.read_message(&rec, &mut buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "handshake failed (token mismatch?)"))?;
+        split(s, hs)
+    }
+
+    /// 待ち受けた側(TCP サーバ)のハンドシェイク。トークンが違えばここで失敗する
+    pub fn accept(mut s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
+        let key = psk(token);
+        let mut hs = builder(label, &key)?.build_responder().map_err(invalid)?;
+        let mut buf = vec![0u8; MAX_MSG];
+        let mut rec = Vec::new();
+        read_rec(&mut s, &mut rec)?;
+        hs.read_message(&rec, &mut buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "handshake failed (token mismatch?)"))?;
+        let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
+        write_rec(&mut s, &buf[..n])?;
+        split(s, hs)
+    }
+}
+
 pub mod net {
     //! 接続元の判定など、両 OS の待受処理で共通の小物
     use std::net::IpAddr;
+
+    /// 接続を受け入れてよい相手か。通信は暗号化と相互認証(secure)で守られるため、
+    /// 家庭・社内の LAN、有線直結(リンクローカル)、Tailscale を許可する。
+    /// インターネット側のアドレスは TSUNAGU_ALLOW_ANY=1 の時だけ許可する
+    /// (旧: Tailscale のみ許可で、usage.md が勧める有線直結 169.254.x.x が繋がらなかった)
+    pub fn is_allowed(ip: IpAddr) -> bool {
+        if crate::envutil::get("TSUNAGU_ALLOW_ANY").as_deref() == Some("1") {
+            return true;
+        }
+        match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback() || is_tailscale(ip),
+            IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // リンクローカル
+                    || v6.to_ipv4_mapped().is_some_and(|v4| is_allowed(IpAddr::V4(v4)))
+            }
+        }
+    }
 
     /// Tailscale の CGNAT 範囲(100.64.0.0/10)か
     pub fn is_tailscale(ip: IpAddr) -> bool {
@@ -394,7 +578,8 @@ pub mod bulk {
 
     /// 本線ポートからの差分(24900 → 24902。24901 は音声)
     pub const PORT_OFFSET: u16 = 2;
-    const HELLO: &str = "TSUNAGU-BULK1";
+    /// 暗号化ハンドシェイクで経路を識別するラベル
+    const LABEL: &[u8] = b"tsunagu-bulk";
     /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
     pub const MAX_FRAME: usize = 1024 * 1024;
     /// ファイル・画像データを分割する単位
@@ -595,7 +780,7 @@ pub mod bulk {
     pub struct Link {
         /// (世代, 書き込み口)。世代は張り替えのたびに増え、古い受信スレッドが
         /// 新しい接続を誤って外さないための照合に使う
-        w: std::sync::Mutex<Option<(u64, std::net::TcpStream)>>,
+        w: std::sync::Mutex<Option<(u64, crate::secure::Writer)>>,
         gen: std::sync::atomic::AtomicU64,
     }
 
@@ -609,21 +794,21 @@ pub mod bulk {
         pub const fn new() -> Self {
             Self { w: std::sync::Mutex::new(None), gen: std::sync::atomic::AtomicU64::new(0) }
         }
-        fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, std::net::TcpStream)>> {
+        fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, crate::secure::Writer)>> {
             self.w.lock().unwrap_or_else(|e| e.into_inner())
         }
         /// 新しい接続を据える。戻り値は世代(受信スレッドの終了時に clear_if へ渡す)
-        pub fn set(&self, s: std::net::TcpStream) -> u64 {
+        pub fn set(&self, s: crate::secure::Writer) -> u64 {
             let g = self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if let Some((_, old)) = self.slot().replace((g, s)) {
-                let _ = old.shutdown(std::net::Shutdown::Both);
+                old.shutdown();
             }
             g
         }
         /// 接続を捨てる(本線の切断時など)。受信スレッドも読み出しエラーで終わる
         pub fn clear(&self) {
             if let Some((_, old)) = self.slot().take() {
-                let _ = old.shutdown(std::net::Shutdown::Both);
+                old.shutdown();
             }
         }
         /// 指定世代の接続がまだ据わっている時だけ捨てる
@@ -631,7 +816,7 @@ pub mod bulk {
             let mut g = self.slot();
             if g.as_ref().is_some_and(|(n, _)| *n == gen) {
                 if let Some((_, old)) = g.take() {
-                    let _ = old.shutdown(std::net::Shutdown::Both);
+                    old.shutdown();
                 }
             }
         }
@@ -641,7 +826,7 @@ pub mod bulk {
         /// 送信する。未接続ならエラー、書き込み失敗なら接続を捨ててエラー
         pub fn send<T>(
             &self,
-            f: impl FnOnce(&mut std::net::TcpStream) -> std::io::Result<T>,
+            f: impl FnOnce(&mut crate::secure::Writer) -> std::io::Result<T>,
         ) -> std::io::Result<T> {
             let mut g = self.slot();
             let Some((_, s)) = g.as_mut() else {
@@ -650,7 +835,7 @@ pub mod bulk {
             let r = f(s);
             if r.is_err() {
                 if let Some((_, old)) = g.take() {
-                    let _ = old.shutdown(std::net::Shutdown::Both);
+                    old.shutdown();
                 }
             }
             r
@@ -666,7 +851,7 @@ pub mod bulk {
         pub log: fn(&str),
     }
 
-    fn spawn_reader(ep: &'static Endpoint, s: std::net::TcpStream, gen: u64) {
+    fn spawn_reader(ep: &'static Endpoint, s: crate::secure::Reader, gen: u64) {
         std::thread::spawn(move || {
             let mut r = std::io::BufReader::with_capacity(CHUNK + 16, s);
             let mut rx = Receiver::new(&ep.dir);
@@ -692,24 +877,27 @@ pub mod bulk {
         };
         (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
         for s in listener.incoming() {
-            let Ok(mut s) = s else { continue };
+            let Ok(s) = s else { continue };
             let Ok(peer) = s.peer_addr() else { continue };
             if !allow(peer.ip()) {
                 (ep.log)(&format!("[bulk] rejected: {peer}"));
                 continue;
             }
-            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            if !server_handshake(&mut s, &ep.token) {
-                (ep.log)(&format!("[bulk] invalid handshake from {peer}"));
-                continue;
-            }
+            let Ok(ctl) = s.try_clone() else { continue };
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let (r, w) = match crate::secure::accept(s, &ep.token, LABEL) {
+                Ok(x) => x,
+                Err(e) => {
+                    (ep.log)(&format!("[bulk] handshake 失敗 ({peer}): {e}"));
+                    continue;
+                }
+            };
             // 接続側は 10 秒毎にキープアライブを送る。3 回分届かなければ死んだ経路
-            s.set_read_timeout(Some(std::time::Duration::from_secs(35))).ok();
-            s.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
-            let Ok(w) = s.try_clone() else { continue };
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(35))).ok();
+            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
             let gen = ep.link.set(w);
             (ep.log)(&format!("[bulk] established ({peer})"));
-            spawn_reader(ep, s, gen);
+            spawn_reader(ep, r, gen);
         }
     }
 
@@ -730,57 +918,29 @@ pub mod bulk {
             if ep.link.is_up() {
                 if last_keepalive.elapsed() >= std::time::Duration::from_secs(10) {
                     last_keepalive = std::time::Instant::now();
-                    let _ = ep.link.send(|w| write_frame(w, KEEPALIVE, &[]));
+                    let _ = ep.link.send(|w| write_frame(w, KEEPALIVE, &[]).and_then(|_| w.flush()));
                 }
                 continue;
             }
             let Some(addr) = addr() else { continue };
-            let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) else {
+            let Ok(s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) else {
                 continue;
             };
-            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            if let Err(e) = client_handshake(&mut s, &ep.token) {
-                (ep.log)(&format!("[bulk] handshake 失敗: {e}"));
-                continue;
-            }
-            s.set_read_timeout(None).ok();
-            s.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
-            let Ok(w) = s.try_clone() else { continue };
+            let Ok(ctl) = s.try_clone() else { continue };
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let (r, w) = match crate::secure::connect(s, &ep.token, LABEL) {
+                Ok(x) => x,
+                Err(e) => {
+                    (ep.log)(&format!("[bulk] handshake 失敗: {e}"));
+                    continue;
+                }
+            };
+            ctl.set_read_timeout(None).ok();
+            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
             let gen = ep.link.set(w);
             (ep.log)(&format!("[bulk] established (→{addr})"));
-            spawn_reader(ep, s, gen);
+            spawn_reader(ep, r, gen);
         }
-    }
-
-    /// 接続側のハンドシェイク
-    pub fn client_handshake(s: &mut std::net::TcpStream, token: &str) -> std::io::Result<()> {
-        use std::io::BufRead;
-        s.write_all(format!("{HELLO} {token}\n").as_bytes())?;
-        let mut line = String::new();
-        std::io::BufReader::new(s.try_clone()?.take(64)).read_line(&mut line)?;
-        if line.trim() == "ok" {
-            Ok(())
-        } else {
-            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bulk handshake rejected"))
-        }
-    }
-
-    /// 待受側のハンドシェイク(1 バイトずつ読むことで、後続のフレームを取りこぼさない)
-    pub fn server_handshake(s: &mut std::net::TcpStream, token: &str) -> bool {
-        let mut line = Vec::new();
-        let mut b = [0u8; 1];
-        while line.len() < 512 {
-            if s.read_exact(&mut b).is_err() {
-                return false;
-            }
-            if b[0] == b'\n' {
-                break;
-            }
-            line.push(b[0]);
-        }
-        let ok = String::from_utf8_lossy(&line) == format!("{HELLO} {token}");
-        let _ = s.write_all(if ok { b"ok\n" } else { b"ng\n" });
-        ok
     }
 }
 
@@ -1133,8 +1293,9 @@ mod tests {
         assert_eq!(GOT.lock().unwrap().first().map(|v| v.as_slice()), Some(&b"over-the-wire"[..]));
 
         // 誤トークンは拒否される
-        let mut bad = std::net::TcpStream::connect(addr).unwrap();
-        assert!(client_handshake(&mut bad, "wrong").is_err());
+        let bad = std::net::TcpStream::connect(addr).unwrap();
+        bad.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        assert!(crate::secure::connect(bad, "wrong", b"tsunagu-bulk").is_err());
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -1156,12 +1317,48 @@ mod tests {
     }
 
     #[test]
+    fn secure_channel_roundtrip_and_token_mismatch() {
+        use super::secure::*;
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 253) as u8).collect();
+        let expect = big.clone();
+        let srv = std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let (mut r, mut w) = accept(s, "tok", b"test").unwrap();
+            let mut got = vec![0u8; expect.len()];
+            r.read_exact(&mut got).unwrap();
+            assert_eq!(got, expect);
+            w.write_all(b"pong").unwrap();
+            w.flush().unwrap();
+            // 誤トークンの接続は拒否される
+            let (s2, _) = l.accept().unwrap();
+            assert!(accept(s2, "tok", b"test").is_err());
+        });
+        let (mut r, mut w) = connect(std::net::TcpStream::connect(addr).unwrap(), "tok", b"test").unwrap();
+        w.write_all(&big).unwrap(); // 64KB を超えて複数レコードに分かれる
+        w.flush().unwrap();
+        let mut p = [0u8; 4];
+        r.read_exact(&mut p).unwrap();
+        assert_eq!(&p, b"pong");
+        assert!(connect(std::net::TcpStream::connect(addr).unwrap(), "wrong", b"test").is_err());
+        srv.join().unwrap();
+    }
+
+    #[test]
     fn tailscale_range() {
         use super::net::is_tailscale;
         assert!(is_tailscale("100.64.0.1".parse().unwrap()));
         assert!(is_tailscale("100.127.255.254".parse().unwrap()));
         assert!(!is_tailscale("100.128.0.1".parse().unwrap()));
         assert!(!is_tailscale("192.168.0.2".parse().unwrap()));
+        use super::net::is_allowed;
+        assert!(is_allowed("169.254.10.2".parse().unwrap())); // 有線直結
+        assert!(is_allowed("192.168.0.2".parse().unwrap()));
+        assert!(is_allowed("100.84.0.2".parse().unwrap()));
+        assert!(is_allowed("fe80::1".parse().unwrap()));
+        assert!(!is_allowed("8.8.8.8".parse().unwrap()));
     }
 
     #[test]
