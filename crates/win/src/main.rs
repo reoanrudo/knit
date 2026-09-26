@@ -1413,7 +1413,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
 }
 
 /// 認証済みストリームの本体処理(接続/待受 両モード共通)
-fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std::io::Result<()> {
+fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std::io::Result<()> {
     // 読み出しタイムアウト: Mac は 3 秒毎に ping を送るため 9 秒(3 回分)無音は経路断。
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
     reader.get_ref().set_read_timeout(Some(Duration::from_secs(9)));
@@ -1513,15 +1513,20 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
     // 接続時点のクリップボードは送らない(以後の変化だけを Mac へ戻る時に同期する)
     LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    // 行バッファを使い回す(lines() は毎行 String を新規確保するため、
+    // mouse_abs のような高頻度行で無駄なアロケーションになる。mac 側と同じ方式)
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
             Err(e) => {
                 mods.release_everything();
                 running_w.store(false, Ordering::Relaxed);
                 return Err(e);
             }
-        };
+        }
         if line.trim().is_empty() {
             continue;
         }
