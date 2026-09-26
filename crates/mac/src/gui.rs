@@ -429,7 +429,10 @@ unsafe extern "C" fn imp_open_recent(_s: ID, _c: SEL, _n: ID) {
         Some(p) => {
             let _ = std::process::Command::new("open").arg(&p).spawn();
         }
-        None => eprintln!("[gui] まだファイルを受信していません"),
+        None => {
+            eprintln!("[gui] まだファイルを受信していません");
+            crate::notify("tsunagu", "まだファイルを受信していません");
+        }
     }
 }
 unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
