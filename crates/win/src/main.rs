@@ -9,6 +9,7 @@ mod audio;
 mod dragdrop;
 mod tray;
 
+use tsunagu_common::bulk;
 use tsunagu_common::keymap::mac_kc_to_win_vk;
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -174,11 +175,6 @@ static BTN_W: [std::sync::atomic::AtomicBool; 3] = [
     std::sync::atomic::AtomicBool::new(false),
     std::sync::atomic::AtomicBool::new(false),
 ];
-/// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
-static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-/// ファイル掴みドラッグ越域: FileDropBegin を受けている間 true。
-/// FileBatchEnd でのクリップボード掲載を抑止し、FileDropEnd で OLE ドラッグへ流す
-static DROP_PENDING: AtomicBool = AtomicBool::new(false);
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// 累計ファイル受信数(ステータス窓の表示用)
@@ -235,10 +231,11 @@ fn sync_clipboard_to_mac() {
             return;
         }
         if let Some(dib) = clipboard_read_dib() {
-            let b64 = tsunagu_common::b64::encode(&dib);
-            if b64.len() <= 5 * 1024 * 1024 {
-                println!("[clip] win->mac image {}KB", dib.len() / 1024);
-                let _ = tx.send(encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }));
+            if dib.len() <= bulk::MAX_IMAGE {
+                match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
+                    Ok(()) => println!("[clip] win->mac image {}KB", dib.len() / 1024),
+                    Err(e) => println!("[clip] win->mac image 送信失敗: {e}"),
+                }
             }
             return;
         }
@@ -250,13 +247,11 @@ fn sync_clipboard_to_mac() {
                 .unwrap_or(false);
             if !echo {
                 println!("[file] CF_HDROP: {} files", files.len());
-                send_files_to_mac(&tx, &files);
+                send_files_to_mac(&files);
             }
         }
     });
 }
-/// ファイル送信 1 チャンクの生バイト上限(b64 後 4MB = プロトコル行上限 8MB 未満)
-const FILE_CHUNK_RAW: usize = 3 * 1024 * 1024;
 
 fn clipboard_read_text() -> Option<String> {
     unsafe {
@@ -441,65 +436,85 @@ fn files_key(paths: &[String]) -> String {
     format!("{}|{sizes}", paths.join("\u{1}"))
 }
 
-/// ファイル群を Mac へ送る(エクスプローラーのコピー検出から呼ぶ)。
-/// テキスト同期と同じ単一ライタチャネル(wtx)へ流すためロック不要
-fn send_files_to_mac(tx: &std::sync::mpsc::Sender<String>, paths: &[String]) {
-    const MAX_TOTAL: u64 = 200 * 1024 * 1024; // Mac 側の受信上限と同じ
-    const CHUNK: usize = FILE_CHUNK_RAW;
-    let mut total = 0u64;
-    for p in paths {
-        if let Ok(m) = std::fs::metadata(p) {
-            if m.is_file() {
-                total += m.len();
-            }
-        }
-    }
-    if total == 0 || total > MAX_TOTAL {
+/// ファイル群を Mac へ送る(大容量経路。本線の入力・ping を詰まらせない)
+fn send_files_to_mac(paths: &[String]) {
+    let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    let total = bulk::total_size(&paths);
+    if total == 0 || total > bulk::MAX_TOTAL {
         println!("[file] win->mac skip(total={total} bytes)");
         return;
     }
-    let mut sent = 0usize;
-    for p in paths {
-        let Ok(meta) = std::fs::metadata(p) else { continue };
-        if !meta.is_file() {
-            continue; // フォルダは対象外(ファイルのみ)
+    match BULK_LINK.send(|w| bulk::send_files(w, &paths, false)) {
+        Ok(n) => println!("[file] win->mac {n} 件送信完了"),
+        Err(e) => println!("[file] win->mac 送信失敗: {e}"),
+    }
+}
+
+/// 画像を CF_DIB としてクリップボードへ(Mac からの画像受信)
+fn clipboard_write_dib(dib: &[u8]) -> bool {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
         }
-        let name = std::path::Path::new(p)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".into());
-        if tx.send(encode(&Msg::FileBegin { name, size: meta.len() })).is_err() {
-            return;
+        EmptyClipboard();
+        let h = GlobalAlloc(GMEM_MOVEABLE, dib.len());
+        let p = if h.is_null() { std::ptr::null_mut() } else { GlobalLock(h) as *mut u8 };
+        if p.is_null() {
+            if !h.is_null() {
+                GlobalFree(h);
+            }
+            CloseClipboard();
+            return false;
         }
-        let Ok(mut f) = std::fs::File::open(p) else {
-            let _ = tx.send(encode(&Msg::FileEnd));
-            continue;
-        };
-        use std::io::Read as _;
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = match f.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(_) => return,
-            };
-            if tx
-                .send(encode(&Msg::FileChunk {
-                    data: tsunagu_common::b64::encode(&buf[..n]),
-                }))
-                .is_err()
-            {
+        std::ptr::copy_nonoverlapping(dib.as_ptr(), p, dib.len());
+        GlobalUnlock(h);
+        if SetClipboardData(CF_DIB, h).is_null() {
+            GlobalFree(h);
+            CloseClipboard();
+            return false;
+        }
+        CloseClipboard();
+        true
+    }
+}
+
+/// 大容量経路(ファイル・画像)。本線とは別の TCP 接続
+static BULK_LINK: bulk::Link = bulk::Link::new();
+static BULK: std::sync::OnceLock<bulk::Endpoint> = std::sync::OnceLock::new();
+
+/// 大容量経路の受信完了(Mac からのファイル・画像)
+fn win_on_bulk(e: bulk::Event) {
+    match e {
+        bulk::Event::Files { paths, drop } => {
+            let files: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let n = files.len();
+            FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
+            // 自分が渡す CF_HDROP を Mac へ送り返さない
+            *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) = Some(files_key(&files));
+            if drop && BTN_W[0].load(Ordering::Relaxed) {
+                // まだ押している=掴んだまま → 本物の OLE ドラッグを開始
+                dragdrop::start(files);
                 return;
             }
+            if drop {
+                println!("[drag] 転送完了時点でボタン非押下のため Ctrl+V 形式へフォールバック");
+            }
+            if clipboard_write_files(&files) {
+                LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+                println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
+                tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+            }
         }
-        if tx.send(encode(&Msg::FileEnd)).is_err() {
-            return;
+        bulk::Event::Image(dib) => {
+            if !CLIP_SHARE_W.load(Ordering::Relaxed) {
+                return;
+            }
+            let ok = clipboard_write_dib(&dib);
+            if ok {
+                LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+            }
+            println!("[clip] mac->win image {}KB {}", dib.len() / 1024, if ok { "ok" } else { "FAILED" });
         }
-        sent += 1;
-    }
-    if sent > 0 {
-        let _ = tx.send(encode(&Msg::FileBatchEnd));
-        println!("[file] win->mac {sent} 件送信完了");
     }
 }
 
@@ -905,8 +920,23 @@ fn main() {
         }
     }
 
+    let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
+        link: &BULK_LINK,
+        token: token.clone(),
+        dir: std::env::var_os("USERPROFILE")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Downloads")
+            .join("Tsunagu"),
+        on_event: win_on_bulk,
+        log: |s| println!("{s}"),
+    });
+
     if role_server {
         println!("[info] server mode. screen {w}x{h}");
+        let bind = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let ep = bulk_ep;
+        std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_tailscale));
         server_loop(&token, port, w, h);
         return;
     }
@@ -921,6 +951,9 @@ fn main() {
         }
     };
     println!("[info] client mode: connecting to {host}:{port}");
+    let mut bulk_addr = addr;
+    bulk_addr.set_port(port + bulk::PORT_OFFSET);
+    std::thread::spawn(move || bulk::connect_loop(bulk_ep, bulk_addr, || CONNECTED.load(Ordering::Relaxed)));
     client_loop(&addr, &token, w, h);
 }
 
@@ -1021,6 +1054,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
         let _ = session(stream, w, h);
         CONNECTED.store(false, Ordering::Relaxed);
+        BULK_LINK.clear();
         audio::speaker_disconnect();
         println!("[conn] lost. waiting for reconnect...");
         tray::notify("tsunagu", "切断しました(待機中)");
@@ -1067,6 +1101,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(stream, w, h);
     CONNECTED.store(false, Ordering::Relaxed);
+    BULK_LINK.clear();
     audio::speaker_disconnect();
     tray::notify("tsunagu", "切断しました(自動再接続中)");
     r
@@ -1094,10 +1129,6 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     });
     let reader = BufReader::new(stream);
     let mut mods = ModState::new();
-    // ファイル受信の途中状態(FileBegin → FileChunk… → FileEnd)。受信ループは
-    // シングルスレッドなのでローカル変数で持つ(チャンク順序もここで保証される)
-    let mut recv_file: Option<std::fs::File> = None;
-    let mut recv_remain: u64 = 0;
     // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
     // 端数は次イベントへ持ち越す。
@@ -1174,87 +1205,6 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             }
             Msg::Stat { rtt } => {
                 RTT_MS.store(rtt, Ordering::Relaxed);
-            }
-            Msg::FileBegin { name, size } => {
-                recv_file = file_begin(&name, size, &mut recv_remain);
-            }
-            Msg::FileChunk { data } => {
-                if recv_file.is_none() {
-                    continue;
-                }
-                let mut ok = false;
-                if let Some(bytes) = tsunagu_common::b64::decode(&data) {
-                    if !bytes.is_empty() && bytes.len() as u64 <= recv_remain {
-                        use std::io::Write as _;
-                        let written = recv_file
-                            .as_mut()
-                            .map(|f| f.write_all(&bytes).is_ok())
-                            .unwrap_or(false);
-                        if written {
-                            recv_remain -= bytes.len() as u64;
-                            ok = true;
-                        }
-                    }
-                }
-                if !ok {
-                    println!("[file] chunk 失敗。受信を破棄します");
-                    recv_file = None;
-                    recv_remain = 0;
-                }
-            }
-            Msg::FileEnd => {
-                recv_file = None; // File の drop で閉じる(掲載は FileBatchEnd で一括)
-                recv_remain = 0;
-            }
-            Msg::FileDropBegin => {
-                DROP_PENDING.store(true, Ordering::Relaxed);
-                println!("[drag] 掴みドラッグ受信開始(クリップボードではなく OLE ドラッグで渡します)");
-            }
-            Msg::FileBatchEnd => {
-                let files = PENDING_FILES
-                    .lock()
-                    .map(|g| g.clone())
-                    .unwrap_or_default();
-                if DROP_PENDING.load(Ordering::Relaxed) {
-                    // 掴みドラッグ: FileDropEnd で OLE ドラッグを開始するため
-                    // ここでは掲載しない(PENDING_FILES は温存)
-                    println!("[drag] ファイル受信完了: {} 件(ドロップ待ち)", files.len());
-                    continue;
-                }
-                if !files.is_empty() && clipboard_write_files(&files) {
-                    LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
-                    let n = files.len();
-                    FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
-                    println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                    tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
-                    // 自分が載せた CF_HDROP を監視スレッドが検出しても送り返さない
-                    *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(files_key(&files));
-                }
-            }
-            Msg::FileDropEnd => {
-                let files = std::mem::take(&mut *PENDING_FILES.lock().unwrap_or_else(|e| e.into_inner()));
-                DROP_PENDING.store(false, Ordering::Relaxed);
-                if files.is_empty() {
-                    continue;
-                }
-                FILES_RX.fetch_add(files.len() as u64, Ordering::Relaxed);
-                // 自分が渡す CF_HDROP を監視スレッドが検出しても送り返さない
-                *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(files_key(&files));
-                if BTN_W[0].load(Ordering::Relaxed) {
-                    // まだ押している=掴んだまま → 本物の OLE ドラッグを開始
-                    dragdrop::start(files);
-                } else {
-                    // 転送中に既に離した(E2E の遅延やユーザー操作)→ 従来体験へ
-                    println!("[drag] 転送完了時点でボタン非押下のため Ctrl+V 形式へフォールバック");
-                    if clipboard_write_files(&files) {
-                        LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
-                        let n = files.len();
-                        println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                        tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
-                    }
-                }
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift, tr } => {
                 if !hello_done {
@@ -1415,36 +1365,6 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
 
 /// ファイル受信の開始: Downloads\Tsunagu へ新規作成し書き込みハンドルを返す。
 /// サイズ上限 200MB。ファイル名はパス区切り・Windows 禁止文字・先頭 '.' を無害化
-fn file_begin(name: &str, size: u64, remain: &mut u64) -> Option<std::fs::File> {
-    if size == 0 || size > tsunagu_common::files::MAX_FILE {
-        println!("[file] 拒否: {name} ({size} bytes)");
-        return None;
-    }
-    let dir = std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join("Downloads")
-        .join("Tsunagu");
-    let Some((f, path)) = tsunagu_common::files::create_unique(&dir, name) else {
-        println!("[file] 作成失敗: {name}");
-        return None;
-    };
-    *remain = size;
-    println!("[file] begin: {} ({size} bytes)", path.display());
-    PENDING_FILES
-        .lock()
-        .map(|mut g| {
-            g.push(path.to_string_lossy().into_owned());
-            // クリップボードに載せるのは直近 16 件まで(無制限増加を防ぐ)
-            if g.len() > 16 {
-                let excess = g.len() - 16;
-                g.drain(..excess);
-            }
-        })
-        .ok();
-    Some(f)
-}
-
 /// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
 /// (連打防止 0.7 秒クールダウン)。境界に沿った比率も送り、Mac 側の復帰位置に
 /// 反映させる(境界の連続性)。side 0/1=縦比率、2/3=横比率を ny へ載せる

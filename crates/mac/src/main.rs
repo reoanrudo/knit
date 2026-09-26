@@ -5,7 +5,7 @@
 mod audio;
 mod gui;
 
-use tsunagu_common::envutil;
+use tsunagu_common::{bulk, envutil};
 use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::net::TcpStream;
@@ -201,6 +201,11 @@ fn sync_clipboard_to_win() {
                     *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
                     eprintln!("[file] クリップボードのファイル {} 件を渡します", files.len());
                     send_files_to_win(files, false);
+                }
+            } else if let Some(dib) = mac_clipboard_image_dib() {
+                match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
+                    Ok(()) => eprintln!("[clip] mac->win image {}KB", dib.len() / 1024),
+                    Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
                 }
             }
             return;
@@ -566,17 +571,8 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
         return;
     }
     std::thread::spawn(move || {
-        const MAX_TOTAL: u64 = 200 * 1024 * 1024; // Windows 側の受信上限と同じ
-        const CHUNK: usize = 3 * 1024 * 1024;
-        let mut total = 0u64;
-        for p in &paths {
-            if let Ok(m) = std::fs::metadata(p) {
-                if m.is_file() {
-                    total += m.len();
-                }
-            }
-        }
-        if total == 0 || total > MAX_TOTAL {
+        let total = bulk::total_size(&paths);
+        if total == 0 || total > bulk::MAX_TOTAL {
             eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
             notify(
                 "tsunagu",
@@ -585,66 +581,92 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
             FILE_TX_BUSY.store(false, Ordering::Relaxed);
             return;
         }
-        if !CONNECTED.load(Ordering::Relaxed) {
-            eprintln!("[file] 未接続のため送信しません");
-            notify("tsunagu", "Windows 未接続のためファイルを送信できません");
-            FILE_TX_BUSY.store(false, Ordering::Relaxed);
-            return;
-        }
-        if drop {
-            send_msg(&Msg::FileDropBegin);
-        }
         eprintln!("[file] 送信開始: {} 件 / 合計 {}KB{}", paths.len(), total / 1024, if drop { "(掴みドラッグ)" } else { "" });
-        use std::io::Read;
-        let mut buf = vec![0u8; CHUNK];
-        for p in &paths {
-            let Ok(meta) = std::fs::metadata(p) else { continue };
-            if !meta.is_file() {
-                continue;
-            }
-            let name = p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
-            }
-            let size = meta.len();
-            let Ok(mut f) = std::fs::File::open(p) else {
-                eprintln!("[file] open 失敗: {}", p.display());
-                continue;
-            };
-            send_msg(&Msg::FileBegin { name: name.clone(), size });
-            let mut remain = size;
-            while remain > 0 {
-                let want = remain.min(CHUNK as u64) as usize;
-                match f.read(&mut buf[..want]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        send_msg(&Msg::FileChunk { data: tsunagu_common::b64::encode(&buf[..n]) });
-                        remain -= n as u64;
-                    }
-                    Err(_) => break,
+        let t0 = std::time::Instant::now();
+        match BULK_LINK.send(|w| bulk::send_files(w, &paths, drop)) {
+            Ok(n) => {
+                let secs = t0.elapsed().as_secs_f64().max(0.001);
+                eprintln!(
+                    "[file] 送信完了({n} 件, {:.1}MB/s)",
+                    total as f64 / 1024.0 / 1024.0 / secs
+                );
+                if drop {
+                    notify("tsunagu", &format!("{n} 件のファイルを Windows へ掴んで渡しました"));
+                } else {
+                    notify("tsunagu", &format!("{n} 件のファイルを Windows へ送信しました(Ctrl+V で貼り付け)"));
                 }
             }
-            send_msg(&Msg::FileEnd);
-            eprintln!("[file] 送信: {name} ({size} bytes)");
-        }
-        send_msg(&Msg::FileBatchEnd);
-        if drop {
-            send_msg(&Msg::FileDropEnd);
-            eprintln!(
-                "[file] 送信完了({} 件)。Windows 側で掴んだままドロップできます",
-                paths.len()
-            );
-            notify("tsunagu", &format!("{} 件のファイルを Windows へ掴んで渡しました", paths.len()));
-        } else {
-            eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
-            notify("tsunagu", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
+            Err(e) => {
+                eprintln!("[file] 送信失敗: {e}");
+                notify("tsunagu", "Windows へファイルを送れませんでした(ファイル転送経路が未接続)");
+            }
         }
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
     });
 }
+
+/// Mac のクリップボード画像(PNG/TIFF/JPEG)を Windows の CF_DIB 形式にする。
+/// NSBitmapImageRep で BMP に書き出し、先頭 14 バイトのファイルヘッダを外すと DIB になる
+/// (Windows 側に画像デコーダを持たずに済む)
+unsafe fn mac_clipboard_image_dib() -> Option<Vec<u8>> {
+    let pb = general_pasteboard();
+    let data = ["public.png", "public.tiff", "public.jpeg"]
+        .iter()
+        .map(|t| msg1_id(pb, sel_registerName(c"dataForType:".as_ptr()), nsstring(t)))
+        .find(|d| !d.is_null())?;
+    let rep = msg1_id(
+        objc_getClass(c"NSBitmapImageRep".as_ptr()),
+        sel_registerName(c"imageRepWithData:".as_ptr()),
+        data,
+    );
+    if rep.is_null() {
+        return None;
+    }
+    let props = msg0(objc_getClass(c"NSDictionary".as_ptr()), sel_registerName(c"dictionary".as_ptr()));
+    let repr: unsafe extern "C" fn(ID, SEL, usize, ID) -> ID = std::mem::transmute(objc_msgSend as usize);
+    // NSBitmapImageFileTypeBMP = 1
+    let bmp = repr(rep, sel_registerName(c"representationUsingType:properties:".as_ptr()), 1, props);
+    if bmp.is_null() {
+        return None;
+    }
+    let len = msg0_isize(bmp, sel_registerName(c"length".as_ptr())) as usize;
+    let ptr = msg0(bmp, sel_registerName(c"bytes".as_ptr())) as *const u8;
+    if ptr.is_null() || len <= 14 || len > bulk::MAX_IMAGE {
+        return None;
+    }
+    Some(std::slice::from_raw_parts(ptr, len)[14..].to_vec())
+}
+
+/// 大容量経路の受信完了(Windows からのファイル・画像)
+fn mac_on_bulk(e: bulk::Event) {
+    with_pool(|| match e {
+        bulk::Event::Files { paths, .. } => {
+            let n = paths.len();
+            let ok = unsafe { mac_clipboard_write_files(&paths) };
+            // 自分が載せたファイルを Windows へ送り返さない
+            *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = mac_files_key(&paths);
+            LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+            if ok {
+                eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
+                notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
+            } else {
+                eprintln!("[file] win->mac 受信: {n} 件(クリップボード載せ失敗)");
+            }
+        }
+        bulk::Event::Image(dib) => {
+            if !CLIP_SHARE.load(Ordering::Relaxed) {
+                return;
+            }
+            let ok = unsafe { mac_set_clipboard_image_bmp(&dib_to_bmp(&dib)) };
+            LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+            eprintln!("[clip] win->mac image {}KB {}", dib.len() / 1024, if ok { "ok" } else { "FAILED" });
+        }
+    })
+}
+
+/// 大容量経路(ファイル・画像)。本線とは別の TCP 接続
+static BULK_LINK: bulk::Link = bulk::Link::new();
+static BULK: OnceLock<bulk::Endpoint> = OnceLock::new();
 
 /// macOS の通知センターへ表示(接続/切断のユーザー可視化)。
 /// osascript 経由で追加権限なしで出せる。失敗しても本体には影響しない。
@@ -1900,6 +1922,17 @@ fn main() {
     // TSUNAGU_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
     // その場合は Windows 側を TSUNAGU_ROLE=server で待ち受ける)
     let client_role = envutil::get("TSUNAGU_ROLE").as_deref() == Some("client");
+    let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
+        link: &BULK_LINK,
+        token: token.clone(),
+        dir: std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Downloads/Tsunagu"),
+        on_event: mac_on_bulk,
+        log: |s| eprintln!("{s}"),
+    });
+    use std::net::ToSocketAddrs;
     if client_role {
         let host = args
             .iter()
@@ -1915,8 +1948,18 @@ fn main() {
                 std::process::exit(1);
             });
         eprintln!("[info] client mode: connecting to {host}:{port}");
+        match (host.as_str(), port + bulk::PORT_OFFSET).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+            Some(addr) => {
+                std::thread::spawn(move || bulk::connect_loop(bulk_ep, addr, || CONNECTED.load(Ordering::Relaxed)));
+            }
+            None => eprintln!("[bulk] 接続先を解決できません: {host}"),
+        }
         std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
     } else {
+        let bind = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        std::thread::spawn(move || {
+            bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_tailscale)
+        });
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
     }
 
@@ -2126,12 +2169,6 @@ const MAX_LINE: u64 = 8 * 1024 * 1024;
 /// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)
 fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
     use std::io::BufRead;
-    // ファイル受信の途中状態(FileBegin → FileChunk… → FileEnd)。
-    // 受信ループはシングルスレッドのためローカル変数で持つ
-    let mut recv_file: Option<std::fs::File> = None;
-    let mut recv_remain: u64 = 0;
-    let mut recv_name = String::new();
-    let mut recv_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut line = String::new();
     loop {
         line.clear();
@@ -2159,28 +2196,6 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             eprintln!("[mode] MAC (return)");
                             leave_win_mode_cursor_unlock(Some(ny));
                         }
-                        Msg::ClipData { kind, data } => {
-                            if !CLIP_SHARE.load(Ordering::Relaxed) {
-                                continue;
-                            }
-                            // 受信側にも上限を課す(送信側制限のみに依存しない)
-                            if data.len() > 8 * 1024 * 1024 {
-                                eprintln!("[clip] win->mac image too large. skipped");
-                                continue;
-                            }
-                            if kind == "image/dib" {
-                                if let Some(bytes) = tsunagu_common::b64::decode(&data) {
-                                    let bmp = dib_to_bmp(&bytes);
-                                    let ok = with_pool(|| unsafe { mac_set_clipboard_image_bmp(&bmp) });
-                                    LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-                                    eprintln!(
-                                        "[clip] win->mac image {}KB {}",
-                                        bytes.len() / 1024,
-                                        if ok { "ok" } else { "FAILED" }
-                                    );
-                                }
-                            }
-                        }
                         Msg::Clip { text } => {
                             if !CLIP_SHARE.load(Ordering::Relaxed) {
                                 continue;
@@ -2197,64 +2212,6 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                                 with_pool(|| unsafe { mac_set_clipboard(&text) });
                                 LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
                                 eprintln!("[clip] win->mac {} bytes", text.len());
-                            }
-                        }
-                        Msg::FileBegin { name, size } => {
-                            recv_file = None;
-                            recv_remain = 0;
-                            if let Some((f, path)) = mac_file_begin(&name, size) {
-                                recv_name = path.to_string_lossy().into_owned();
-                                recv_paths.push(path);
-                                recv_file = Some(f);
-                                recv_remain = size;
-                            }
-                        }
-                        Msg::FileChunk { data } => {
-                            if recv_file.is_none() {
-                                continue;
-                            }
-                            let mut ok = false;
-                            if let Some(bytes) = tsunagu_common::b64::decode(&data) {
-                                if !bytes.is_empty() && bytes.len() as u64 <= recv_remain {
-                                    use std::io::Write as _;
-                                    let written = recv_file
-                                        .as_mut()
-                                        .map(|f| f.write_all(&bytes).is_ok())
-                                        .unwrap_or(false);
-                                    if written {
-                                        recv_remain -= bytes.len() as u64;
-                                        ok = true;
-                                    }
-                                }
-                            }
-                            if !ok {
-                                eprintln!("[file] chunk 失敗。このファイルを破棄します");
-                                recv_file = None;
-                                recv_remain = 0;
-                            }
-                        }
-                        Msg::FileEnd => {
-                            recv_file = None; // File の drop で閉じる
-                            recv_remain = 0;
-                            recv_name.clear();
-                        }
-                        Msg::FileBatchEnd => {
-                            // 一括送信の終了: 受け取った全ファイルをクリップボードへ
-                            if !recv_paths.is_empty() {
-                                let key = mac_files_key(&recv_paths);
-                                let n = recv_paths.len();
-                                let ok = with_pool(|| unsafe { mac_clipboard_write_files(&recv_paths) });
-                                LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-                                // 自分が載せたファイルを監視スレッドが Windows へ
-                                // 送り返さないよう指紋を登録(ループ防止)
-                                *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
-                                if ok {
-                                    eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
-                                    notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
-                                } else {
-                                    eprintln!("[file] win->mac 受信: {n} 件(クリップボード載せ失敗)");
-                                }
-                                recv_paths.clear();
                             }
                         }
                         Msg::Pong { ts } => {
@@ -2283,6 +2240,7 @@ fn on_disconnect() {
         *guard = None;
     }
     CONNECTED.store(false, Ordering::Relaxed);
+    BULK_LINK.clear();
     // WIN モード中の切断は正規の leave 経由で復帰させる(カーソル表示・
     // EDGE_GUARD・CUR_POS 整合を自己修復スレッドの「たまたま」に任せない)
     if WIN_MODE.swap(false, Ordering::Relaxed) {

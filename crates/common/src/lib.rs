@@ -98,12 +98,13 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入
-    pub const VERSION: u32 = 9;
+    /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入。
+    /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除
+    pub const VERSION: u32 = 10;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
-    pub const MIN_VERSION: u32 = 9;
+    pub const MIN_VERSION: u32 = 10;
 
     /// 相手の版を受け入れてよいか
     pub fn compatible(peer: u32) -> bool {
@@ -158,9 +159,6 @@ pub mod proto {
         /// クリップボード同期(プレーンテキスト)
         #[serde(rename = "clip")]
         Clip { text: String },
-        /// クリップボード同期(バイナリ、base64)。kind 例: "image/dib"
-        #[serde(rename = "clip_data")]
-        ClipData { kind: String, data: String },
         /// Mac が制御を取り戻した(Windows を離れた)。Windows は押下中の全キー・
         /// ボタン・Alt+Tab を解放する。ホットキー/Mac 内完結の左端復帰/切断など
         /// Windows が自力で検知できない離脱経路のための後片付け合図
@@ -201,27 +199,6 @@ pub mod proto {
         /// 接続品質通知: Mac が測定した RTT(ms)を Windows 側の表示へ回す
         #[serde(rename = "stat")]
         Stat { rtt: u64 },
-        /// ファイル送信(双方向)。begin → chunk(base64, 生3MB以下) → end の順。
-        /// 受信側は Downloads\Tsunagu へ保存しファイル参照をクリップボードへ
-        #[serde(rename = "file_begin")]
-        FileBegin { name: String, size: u64 },
-        #[serde(rename = "file_chunk")]
-        FileChunk { data: String },
-        #[serde(rename = "file_end")]
-        FileEnd,
-        /// ファイル一括送信の終了合図(全ファイルの FileEnd 後に 1 回)。
-        /// 受信側はこの時点でクリップボードへファイル参照を載せ通知する
-        #[serde(rename = "file_batch_end")]
-        FileBatchEnd,
-        /// ファイル掴みドラッグ越境の開始合図。Mac が Finder 等のファイルドラッグ
-        /// 中に境界を越えた時に FileBegin 群の前に送る。受信側は続くファイル群を
-        /// 「ドロップ用」(クリップボードではなく OLE ドラッグで渡す)と扱う
-        #[serde(rename = "file_drop_begin")]
-        FileDropBegin,
-        /// ファイル掴みドラッグ越域の転送完了合図(FileBatchEnd の後)。
-        /// 受信側はこの時点で押下中ボタンの継続を前提に DoDragDrop を開始する
-        #[serde(rename = "file_drop_end")]
-        FileDropEnd,
         #[serde(rename = "bye")]
         Bye,
     }
@@ -339,6 +316,417 @@ pub mod files {
             }
         }
         None
+    }
+}
+
+pub mod net {
+    //! 接続元の判定など、両 OS の待受処理で共通の小物
+    use std::net::IpAddr;
+
+    /// Tailscale の CGNAT 範囲(100.64.0.0/10)か
+    pub fn is_tailscale(ip: IpAddr) -> bool {
+        match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                o[0] == 100 && (64..=127).contains(&o[1])
+            }
+            IpAddr::V6(_) => false,
+        }
+    }
+}
+
+pub mod bulk {
+    //! 大容量データ(ファイル・画像)専用の経路。本線(入力・制御の JSON Lines)と
+    //! 別の TCP 接続に分けることで、転送中もマウス・キー・ping が詰まらない
+    //! (旧方式は 3MB チャンクが入力と同じキューとソケットに並び、転送中は入力が止まり、
+    //! 転送が 10 秒を超えると pong 遅延で切断と誤判定された)。
+    //! フレーム: [種別 u8][長さ u32 LE][本体]。base64 を使わない(33% 増と変換 CPU の削減)
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+
+    /// 本線ポートからの差分(24900 → 24902。24901 は音声)
+    pub const PORT_OFFSET: u16 = 2;
+    const HELLO: &str = "TSUNAGU-BULK1";
+    /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
+    pub const MAX_FRAME: usize = 1024 * 1024;
+    /// ファイル・画像データを分割する単位
+    pub const CHUNK: usize = 256 * 1024;
+    /// 1 回の一括送信の合計上限
+    pub const MAX_TOTAL: u64 = 200 * 1024 * 1024;
+    /// クリップボード画像の上限(生 DIB)
+    pub const MAX_IMAGE: usize = 64 * 1024 * 1024;
+
+    pub const KEEPALIVE: u8 = 0;
+    pub const FILE_BEGIN: u8 = 1;
+    pub const DATA: u8 = 2;
+    pub const FILE_END: u8 = 3;
+    pub const BATCH_END: u8 = 4;
+    pub const DROP_BEGIN: u8 = 5;
+    pub const DROP_END: u8 = 6;
+    pub const IMAGE_BEGIN: u8 = 7;
+    pub const IMAGE_END: u8 = 8;
+
+    pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
+        let mut head = [0u8; 5];
+        head[0] = kind;
+        head[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        w.write_all(&head)?;
+        w.write_all(body)
+    }
+
+    /// 1 フレーム読む(本体は buf に入れ直す)。上限超過は不正として切断させる
+    pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> std::io::Result<u8> {
+        let mut head = [0u8; 5];
+        r.read_exact(&mut head)?;
+        let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
+        if len > MAX_FRAME {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
+        }
+        buf.resize(len, 0);
+        r.read_exact(buf)?;
+        Ok(head[0])
+    }
+
+    pub fn total_size(paths: &[PathBuf]) -> u64 {
+        paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len()))
+            .sum()
+    }
+
+    /// ファイル群を送る。drop=true は「掴んだまま境界越え」(受信側は OLE ドラッグで渡す)。
+    /// 戻り値は送った件数
+    pub fn send_files(w: &mut impl Write, paths: &[PathBuf], drop: bool) -> std::io::Result<usize> {
+        if drop {
+            write_frame(w, DROP_BEGIN, &[])?;
+        }
+        let mut buf = vec![0u8; CHUNK];
+        let mut sent = 0;
+        for p in paths {
+            let Ok(meta) = std::fs::metadata(p) else { continue };
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let Ok(mut f) = std::fs::File::open(p) else { continue };
+            let head = serde_json::json!({ "name": name, "size": meta.len() }).to_string();
+            write_frame(w, FILE_BEGIN, head.as_bytes())?;
+            let mut remain = meta.len();
+            while remain > 0 {
+                let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
+                if n == 0 {
+                    break;
+                }
+                write_frame(w, DATA, &buf[..n])?;
+                remain -= n as u64;
+            }
+            write_frame(w, FILE_END, &[])?;
+            sent += 1;
+        }
+        write_frame(w, BATCH_END, &[])?;
+        if drop {
+            write_frame(w, DROP_END, &[])?;
+        }
+        w.flush()?;
+        Ok(sent)
+    }
+
+    /// クリップボード画像(DIB)を送る
+    pub fn send_image(w: &mut impl Write, dib: &[u8]) -> std::io::Result<()> {
+        write_frame(w, IMAGE_BEGIN, &(dib.len() as u64).to_le_bytes())?;
+        for c in dib.chunks(CHUNK) {
+            write_frame(w, DATA, c)?;
+        }
+        write_frame(w, IMAGE_END, &[])?;
+        w.flush()
+    }
+
+    /// 受信完了の単位
+    #[derive(Debug)]
+    pub enum Event {
+        /// 一括送信が完了した(drop=true は掴みドラッグ)
+        Files { paths: Vec<PathBuf>, drop: bool },
+        Image(Vec<u8>),
+    }
+
+    enum Sink {
+        None,
+        File { f: std::fs::File, remain: u64 },
+        Image { data: Vec<u8>, remain: usize },
+    }
+
+    /// 受信側の状態機械。フレームを順に与えると完了時に Event を返す
+    pub struct Receiver {
+        dir: PathBuf,
+        sink: Sink,
+        paths: Vec<PathBuf>,
+        drop: bool,
+    }
+
+    impl Receiver {
+        pub fn new(dir: &Path) -> Self {
+            Self { dir: dir.to_path_buf(), sink: Sink::None, paths: Vec::new(), drop: false }
+        }
+
+        pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
+            match kind {
+                DROP_BEGIN => self.drop = true,
+                FILE_BEGIN => {
+                    self.sink = Sink::None;
+                    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+                    let name = v["name"].as_str().unwrap_or("file");
+                    let size = v["size"].as_u64().unwrap_or(0);
+                    if size > crate::files::MAX_FILE {
+                        return None;
+                    }
+                    let (f, path) = crate::files::create_unique(&self.dir, name)?;
+                    self.paths.push(path);
+                    self.sink = Sink::File { f, remain: size };
+                }
+                DATA => match &mut self.sink {
+                    Sink::File { f, remain } => {
+                        // 宣言サイズを超える・書けないデータは、そのファイルごと破棄する
+                        if body.len() as u64 > *remain || f.write_all(body).is_err() {
+                            self.sink = Sink::None;
+                            if let Some(p) = self.paths.pop() {
+                                let _ = std::fs::remove_file(p);
+                            }
+                        } else {
+                            *remain -= body.len() as u64;
+                        }
+                    }
+                    Sink::Image { data, remain } => {
+                        if body.len() > *remain {
+                            self.sink = Sink::None;
+                        } else {
+                            data.extend_from_slice(body);
+                            *remain -= body.len();
+                        }
+                    }
+                    Sink::None => {}
+                },
+                FILE_END => {
+                    // 途中で切れた(宣言サイズに満たない)ファイルは残さない
+                    if let Sink::File { remain, .. } = &self.sink {
+                        if *remain > 0 {
+                            if let Some(p) = self.paths.pop() {
+                                let _ = std::fs::remove_file(p);
+                            }
+                        }
+                    }
+                    self.sink = Sink::None;
+                }
+                BATCH_END => {
+                    self.sink = Sink::None;
+                    let paths = std::mem::take(&mut self.paths);
+                    let drop = std::mem::replace(&mut self.drop, false);
+                    if !paths.is_empty() {
+                        return Some(Event::Files { paths, drop });
+                    }
+                }
+                IMAGE_BEGIN => {
+                    let n = u64::from_le_bytes(body.try_into().ok()?) as usize;
+                    if n == 0 || n > MAX_IMAGE {
+                        return None;
+                    }
+                    self.sink = Sink::Image { data: Vec::with_capacity(n), remain: n };
+                }
+                IMAGE_END => {
+                    if let Sink::Image { data, remain: 0 } = std::mem::replace(&mut self.sink, Sink::None) {
+                        return Some(Event::Image(data));
+                    }
+                }
+                _ => {}
+            }
+            None
+        }
+    }
+
+    /// 大容量経路の送信口。接続が張り替わるたびに差し替える。
+    /// 送信中はロックを保持するため、複数の転送のフレームが混ざらない
+    pub struct Link {
+        /// (世代, 書き込み口)。世代は張り替えのたびに増え、古い受信スレッドが
+        /// 新しい接続を誤って外さないための照合に使う
+        w: std::sync::Mutex<Option<(u64, std::net::TcpStream)>>,
+        gen: std::sync::atomic::AtomicU64,
+    }
+
+    impl Default for Link {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl Link {
+        pub const fn new() -> Self {
+            Self { w: std::sync::Mutex::new(None), gen: std::sync::atomic::AtomicU64::new(0) }
+        }
+        fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, std::net::TcpStream)>> {
+            self.w.lock().unwrap_or_else(|e| e.into_inner())
+        }
+        /// 新しい接続を据える。戻り値は世代(受信スレッドの終了時に clear_if へ渡す)
+        pub fn set(&self, s: std::net::TcpStream) -> u64 {
+            let g = self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if let Some((_, old)) = self.slot().replace((g, s)) {
+                let _ = old.shutdown(std::net::Shutdown::Both);
+            }
+            g
+        }
+        /// 接続を捨てる(本線の切断時など)。受信スレッドも読み出しエラーで終わる
+        pub fn clear(&self) {
+            if let Some((_, old)) = self.slot().take() {
+                let _ = old.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        /// 指定世代の接続がまだ据わっている時だけ捨てる
+        pub fn clear_if(&self, gen: u64) {
+            let mut g = self.slot();
+            if g.as_ref().is_some_and(|(n, _)| *n == gen) {
+                if let Some((_, old)) = g.take() {
+                    let _ = old.shutdown(std::net::Shutdown::Both);
+                }
+            }
+        }
+        pub fn is_up(&self) -> bool {
+            self.slot().is_some()
+        }
+        /// 送信する。未接続ならエラー、書き込み失敗なら接続を捨ててエラー
+        pub fn send<T>(
+            &self,
+            f: impl FnOnce(&mut std::net::TcpStream) -> std::io::Result<T>,
+        ) -> std::io::Result<T> {
+            let mut g = self.slot();
+            let Some((_, s)) = g.as_mut() else {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "bulk link down"));
+            };
+            let r = f(s);
+            if r.is_err() {
+                if let Some((_, old)) = g.take() {
+                    let _ = old.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            r
+        }
+    }
+
+    /// 経路ごとの設定(受信先・完了時の処理・ログ出力先)
+    pub struct Endpoint {
+        pub link: &'static Link,
+        pub token: String,
+        pub dir: PathBuf,
+        pub on_event: fn(Event),
+        pub log: fn(&str),
+    }
+
+    fn spawn_reader(ep: &'static Endpoint, s: std::net::TcpStream, gen: u64) {
+        std::thread::spawn(move || {
+            let mut r = std::io::BufReader::with_capacity(CHUNK + 16, s);
+            let mut rx = Receiver::new(&ep.dir);
+            let mut buf = Vec::new();
+            while let Ok(kind) = read_frame(&mut r, &mut buf) {
+                if let Some(e) = rx.feed(kind, &buf) {
+                    (ep.on_event)(e);
+                }
+            }
+            ep.link.clear_if(gen);
+            (ep.log)("[bulk] 受信経路が切れました");
+        });
+    }
+
+    /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす
+    pub fn serve(ep: &'static Endpoint, bind: &str, port: u16, allow: fn(std::net::IpAddr) -> bool) {
+        let listener = match std::net::TcpListener::bind((bind, port)) {
+            Ok(l) => l,
+            Err(e) => {
+                (ep.log)(&format!("[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可)"));
+                return;
+            }
+        };
+        (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let Ok(peer) = s.peer_addr() else { continue };
+            if !allow(peer.ip()) {
+                (ep.log)(&format!("[bulk] rejected: {peer}"));
+                continue;
+            }
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            if !server_handshake(&mut s, &ep.token) {
+                (ep.log)(&format!("[bulk] invalid handshake from {peer}"));
+                continue;
+            }
+            // 接続側は 10 秒毎にキープアライブを送る。3 回分届かなければ死んだ経路
+            s.set_read_timeout(Some(std::time::Duration::from_secs(35))).ok();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
+            let Ok(w) = s.try_clone() else { continue };
+            let gen = ep.link.set(w);
+            (ep.log)(&format!("[bulk] established ({peer})"));
+            spawn_reader(ep, s, gen);
+        }
+    }
+
+    /// 接続側: 本線が繋がっている間、大容量経路が無ければ張り直し、キープアライブを送る
+    pub fn connect_loop(ep: &'static Endpoint, addr: std::net::SocketAddr, main_up: fn() -> bool) {
+        let mut last_keepalive = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if !main_up() {
+                ep.link.clear();
+                continue;
+            }
+            if ep.link.is_up() {
+                if last_keepalive.elapsed() >= std::time::Duration::from_secs(10) {
+                    last_keepalive = std::time::Instant::now();
+                    let _ = ep.link.send(|w| write_frame(w, KEEPALIVE, &[]));
+                }
+                continue;
+            }
+            let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) else {
+                continue;
+            };
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            if let Err(e) = client_handshake(&mut s, &ep.token) {
+                (ep.log)(&format!("[bulk] handshake 失敗: {e}"));
+                continue;
+            }
+            s.set_read_timeout(None).ok();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
+            let Ok(w) = s.try_clone() else { continue };
+            let gen = ep.link.set(w);
+            (ep.log)(&format!("[bulk] established (→{addr})"));
+            spawn_reader(ep, s, gen);
+        }
+    }
+
+    /// 接続側のハンドシェイク
+    pub fn client_handshake(s: &mut std::net::TcpStream, token: &str) -> std::io::Result<()> {
+        use std::io::BufRead;
+        s.write_all(format!("{HELLO} {token}\n").as_bytes())?;
+        let mut line = String::new();
+        std::io::BufReader::new(s.try_clone()?.take(64)).read_line(&mut line)?;
+        if line.trim() == "ok" {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "bulk handshake rejected"))
+        }
+    }
+
+    /// 待受側のハンドシェイク(1 バイトずつ読むことで、後続のフレームを取りこぼさない)
+    pub fn server_handshake(s: &mut std::net::TcpStream, token: &str) -> bool {
+        let mut line = Vec::new();
+        let mut b = [0u8; 1];
+        while line.len() < 512 {
+            if s.read_exact(&mut b).is_err() {
+                return false;
+            }
+            if b[0] == b'\n' {
+                break;
+            }
+            line.push(b[0]);
+        }
+        let ok = String::from_utf8_lossy(&line) == format!("{HELLO} {token}");
+        let _ = s.write_all(if ok { b"ok\n" } else { b"ng\n" });
+        ok
     }
 }
 
@@ -581,6 +969,127 @@ mod tests {
             assert!(String::from_utf8_lossy(&out.stdout).contains(";Tsunagu;"), "quarantine 属性が付いていない");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bulk_roundtrip_files_and_image() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-bulk-{}", std::process::id()));
+        let src = base.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let big: Vec<u8> = (0..(CHUNK * 2 + 123)).map(|i| (i % 251) as u8).collect();
+        std::fs::write(src.join("big.bin"), &big).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello").unwrap();
+        let mut wire = Vec::new();
+        let paths = vec![src.join("big.bin"), src.join("a.txt")];
+        assert_eq!(send_files(&mut wire, &paths, true).unwrap(), 2);
+        let dib: Vec<u8> = (0..(CHUNK + 7)).map(|i| (i % 13) as u8).collect();
+        send_image(&mut wire, &dib).unwrap();
+
+        let mut rx = Receiver::new(&base.join("dst"));
+        let mut r = std::io::Cursor::new(wire);
+        let mut buf = Vec::new();
+        let mut events = Vec::new();
+        while let Ok(k) = read_frame(&mut r, &mut buf) {
+            if let Some(e) = rx.feed(k, &buf) {
+                events.push(e);
+            }
+        }
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            Event::Files { paths, drop } => {
+                assert!(*drop);
+                assert_eq!(std::fs::read(&paths[0]).unwrap(), big);
+                assert_eq!(std::fs::read(&paths[1]).unwrap(), b"hello");
+            }
+            e => panic!("unexpected {e:?}"),
+        }
+        assert!(matches!(&events[1], Event::Image(d) if *d == dib));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bulk_rejects_oversized_frames_and_overflowing_data() {
+        use super::bulk::*;
+        let mut wire = Vec::new();
+        wire.push(DATA);
+        wire.extend_from_slice(&((MAX_FRAME as u32) + 1).to_le_bytes());
+        assert!(read_frame(&mut std::io::Cursor::new(wire), &mut Vec::new()).is_err());
+
+        // 宣言サイズより多いデータを送られたらファイルごと破棄する
+        let base = std::env::temp_dir().join(format!("tsunagu-bulk-bad-{}", std::process::id()));
+        let mut rx = Receiver::new(&base);
+        rx.feed(FILE_BEGIN, br#"{"name":"x.bin","size":3}"#);
+        rx.feed(DATA, b"toolong");
+        rx.feed(FILE_END, &[]);
+        assert!(rx.feed(BATCH_END, &[]).is_none());
+        assert!(!base.join("x.bin").exists());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 実ソケットでの結合確認: 待受・接続・認証・送信・受信・誤トークン拒否
+    #[test]
+    fn bulk_link_over_real_tcp() {
+        use super::bulk::*;
+        use std::sync::{Mutex, OnceLock};
+        static SERVER_LINK: Link = Link::new();
+        static CLIENT_LINK: Link = Link::new();
+        static SERVER: OnceLock<Endpoint> = OnceLock::new();
+        static CLIENT: OnceLock<Endpoint> = OnceLock::new();
+        static GOT: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let base = std::env::temp_dir().join(format!("tsunagu-link-{}", std::process::id()));
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let server = SERVER.get_or_init(|| Endpoint {
+            link: &SERVER_LINK,
+            token: "secret".into(),
+            dir: base.join("srv"),
+            on_event: |e| {
+                if let Event::Files { paths, .. } = e {
+                    GOT.lock().unwrap().push(std::fs::read(&paths[0]).unwrap());
+                }
+            },
+            log: |_| {},
+        });
+        let client = CLIENT.get_or_init(|| Endpoint {
+            link: &CLIENT_LINK,
+            token: "secret".into(),
+            dir: base.join("cli"),
+            on_event: |_| {},
+            log: |_| {},
+        });
+        std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true));
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        std::thread::spawn(move || connect_loop(client, addr, || true));
+        let t0 = std::time::Instant::now();
+        while !CLIENT_LINK.is_up() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(CLIENT_LINK.is_up(), "接続が張れない");
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("payload.bin");
+        std::fs::write(&src, b"over-the-wire").unwrap();
+        CLIENT_LINK.send(|w| send_files(w, &[src.clone()], false)).unwrap();
+        while GOT.lock().unwrap().is_empty() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(GOT.lock().unwrap().first().map(|v| v.as_slice()), Some(&b"over-the-wire"[..]));
+
+        // 誤トークンは拒否される
+        let mut bad = std::net::TcpStream::connect(addr).unwrap();
+        assert!(client_handshake(&mut bad, "wrong").is_err());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn tailscale_range() {
+        use super::net::is_tailscale;
+        assert!(is_tailscale("100.64.0.1".parse().unwrap()));
+        assert!(is_tailscale("100.127.255.254".parse().unwrap()));
+        assert!(!is_tailscale("100.128.0.1".parse().unwrap()));
+        assert!(!is_tailscale("192.168.0.2".parse().unwrap()));
     }
 
     #[test]
