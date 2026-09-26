@@ -102,7 +102,32 @@ unsafe extern "C" {
         in_packet_descs: *const core::ffi::c_void,
     ) -> OSStatus;
     fn AudioQueueStart(in_aq: AudioQueueRef, in_time: *const core::ffi::c_void) -> OSStatus;
-    fn AudioQueueFlush(in_aq: AudioQueueRef) -> OSStatus;
+    fn AudioQueueStop(in_aq: AudioQueueRef, immediate: u8) -> OSStatus;
+    fn AudioQueueDispose(in_aq: AudioQueueRef, immediate: u8) -> OSStatus;
+}
+
+/// 再生中の AudioQueue と、そのサンプリングレート。レートが変わった接続では作り直す
+/// (旧実装は最初の接続のレートで作ったきりで、Windows 側のデバイス切替で
+/// 44.1kHz⇄48kHz が変わると音程がずれたまま再生された)
+static AQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static AQ_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn ensure_playback(rate: u32) {
+    if AQ.load(Ordering::Relaxed) != 0 && AQ_RATE.load(Ordering::Relaxed) == rate {
+        return;
+    }
+    let old = AQ.swap(0, Ordering::Relaxed);
+    if old != 0 {
+        unsafe {
+            AudioQueueStop(old as AudioQueueRef, 1);
+            AudioQueueDispose(old as AudioQueueRef, 1);
+        }
+        eprintln!("[audio] サンプリングレート変更 {} → {rate}Hz。再生キューを作り直します", AQ_RATE.load(Ordering::Relaxed));
+    }
+    if let Some(aq) = start_playback(rate) {
+        AQ.store(aq as usize, Ordering::Relaxed);
+        AQ_RATE.store(rate, Ordering::Relaxed);
+    }
 }
 
 /// リサンプル位相: 前回コールバックの消費端数(フレーム単位、0..1)。
@@ -173,14 +198,14 @@ unsafe extern "C" fn aq_callback(
             } else {
                 1.0 + (over as f64 / RING_SOFT_TARGET as f64).min(1.0) * 0.01
             };
+            // リアルタイムスレッドでメモリを確保しないよう、リングを直接読む
             let need = (cap as f64 * ratio) as usize + 16;
-            let src: Vec<u8> = ring.iter().take(need).copied().collect();
-            let src_frames = src.len() / 8; // 1フレーム=8バイト(L+R)
+            let src_frames = need.min(ring.len()) / 8; // 1フレーム=8バイト(L+R)
             let out_frames = cap / 8;
             if src_frames >= 2 {
                 let dst_f = dst as *mut f32;
                 let sample = |i: usize| -> f32 {
-                    f32::from_le_bytes([src[i * 4], src[i * 4 + 1], src[i * 4 + 2], src[i * 4 + 3]])
+                    f32::from_le_bytes([ring[i * 4], ring[i * 4 + 1], ring[i * 4 + 2], ring[i * 4 + 3]])
                 };
                 // sp はフレーム単位の読み出し位置(整数部=フレーム、端数=補間位相)。
                 // L(偶数サンプル)は L 同士、R は R 同士で補間するため L/R は混ざらない。
@@ -266,7 +291,7 @@ unsafe extern "C" fn aq_callback(
 /// AudioQueue を起動する(4バッファ x 15ms = 60ms の再生バッファ)。
 /// 低遅延と音切れ防止のバランス点: 供給側の揺らぎ(TCP 到着間隔)を
 /// この余裕で吸収し、滞留はクリップで「目標 ≈78ms」に保つ
-fn start_playback(rate: u32) -> bool {
+fn start_playback(rate: u32) -> Option<AudioQueueRef> {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
         // 15ms 分。奇数サンプルレート環境で L/R が割れないよう 8 バイト境界へ丸める
@@ -294,13 +319,13 @@ fn start_playback(rate: u32) -> bool {
         ) != 0
         {
             eprintln!("[audio] AudioQueueNewOutput 失敗");
-            return false;
+            return None;
         }
         for _ in 0..4 {
             let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
             if AudioQueueAllocateBuffer(aq, frame_bytes, &mut buf) != 0 {
                 eprintln!("[audio] AllocateBuffer 失敗");
-                return false;
+                return None;
             }
             (*buf).mAudioDataByteSize = frame_bytes as u32;
             for i in 0..frame_bytes {
@@ -314,12 +339,10 @@ fn start_playback(rate: u32) -> bool {
         let st = AudioQueueStart(aq, std::ptr::null());
         if st != 0 {
             eprintln!("[audio] AudioQueueStart 失敗 st={st}");
-            return false;
+            return None;
         }
-        eprintln!("[audio] AudioQueueStart ok (frame_bytes={frame_bytes})");
-        // aq は停止しない(プロセス終了まで)。ref は意図的に保持しない
-        std::mem::forget(aq);
-        true
+        eprintln!("[audio] AudioQueueStart ok ({rate}Hz, frame_bytes={frame_bytes})");
+        Some(aq)
     }
 }
 
@@ -337,7 +360,6 @@ pub fn start(token: String) {
             }
         };
         eprintln!("[audio] listening on {bind_ip}:{port}");
-        let mut playback_started = false;
         loop {
             let (stream, peer) = match listener.accept() {
                 Ok(x) => x,
@@ -362,13 +384,16 @@ pub fn start(token: String) {
             let Ok(sr) = stream.try_clone() else { continue };
             let mut reader = std::io::BufReader::new(sr);
             let mut w = stream;
-            // ハンドシェイク: "SDAUDIO1 <token> <rate>\n" → "ok\n"
+            // ハンドシェイク: "SDAUDIO2 <token> <rate> s16\n"(16bit 整数)または
+            // 旧 "SDAUDIO1 <token> <rate>\n"(f32) → "ok\n"
             let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            if (&mut reader).take(512).read_line(&mut line).unwrap_or(0) == 0 {
                 continue;
             }
             let parts: Vec<&str> = line.trim().split_whitespace().collect();
-            if parts.len() != 3 || parts[0] != "SDAUDIO1" || parts[1] != token {
+            let s16 = parts.len() == 4 && parts[0] == "SDAUDIO2" && parts[3] == "s16";
+            let f32_legacy = parts.len() == 3 && parts[0] == "SDAUDIO1";
+            if !(s16 || f32_legacy) || parts[1] != token {
                 eprintln!("[audio] invalid handshake");
                 let _ = w.write_all(b"ng\n");
                 continue;
@@ -381,13 +406,11 @@ pub fn start(token: String) {
             if w.write_all(b"ok\n").and_then(|_| w.flush()).is_err() {
                 continue;
             }
-            if !playback_started {
-                playback_started = start_playback(rate);
-            }
+            ensure_playback(rate);
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
             PRIMED.store(false, Ordering::Relaxed);
             phase_store(0.0);
-            eprintln!("[audio] streaming started ({rate}Hz f32/stereo)");
+            eprintln!("[audio] streaming started ({rate}Hz {}/stereo)", if s16 { "s16" } else { "f32" });
             // PCM フレーム受信: [u32 LE 長][データ]。長さ上限は 128KB
             let mut len_buf = [0u8; 4];
             let mut last_diag = std::time::Instant::now();
@@ -409,6 +432,13 @@ pub fn start(token: String) {
                 let mut frame = vec![0u8; len];
                 if reader.read_exact(&mut frame).is_err() {
                     break;
+                }
+                if s16 {
+                    // 再生リングは f32 のまま(補間・追い込み処理を共通にする)
+                    frame = frame
+                        .chunks_exact(2)
+                        .flat_map(|b| (i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).to_le_bytes())
+                        .collect();
                 }
                 // フレーム整合の防御: 8 バイト(f32×2ch)境界に切り詰める。
                 // 送信側はフレーム単位で送るはずだが、万一の途中欠けが

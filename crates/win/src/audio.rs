@@ -38,7 +38,7 @@ struct IMMDeviceVtbl {
     base: IUnknownVtbl,
     Activate: unsafe extern "system" fn(*mut core::ffi::c_void, *const windows_sys::core::GUID, u32, *mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> HRESULT,
     OpenPropertyStore: usize,
-    GetId: usize,
+    GetId: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut u16) -> HRESULT,
     GetState: usize,
 }
 #[repr(C)]
@@ -124,6 +124,38 @@ struct Capture {
     sample_rate: u32,
     fmt_kind: u8,
     bytes_per_frame: usize,
+}
+
+/// 既定の再生デバイスの ID(ヘッドホン接続・出力先切替の検知に使う)
+fn default_render_id() -> Option<String> {
+    unsafe {
+        let mut enumerator: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, std::ptr::null_mut(), CLSCTX_ALL, &IID_IMMDEVICE_ENUMERATOR, &mut enumerator);
+        if hr < 0 || enumerator.is_null() {
+            return None;
+        }
+        let evt = &*(*(enumerator as *mut ObjVt<IMMDeviceEnumeratorVtbl>)).lpVtbl;
+        let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
+        let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0, 0, &mut device);
+        (evt.base.Release)(enumerator);
+        if hr < 0 || device.is_null() {
+            return None;
+        }
+        let dvt = &*(*(device as *mut ObjVt<IMMDeviceVtbl>)).lpVtbl;
+        let mut pid: *mut u16 = std::ptr::null_mut();
+        let hr = (dvt.GetId)(device, &mut pid);
+        (dvt.base.Release)(device);
+        if hr < 0 || pid.is_null() {
+            return None;
+        }
+        let mut n = 0;
+        while *pid.add(n) != 0 {
+            n += 1;
+        }
+        let id = String::from_utf16_lossy(std::slice::from_raw_parts(pid, n));
+        CoTaskMemFree(pid as *mut core::ffi::c_void);
+        Some(id)
+    }
 }
 
 unsafe fn capture_open() -> Result<Capture, String> {
@@ -223,8 +255,11 @@ unsafe fn capture_open() -> Result<Capture, String> {
     }
 }
 
-/// GetBuffer で溜まっている分を f32/stereo へ変換して返す(無音なら None)
-unsafe fn capture_read(cap: &mut Capture) -> Option<Vec<u8>> {
+/// GetBuffer で溜まっている分を s16/stereo へ変換して返す(無音なら Ok(None))。
+/// Err はデバイスの無効化等(負の HRESULT)で、キャプチャを開き直す必要がある。
+/// 旧実装は失敗と「空」(AUDCLNT_S_BUFFER_EMPTY=正の成功コード)を区別せず、
+/// ヘッドホン接続などで既定デバイスが変わると無音のまま復帰しなかった
+unsafe fn capture_read(cap: &mut Capture) -> Result<Option<Vec<u8>>, HRESULT> {
     unsafe {
         let mut out: Vec<u8> = Vec::new();
         let vt = &*(*cap.capture).lpVtbl;
@@ -240,8 +275,11 @@ unsafe fn capture_read(cap: &mut Capture) -> Option<Vec<u8>> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             );
+            if hr < 0 {
+                return Err(hr);
+            }
             if hr != 0 {
-                break; // バッファ空または一時エラー(次ポーリングで再試行)
+                break; // AUDCLNT_S_BUFFER_EMPTY: 今回分は取り切った
             }
             if frames > 0 && !data.is_null() && (flags & AUDCLNT_BUFFERFLAGS_SILENT) == 0 {
                 let n = frames as usize * cap.bytes_per_frame;
@@ -251,15 +289,15 @@ unsafe fn capture_read(cap: &mut Capture) -> Option<Vec<u8>> {
             (vt.ReleaseBuffer)(cap.capture as *mut core::ffi::c_void, frames);
         }
         let silent = out.iter().all(|&b| b == 0);
-        (!silent).then_some(out)
+        Ok((!silent).then_some(out))
     }
 }
 
-/// ミックス形式(任意ch/f32, s16, i32)→ f32/stereo への変換(ch>2 は先頭2chで代表)
+/// ミックス形式(任意ch/f32, s16, i32)→ s16/stereo への変換(ch>2 は先頭2chで代表)
 fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
     let ch = cap.channels.max(1);
     let frames = src.len() / cap.bytes_per_frame;
-    out.reserve(frames * 8);
+    out.reserve(frames * 4);
     for f in 0..frames {
         let base = f * cap.bytes_per_frame;
         let (l, r): (f32, f32) = match cap.fmt_kind {
@@ -289,8 +327,11 @@ fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
                 (s(0), if ch >= 2 { s(1) } else { s(0) })
             }
         };
-        out.extend_from_slice(&l.clamp(-1.0, 1.0).to_le_bytes());
-        out.extend_from_slice(&r.clamp(-1.0, 1.0).to_le_bytes());
+        // 送信は 16bit 整数(f32 の半分の帯域。16bit のダイナミックレンジ 96dB は
+        // ループバック音声の再生には十分)
+        let q = |v: f32| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes();
+        out.extend_from_slice(&q(l));
+        out.extend_from_slice(&q(r));
     }
 }
 
@@ -327,7 +368,7 @@ fn audio_run(host: String, token: String) {
         };
         stream.set_nodelay(true).ok();
         let Ok(mut w) = stream.try_clone() else { continue };
-        let hs = format!("SDAUDIO1 {token} {}\n", cap.sample_rate);
+        let hs = format!("SDAUDIO2 {token} {} s16\n", cap.sample_rate);
         if w.write_all(hs.as_bytes()).and_then(|_| w.flush()).is_err() {
             continue;
         }
@@ -339,7 +380,9 @@ fn audio_run(host: String, token: String) {
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         }
-        println!("[audio] ストリーミング開始({}Hz f32/stereo)", cap.sample_rate);
+        println!("[audio] ストリーミング開始({}Hz s16/stereo)", cap.sample_rate);
+        let dev_id = default_render_id();
+        let mut last_dev_check = std::time::Instant::now();
         let mut sent_bytes: u64 = 0;
         let mut last_diag = std::time::Instant::now();
         let mut last_send = std::time::Instant::now();
@@ -351,7 +394,23 @@ fn audio_run(host: String, token: String) {
             // 8ms 間隔でポーリング(低遅延: WASAPI のエンジン周期 10ms に対し
             // 取得側の追加滞留を平均 4ms 程に抑える)
             std::thread::sleep(std::time::Duration::from_millis(8));
-            let Some(frame) = (unsafe { capture_read(&mut cap) }) else {
+            // 既定デバイスの切替(ヘッドホン接続・出力先変更)を検知して開き直す
+            if last_dev_check.elapsed() >= std::time::Duration::from_secs(2) {
+                last_dev_check = std::time::Instant::now();
+                if default_render_id() != dev_id {
+                    println!("[audio] 既定の再生デバイスが変わりました。キャプチャを開き直します");
+                    break;
+                }
+            }
+            let read = unsafe { capture_read(&mut cap) };
+            let read = match read {
+                Ok(r) => r,
+                Err(hr) => {
+                    println!("[audio] キャプチャ失敗 hr={hr:08x}(デバイス無効化)。開き直します");
+                    break;
+                }
+            };
+            let Some(frame) = read else {
                 // 無音が続いても1秒毎に長さ0のキープアライブを送る:
                 // 相手の再起動等で死んだ接続を無音期間中に検知するため
                 if last_send.elapsed() >= std::time::Duration::from_secs(1) {
@@ -377,8 +436,11 @@ fn audio_run(host: String, token: String) {
         }
         unsafe {
             ((*(*cap.client).lpVtbl).Stop)(cap.client as *mut _);
+            // 開き直すたびに漏れないよう解放する
+            ((*(*cap.capture).lpVtbl).base.Release)(cap.capture as *mut _);
+            ((*(*cap.client).lpVtbl).base.Release)(cap.client as *mut _);
         }
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
