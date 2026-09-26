@@ -12,9 +12,14 @@
 
 - **Mac = サーバ**(`tsunagu-mac`, TCP 24900 受信)/ **Win = クライアント**(`tsunagu-win`, 接続ループ)。
   逆転構成は環境固有(本環境は Mac 発 TCP が不通なため)。`TSUNAGU_ROLE=server` で反転可
-- 音声: Win の WASAPI ループバック → TCP 24901 → Mac AudioQueue(f32/48k/stereo)
-- プロトコル: JSON Lines、`crates/common/src/lib.rs` の `Msg`。**両側同時更新が前提**
-  (VERSION を上げて混在検知)
+- 経路: 本線 TCP 24900(JSON Lines の `Msg`)/ 音声 TCP 24901(s16 PCM)/
+  ファイル・画像 TCP 24902(`common::bulk` のバイナリフレーム)/ LAN 自動発見 UDP 24903(`common::discover`)
+- **全 TCP 経路は `common::secure`(Noise NNpsk0)で包む**。平文で読み書きしない。
+  `secure::Writer` は flush で送信されるため、書いたら必ず flush する
+- プロトコル: `crates/common/src/lib.rs` の `Msg`。`MIN_VERSION` 以上なら接続を受け入れ、
+  未知のメッセージは無視される。互換を壊す変更は MIN_VERSION も上げる(両側同時更新)
+- クリップボードは「画面を移る時」だけ同期する(Mac: enter_win_mode、Win: Leave 受信)。
+  コピー毎に送る実装へ戻さない(大容量ファイルの無駄な転送・秘匿データ流出の原因)
 - 実機: ssh ホスト名 `home`(Windows)/ Tailscale(Mac 100.100.10.9, Win 100.84.0.2)
 
 ## ワンコマンド(改善ループの標準手順)
@@ -75,9 +80,10 @@
 
 ## 既知の制限(今後の課題)
 
-- 境界判定の左/上/下端はメイン画面基準(右端のみ union 対応)。左にサブモニタが
-  ある環境では左端判定が全域ヒットする。union の min/max を起動時計算して gap へ
-  使う修正が望ましい(レビュー #7)
+- Windows のロック画面・UAC 画面は操作不可(SYSTEM サービス構成が必要)。Windows 側は DPI 非対応
+  のまま(DPI 対応にするとトレイ/設定窓の描画倍率が変わるため GUI 側と同時に行う)
+- 実機での未検証項目: 暗号化後の 3 経路の疎通、ゲームモード、ロック連動、Mac→Win 画像の
+  CF_DIB 互換性(BMP 書き出しの V4/V5 ヘッダを受け付けないアプリがある可能性)
 - キー送信の E2E(⌘]/ドラッグ切替)は手動検証領域。自動化するなら schtasks 経由で
   キーログを取る検証を追加する
 

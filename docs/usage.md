@@ -60,10 +60,12 @@ WiFi の瞬間的な揺らぎがカーソルのカクつきの原因になる場
 | USB リンクケーブル | ブリッジチップ入りの転送用ケーブル | Mac 対応品がほぼ無い |
 
 いずれも IP リンクが張れれば Tsunagu はそのまま動きます(TCP のみのため)。
-直結 IP への切り替えは Windows 側 `.env` に `TSUNAGU_HOST=<Macの直結IP>` を
-設定(例: リンクローカル 169.254.x.x、または手動 IP)。Mac の IP は
-`ifconfig` で確認(Thunderbolt ブリッジは bridge0、USB-LAN は en* )。
-Tailscale 経続併用も可能(戻す場合は .env の行を削除)。
+直結 IP は Windows 側 `.env` の `TSUNAGU_HOST` に **カンマ区切りで並べて** 指定できます
+(例: `TSUNAGU_HOST=169.254.10.2,100.100.10.9`)。起動のたびに全候補へ同時に接続を試み、
+最初に繋がった経路(=遅延の小さい経路)を使うため、直結を抜いても Tailscale へ自動で戻ります。
+Mac の IP は `ifconfig` で確認(Thunderbolt ブリッジは bridge0、USB-LAN は en*)。
+`TSUNAGU_HOST` を省略すると、同じ LAN にいる Mac を自動で探します(UDP 24903。
+AP 隔離や Tailscale 越しではブロードキャストが届かないため、その場合は指定が必要)。
 
 ## Mac 流ショートカットの自動翻訳(Windows 画面操作中)
 
@@ -83,7 +85,6 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | ⌘⌥Esc | タスクマネージャ(Ctrl+Shift+Esc) |
 | ⌘Ctrl+Q | 画面ロック(Win+L) |
 | fn+F11 | デスクトップ表示(Win+D) |
-| Ctrl+クリック | 右クリック(`TSUNAGU_CTRL_CLICK=1` のみ有効。既定は 2本指クリックで右クリック) |
 | ⌘Space | Win+Space(IME/言語の切替) |
 | ⌘C/⌘V/⌘A 等 | Ctrl+C/V/A(⌘→Ctrl 自動変換、従来どおり) |
 
@@ -98,22 +99,32 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 - Windows 側はノッチ × 120 ホイールユニットで注入
 - 除数を大きくすると遅くなる(40〜200 程度で調整)
 
-## クリップボード(双方向同期)
+## クリップボード(画面を移る時に同期)
 
-- 両側で 0.25 秒間隔にポーリングし、コピーして約 0.25 秒で相手側に反映
-  (プレーンテキスト、1MB まで)
-- Win→Mac は CRLF を LF へ正規化して書き込む。Windows 側の書き込みが
-  他プロセスのクリップボード占有で失敗した場合は 150ms 後に 1 回だけ再試行
-- 相手から受信して書き込んだ内容は送り返さない(ループ防止)
-- 接続が切れている間にコピーした内容も、再接続後に自動送信される
-- 画像や書式は未対応(今後の課題)
+- **画面を移る瞬間に同期します**(Deskflow と同じ方式)。Mac で ⌘C → Windows へ移ると
+  Mac の内容が Windows に渡り、Windows で Ctrl+C → Mac へ戻ると Windows の内容が Mac に渡る。
+  コピーのたびには送らないため、Mac の中だけのコピペで大きなファイルが流れることはない
+- 対応形式: テキスト(1MB まで)・画像(両方向)・ファイル(両方向、合計 200MB まで)
+- パスワードマネージャ等が「共有しない」印を付けたコピーは送らない
+  (Mac: nspasteboard の Concealed/Transient、Windows: ExcludeClipboardContentFromMonitorProcessing)
+- 受信ファイルは各 PC の Downloads/Tsunagu に保存し、同名は「名前 (1).拡張子」で回避する。
+  外部から来たファイルとして Mac は quarantine、Windows は Zone.Identifier を付ける
+  (開く時に OS の確認が出る)
+- Win→Mac は CRLF を LF へ正規化して書き込む。相手から受信した内容は送り返さない
+- 設定窓でクリップボード共有を OFF にすると、Windows 側も送らない
 
 ## 接続の挙動
 
-- ping を 3 秒間隔で送り、10 秒間 pong が無ければ実質切断扱い(TCP が生きていても
-  相手プロセスが固まった場合を拾う)
-- Windows 側は切断後 0.5 秒から最大 3 秒のバックオフで自動再接続
-- Windows モード中に切断したら即 Mac モードへ復帰(入力の閉じ込め防止)
+- 経路: 本線 TCP 24900(入力・制御)/ 音声 TCP 24901 / ファイル・画像 TCP 24902 /
+  自動発見 UDP 24903。ファイル転送は本線と別経路のため、転送中もマウスが止まらない
+- **全経路を暗号化**(Noise プロトコル。トークンから導いた鍵で相互認証し、トークン自体は
+  回線に流れない)。接続を受け入れるのは LAN・有線直結・Tailscale のアドレスのみ
+  (`TSUNAGU_ALLOW_ANY=1` で全許可)
+- 生存確認は双方向: Mac・Windows とも 3 秒毎に ping し、9〜10 秒応答が無ければ張り直す
+- Mac のスリープ復帰を検知すると即座に張り直す(復帰直後の死んだ接続を待たない)
+- Tailscale の経路が直結から中継(DERP)に落ちると通知する(遅延が数倍になるため)
+- Windows モード中に切断・Mac の画面ロックが起きたら即 Mac モードへ復帰(入力の閉じ込め防止)
+- 画面を離れる時は、Windows 側で押下中の全キー・ボタンを解放する(押しっぱなしを残さない)
 
 ## 調整用環境変数(tsunagu-mac 起動時)
 
@@ -138,7 +149,6 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 
 | 変数 | 既定 | 説明 |
 | `TSUNAGU_SIDE` | right | Windows 画面の位置。right/left/up/down + upright/lowright(右下)/upleft/lowleft。設定窓の配置エディタ(ドラッグ)が同じ結果を視覚的に作れる |
-| `TSUNAGU_SIDE` | right | Windows 画面の位置(Deskflow links 相当)。right/left/up/down。切替境界と戻り端が連動 |
 | `TSUNAGU_SWITCH_DELAY` | 0 | 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時) |
 | `TSUNAGU_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |
 | `TSUNAGU_CORNER_PX` | 0 | 四隅 N px 内では切替しない(switchCorners/cornerSize) |
@@ -147,7 +157,12 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 | `TSUNAGU_CLIP` | 1 | クリップボード共有(clipboardSharing)。0 で無効 |
 | `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(500ms以内)だけ切替(誤爆防止)。1=従来の1回切替 |
 | `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
-| `TSUNAGU_TOKEN` | tsunagu-dev | 両側共通の認証トークン |
+| `TSUNAGU_TOKEN` | (必須) | 両側共通の秘密。暗号化の鍵の元になる。未設定だと起動しない |
+| `TSUNAGU_HOST` | (未設定=LAN 自動発見) | Windows 側の接続先。カンマ区切りで複数指定すると同時に試し最速の経路を使う |
+| `TSUNAGU_ALLOW_ANY` | 0 | 1 で LAN・直結・Tailscale 以外のアドレスからの接続も受け入れる |
+| `TSUNAGU_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
+| `TSUNAGU_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
+| `TSUNAGU_LOCK_SYNC` | 1 | Mac の画面ロックで Windows もロックする。0 で無効 |
 
 ## 改善ループ(開発者用)
 
@@ -181,15 +196,23 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 - ログ: Mac=`/tmp/tsunagu-mac.log`、Windows=`C:\Users\<user>\tsunagu\tsunagu-win.log`
   (ssh home で type)
 
+## 開発者・ゲーム向けの自動切替
+
+- **ターミナルでの Control**: Windows の前面が Windows Terminal・cmd・PowerShell・WSL 等の間は、
+  Mac の Control を Windows の Ctrl として送る(Ctrl+A/E/R/C がそのまま効く)。それ以外のアプリでは
+  従来どおり Win キー。対象は `TSUNAGU_CTRL_APPS` で変更できる
+- **ゲームモード**: Windows でカーソルが閉じ込められた(FPS 等)、または全画面でカーソルが
+  1.5 秒以上隠れた間は相対移動で送る(視点回転が効く)。戻るにはホットキーを使う
+- **Secure Input の通知**: Mac でパスワード欄などの保護入力が有効だと、キーボードを Windows へ
+  送れない。Windows へ移った時にこの状態なら、原因のアプリ名を通知する
+
 ## 既知の制限
 
-- クリップボードはプレーンテキストのみ(1MB 上限)。画像・書式・ファイルは未対応
-- Windows 側のウィンドウ操作(Focus/Minimize)は可視ウィンドウのタイトル部分一致
-  (先に見つかった 1 枚に対して動作)
+- リッチテキスト(書式付き)のコピーは未対応(プレーンテキストとして渡る)
 - Mac 側の IME 状態とは独立(かな/英数キーで Windows 側だけ切替)
 - IME コンテキストが取れないウィンドウでのみ、IME フォールバックがトグル動作のため
   開閉の方向が保証されない
 - UAC 昇格中のプロセスには UIPI により SendInput が弾かれる
   (design.md「残リスク」参照)
-- 通信の暗号化は Tailscale(WireGuard)層に依存し、アプリ層はトークン認証のみ
-  (TLS なし)
+- Windows のロック画面・UAC の確認画面は操作できない(SendInput が保護デスクトップに届かない)
+- Windows 側は DPI 非対応のまま動作する(座標は OS が拡大率に応じて換算する)
