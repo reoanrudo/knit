@@ -189,8 +189,6 @@ static XBTN_W: [std::sync::atomic::AtomicBool; 2] = [
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// 累計ファイル受信数(ステータス窓の表示用)
 pub static FILES_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 最近 Mac から受信したファイル(トレイの「最新の受信を開く」用。新しい順に最大 10 件)
-pub(crate) static RECENT_RX_W: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
 /// Mac のクリップボード共有設定(Cfg で同期)。OFF の間は Windows からも送らない
 static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
@@ -222,18 +220,13 @@ fn clipboard_is_excluded() -> bool {
 /// Mac へ制御が戻る時に Windows のクリップボードを渡す(Deskflow と同じ「画面を
 /// 離れる時に同期」方式)。旧方式は 200ms ごとに本文と画像全体を読み、画像は毎回
 /// base64 化して比較していた(常時の CPU・メモリ負荷。レビュー D-F1)。
-/// シーケンス番号が変わっていない限りクリップボードを開きもしない。
-/// force=true はトレイの「今すぐ Mac へ送る」用
-pub(crate) fn sync_clipboard_to_mac(force: bool) {
+/// シーケンス番号が変わっていない限りクリップボードを開きもしない
+fn sync_clipboard_to_mac() {
     if !CLIP_SHARE_W.load(Ordering::Relaxed) {
-        if force {
-            println!("[clip] 送信できません(クリップボード共有が OFF)");
-            tray::notify("tsunagu", "クリップボードを送れません(共有が OFF)");
-        }
         return;
     }
     let seq = clipboard_seq();
-    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq && !force {
+    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq {
         return;
     }
     let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
@@ -250,21 +243,13 @@ pub(crate) fn sync_clipboard_to_mac(force: bool) {
             if !text.is_empty() && text.len() <= CLIP_MAX_CHARS && !echo {
                 println!("[clip] win->mac {} bytes", text.len());
                 let _ = tx.send(encode(&Msg::Clip { text }));
-                if force {
-                    tray::notify("tsunagu", "クリップボードを Mac へ送りました");
-                }
             }
             return;
         }
         if let Some(dib) = clipboard_read_dib() {
             if dib.len() <= bulk::MAX_IMAGE {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => {
-                        println!("[clip] win->mac image {}KB", dib.len() / 1024);
-                        if force {
-                            tray::notify("tsunagu", "クリップボードの画像を Mac へ送りました");
-                        }
-                    }
+                    Ok(()) => println!("[clip] win->mac image {}KB", dib.len() / 1024),
                     Err(e) => println!("[clip] win->mac image 送信失敗: {e}"),
                 }
             }
@@ -567,13 +552,6 @@ fn win_on_bulk(e: bulk::Event) {
             let files: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
             let n = files.len();
             FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
-            {
-                let mut r = RECENT_RX_W.lock().unwrap_or_else(|e| e.into_inner());
-                for f in files.iter().rev() {
-                    r.insert(0, f.clone());
-                }
-                r.truncate(10);
-            }
             // 自分が渡す CF_HDROP を Mac へ送り返さない
             *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) = Some(files_key(&files));
             if drop && BTN_W[0].load(Ordering::Relaxed) {
@@ -1065,7 +1043,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-235342-51f0769";
+const BUILD_ID: &str = "win-20260927-002228-24c4e71";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1706,7 +1684,7 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で
                 // コピーされた内容があれば Mac へ渡す
                 mods.release_everything();
-                sync_clipboard_to_mac(false);
+                sync_clipboard_to_mac();
             }
             Msg::Warp { nx, ny } => {
                 let (vx, vy, vw, vh) = vscreen();

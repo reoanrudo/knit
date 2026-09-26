@@ -406,26 +406,7 @@ unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
     crate::send_msg(&crate::Msg::Vol { op });
 }
 
-/// メニューの「クリップボードを今すぐ Windows へ」: 画面を切り替えずに明示送信する。
-/// force 版は変化チェックだけを飛ばし、秘匿除外・エコーバック防止はそのまま効く
-unsafe extern "C" fn imp_send_clip(_s: ID, _c: SEL, _n: ID) {
-    eprintln!("[clip] メニューから今すぐ Windows へ送ります");
-    crate::sync_clipboard_to_win(true);
-}
 
-/// メニューの「最新の受信ファイルを開く」: 受信履歴の先頭(最新)を規定アプリで開く
-unsafe extern "C" fn imp_open_recent(_s: ID, _c: SEL, _n: ID) {
-    let last = crate::RECENT_RX.lock().unwrap_or_else(|e| e.into_inner()).first().cloned();
-    match last {
-        Some(p) => {
-            let _ = std::process::Command::new("open").arg(&p).spawn();
-        }
-        None => {
-            eprintln!("[gui] まだファイルを受信していません");
-            crate::notify("tsunagu", "まだファイルを受信していません");
-        }
-    }
-}
 unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
     // accessory アプリでも明示アクティベートすればモーダルパネルは出せる
     let app = msg0(
@@ -1177,8 +1158,6 @@ unsafe fn make_target() -> ID {
         (c"sdSpkMute:", imp_spk_mute as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
-        (c"sdSendClip:", imp_send_clip as *const () as usize),
-        (c"sdOpenRecent:", imp_open_recent as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdScrollGain:", imp_scroll_gain as *const () as usize),
         (c"sdSide:", imp_side as *const () as usize),
@@ -1262,20 +1241,6 @@ pub fn start() -> bool {
             msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
         );
 
-        // 画面を切り替えずにクリップボードを渡す(通常の同期は画面を移る時だけのため)
-        let send_clip = menu_item("クリップボードを今すぐ Windows へ", Some(c"sdSendClip:"), "");
-        if !send_clip.is_null() {
-            msg1_void_id(send_clip, sel(c"setTarget:"), target);
-            msg1_void_sel(send_clip, sel(c"setAction:"), sel(c"sdSendClip:"));
-            add_item(menu, send_clip);
-        }
-        // 最新の受信ファイル(Downloads/Tsunagu)を開く
-        let open_recent = menu_item("最新の受信ファイルを開く", Some(c"sdOpenRecent:"), "");
-        if !open_recent.is_null() {
-            msg1_void_id(open_recent, sel(c"setTarget:"), target);
-            msg1_void_sel(open_recent, sel(c"setAction:"), sel(c"sdOpenRecent:"));
-            add_item(menu, open_recent);
-        }
 
         let prefs = menu_item("設定…", Some(c"sdShowPrefs:"), ",");
         if prefs.is_null() {

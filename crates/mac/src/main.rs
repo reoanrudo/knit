@@ -180,23 +180,15 @@ static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::Atom
 
 /// Windows へ入る時に Mac のクリップボードを渡す(Deskflow と同じ「画面を離れる時に
 /// 同期」方式)。コピーのたびに送る旧方式は、Mac 内だけのコピペでも最大 200MB の
-/// ファイルを流し、パスワード等も即座に相手へ渡っていた。
-/// force=true はメニューの「今すぐ Windows へ送る」用: 変化チェックだけを飛ばし、
-/// 秘匿除外・エコーバック防止はそのまま効く
-pub(crate) fn sync_clipboard_to_win(force: bool) {
+/// ファイルを流し、パスワード等も即座に相手へ渡っていた
+fn sync_clipboard_to_win() {
     if !CLIP_SHARE.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
-        // メニューからの明示操作なら、何も起きなかった理由を伝える
-        if force {
-            let why = if !CONNECTED.load(Ordering::Relaxed) { "未接続" } else { "クリップボード共有が OFF" };
-            eprintln!("[clip] 送信できません({why})");
-            notify("tsunagu", &format!("クリップボードを送れません({why})"));
-        }
         return;
     }
     // 貼り付け元アプリの遅延提供データ読み出しでタップを止めないよう別スレッドで行う
     std::thread::spawn(move || with_pool(|| unsafe {
         let cnt = clipboard_change_count();
-        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt && !force {
+        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt {
             return;
         }
         if pb_is_concealed(general_pasteboard()) {
@@ -213,19 +205,13 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
                     eprintln!("[file] クリップボードのファイル {} 件を渡します", files.len());
                     send_files_to_win(files, false);
                 }
-            } else if !force && now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
-                // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る。
-                // 明示送信(force)は意図が明確なためそのまま送る
+            } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
+                // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る
                 eprintln!("[clip] 画像受信直後のため同期を控えます");
                 return;
             } else if let Some(dib) = mac_clipboard_image_dib() {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => {
-                        eprintln!("[clip] mac->win image {}KB", dib.len() / 1024);
-                        if force {
-                            notify("tsunagu", "クリップボードの画像を Windows へ送りました");
-                        }
-                    }
+                    Ok(()) => eprintln!("[clip] mac->win image {}KB", dib.len() / 1024),
                     Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
                 }
             }
@@ -237,9 +223,6 @@ pub(crate) fn sync_clipboard_to_win(force: bool) {
         }
         eprintln!("[clip] mac->win {} bytes", text.len());
         send_msg(&Msg::Clip { text });
-        if force {
-            notify("tsunagu", "クリップボードを Windows へ送りました");
-        }
     }));
 }
 
@@ -682,7 +665,6 @@ fn mac_on_bulk(e: bulk::Event) {
             // 自分が載せたファイルを Windows へ送り返さない
             *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = mac_files_key(&paths);
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-            push_recent_rx(&paths);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
@@ -921,17 +903,6 @@ static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
 /// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
 static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
-/// 最近 Windows から受信したファイル(メニューの「最新の受信を開く」用。新しい順に最大 10 件)
-pub(crate) static RECENT_RX: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-
-/// 受信履歴へ追加(新しい順で先頭に挿入し、10 件で打ち切る。バッチ内の元順は保つ)
-pub(crate) fn push_recent_rx(paths: &[std::path::PathBuf]) {
-    let mut r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
-    for p in paths.iter().rev() {
-        r.insert(0, p.clone());
-    }
-    r.truncate(10);
-}
 static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<secure::Writer>>>> = OnceLock::new();
 static TAP_PORT: OnceLock<usize> = OnceLock::new();
@@ -1299,7 +1270,7 @@ unsafe fn set_cursor_in_background() {
 }
 
 fn enter_win_mode_cursor_lock() {
-    sync_clipboard_to_win(false);
+    sync_clipboard_to_win();
     std::thread::spawn(|| {
         static LAST: AtomicU64 = AtomicU64::new(0);
         if let Some(app) = secure_input_app() {
@@ -1948,7 +1919,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-235319-51f0769";
+const BUILD_ID: &str = "build-20260927-002812-39ac2c8";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -2853,41 +2824,6 @@ mod shortcut_tests {
         assert_eq!(tr(0, false, false, false, false), None);
         assert_eq!(tr(0, false, false, true, false), None);
         assert_eq!(tr(0, false, true, false, false), None);
-    }
-}
-
-#[cfg(test)]
-mod recent_tests {
-    use super::{push_recent_rx, RECENT_RX};
-    use std::path::PathBuf;
-
-    /// 履歴は新しい順・10 件で打ち切り・バッチ内の元順は保存
-    #[test]
-    fn recent_rx_keeps_newest_first_and_caps_at_10() {
-        let mk = |i: usize| PathBuf::from(format!("/tmp/tsunagu-recent-{i}.txt"));
-        {
-            let mut r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
-            r.clear();
-        }
-        push_recent_rx(&[mk(0), mk(1)]); // 古いバッチ(2 件)
-        for i in 2..12 {
-            push_recent_rx(&[mk(i)]);
-        }
-        {
-            let r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(r.len(), 10, "10 件で打ち切る: {:?}", r);
-            assert_eq!(r[0], mk(11), "最新が先頭");
-            assert_eq!(r[9], mk(2), "最古は 2(0/1 は押し出される");
-        }
-        // バッチ内の元順(バッチ先頭が先頭に来る)。guard は push 前に必ず解放する
-        // (push_recent_rx が同じ Mutex を取り、保持したまま呼ぶと自己デッドロック)
-        {
-            RECENT_RX.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        }
-        push_recent_rx(&[mk(20), mk(21)]);
-        let r = RECENT_RX.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(r[0], mk(20));
-        assert_eq!(r[1], mk(21));
     }
 }
 
