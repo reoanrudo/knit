@@ -221,16 +221,22 @@ fn audio_line() -> String {
         "音声転送: OFF".to_string()
     }
 }
-/// Mac が測定した RTT(接続品質)。未測定/切断時は --
+/// Mac が測定した RTT(接続品質)と接続経路。未測定/切断時は --
 fn rtt_line() -> String {
     if !crate::CONNECTED.load(Ordering::Relaxed) {
         return "遅延: --".to_string();
     }
+    // 経路(LAN 直 / Tailscale)を併記: Mac のメニューバー表示との対称
+    let route = match crate::peer_ip() {
+        Some(ip) if tsunagu_common::net::is_tailscale(ip) => "・Tailscale",
+        Some(_) => "・LAN 直",
+        None => "",
+    };
     let ms = crate::RTT_MS.load(Ordering::Relaxed);
     if ms == 0 {
-        "遅延: 計測中…".to_string()
+        format!("遅延: 計測中…{route}")
     } else {
-        format!("遅延: {ms}ms")
+        format!("遅延: {ms}ms{route}")
     }
 }
 /// exe と同じフォルダの .env の TSUNAGU_HOST 行を書き換える(無ければ追記)
