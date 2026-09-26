@@ -141,6 +141,77 @@ unsafe extern "C" {
     ) -> *mut core::ffi::c_void;
     /// ファイル URL のみを読む指定キー(readObjectsForClasses:options: 用)
     static NSPasteboardURLReadingFileURLsOnlyKey: *mut core::ffi::c_void;
+    fn objc_autoreleasePoolPush() -> *mut core::ffi::c_void;
+    fn objc_autoreleasePoolPop(pool: *mut core::ffi::c_void);
+}
+
+/// バックグラウンドスレッドで ObjC の一時オブジェクトを扱う区間を囲む。
+/// メインスレッド以外には autorelease pool が無く、nsstring 等が解放されずに
+/// 溜まり続ける(120ms 周期の監視で確定的にリークしていた。レビュー B-P1-1)
+fn with_pool<T>(f: impl FnOnce() -> T) -> T {
+    unsafe {
+        let pool = objc_autoreleasePoolPush();
+        let r = f();
+        objc_autoreleasePoolPop(pool);
+        r
+    }
+}
+
+/// パスワードマネージャ等が「記録・共有しないで」と印を付けたコピーか
+/// (nspasteboard.org の慣行。1Password/Bitwarden/キーチェーン等が付ける)
+unsafe fn pb_is_concealed(pb: ID) -> bool {
+    let types = msg0(pb, sel_registerName(c"types".as_ptr()));
+    if types.is_null() {
+        return false;
+    }
+    ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"]
+        .iter()
+        .any(|t| {
+            let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 = std::mem::transmute(objc_msgSend as usize);
+            f(types, sel_registerName(c"containsObject:".as_ptr()), nsstring(t)) != 0
+        })
+}
+
+/// 最後に Windows と同期したクリップボードの changeCount
+static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+
+/// Windows へ入る時に Mac のクリップボードを渡す(Deskflow と同じ「画面を離れる時に
+/// 同期」方式)。コピーのたびに送る旧方式は、Mac 内だけのコピペでも最大 200MB の
+/// ファイルを流し、パスワード等も即座に相手へ渡っていた
+fn sync_clipboard_to_win() {
+    if !CLIP_SHARE.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
+        return;
+    }
+    // 貼り付け元アプリの遅延提供データ読み出しでタップを止めないよう別スレッドで行う
+    std::thread::spawn(|| with_pool(|| unsafe {
+        let cnt = clipboard_change_count();
+        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt {
+            return;
+        }
+        if pb_is_concealed(general_pasteboard()) {
+            eprintln!("[clip] 秘匿指定のコピー(パスワード等)のため送りません");
+            return;
+        }
+        let text = mac_get_clipboard().filter(|t| !t.is_empty() && t.len() <= CLIP_MAX_BYTES);
+        let Some(text) = text else {
+            if let Some(files) = mac_clipboard_files() {
+                let key = mac_files_key(&files);
+                let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
+                if !dup {
+                    *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                    eprintln!("[file] クリップボードのファイル {} 件を渡します", files.len());
+                    send_files_to_win(files, false);
+                }
+            }
+            return;
+        };
+        // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
+        if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
+            return;
+        }
+        eprintln!("[clip] mac->win {} bytes", text.len());
+        send_msg(&Msg::Clip { text });
+    }));
 }
 
 /// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
@@ -729,12 +800,18 @@ pub fn set_side(v: u8) {
         5 | 7 => (0.5, 1.0),
         _ => (0.0, 1.0),
     };
+    send_cfg();
+    eprintln!("[cfg] Windows の位置 -> {}", side_name());
+}
+
+/// Windows と共有する設定を一括送信する(接続確立時と各設定の変更時)
+pub fn send_cfg() {
     send_msg(&Msg::Cfg {
         cmd_alt: CMD_ALT.load(Ordering::Relaxed),
         spk_mute: SPK_MUTE.load(Ordering::Relaxed),
-        side: v,
+        side: SIDE.load(Ordering::Relaxed),
+        clip: CLIP_SHARE.load(Ordering::Relaxed),
     });
-    eprintln!("[cfg] Windows の位置 -> {}", side_name());
 }
 static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -851,6 +928,7 @@ unsafe fn set_cursor_in_background() {
 }
 
 fn enter_win_mode_cursor_lock() {
+    sync_clipboard_to_win();
     // 持ち越していたスクロール残量を切替時に捨てる(切替直後の意図しないスクロール防止)
     *SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
     // Deskflow leave() 相当: hideCursor(プロパティ付き) → suppression間隔最小化 → 関連切断 → warp固定
@@ -1874,49 +1952,8 @@ fn main() {
         });
     }
 
-    // クリップボード監視(Mac→Windows 方向): changeCount の変化でテキストを送る
-    std::thread::spawn(|| {
-        let mut last_count = clipboard_change_count();
-        loop {
-            std::thread::sleep(Duration::from_millis(200));
-            // 未接続の間は基準を更新しない(切断中のコピーも再接続後に送る)
-            if !CONNECTED.load(Ordering::Relaxed) {
-                continue;
-            }
-            let cnt = clipboard_change_count();
-            if cnt == last_count {
-                continue;
-            }
-            last_count = cnt;
-            // clipboardSharing=false の間は Mac→Win 方向へ送らない
-            if !CLIP_SHARE.load(Ordering::Relaxed) {
-                continue;
-            }
-            // テキストが無い/空のときは Finder の ⌘C(ファイル参照)を試す:
-            // Mac で ⌘C → 画面端で切替 → Windows で Ctrl+V のファイル渡し
-            let text = unsafe { mac_get_clipboard() }
-                .filter(|t| !t.is_empty() && t.len() <= CLIP_MAX_BYTES);
-            let Some(text) = text else {
-                if let Some(files) = (unsafe { mac_clipboard_files() }) {
-                    // 同じ選択の再 ⌘C で何度も流れないよう指紋で抜く
-                    let key = mac_files_key(&files);
-                    let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
-                    if !dup {
-                        *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
-                        eprintln!("[file] クリップボードのファイル {} 件を検出", files.len());
-                        send_files_to_win(files, false);
-                    }
-                }
-                continue;
-            };
-            // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
-            if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
-                continue;
-            }
-            eprintln!("[clip] mac->win {} bytes", text.len());
-            send_msg(&Msg::Clip { text });
-        }
-    });
+    // 起動時点のクリップボードは送らない(以後の変化だけを切替時に同期する)
+    LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
 
     // ファイル掴み検出(Mac→Windows の掴みドラッグ越境): ドラッグ用ペーストボードに
     // ファイル参照が載っており左ボタン押下中 = Finder 等でファイルを掴んでいる。
@@ -1938,10 +1975,10 @@ fn main() {
             if DRAG_FILE.load(Ordering::Relaxed) {
                 continue; // 掴み確立済み(切替は tap 側が担う)
             }
-            unsafe {
+            with_pool(|| unsafe {
                 let pb = drag_pasteboard();
                 if pb.is_null() {
-                    continue;
+                    return;
                 }
                 let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
                 match baseline {
@@ -1959,7 +1996,7 @@ fn main() {
                     }
                     _ => {}
                 }
-            }
+            });
         }
     });
 
@@ -2134,7 +2171,8 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             if kind == "image/dib" {
                                 if let Some(bytes) = tsunagu_common::b64::decode(&data) {
                                     let bmp = dib_to_bmp(&bytes);
-                                    let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
+                                    let ok = with_pool(|| unsafe { mac_set_clipboard_image_bmp(&bmp) });
+                                    LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
                                     eprintln!(
                                         "[clip] win->mac image {}KB {}",
                                         bytes.len() / 1024,
@@ -2156,7 +2194,8 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                                 };
                                 *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(text.clone());
-                                unsafe { mac_set_clipboard(&text) };
+                                with_pool(|| unsafe { mac_set_clipboard(&text) });
+                                LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
                                 eprintln!("[clip] win->mac {} bytes", text.len());
                             }
                         }
@@ -2204,7 +2243,8 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             if !recv_paths.is_empty() {
                                 let key = mac_files_key(&recv_paths);
                                 let n = recv_paths.len();
-                                let ok = unsafe { mac_clipboard_write_files(&recv_paths) };
+                                let ok = with_pool(|| unsafe { mac_clipboard_write_files(&recv_paths) });
+                                LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
                                 // 自分が載せたファイルを監視スレッドが Windows へ
                                 // 送り返さないよう指紋を登録(ループ防止)
                                 *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
@@ -2333,11 +2373,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         // hello_ok 送信は送信スレッド経由で確実に
         send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
         // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
-        send_msg(&Msg::Cfg {
-            cmd_alt: CMD_ALT.load(Ordering::Relaxed),
-            spk_mute: SPK_MUTE.load(Ordering::Relaxed),
-            side: SIDE.load(Ordering::Relaxed),
-        });
+        send_cfg();
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         eprintln!("[conn] established");
@@ -2397,11 +2433,7 @@ fn client_attempt(
     CONNECTED.store(true, Ordering::Relaxed);
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     // 現在の ⌘キー設定を同期(クライアントモードの確立時)
-    send_msg(&Msg::Cfg {
-        cmd_alt: CMD_ALT.load(Ordering::Relaxed),
-        spk_mute: SPK_MUTE.load(Ordering::Relaxed),
-        side: SIDE.load(Ordering::Relaxed),
-    });
+    send_cfg();
     eprintln!("[conn] established");
     notify("tsunagu", "Windows に接続しました");
     session_receive_loop(&mut reader);

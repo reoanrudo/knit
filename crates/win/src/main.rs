@@ -48,6 +48,9 @@ unsafe extern "system" {
     fn EmptyClipboard() -> i32;
     fn GetClipboardData(uFormat: u32) -> *mut core::ffi::c_void;
     fn SetClipboardData(uFormat: u32, hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn GetClipboardSequenceNumber() -> u32;
+    fn IsClipboardFormatAvailable(format: u32) -> i32;
+    fn RegisterClipboardFormatW(name: *const u16) -> u32;
 }
 
 // CF_HDROP からファイルパス群を列挙する(shell32)
@@ -181,6 +184,77 @@ static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new
 /// 累計ファイル受信数(ステータス窓の表示用)
 pub static FILES_RX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const CLIP_MAX_CHARS: usize = 1024 * 1024; // 1MB
+/// Mac のクリップボード共有設定(Cfg で同期)。OFF の間は Windows からも送らない
+static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
+/// 最後に Mac と同期したクリップボードのシーケンス番号
+static LAST_SYNC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn clipboard_seq() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
+/// パスワードマネージャ等が「監視・共有しないで」と付ける登録形式があるか
+/// (KeePass/1Password/Bitwarden 等が付ける Windows の慣行)
+fn clipboard_is_excluded() -> bool {
+    ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"].iter().any(|n| {
+        let w: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let fmt = RegisterClipboardFormatW(w.as_ptr());
+            fmt != 0 && IsClipboardFormatAvailable(fmt) != 0
+        }
+    })
+}
+
+/// Mac へ制御が戻る時に Windows のクリップボードを渡す(Deskflow と同じ「画面を
+/// 離れる時に同期」方式)。旧方式は 200ms ごとに本文と画像全体を読み、画像は毎回
+/// base64 化して比較していた(常時の CPU・メモリ負荷。レビュー D-F1)。
+/// シーケンス番号が変わっていない限りクリップボードを開きもしない
+fn sync_clipboard_to_mac() {
+    if !CLIP_SHARE_W.load(Ordering::Relaxed) {
+        return;
+    }
+    let seq = clipboard_seq();
+    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq {
+        return;
+    }
+    let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+    std::thread::spawn(move || {
+        if clipboard_is_excluded() {
+            println!("[clip] 秘匿指定のコピー(パスワード等)のため送りません");
+            return;
+        }
+        if let Some(text) = clipboard_read_text() {
+            let echo = LAST_RECV_CLIP
+                .lock()
+                .map(|g| g.as_deref() == Some(text.as_str()))
+                .unwrap_or(false);
+            if !text.is_empty() && text.len() <= CLIP_MAX_CHARS && !echo {
+                println!("[clip] win->mac {} bytes", text.len());
+                let _ = tx.send(encode(&Msg::Clip { text }));
+            }
+            return;
+        }
+        if let Some(dib) = clipboard_read_dib() {
+            let b64 = tsunagu_common::b64::encode(&dib);
+            if b64.len() <= 5 * 1024 * 1024 {
+                println!("[clip] win->mac image {}KB", dib.len() / 1024);
+                let _ = tx.send(encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }));
+            }
+            return;
+        }
+        if let Some(files) = clipboard_read_files() {
+            let key = files_key(&files);
+            let echo = LAST_RECV_FILES
+                .lock()
+                .map(|g| g.as_deref() == Some(key.as_str()))
+                .unwrap_or(false);
+            if !echo {
+                println!("[file] CF_HDROP: {} files", files.len());
+                send_files_to_mac(&tx, &files);
+            }
+        }
+    });
+}
 /// ファイル送信 1 チャンクの生バイト上限(b64 後 4MB = プロトコル行上限 8MB 未満)
 const FILE_CHUNK_RAW: usize = 3 * 1024 * 1024;
 
@@ -1037,66 +1111,8 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
     // (旧heartbeatスレッドは削除: ソケット生死は read のエラーで判定し、
     //  接続監視は Mac 側の ping/pong が担うため不要だった)
 
-    // クリップボード監視スレッド(Windows→Mac 方向)。起動時点の内容は送らない。
-    // 送信は単一ライタスレッド(wtx)経由で行う
-    let cb_tx = wtx.clone();
-    let cb_running = running.clone();
-    std::thread::spawn(move || {
-        let mut last_sent = clipboard_read_text();
-        let mut last_img: Option<String> = None;
-        let mut last_files: Option<String> = None;
-        println!("[clip] watch thread started");
-        while cb_running.load(Ordering::Relaxed) {
-            std::thread::sleep(Duration::from_millis(200));
-            let Some(text) = clipboard_read_text() else {
-                // テキストが無いときは画像(CF_DIB)の変化を送る(スクショ等)
-                if let Some(dib) = clipboard_read_dib() {
-                    let b64 = tsunagu_common::b64::encode(&dib);
-                    if b64.len() <= 5 * 1024 * 1024 && last_img.as_deref() != Some(b64.as_str()) {
-                        last_img = Some(b64.clone());
-                        if cb_tx
-                            .send(encode(&Msg::ClipData { kind: "image/dib".into(), data: b64 }))
-                            .is_ok()
-                        {
-                            println!("[clip] win->mac image");
-                        }
-                    }
-                    continue;
-                }
-                // 画像も無いときはファイル参照(CF_HDROP)を送る:
-                // エクスプローラーで Ctrl+C → 切替 → Mac で ⌘V のファイル渡し
-                if let Some(files) = clipboard_read_files() {
-                    let key = files_key(&files);
-                    let dup = last_files.as_deref() == Some(key.as_str());
-                    let echo = LAST_RECV_FILES
-                        .lock()
-                        .map(|g| g.as_deref() == Some(key.as_str()))
-                        .unwrap_or(false);
-                    if !dup && !echo {
-                        println!("[file] CF_HDROP detected: {} files", files.len());
-                        last_files = Some(key);
-                        send_files_to_mac(&cb_tx, &files);
-                    }
-                }
-                continue;
-            };
-            if text.len() > CLIP_MAX_CHARS || last_sent.as_deref() == Some(text.as_str()) {
-                continue;
-            }
-            // Mac から受信して書き込んだ内容は送り返さない(ループ防止)
-            let echo = LAST_RECV_CLIP
-                .lock()
-                .map(|g| g.as_deref() == Some(text.as_str()))
-                .unwrap_or(false);
-            if echo {
-                continue;
-            }
-            if cb_tx.send(encode(&Msg::Clip { text: text.clone() })).is_ok() {
-                println!("[clip] win->mac {} bytes", text.len());
-                last_sent = Some(text);
-            }
-        }
-    });
+    // 接続時点のクリップボードは送らない(以後の変化だけを Mac へ戻る時に同期する)
+    LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
 
     for line in reader.lines() {
         let line = match line {
@@ -1121,8 +1137,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             Msg::Ping { ts } => {
                 let _ = wtx.send(encode(&Msg::Pong { ts }));
             }
-            Msg::Cfg { cmd_alt, spk_mute, side } => {
+            Msg::Cfg { cmd_alt, spk_mute, side, clip } => {
                 CMD_ALT.store(cmd_alt, Ordering::Relaxed);
+                CLIP_SHARE_W.store(clip, Ordering::Relaxed);
                 SIDE_W.store(side.min(7), Ordering::Relaxed);
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
                 if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
@@ -1205,6 +1222,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     continue;
                 }
                 if !files.is_empty() && clipboard_write_files(&files) {
+                    LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                     let n = files.len();
                     FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
                     println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
@@ -1231,6 +1249,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     // 転送中に既に離した(E2E の遅延やユーザー操作)→ 従来体験へ
                     println!("[drag] 転送完了時点でボタン非押下のため Ctrl+V 形式へフォールバック");
                     if clipboard_write_files(&files) {
+                        LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                         let n = files.len();
                         println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
                         tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
@@ -1354,8 +1373,10 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 inject_scroll(dx, dy);
             }
             Msg::Leave => {
-                // Mac が制御を取り戻した: 押しっぱなしを残さない
+                // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で
+                // コピーされた内容があれば Mac へ渡す
                 mods.release_everything();
+                sync_clipboard_to_mac();
             }
             Msg::Warp { nx, ny } => {
                 if !hello_done {
@@ -1374,6 +1395,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 let ok = clipboard_write_text(&text)
                     || (std::thread::sleep(Duration::from_millis(150)), clipboard_write_text(&text)).1;
                 if ok {
+                    LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                     println!("[clip] mac->win {} bytes", text.len());
                 } else {
                     println!("[clip] mac->win write failed (busy clipboard)");

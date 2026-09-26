@@ -191,6 +191,9 @@ pub mod proto {
             /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下。Deskflow の links 相当)
             #[serde(default)]
             side: u8,
+            /// クリップボード共有。false の間は Windows 側も送らない(相手任せにしない)
+            #[serde(default = "default_true")]
+            clip: bool,
         },
         /// Windows の音量制御(0=up / 1=down / 2=ミュート)。Mac メニューから送る
         #[serde(rename = "vol")]
@@ -221,6 +224,10 @@ pub mod proto {
         FileDropEnd,
         #[serde(rename = "bye")]
         Bye,
+    }
+
+    fn default_true() -> bool {
+        true
     }
 
     pub fn encode(msg: &Msg) -> String {
@@ -272,6 +279,51 @@ pub mod files {
         s
     }
 
+    /// 相手 PC から来たファイルに「外部から入手した」印を付ける。これが無いと、
+    /// 受信した実行ファイルや .app が OS の警告(SmartScreen / Gatekeeper)なしで開ける。
+    /// 付与できなくても受信自体は続ける(NTFS 以外のドライブ等)
+    pub fn mark_untrusted(path: &Path) {
+        #[cfg(windows)]
+        {
+            let mut ads = path.as_os_str().to_owned();
+            ads.push(":Zone.Identifier");
+            let _ = std::fs::write(ads, "[ZoneTransfer]\r\nZoneId=3\r\n");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            unsafe extern "C" {
+                fn setxattr(
+                    path: *const core::ffi::c_char,
+                    name: *const core::ffi::c_char,
+                    value: *const core::ffi::c_void,
+                    size: usize,
+                    position: u32,
+                    options: i32,
+                ) -> i32;
+            }
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            // 形式: フラグ;時刻(16進);取得元アプリ;UUID(省略可)
+            let value = format!("0081;{secs:x};Tsunagu;");
+            let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+            unsafe {
+                setxattr(
+                    p.as_ptr(),
+                    c"com.apple.quarantine".as_ptr(),
+                    value.as_ptr() as *const core::ffi::c_void,
+                    value.len(),
+                    0,
+                    0,
+                );
+            }
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = path;
+    }
+
     /// dir 内に新規ファイルを作る。同名があれば「名前 (n).拡張子」で回避する
     pub fn create_unique(dir: &Path, name: &str) -> Option<(std::fs::File, PathBuf)> {
         std::fs::create_dir_all(dir).ok()?;
@@ -282,6 +334,7 @@ pub mod files {
         for i in 0..1000u32 {
             let cand = if i == 0 { dir.join(&base) } else { dir.join(format!("{stem} ({i}){ext}")) };
             if let Ok(f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+                mark_untrusted(&cand);
                 return Some((f, cand));
             }
         }
@@ -522,6 +575,11 @@ mod tests {
         let (_, b) = super::files::create_unique(&dir, "x.txt").unwrap();
         assert_ne!(a, b);
         assert!(b.to_string_lossy().ends_with("x (1).txt"));
+        #[cfg(target_os = "macos")]
+        {
+            let out = std::process::Command::new("xattr").arg("-p").arg("com.apple.quarantine").arg(&a).output().unwrap();
+            assert!(String::from_utf8_lossy(&out.stdout).contains(";Tsunagu;"), "quarantine 属性が付いていない");
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

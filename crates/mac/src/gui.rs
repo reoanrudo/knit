@@ -243,11 +243,7 @@ unsafe extern "C" fn imp_cmd_map(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::CMD_ALT.load(Ordering::Relaxed);
     crate::CMD_ALT.store(next, Ordering::Relaxed);
     eprintln!("[cfg] ⌘キー -> {}", if next { "Alt" } else { "Ctrl" });
-    crate::send_msg(&crate::Msg::Cfg {
-        cmd_alt: next,
-        spk_mute: crate::SPK_MUTE.load(Ordering::Relaxed),
-        side: crate::SIDE.load(Ordering::Relaxed),
-    });
+    crate::send_cfg();
     refresh_status();
     preferences::save();
 }
@@ -258,11 +254,7 @@ unsafe extern "C" fn imp_spk_mute(_s: ID, _c: SEL, _n: ID) {
         "[cfg] 接続中スピーカーミュート -> {}",
         if next { "ON" } else { "OFF" }
     );
-    crate::send_msg(&crate::Msg::Cfg {
-        cmd_alt: crate::CMD_ALT.load(Ordering::Relaxed),
-        spk_mute: next,
-        side: crate::SIDE.load(Ordering::Relaxed),
-    });
+    crate::send_cfg();
     refresh_status();
     preferences::save();
 }
@@ -368,6 +360,7 @@ unsafe extern "C" fn imp_clip_share(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::CLIP_SHARE.load(Ordering::Relaxed);
     crate::CLIP_SHARE.store(next, Ordering::Relaxed);
     eprintln!("[cfg] クリップボード共有 -> {next}");
+    crate::send_cfg();
     preferences::save();
 }
 
