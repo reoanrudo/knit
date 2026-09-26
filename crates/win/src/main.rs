@@ -963,7 +963,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-143916-049c56c";
+const BUILD_ID: &str = "win-20260926-155013-a8390bb";
 
 fn main() {
     if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
@@ -1103,7 +1103,7 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
     loop {
         let addrs = tsunagu_common::connect::resolve(hosts.as_deref(), port, token);
         if addrs.is_empty() {
-            println!("[conn] 接続先が見つかりません(TSUNAGU_HOST 未指定時は同じ LAN の Mac を探します)");
+            println!("[conn] 接続先が見つかりません(LAN の Mac を発見できず TSUNAGU_HOST の候補も空です)");
         }
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {

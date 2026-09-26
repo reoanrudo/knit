@@ -561,34 +561,6 @@ pub mod discover {
         }
     }
 
-    /// 問い合わせ側。target(通常はブロードキャスト)へ投げ、wait の間に応答した相手を返す
-    pub fn seek(target: SocketAddr, token: &str, wait: Duration) -> Vec<IpAddr> {
-        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return Vec::new() };
-        let _ = sock.set_broadcast(true);
-        let ask = format!("TSUNAGU?{}", room_id(token));
-        let ans = format!("TSUNAGU!{}", room_id(token));
-        if sock.send_to(ask.as_bytes(), target).is_err() {
-            return Vec::new();
-        }
-        let until = Instant::now() + wait;
-        let mut found = Vec::new();
-        let mut buf = [0u8; 128];
-        while let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
-            let _ = sock.set_read_timeout(Some(left));
-            match sock.recv_from(&mut buf) {
-                Ok((n, from)) if &buf[..n] == ans.as_bytes() && !found.contains(&from.ip()) => found.push(from.ip()),
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        found
-    }
-
-    /// LAN 全体へ問い合わせる
-    pub fn seek_lan(port: u16, token: &str) -> Vec<IpAddr> {
-        seek(SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)), token, Duration::from_millis(1500))
-    }
-
     /// 問い合わせ側(早期終了版)。最初の応答が届いた時点で返る。
     /// 再接続のたびに呼ばれるため、LAN 内の実質レイテンシは応答 1 往復分で済む
     pub fn seek_first(target: SocketAddr, token: &str, wait: Duration) -> Option<IpAddr> {
@@ -641,15 +613,25 @@ pub mod connect {
             .collect()
     }
 
-    /// 接続候補: 指定(TSUNAGU_HOST)があればそれ、無ければ LAN の自動発見で見つけた相手
-    pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
-        match hosts {
-            Some(h) => parse_hosts(h, port),
-            None => crate::discover::seek_lan(port, token)
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, port))
-                .collect(),
+    /// 発見結果と手動指定を併合する(発見を先頭・IP+ポート単位で重複排除)。
+    /// LAN 直と Tailscale を両方候補へ並べるため、first_reachable が自然に最速経路を採用する
+    pub(crate) fn merge_candidates(found: Vec<std::net::IpAddr>, hosts: Option<&str>, port: u16) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = found.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+        if let Some(h) = hosts {
+            for a in parse_hosts(h, port) {
+                if !addrs.contains(&a) {
+                    addrs.push(a);
+                }
+            }
         }
+        addrs
+    }
+
+    /// 接続候補: LAN 自動発見の結果を先頭に、指定(TSUNAGU_HOST)を併せて返す。
+    /// 同じ LAN にいれば発見=LAN 直が最速で、いなければ指定(Tailscale 等)へフォールバックする
+    pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
+        let found = crate::discover::seek_first_lan(port, token).into_iter().collect::<Vec<_>>();
+        merge_candidates(found, hosts, port)
     }
 
     pub fn first_reachable(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
@@ -1321,6 +1303,28 @@ mod tests {
         drop(quiet);
     }
 
+    /// resolve の併合: 発見結果を先頭に、手動指定を重複排除して並べる
+    #[test]
+    fn merge_candidates_puts_discovery_first_and_dedups() {
+        use super::connect::merge_candidates;
+        use std::net::IpAddr;
+        let found: Vec<IpAddr> = vec!["192.168.0.1".parse().unwrap()];
+        let merged = merge_candidates(found, Some("100.100.10.9,192.168.0.1"), 24900);
+        assert_eq!(merged.len(), 2, "発見と指定の同じ IP は 1 つに: {merged:?}");
+        assert_eq!(merged[0].to_string(), "192.168.0.1:24900", "発見結果が先頭");
+        assert_eq!(merged[1].to_string(), "100.100.10.9:24900");
+
+        // 指定なし → 発見のみ
+        let only = merge_candidates(vec!["192.168.0.1".parse().unwrap()], None, 24900);
+        assert_eq!(only.len(), 1);
+        // 発見なし → 指定のみ
+        let fallback = merge_candidates(Vec::new(), Some("100.100.10.9"), 24900);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].to_string(), "100.100.10.9:24900");
+        // 両方なし → 空(呼び出し側は再試行へ落ちる)
+        assert!(merge_candidates(Vec::new(), None, 24900).is_empty());
+    }
+
     /// 実ソケットでの結合確認: 待受・接続・認証・送信・受信・誤トークン拒否
     #[test]
     fn bulk_link_over_real_tcp() {
@@ -1436,9 +1440,9 @@ mod tests {
         std::thread::spawn(move || respond("127.0.0.1", port, "room-token", |_| true));
         std::thread::sleep(std::time::Duration::from_millis(100));
         let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let found = seek(target, "room-token", std::time::Duration::from_millis(500));
-        assert_eq!(found, vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
-        assert!(seek(target, "other-token", std::time::Duration::from_millis(300)).is_empty());
+        let found = seek_first(target, "room-token", std::time::Duration::from_millis(500));
+        assert_eq!(found, Some("127.0.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert_eq!(seek_first(target, "other-token", std::time::Duration::from_millis(300)), None);
         assert_ne!(room_id("a"), room_id("b"));
         assert!(!room_id("secret").contains("secret"));
     }
