@@ -1517,8 +1517,14 @@ unsafe extern "C" fn tap_callback(
                     }
                 }
             };
-            if pressed && connected {
+            // キーリピートは down が連続で届くため、押下エッジ(未押下→押下)だけで
+            // トグルする。押しっぱなしでの高速トグル暴発を防ぐ
+            static HOTKEY_DOWN: AtomicBool = AtomicBool::new(false);
+            if pressed && !HOTKEY_DOWN.swap(true, Ordering::Relaxed) && connected {
                 do_toggle("hotkey");
+            }
+            if !pressed {
+                HOTKEY_DOWN.store(false, Ordering::Relaxed);
             }
             return std::ptr::null_mut(); // トグル専用キーのため down/up 両方握る
         }
@@ -1959,6 +1965,8 @@ const BUILD_ID: &str = "build-20260926-171337-f561628";
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(debug_assertions)]
+    if args.iter().any(|a| a == "--probe-setup") { gui::setup::probe_invitation(); return; }
     if args.iter().any(|a| a == "--preview-setup") { let _=gui::setup::first_run(true); return; }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
