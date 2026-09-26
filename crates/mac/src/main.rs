@@ -2281,14 +2281,15 @@ fn main() {
     // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録
     if args.iter().any(|a| a == "--diag") {
         DIAG_ENABLED.store(true, Ordering::Relaxed);
-        // 検証用の切替指示(--diag 起動時のみ): /tmp/tsunagu-cmd に "toggle" と書くと画面を
-        // 切り替える。クリップボードは画面を移る時にだけ同期するため、自動検証で
-        // 「移る」操作を起こす手段が要る(verify.sh が使う)
+        // 検証用の切替指示(--diag 起動時のみ): 一時ディレクトリへ "toggle" と書くと
+        // 画面を切り替える。クリップボードは画面を移る時にだけ同期するため、自動検証で
+        // 「移る」操作を起こす手段が要る(verify.sh が使う)。/tmp 共有領域だとローカルの
+        // 他ユーザーから切替できるため temp_dir()=$TMPDIR(ユーザー固有)へ置く
         std::thread::spawn(|| loop {
             std::thread::sleep(Duration::from_millis(200));
-            let p = std::path::Path::new("/tmp/tsunagu-cmd");
-            if let Ok(cmd) = std::fs::read_to_string(p) {
-                let _ = std::fs::remove_file(p);
+            let p = std::env::temp_dir().join("tsunagu-cmd");
+            if let Ok(cmd) = std::fs::read_to_string(&p) {
+                let _ = std::fs::remove_file(&p);
                 if cmd.trim() == "toggle" {
                     do_toggle("verify");
                 }

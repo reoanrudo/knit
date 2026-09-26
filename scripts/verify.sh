@@ -10,7 +10,7 @@ SCP="scp -q -o BatchMode=yes -o ConnectTimeout=5"
 pass=0; fail=0; warn=0
 # クリップボードは「画面を移る時」にだけ同期する(v0.23)。検証では Mac 側へ切替指示を出して
 # Windows へ入り、また戻る(restart-mac.sh --diag 起動時のみ有効な /tmp/tsunagu-cmd を使う)
-toggle() { echo toggle > /tmp/tsunagu-cmd; sleep 1; }
+toggle() { echo toggle > "${TMPDIR:-/tmp}/tsunagu-cmd"; sleep 1; }
 round_trip() { toggle; toggle; }
 check() { # check "名前" "期待" "実際"
   if [ "$2" = "$3" ]; then echo "  OK  $1"; pass=$((pass+1)); else echo "  NG  $1 (expect=[$2] got=[$3])"; fail=$((fail+1)); fi
