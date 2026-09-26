@@ -966,12 +966,13 @@ fn refresh_status() {
         }
         let connected = crate::CONNECTED.load(Ordering::Relaxed);
         let win = crate::WIN_MODE.load(Ordering::Relaxed);
+        // Mac 画面(通常時)はアイコンのみ。Windows 操作中と未接続の時だけ文字を出す
         let title = if !connected {
             "未接続"
         } else if win {
             "Windows"
         } else {
-            "Mac"
+            ""
         };
         msg1_void_id(button, sel(c"setTitle:"), nsstring(title));
 
