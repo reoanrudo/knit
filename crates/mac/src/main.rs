@@ -99,6 +99,10 @@ unsafe extern "C" {
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
     fn CGGetActiveDisplayList(max_displays: u32, active_displays: *mut u32, display_count: *mut u32) -> i32;
+    fn CGDisplayRegisterReconfigurationCallback(
+        callback: unsafe extern "C" fn(u32, u32, *mut core::ffi::c_void),
+        user_info: *mut core::ffi::c_void,
+    ) -> i32;
     fn CGWarpMouseCursorPosition(new: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connect: bool) -> i32;
     fn CGDisplayHideCursor(display: u32) -> i32;
@@ -721,8 +725,6 @@ static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
 static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
 static TX: OnceLock<Sender<String>> = OnceLock::new();
 static STREAM_SLOT: OnceLock<Arc<Mutex<Option<TcpStream>>>> = OnceLock::new();
-static SCREEN_W: OnceLock<f64> = OnceLock::new();
-static SCREEN_H: OnceLock<f64> = OnceLock::new();
 static TAP_PORT: OnceLock<usize> = OnceLock::new();
 static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -857,7 +859,7 @@ static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// 前回送信した絶対位置(量子化変化検出用)
 static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
-static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((0.05, 0.5));
+static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 絶対位置送信モード(既定ON。TSUNAGU_MOUSE_MODE=rel で旧・相対移動に戻す)
 static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 切替方式: false=境界+ホットキー(既定)/ true=ホットキー(F13)のみで切替、
@@ -922,13 +924,142 @@ pub fn edge_px() -> f64 {
 pub fn set_edge_px(v: f64) {
     EDGE_PX.store(v.clamp(0.0, 50.0).to_bits(), Ordering::Relaxed);
 }
-/// 全ディスプレイ領域(union)の右端。右にサブモニターがある環境では
-/// メイン画面右端で切替すると Mac 内のモニター間移動ができなくなるため、
-/// 仮想画面全体の右端で判定する
-static UNION_MAX_X: OnceLock<f64> = OnceLock::new();
-/// 出口(union 右端を持つディスプレイ)のグローバル y 範囲。
-/// 切替・復帰の高さ対応を MacBook 基準ではなく出口モニター基準で正確に行う
-static EDGE_DISP_Y: OnceLock<(f64, f64)> = OnceLock::new();
+/// 画面構成。ディスプレイの抜き差し・配置変更の通知で作り直す(Deskflow と同じく
+/// CGDisplayRegisterReconfigurationCallback を使う。旧実装は起動時に一度だけ確定させ、
+/// モニターを抜き差しすると境界がずれたままだった)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Geo {
+    /// メイン画面の大きさ(絶対位置モードの速度換算・配置エディタ用)
+    pub main_w: f64,
+    pub main_h: f64,
+    /// 全ディスプレイを合わせた領域の端(グローバル座標)
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+    /// 各辺で Windows に接する出口ディスプレイの、辺に沿った範囲
+    /// (左右の辺は y の範囲、上下の辺は x の範囲)
+    exit: [(f64, f64); 4],
+}
+
+const GEO_DEFAULT: Geo = Geo {
+    main_w: 2056.0,
+    main_h: 1329.0,
+    min_x: 0.0,
+    max_x: 2056.0,
+    min_y: 0.0,
+    max_y: 1329.0,
+    exit: [(0.0, 1329.0), (0.0, 1329.0), (0.0, 2056.0), (0.0, 2056.0)],
+};
+
+static GEO: Mutex<Option<Geo>> = Mutex::new(None);
+
+pub(crate) fn geo() -> Geo {
+    GEO.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(GEO_DEFAULT)
+}
+
+impl Geo {
+    /// dir(0=右/1=左/2=上/3=下)の境界までの距離。左右に別モニターがある環境でも
+    /// 「全体の端」で測るため、Mac 内のモニター間移動では切り替わらない
+    fn gap(&self, dir: u8, x: f64, y: f64) -> f64 {
+        match dir {
+            1 => x - self.min_x,
+            2 => y - self.min_y,
+            3 => self.max_y - y,
+            _ => self.max_x - x,
+        }
+    }
+    fn exit_span(&self, dir: u8) -> (f64, f64) {
+        self.exit[dir.min(3) as usize]
+    }
+    /// 境界に沿った位置の比率(0..1)。左右の辺は y、上下の辺は x で測る
+    fn along_ratio(&self, dir: u8, x: f64, y: f64) -> f64 {
+        let (lo, hi) = self.exit_span(dir);
+        let v = if dir >= 2 { x } else { y };
+        if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.5 }
+    }
+    /// 比率から境界に沿った座標へ(端から 20px は避ける)
+    fn along_pos(&self, dir: u8, r: Option<f64>) -> f64 {
+        let (lo, hi) = self.exit_span(dir);
+        match r {
+            Some(n) => (lo + n.clamp(0.0, 1.0) * (hi - lo)).clamp(lo + 20.0, (hi - 20.0).max(lo + 20.0)),
+            None => (lo + hi) / 2.0,
+        }
+    }
+    /// 境界から inset だけ内側の、境界に沿った比率 r の点
+    fn inside_point(&self, dir: u8, inset: f64, r: Option<f64>) -> (f64, f64) {
+        let a = self.along_pos(dir, r);
+        match dir {
+            1 => (self.min_x + inset, a),
+            2 => (a, self.min_y + inset),
+            3 => (a, self.max_y - inset),
+            _ => (self.max_x - inset, a),
+        }
+    }
+}
+
+fn compute_geo() -> Geo {
+    unsafe {
+        let mb = CGDisplayBounds(CGMainDisplayID());
+        let mut g = Geo {
+            main_w: mb.size.w,
+            main_h: mb.size.h,
+            min_x: mb.origin.x,
+            max_x: mb.origin.x + mb.size.w,
+            min_y: mb.origin.y,
+            max_y: mb.origin.y + mb.size.h,
+            exit: [
+                (mb.origin.y, mb.origin.y + mb.size.h),
+                (mb.origin.y, mb.origin.y + mb.size.h),
+                (mb.origin.x, mb.origin.x + mb.size.w),
+                (mb.origin.x, mb.origin.x + mb.size.w),
+            ],
+        };
+        let mut ids = [0u32; 16];
+        let mut n = 0u32;
+        if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+            for id in &ids[..(n as usize).min(16)] {
+                let b = CGDisplayBounds(*id);
+                let (l, r, t, btm) = (b.origin.x, b.origin.x + b.size.w, b.origin.y, b.origin.y + b.size.h);
+                if r > g.max_x {
+                    g.max_x = r;
+                    g.exit[0] = (t, btm);
+                }
+                if l < g.min_x {
+                    g.min_x = l;
+                    g.exit[1] = (t, btm);
+                }
+                if t < g.min_y {
+                    g.min_y = t;
+                    g.exit[2] = (l, r);
+                }
+                if btm > g.max_y {
+                    g.max_y = btm;
+                    g.exit[3] = (l, r);
+                }
+            }
+        }
+        g
+    }
+}
+
+fn refresh_geo() {
+    let g = compute_geo();
+    *GEO.lock().unwrap_or_else(|e| e.into_inner()) = Some(g);
+    eprintln!(
+        "[screen] main {}x{} / 全体 x={:.0}..{:.0} y={:.0}..{:.0}",
+        g.main_w, g.main_h, g.min_x, g.max_x, g.min_y, g.max_y
+    );
+}
+
+/// ディスプレイ構成の変更通知(メイン RunLoop 上で呼ばれる)。変更完了時だけ作り直す
+unsafe extern "C" fn display_reconfigured(_display: u32, flags: u32, _user: *mut core::ffi::c_void) {
+    const BEGIN: u32 = 1; // kCGDisplayBeginConfigurationFlag
+    if flags & BEGIN == 0 {
+        refresh_geo();
+    }
+}
+
 /// カーソル非表示状態の管理(hide/show の対称性を保証し、復帰時に必ず表示する)
 static CURSOR_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -973,25 +1104,16 @@ fn enter_win_mode_cursor_lock() {
             lock_y = loc.y;
             CFRelease(ev);
         }
-        // SIDE の境界端に固定(SCREEN_W はメイン画面幅なので、右サブモニターが
-        // ある環境で右端固定すると隠れカーソルが MacBook 側へ飛んでしまう)
+        // 全ディスプレイを合わせた領域の、Windows 側の辺に固定する(メイン画面の端に
+        // 固定すると、その先にサブモニターがある環境で隠れカーソルが別画面へ飛ぶ)
         let dir = side_dir();
-        let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
-        let edge_x = UNION_MAX_X.get().copied().unwrap_or_else(|| {
-            SCREEN_W.get().copied().unwrap_or(2056.0)
-        });
-        let ev2 = CGEventCreate(std::ptr::null_mut());
-        let mut lock_x2 = 0.0f64;
-        if !ev2.is_null() {
-            let loc2 = CGEventGetLocation(ev2);
-            lock_x2 = loc2.x;
-            CFRelease(ev2);
-        }
+        let g = geo();
+        let lock_x2 = live_cursor().map(|p| p.x).unwrap_or((g.min_x + g.max_x) / 2.0);
         let (lock_x, lock_y) = match dir {
-            1 => (2.0, lock_y),                     // 左端
-            2 => (lock_x2, 2.0),                    // 上端
-            3 => (lock_x2, main_h - 2.0),           // 下端
-            _ => (edge_x - 2.0, lock_y),            // 右端(既定)
+            1 => (g.min_x + 2.0, lock_y),
+            2 => (lock_x2, g.min_y + 2.0),
+            3 => (lock_x2, g.max_y - 2.0),
+            _ => (g.max_x - 2.0, lock_y),
         };
         CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
         // タップが握った位置を CUR_POS にも反映(積算の起点を正しくする)
@@ -1042,42 +1164,15 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         // 誤再突入を防ぐ
         // SIDE(Windows の位置)に応じた復帰座標: 出てきた境界のすぐ内側へ。
         // ny は Windows 側カーソルの「境界に沿った比率」(side 0/1=縦、2/3=横)
-        let main_w = SCREEN_W.get().copied().unwrap_or(2056.0);
-        let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
-        let edge_x = UNION_MAX_X.get().copied().unwrap_or(main_w);
+        let g = geo();
+        let dir = side_dir();
         let taps = EDGE_TAPS.load(Ordering::Relaxed);
-        let side = SIDE.load(Ordering::Relaxed);
         let inset: f64 = if taps >= 2 { 60.0 } else { 150.0 };
-        let (ymin, ymax) = EDGE_DISP_Y
-            .get()
-            .copied()
-            .unwrap_or((0.0, main_h));
-        let along_y = |r: Option<f64>| -> f64 {
-            match r {
-                Some(n) => (ymin + n.clamp(0.0, 1.0) * (ymax - ymin)).clamp(ymin + 20.0, (ymax - 20.0).max(ymin + 20.0)),
-                None => (ymin + ymax) / 2.0,
-            }
-        };
-        let along_x = |r: Option<f64>| -> f64 {
-            match r {
-                Some(n) => (n.clamp(0.0, 1.0) * main_w).clamp(20.0, main_w - 20.0),
-                None => main_w / 2.0,
-            }
-        };
-        let (x, y) = match side {
-            1 => (inset.max(20.0), along_y(ny)), // 左端から戻る
-            2 => (along_x(ny), inset.max(20.0)), // 上端から戻る
-            3 => (along_x(ny), (main_h - inset).min(main_h - 20.0)), // 下端から戻る
-            _ => {
-                // 右端(既定): 1回切替時は MacBook 側へ十分退ける
-                let x = if taps >= 2 {
-                    edge_x - inset
-                } else {
-                    (main_w - 100.0).min(edge_x - inset)
-                };
-                (x, along_y(ny))
-            }
-        };
+        let (mut x, y) = g.inside_point(dir, inset, ny);
+        if dir == 0 && taps < 2 {
+            // 1回切替では MacBook 側へ十分退けて誤再突入を防ぐ
+            x = x.min(g.main_w - 100.0);
+        }
         CGWarpMouseCursorPosition(CGPoint { x, y });
         // ワープ先を CUR_POS へ反映(同期をワープ前に取ると境界値が残り
         // 復帰直後に必ず再突入して戻れなくなる)
@@ -1215,7 +1310,7 @@ unsafe extern "C" fn tap_callback(
             && !HOTKEY_ONLY.load(Ordering::Relaxed) // hotkey モードでは境界切替しない(ロック)
             && now_ms() >= EDGE_GUARD_UNTIL_MS.load(Ordering::Relaxed)
         {
-            if let Some(w) = SCREEN_W.get() {
+            {
                 // delta 積算でカーソル位置を追跡(Deskflow の m_xCursor 方式)。
                 // 32イベントに1回ライブ位置へ同期しドリフトを補正する
                 let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
@@ -1232,33 +1327,19 @@ unsafe extern "C" fn tap_callback(
                 let (px, py) = *pos;
                 drop(pos);
                 let edge = edge_px();
-                // 仮想画面全体の右端(右サブモニターがある環境ではそちらの右端)
-                let main_w = *w;
-                let main_h = SCREEN_H.get().copied().unwrap_or(1329.0);
-                let edge_x = UNION_MAX_X.get().copied().unwrap_or(*w);
-                let side = SIDE.load(Ordering::Relaxed);
+                let g = geo();
                 let dir = side_dir();
                 let (lay_lo, lay_hi) = *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
                 // SIDE に応じた「切替境界までの距離」(小さいほど端に近い)。
                 // Deskflow の links 相当+斜め(4-7)は境界の半分(上/下)でのみ接続
                 let gap = |x: f64, y: f64| -> f64 {
-                    let base = match dir {
-                        1 => x,            // 左端
-                        2 => y,            // 上端
-                        3 => main_h - y,   // 下端
-                        _ => edge_x - x,   // 右端(既定)
-                    };
+                    let base = g.gap(dir, x, y);
                     if base > edge + 40.0 {
                         return base; // 境界から遠い=範囲判定不要
                     }
-                    // 境界付近でのみ範囲(斜め)制限を適用:
-                    // 水平境界(左右)は上下半分、垂直境界(上下)は左右半分
-                    let (lo, hi, v) = if dir == 2 || dir == 3 {
-                        (0.0, main_w, x) // 上下境界: 横位置で判定
-                    } else {
-                        (0.0, main_h, y) // 左右境界: 縦位置で判定
-                    };
-                    let f = ((v - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+                    // 境界付近でのみ接続範囲(配置エディタ/斜め配置)の制限を適用する。
+                    // 範囲は出口ディスプレイの辺に沿った比率で測る
+                    let f = g.along_ratio(dir, x, y);
                     if f < lay_lo || f > lay_hi {
                         return f64::MAX; // Windows 画面が接している範囲外
                     }
@@ -1273,8 +1354,8 @@ unsafe extern "C" fn tap_callback(
                     // switchCorners(+cornerSize): 四隅 N px 内では切替しない(誤爆防止)
                     let corner = CORNER_PX.load(Ordering::Relaxed) as f64;
                     if corner > 0.0
-                        && (px < corner || px > edge_x - corner)
-                        && (py < corner || py > main_h - corner)
+                        && (px < g.min_x + corner || px > g.max_x - corner)
+                        && (py < g.min_y + corner || py > g.max_y - corner)
                     {
                         return event;
                     }
@@ -1314,11 +1395,13 @@ unsafe extern "C" fn tap_callback(
                             // 1回目: 境界から少し内側へ弾き返す。壁に当たった感触で
                             // 「もう一度押すと通る」ことを体感させる(本質の可視化)
                             eprintln!("[edge] 1回目の到達(跳ね返し)");
-                            let (bx, by) = match side {
-                                1 => (15.0, loc.y),
-                                2 => (loc.x, 15.0),
-                                3 => (loc.x, main_h - 15.0),
-                                _ => (edge_x - 15.0, loc.y),
+                            // 配置番号(0-7)ではなく方向で判定する(旧実装は左上/左下配置で
+                            // 右端へ弾き返していた)
+                            let (bx, by) = match dir {
+                                1 => (g.min_x + 15.0, loc.y),
+                                2 => (loc.x, g.min_y + 15.0),
+                                3 => (loc.x, g.max_y - 15.0),
+                                _ => (g.max_x - 15.0, loc.y),
                             };
                             CGWarpMouseCursorPosition(CGPoint { x: bx, y: by });
                             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (bx, by);
@@ -1388,15 +1471,13 @@ unsafe extern "C" fn tap_callback(
                     // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
                     let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
                     if nx < 0.0 {
-                        nx = 0.05;
-                        let (ymin, ymax) = EDGE_DISP_Y
-                            .get()
-                            .copied()
-                            .unwrap_or((0.0, SCREEN_H.get().copied().unwrap_or(1329.0)));
-                        ny = if ymax > ymin {
-                            ((loc.y - ymin) / (ymax - ymin)).clamp(0.0, 1.0)
-                        } else {
-                            0.5
+                        // 初回: 越えた境界の対応位置から入る(Windows 側の反対の辺)
+                        let r = g.along_ratio(dir, loc.x, loc.y);
+                        (nx, ny) = match dir {
+                            1 => (0.95, r),
+                            2 => (r, 0.95),
+                            3 => (r, 0.05),
+                            _ => (0.05, r),
                         };
                     }
                     send_msg(&Msg::Warp { nx, ny });
@@ -1537,10 +1618,7 @@ unsafe extern "C" fn tap_callback(
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
                     let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-                    let (mw, mh) = (
-                        SCREEN_W.get().copied().unwrap_or(2056.0),
-                        SCREEN_H.get().copied().unwrap_or(1329.0),
-                    );
+                    let (mw, mh) = { let g = geo(); (g.main_w, g.main_h) };
                     let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
                     // 重要: WIN_CUR のガードをこのブロック内で必ず解放してから
                     // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
@@ -1549,12 +1627,19 @@ unsafe extern "C" fn tap_callback(
                         let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
                         wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
                         wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
+                        // Mac 側へ戻る辺は Windows の位置で決まる(右配置なら Windows の左端、
+                        // 左配置なら右端、上配置なら下端、下配置なら上端)。旧実装は常に
+                        // 左端で判定し、上下配置では Windows の左端に触れるだけで戻っていた
+                        let at_edge = match side_dir() {
+                            1 => wc.0 >= ww - 3.0,
+                            2 => wc.1 >= wh - 3.0,
+                            3 => wc.1 <= 2.0,
+                            _ => wc.0 <= 2.0,
+                        };
                         (
                             wc.0 / ww,
                             wc.1 / wh,
-                            !HOTKEY_ONLY.load(Ordering::Relaxed)
-                                && event_type == EVT_MOUSE_MOVED
-                                && wc.0 <= 2.0,
+                            !HOTKEY_ONLY.load(Ordering::Relaxed) && event_type == EVT_MOUSE_MOVED && at_edge,
                         )
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
@@ -1567,8 +1652,9 @@ unsafe extern "C" fn tap_callback(
                     if at_left {
                         WIN_MODE.store(false, Ordering::Relaxed);
                         DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
-                        eprintln!("[mode] MAC (abs-left)");
-                        leave_win_mode_cursor_unlock(Some(ny));
+                        eprintln!("[mode] MAC (abs-edge)");
+                        // 境界に沿った比率: 左右の辺は縦位置、上下の辺は横位置
+                        leave_win_mode_cursor_unlock(Some(if side_dir() >= 2 { nx } else { ny }));
                     }
                 } else {
                     // 相対移動モード(従来互換)
@@ -1710,33 +1796,9 @@ fn main() {
         }
     };
 
-    let (screen_w, screen_h) = unsafe {
-        let d = CGMainDisplayID();
-        let b = CGDisplayBounds(d);
-        (b.size.w, b.size.h)
-    };
-    // 全アクティブディスプレイの bounds 和集合の右端(仮想画面の右端)
-    let (union_max_x, edge_disp_y) = unsafe {
-        let mut ids = [0u32; 16];
-        let mut n = 0u32;
-        let mut max_x = screen_w;
-        let mut disp_y = (0.0, screen_h);
-        if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
-            for id in &ids[..n as usize] {
-                let b = CGDisplayBounds(*id);
-                let right = b.origin.x + b.size.w;
-                if right > max_x {
-                    max_x = right;
-                    disp_y = (b.origin.y, b.origin.y + b.size.h);
-                }
-            }
-        }
-        (max_x, disp_y)
-    };
-    let _ = UNION_MAX_X.set(union_max_x);
-    let _ = EDGE_DISP_Y.set(edge_disp_y);
-    let _ = SCREEN_W.set(screen_w);
-    let _ = SCREEN_H.set(screen_h);
+    refresh_geo();
+    let (screen_w, screen_h) = { let g = geo(); (g.main_w, g.main_h) };
+    unsafe { CGDisplayRegisterReconfigurationCallback(display_reconfigured, std::ptr::null_mut()) };
     unsafe {
         if let Some(loc) = live_cursor() {
             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
@@ -1833,7 +1895,7 @@ fn main() {
         SPK_MUTE.store(false, Ordering::Relaxed);
     }
     eprintln!(
-        "[info] screen {screen_w}x{screen_h} union_max_x={union_max_x:.0}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
+        "[info] screen {screen_w}x{screen_h}. listening on :{port} (server mode). scroll_div={} mouse_scale={} edge_px={} clip_max={}KB mouse_mode={} switch_mode={} hotkey_kc={} edge_taps={}",
         scroll_div(),
         mouse_scale(),
         edge_px(),
@@ -2224,6 +2286,10 @@ fn session_receive_loop(reader: &mut std::io::BufReader<TcpStream>) {
                             send_msg(&Msg::Stat { rtt });
                         }
                         Msg::Ping { ts } => send_msg(&Msg::Pong { ts }),
+                        Msg::Screen { w, h } if w > 0 && h > 0 => {
+                            *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
+                            eprintln!("[info] win screen changed {w}x{h}");
+                        }
                         Msg::Bye => break,
                         _ => {}
                     }
@@ -2416,5 +2482,48 @@ fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);
+    }
+}
+
+#[cfg(test)]
+mod geo_tests {
+    use super::Geo;
+
+    /// MacBook(0..2056) の左に 1920 幅、右に 2560 幅のモニターがある構成
+    fn three_screens() -> Geo {
+        Geo {
+            main_w: 2056.0,
+            main_h: 1329.0,
+            min_x: -1920.0,
+            max_x: 4616.0,
+            min_y: -200.0,
+            max_y: 1329.0,
+            exit: [(-200.0, 1240.0), (0.0, 1080.0), (-1920.0, 0.0), (0.0, 2056.0)],
+        }
+    }
+
+    #[test]
+    fn edges_are_measured_on_the_whole_desktop() {
+        let g = three_screens();
+        // MacBook の左端(x=0)は左モニターへの通り道なので、左配置でも切替境界ではない
+        assert!(g.gap(1, 0.0, 500.0) > 1000.0);
+        assert_eq!(g.gap(1, -1920.0, 500.0), 0.0);
+        // MacBook の右端も右モニターへの通り道
+        assert!(g.gap(0, 2056.0, 500.0) > 1000.0);
+        assert_eq!(g.gap(0, 4616.0, 500.0), 0.0);
+    }
+
+    #[test]
+    fn return_point_is_inside_the_exit_display() {
+        let g = three_screens();
+        let (x, y) = g.inside_point(1, 60.0, Some(0.5));
+        assert_eq!(x, -1860.0);
+        assert_eq!(y, 540.0);
+        let (x, y) = g.inside_point(0, 60.0, Some(0.0));
+        assert_eq!(x, 4556.0);
+        assert_eq!(y, -180.0); // 端から 20px は避ける
+        assert_eq!(g.along_ratio(0, 4616.0, 520.0), 0.5);
+        // 上下の辺は横位置で測る
+        assert_eq!(g.along_ratio(3, 1028.0, 1329.0), 0.5);
     }
 }

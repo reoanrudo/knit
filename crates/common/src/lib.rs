@@ -127,6 +127,9 @@ pub mod proto {
         },
         #[serde(rename = "hello_ok")]
         HelloOk { name: String, w: i32, h: i32 },
+        /// 画面構成の変化(Windows→Mac)。解像度変更・モニター抜き差しで送る
+        #[serde(rename = "screen")]
+        Screen { w: i32, h: i32 },
         #[serde(rename = "key")]
         Key {
             kc: u16,

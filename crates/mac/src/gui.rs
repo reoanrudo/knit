@@ -630,10 +630,7 @@ const LAY_VH: f64 = 320.0;
 
 /// Mac/Win 両画面の実ピクセルサイズ(hello 受信値。未接続時は一般値)
 fn lay_px() -> ((f64, f64), (f64, f64)) {
-    let mac = (
-        crate::SCREEN_W.get().copied().unwrap_or(2056.0),
-        crate::SCREEN_H.get().copied().unwrap_or(1329.0),
-    );
+    let mac = { let g = crate::geo(); (g.main_w, g.main_h) };
     let win = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     (mac, win)
 }

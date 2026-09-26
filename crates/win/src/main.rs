@@ -586,10 +586,11 @@ fn inject_mouse_move_rel(dx: i32, dy: i32) -> bool {
 /// Windows のポインタ加速曲線を通らないため、Mac の速度感がそのまま再現される
 fn inject_mouse_move_abs(x: i32, y: i32) -> bool {
     const ABSOLUTE: u32 = 0x8000;
+    const VIRTUALDESK: u32 = 0x4000;
     send_input_buf(InputBuf {
         itype: INPUT_MOUSE,
         _pad: 0,
-        body: [x as u32, y as u32, 0, MOUSEEVENTF_MOVE | ABSOLUTE, 0, 0],
+        body: [x as u32, y as u32, 0, MOUSEEVENTF_MOVE | ABSOLUTE | VIRTUALDESK, 0, 0],
         extra: 0,
     })
 }
@@ -829,6 +830,32 @@ fn detach_if_console() {
     }
 }
 
+/// 仮想デスクトップ(全モニターを合わせた領域)の (x, y, w, h)。プライマリ画面だけを
+/// 前提にすると、2 枚目以降のモニターへカーソルを動かせず端の判定もずれる
+static VSCREEN: std::sync::Mutex<(i32, i32, i32, i32)> = std::sync::Mutex::new((0, 0, 1920, 1080));
+
+fn vscreen() -> (i32, i32, i32, i32) {
+    *VSCREEN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 仮想デスクトップの範囲を取り直す(変化があれば true を返せるよう値を返す)
+fn refresh_vscreen() -> (i32, i32, i32, i32) {
+    const SM_XVIRTUALSCREEN: i32 = 76;
+    const SM_YVIRTUALSCREEN: i32 = 77;
+    const SM_CXVIRTUALSCREEN: i32 = 78;
+    const SM_CYVIRTUALSCREEN: i32 = 79;
+    let v = unsafe {
+        let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        if w > 0 && h > 0 {
+            (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), w, h)
+        } else {
+            (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+        }
+    };
+    *VSCREEN.lock().unwrap_or_else(|e| e.into_inner()) = v;
+    v
+}
+
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = "win-20260926-143916-049c56c";
@@ -876,8 +903,7 @@ fn main() {
         }
     }
 
-    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
-    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    let (_, _, w, h) = refresh_vscreen();
     println!("[info] desktop attached. screen {w}x{h}. listening on :{port}");
 
     if args.iter().any(|a| a == "--debug-keys") {
@@ -1052,7 +1078,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         println!("[conn] established");
         tray::notify("tsunagu", "接続しました");
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
-        let _ = session(stream, w, h);
+        let _ = session(stream);
         CONNECTED.store(false, Ordering::Relaxed);
         BULK_LINK.clear();
         audio::speaker_disconnect();
@@ -1099,7 +1125,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     CONNECTED.store(true, Ordering::Relaxed);
     tray::notify("tsunagu", "接続しました");
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
-    let r = session(stream, w, h);
+    let r = session(stream);
     CONNECTED.store(false, Ordering::Relaxed);
     BULK_LINK.clear();
     audio::speaker_disconnect();
@@ -1108,7 +1134,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
 }
 
 /// 認証済みストリームの本体処理(接続/待受 両モード共通)
-fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
+fn session(stream: TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     // 読み出しタイムアウト: Mac は3秒毎に ping を送るため 12秒無音は経路断。
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
@@ -1141,6 +1167,27 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
 
     // (旧heartbeatスレッドは削除: ソケット生死は read のエラーで判定し、
     //  接続監視は Mac 側の ping/pong が担うため不要だった)
+
+    // 画面構成(解像度・モニター抜き差し)の変化を 2 秒毎に確認し Mac へ知らせる
+    // (Mac 側の速度換算と端の判定が古い大きさのままになるのを防ぐ)
+    {
+        let tx = wtx.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            let mut last = vscreen();
+            while running.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(2));
+                let now = refresh_vscreen();
+                if now != last {
+                    println!("[screen] 仮想デスクトップ {:?} -> {:?}", last, now);
+                    last = now;
+                    if tx.send(encode(&Msg::Screen { w: now.2, h: now.3 })).is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // 接続時点のクリップボードは送らない(以後の変化だけを Mac へ戻る時に同期する)
     LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
@@ -1289,7 +1336,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     accum.1 -= iy;
                     inject_mouse_move_rel(ix as i32, iy as i32);
                     // 実際にカーソルが動いたときだけ左端到達を判定する
-                    maybe_notify_return(&wtx, &mut last_return_notify, w, h, &mut mods);
+                    maybe_notify_return(&wtx, &mut last_return_notify, &mut mods);
                 }
             }
             Msg::MouseAbs { nx, ny } => {
@@ -1302,7 +1349,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 if DEBUG_KEYS.load(Ordering::Relaxed) {
                     println!("[abs] -> ({x},{y})");
                 }
-                maybe_notify_return(&wtx, &mut last_return_notify, w, h, &mut mods);
+                maybe_notify_return(&wtx, &mut last_return_notify, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
                 if !hello_done {
@@ -1332,8 +1379,9 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 if !hello_done {
                     continue;
                 }
-                let x = (nx.clamp(0.0, 1.0) * w as f64) as i32;
-                let y = (ny.clamp(0.0, 1.0) * h as f64) as i32;
+                let (vx, vy, vw, vh) = vscreen();
+                let x = vx + (nx.clamp(0.0, 1.0) * vw as f64) as i32;
+                let y = vy + (ny.clamp(0.0, 1.0) * vh as f64) as i32;
                 unsafe { SetCursorPos(x, y) };
                 last_return_notify = Instant::now();
             }
@@ -1371,26 +1419,26 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
 fn maybe_notify_return(
     wtx: &std::sync::mpsc::Sender<String>,
     last: &mut Instant,
-    w: i32,
-    h: i32,
     mods: &mut ModState,
 ) {
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
+    let (vx, vy, w, h) = vscreen();
+    let (px, py) = (p.x - vx, p.y - vy);
     let side = SIDE_W.load(Ordering::Relaxed);
     let hit = match side {
-        1 | 6 | 7 => p.x >= w - 1, // Mac は左(左上/左下含む)→ Win の右端で戻る
-        2 => p.y >= h - 1,          // Mac は上にある → Win の下端で戻る
-        3 => p.y <= 1,              // Mac は下にある → Win の上端で戻る
-        _ => p.x <= 1,              // 既定: Mac は右(右上/右下含む)→ 左端で戻る
+        1 | 6 | 7 => px >= w - 1, // Mac は左(左上/左下含む)→ Win の右端で戻る
+        2 => py >= h - 1,          // Mac は上にある → Win の下端で戻る
+        3 => py <= 1,              // Mac は下にある → Win の上端で戻る
+        _ => px <= 1,              // 既定: Mac は右(右上/右下含む)→ 左端で戻る
     };
     if hit && last.elapsed() >= Duration::from_millis(700) {
         let ny = match side {
             2 | 3 => {
-                if w > 0 { (p.x as f64 / w as f64).clamp(0.0, 1.0) } else { 0.5 }
+                if w > 0 { (px as f64 / w as f64).clamp(0.0, 1.0) } else { 0.5 }
             }
             _ => {
-                if h > 0 { (p.y as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 }
+                if h > 0 { (py as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 }
             }
         };
         let _ = wtx.send(encode(&Msg::Return { ny }));
