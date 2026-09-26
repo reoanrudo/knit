@@ -465,13 +465,9 @@ pub(crate) fn release_all_input() {
     }
 }
 
-/// ファイル群の指紋(パス+サイズ)。同一コピーの再検出・エコーバック判定に使う
+/// ファイル群の指紋(パス+サイズ)。形式は common::files::key に統一
 fn files_key(paths: &[String]) -> String {
-    let sizes: u64 = paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
-    format!("{}|{sizes}", paths.join("\u{1}"))
+    bulk::files_key(paths)
 }
 
 /// ファイル群を Mac へ送る(大容量経路。本線の入力・ping を詰まらせない)
@@ -1059,6 +1055,15 @@ fn registration_authenticated(_token: &str) {
     }
 }
 fn main() {
+    #[cfg(debug_assertions)]
+    if std::env::args().any(|a| a == "--probe-setup") {
+        // The test runner supplies an isolated LOCALAPPDATA directory.
+        if let Some(root) = std::env::var_os("TSUNAGU_PROBE_DATA") {
+            std::env::set_var("LOCALAPPDATA", root);
+            let _ = tray::setup::first_run(false);
+        }
+        return;
+    }
     if std::env::args().any(|a| a == "--preview-setup") { let _=tray::setup::first_run(true); return; }
     if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
     ensure_stdout();

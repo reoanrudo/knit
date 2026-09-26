@@ -283,6 +283,16 @@ pub mod files {
         s
     }
 
+    /// ファイル群の指紋(パス+合計サイズ)。同一コピーの再検出・エコーバック判定に
+    /// 使う。両 OS で同じ形式にするためここへ置く
+    pub fn key(paths: &[String]) -> String {
+        let sizes: u64 = paths
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
+            .sum();
+        format!("{}|{sizes}", paths.join("\u{1}"))
+    }
+
     /// 相手 PC から来たファイルに「外部から入手した」印を付ける。これが無いと、
     /// 受信した実行ファイルや .app が OS の警告(SmartScreen / Gatekeeper)なしで開ける。
     /// 付与できなくても受信自体は続ける(NTFS 以外のドライブ等)
@@ -682,6 +692,8 @@ pub mod bulk {
 
     /// 本線ポートからの差分(24900 → 24902。24901 は音声)
     pub const PORT_OFFSET: u16 = 2;
+    /// ファイル指紋の再公開(利用側は bulk 経由で呼ぶことが多いため)
+    pub use crate::files::key as files_key;
     /// 暗号化ハンドシェイクで経路を識別するラベル
     const LABEL: &[u8] = b"tsunagu-bulk";
     /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
@@ -1239,6 +1251,22 @@ mod tests {
         assert_eq!(sanitize("console.txt"), "console.txt");
         assert_eq!(sanitize(""), "file");
         assert_eq!(sanitize("報告書.pdf"), "報告書.pdf");
+    }
+
+    #[test]
+    fn files_key_is_stable_and_size_aware() {
+        use super::files::key;
+        let base = std::env::temp_dir().join(format!("tsunagu-key-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), b"hello").unwrap();
+        let a = base.join("a.txt").to_string_lossy().into_owned();
+        let k1 = key(&[a.clone()]);
+        let k2 = key(&[a.clone()]);
+        assert_eq!(k1, k2, "同じ選択は同じ指紋");
+        std::fs::write(&base.join("a.txt"), b"hello world").unwrap();
+        assert_ne!(k1, key(&[a.clone()]), "内容が変われば指紋も変わる");
+        assert_eq!(key(&[a.clone(), a.clone()]).split('|').next(), key(&[a.clone(), a.clone()]).split('|').next(), "順序込みで一貫");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

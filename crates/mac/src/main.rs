@@ -560,20 +560,10 @@ unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
     write(pb, sel_registerName(c"writeObjects:".as_ptr()), arr) != 0
 }
 
-/// ファイル群の指紋(パス+合計サイズ)。同一コピーの再検出・エコーバック判定に使う
+/// ファイル群の指紋(パス+合計サイズ)。形式は common::files::key に統一
 fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
-    let sizes: u64 = paths
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-        .sum();
-    format!(
-        "{}|{sizes}",
-        paths
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("\u{1}")
-    )
+    let v: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    bulk::files_key(&v)
 }
 
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
