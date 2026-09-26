@@ -70,7 +70,16 @@ scp -o BatchMode=yes target/x86_64-pc-windows-gnu/release/tsunagu-win.exe home:C
 # 起動資材(ログローテーション実効化のため bat 経由へ変更)+アイコン+トークンも更新
 scp -o BatchMode=yes win-dist/run_tsunagu.vbs win-dist/run_tsunagu.bat home:C:/Users/<user>/tsunagu/ >/dev/null
 scp -o BatchMode=yes win-dist/app.ico home:C:/Users/<user>/tsunagu/ >/dev/null
-scp -o BatchMode=yes "$TOKEN_SRC" home:C:/Users/<user>/tsunagu/.env >/dev/null
+# 接続先(Mac の Tailscale IP)が設定に無ければ配布用 .env に補う(手元の設定は書き換えない)。
+# exe は既定の接続先を持たず、未指定だと LAN 自動発見になるが、AP 隔離の環境では届かないため
+ENV_OUT=$(mktemp)
+cp "$TOKEN_SRC" "$ENV_OUT"
+if ! grep -q "^TSUNAGU_HOST=" "$ENV_OUT"; then
+  MAC_IP=$(tailscale ip -4 2>/dev/null | head -1)
+  [ -n "$MAC_IP" ] && printf '\nTSUNAGU_HOST=%s\n' "$MAC_IP" >> "$ENV_OUT"
+fi
+scp -o BatchMode=yes "$ENV_OUT" home:C:/Users/<user>/tsunagu/.env >/dev/null
+rm -f "$ENV_OUT"
 # 自動復帰ウォッチ(毎分。二重起動は exe 側のミューテックスで即終了)
 ssh -o BatchMode=yes home 'schtasks /Create /TN tsunagu_watch /TR "wscript.exe C:\Users\<user>\tsunagu\run_tsunagu.vbs" /SC MINUTE /MO 1 /F' >/dev/null 2>&1 || true
 ssh -o BatchMode=yes home "schtasks /Run /TN tsunagu_run" >/dev/null 2>&1

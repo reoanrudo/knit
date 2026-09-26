@@ -529,6 +529,67 @@ pub mod net {
     }
 }
 
+pub mod discover {
+    //! 同じ LAN にいる相手の自動発見(接続先の IP を手で入れずに済むように)。
+    //! 問い合わせと応答には、トークンから導いた「部屋 ID」だけを載せる(トークンそのもの
+    //! は含まない)。同じトークンを持つ相手だけが応答するため、他人の Tsunagu とは混ざらない。
+    //! Tailscale や AP 隔離の環境ではブロードキャストが届かないため TSUNAGU_HOST を併用する
+    use std::net::{IpAddr, SocketAddr, UdpSocket};
+    use std::time::{Duration, Instant};
+
+    /// 本線ポートからの差分(24900 → 24903/UDP)
+    pub const PORT_OFFSET: u16 = 3;
+
+    pub fn room_id(token: &str) -> String {
+        use blake2::Digest;
+        let mut h = blake2::Blake2s256::new();
+        h.update(b"tsunagu-room-v1\0");
+        h.update(token.as_bytes());
+        h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える
+    pub fn respond(bind: &str, port: u16, token: &str, allow: fn(IpAddr) -> bool) {
+        let Ok(sock) = UdpSocket::bind((bind, port)) else { return };
+        let ask = format!("TSUNAGU?{}", room_id(token));
+        let ans = format!("TSUNAGU!{}", room_id(token));
+        let mut buf = [0u8; 128];
+        while let Ok((n, from)) = sock.recv_from(&mut buf) {
+            if allow(from.ip()) && &buf[..n] == ask.as_bytes() {
+                let _ = sock.send_to(ans.as_bytes(), from);
+            }
+        }
+    }
+
+    /// 問い合わせ側。target(通常はブロードキャスト)へ投げ、wait の間に応答した相手を返す
+    pub fn seek(target: SocketAddr, token: &str, wait: Duration) -> Vec<IpAddr> {
+        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return Vec::new() };
+        let _ = sock.set_broadcast(true);
+        let ask = format!("TSUNAGU?{}", room_id(token));
+        let ans = format!("TSUNAGU!{}", room_id(token));
+        if sock.send_to(ask.as_bytes(), target).is_err() {
+            return Vec::new();
+        }
+        let until = Instant::now() + wait;
+        let mut found = Vec::new();
+        let mut buf = [0u8; 128];
+        while let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+            let _ = sock.set_read_timeout(Some(left));
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) if &buf[..n] == ans.as_bytes() && !found.contains(&from.ip()) => found.push(from.ip()),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        found
+    }
+
+    /// LAN 全体へ問い合わせる
+    pub fn seek_lan(port: u16, token: &str) -> Vec<IpAddr> {
+        seek(SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)), token, Duration::from_millis(1500))
+    }
+}
+
 pub mod connect {
     //! 複数の接続候補(有線直結・LAN・Tailscale 等)へ同時に接続を試み、最初に
     //! 繋がったものを使う。遅延の小さい経路ほど早く繋がるため、自然に最速経路が選ばれ、
@@ -550,6 +611,17 @@ pub mod connect {
                 with_port.to_socket_addrs().ok().and_then(|mut it| it.next())
             })
             .collect()
+    }
+
+    /// 接続候補: 指定(TSUNAGU_HOST)があればそれ、無ければ LAN の自動発見で見つけた相手
+    pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
+        match hosts {
+            Some(h) => parse_hosts(h, port),
+            None => crate::discover::seek_lan(port, token)
+                .into_iter()
+                .map(|ip| SocketAddr::new(ip, port))
+                .collect(),
+        }
     }
 
     pub fn first_reachable(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
@@ -944,66 +1016,6 @@ pub mod bulk {
     }
 }
 
-pub mod b64 {
-    /// 小さな base64 実装(依存追加なし。クリップボード画像の運搬用)
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const R: [u8; 256] = {
-        let mut t = [255u8; 256];
-        let mut i = 0;
-        while i < 64 {
-            t[T[i] as usize] = i as u8;
-            i += 1;
-        }
-        t
-    };
-
-    pub fn encode(data: &[u8]) -> String {
-        let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-        for c in data.chunks(3) {
-            let b = [*c.first().unwrap_or(&0), *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0)];
-            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-            out.push(T[(n >> 18 & 63) as usize] as char);
-            out.push(T[(n >> 12 & 63) as usize] as char);
-            out.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-            out.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
-        }
-        out
-    }
-
-    pub fn decode(s: &str) -> Option<Vec<u8>> {
-        let b: Vec<u8> = s.bytes().filter(|c| *c != b'\n' && *c != b'\r').collect();
-        if b.len() % 4 != 0 {
-            return None;
-        }
-        let mut out = Vec::with_capacity(b.len() / 4 * 3);
-        for c in b.chunks(4) {
-            let mut n: u32 = 0;
-            let mut pad = 0;
-            for (i, ch) in c.iter().enumerate() {
-                if *ch == b'=' {
-                    n <<= 6;
-                    pad += 1;
-                } else {
-                    let v = R[*ch as usize];
-                    if v == 255 {
-                        return None;
-                    }
-                    n = (n << 6) | v as u32;
-                    let _ = i;
-                }
-            }
-            out.push((n >> 16) as u8);
-            if pad < 2 {
-                out.push((n >> 8) as u8);
-            }
-            if pad < 1 {
-                out.push(n as u8);
-            }
-        }
-        Some(out)
-    }
-}
-
 pub mod keymap {
     /// Mac keycode(HIToolbox)→ Windows 仮想キーコード(VK)
     pub fn mac_kc_to_win_vk(kc: u16) -> Option<u16> {
@@ -1344,6 +1356,23 @@ mod tests {
         assert_eq!(&p, b"pong");
         assert!(connect(std::net::TcpStream::connect(addr).unwrap(), "wrong", b"test").is_err());
         srv.join().unwrap();
+    }
+
+    #[test]
+    fn discovery_answers_only_the_same_room() {
+        use super::discover::*;
+        let port = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.local_addr().unwrap().port()
+        };
+        std::thread::spawn(move || respond("127.0.0.1", port, "room-token", |_| true));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let found = seek(target, "room-token", std::time::Duration::from_millis(500));
+        assert_eq!(found, vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]);
+        assert!(seek(target, "other-token", std::time::Duration::from_millis(300)).is_empty());
+        assert_ne!(room_id("a"), room_id("b"));
+        assert!(!room_id("secret").contains("secret"));
     }
 
     #[test]

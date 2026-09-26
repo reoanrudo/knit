@@ -92,7 +92,6 @@ unsafe extern "C" {
         user_info: *mut core::ffi::c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
-    fn CGEventGetType(event: CGEventRef) -> u32;
     fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
     fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
@@ -554,17 +553,6 @@ fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
     )
 }
 
-/// Windows からのファイル受信を ~/Downloads/Tsunagu へ新規作成する。
-/// 同名との衝突は "名前 (n).拡張子" として回避。1ファイル 200MB 上限
-fn mac_file_begin(name: &str, size: u64) -> Option<(std::fs::File, std::path::PathBuf)> {
-    if size == 0 || size > tsunagu_common::files::MAX_FILE {
-        eprintln!("[file] win->mac skip(name={name:?} size={size})");
-        return None;
-    }
-    let dir = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join("Downloads/Tsunagu");
-    tsunagu_common::files::create_unique(&dir, name)
-}
-
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
 /// drop=true は「掴んだまま境界越え」: FileDropBegin で始め FileDropEnd で終わり、
@@ -943,8 +931,6 @@ static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 pub(crate) static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
 /// WIN モード中の Windows 仮想カーソル位置(px)。絶対位置送信モードで使う
 static WIN_CUR: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
-/// 前回送信した絶対位置(量子化変化検出用)
-static LAST_ABS_SENT: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
 static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
 /// 絶対位置送信モード(既定ON。TSUNAGU_MOUSE_MODE=rel で旧・相対移動に戻す)
@@ -1586,7 +1572,6 @@ unsafe extern "C" fn tap_callback(
                     {
                         let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
                         *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner()) = (nx * ww, ny * wh);
-                        *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (-1.0, -1.0);
                     }
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
@@ -1743,7 +1728,6 @@ unsafe extern "C" fn tap_callback(
                         )
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
-                    *LAST_ABS_SENT.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
                     LAST_ABS_MS.store(now_ms(), Ordering::Relaxed);
                     DIAG_ABS_COUNT.fetch_add(1, Ordering::Relaxed);
                     send_msg(&Msg::MouseAbs { nx, ny });
@@ -2158,15 +2142,8 @@ fn main() {
             .position(|a| a == "--host")
             .and_then(|i| args.get(i + 1))
             .cloned()
-            .or_else(|| envutil::get("TSUNAGU_HOST"))
-            .unwrap_or_else(|| {
-                eprintln!(
-                    "[fatal] TSUNAGU_ROLE=client には TSUNAGU_HOST=<Windows側IP> \
-                     (または --host <IP>)の指定が必要です"
-                );
-                std::process::exit(1);
-            });
-        eprintln!("[info] client mode: connecting to {host}:{port}");
+            .or_else(|| envutil::get("TSUNAGU_HOST"));
+        eprintln!("[info] client mode: connecting to {}", host.as_deref().unwrap_or("LAN から自動検出"));
         std::thread::spawn(move || {
             bulk::connect_loop(
                 bulk_ep,
@@ -2180,6 +2157,11 @@ fn main() {
         std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
     } else {
         let bind = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
+        let tk = token.clone();
+        std::thread::spawn(move || {
+            tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed)
+        });
         std::thread::spawn(move || {
             bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed)
         });
@@ -2633,14 +2615,10 @@ fn client_attempt(
 }
 
 /// 接続モード(TSUNAGU_ROLE=client): Windows(サーバ)へ接続し続ける
-fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h: f64) {
-    let addrs = tsunagu_common::connect::parse_hosts(&host, port);
-    if addrs.is_empty() {
-        eprintln!("[fatal] invalid host: {host}");
-        std::process::exit(1);
-    }
+fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, screen_h: f64) {
     let mut backoff = 500u64;
     loop {
+        let addrs = tsunagu_common::connect::resolve(host.as_deref(), port, &token);
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 eprintln!("[conn] connected ({a})");
@@ -2650,7 +2628,7 @@ fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h
                     Err(e) => eprintln!("[conn] {e}"),
                 }
             }
-            None => eprintln!("[conn] どの接続先にも繋がりません: {host}"),
+            None => eprintln!("[conn] どの接続先にも繋がりません: {:?}", host),
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);

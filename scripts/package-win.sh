@@ -23,6 +23,11 @@ cp win-dist/app.ico "$OUT/" 2>/dev/null || true
 if [ -z "$NO_TOKEN" ] && [ -f "$HOME/.config/tsunagu/env" ]; then
   cp "$HOME/.config/tsunagu/env" "$OUT/.env"
   chmod 600 "$OUT/.env"
+  # 接続先が無ければ Mac の Tailscale IP を補う(無ければ導入先で LAN 自動発見になる)
+  if ! grep -q "^TSUNAGU_HOST=" "$OUT/.env"; then
+    MAC_IP=$(tailscale ip -4 2>/dev/null | head -1)
+    [ -n "$MAC_IP" ] && printf '\nTSUNAGU_HOST=%s\n' "$MAC_IP" >> "$OUT/.env"
+  fi
   echo "[package-win] トークン設定を .env として同梱しました"
 else
   echo "[package-win] WARN: .env は同梱していません(導入先で設定が必要)"

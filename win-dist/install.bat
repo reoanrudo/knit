@@ -1,6 +1,6 @@
 @echo off
 REM tsunagu installer: deploy + startup task + start now
-set DIR=C:\Users\<user>\tsunagu
+set DIR=%USERPROFILE%\tsunagu
 mkdir %DIR% 2>nul
 copy /Y %~dp0tsunagu-win.exe %DIR%\tsunagu-win.exe
 copy /Y %~dp0run_tsunagu.bat %DIR%\run_tsunagu.bat

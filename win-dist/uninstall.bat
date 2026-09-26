@@ -1,7 +1,7 @@
 @echo off
 REM Tsunagu uninstaller: 常駐・タスク登録を解除し、インストール済みファイルを削除する
-REM (トークン(.env)も含め C:\Users\<user>\tsunagu 配下をすべて削除する点に注意)
-set DIR=C:\Users\<user>\tsunagu
+REM (トークン(.env)も含め %USERPROFILE%\tsunagu 配下をすべて削除する点に注意)
+set DIR=%USERPROFILE%\tsunagu
 
 echo [uninstall] 停止中...
 for %%T in (tsunagu tsunagu_run tsunagu_watch seamless_desk seamless_desk_run seamless_desk_watch) do (

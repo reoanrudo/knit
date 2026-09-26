@@ -411,9 +411,12 @@ unsafe fn handle_command(id: u32) {
             update_tip();
         }
         MENU_OPENLOG => {
-            let mut log: Vec<u16> = r"C:\Users\<user>\tsunagu\tsunagu-win.log"
-                .encode_utf16()
-                .collect();
+            // ログは exe と同じフォルダ(run_tsunagu.bat が書き出す)
+            let path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("tsunagu-win.log")))
+                .unwrap_or_default();
+            let mut log: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
             log.push(0);
             let verb = wide("open");
             let np = wide("notepad.exe");

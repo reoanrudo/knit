@@ -34,8 +34,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const INPUT_MOUSE: u32 = 0;
 const MOUSEEVENTF_MOVE: u32 = 0x0001;
-const VK_LBUTTON_SENTINEL: u16 = 0xFF; // 使用しない(ボタンは専用関数で)
-const VK_XBUTTON2: u16 = 0x06;
 
 // ---------- Win32 直宣言(desktop 接続) ----------
 #[link(name = "user32")]
@@ -101,9 +99,6 @@ unsafe extern "system" {
 // ---------- Win32 直宣言(IME 制御) ----------
 #[link(name = "imm32")]
 unsafe extern "system" {
-    fn ImmGetContext(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
-    fn ImmSetOpenStatus(himc: *mut core::ffi::c_void, fOpen: i32) -> i32;
-    fn ImmReleaseContext(hwnd: *mut core::ffi::c_void, himc: *mut core::ffi::c_void) -> i32;
     /// ウィンドウのデフォルトIMEウィンドウを取得(他プロセスのウィンドウでも可)
     fn ImmGetDefaultIMEWnd(hwnd: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
 }
@@ -838,10 +833,6 @@ impl ModState {
     fn release_all(&mut self) {
         self.apply(false, false, false, false);
     }
-    /// Mac cmd キーの押下状態(self.ctrl が cmd に対応)
-    fn cmd_pressed(&self) -> bool {
-        self.ctrl
-    }
 }
 
 // ---------- Win32 直宣言(コンソール無し運用/二重起動防止) ----------
@@ -1030,10 +1021,11 @@ fn main() {
         .position(|a| a == "--host")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"))
-        .unwrap_or_else(|| "100.100.10.9".to_string());
-    println!("[info] desktop attached. screen {w}x{h}. connecting to {host}:{port}");
-    *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = host.clone();
+        .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"));
+    // 接続先の既定値(開発者の環境の固定 IP)は持たない。未指定なら LAN で自動発見する
+    let host_label = host.clone().unwrap_or_else(|| "LAN から自動検出".into());
+    println!("[info] desktop attached. screen {w}x{h}. connecting to {host_label}");
+    *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = host_label;
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
     // TSUNAGU_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
@@ -1077,16 +1069,15 @@ fn main() {
         let bind = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let ep = bulk_ep;
         std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed));
+        let tk = token.clone();
+        std::thread::spawn(move || {
+            tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed)
+        });
         server_loop(&token, port, w, h);
         return;
     }
 
-    let addrs = tsunagu_common::connect::parse_hosts(&host, port);
-    if addrs.is_empty() {
-        eprintln!("[fatal] invalid host: {host}");
-        exit(1);
-    }
-    println!("[info] client mode: connecting to {addrs:?}");
+    println!("[info] client mode");
     std::thread::spawn(move || {
         bulk::connect_loop(
             bulk_ep,
@@ -1094,7 +1085,7 @@ fn main() {
             || CONNECTED.load(Ordering::Relaxed),
         )
     });
-    client_loop(&addrs, &token, w, h);
+    client_loop(host, port, &token, w, h);
 }
 
 /// 接続モード(既定): 相手(Mac)へ接続し続ける。切断は指数バックオフで再接続
@@ -1107,10 +1098,14 @@ pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
 
 /// 接続モード(既定): 候補(TSUNAGU_HOST のカンマ区切り)へ同時に接続を試み、
 /// 最初に繋がった経路を使う。切断は指数バックオフで再接続
-fn client_loop(addrs: &[std::net::SocketAddr], token: &str, w: i32, h: i32) {
+fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
     let mut backoff = 500u64;
     loop {
-        match tsunagu_common::connect::first_reachable(addrs, Duration::from_secs(3)) {
+        let addrs = tsunagu_common::connect::resolve(hosts.as_deref(), port, token);
+        if addrs.is_empty() {
+            println!("[conn] 接続先が見つかりません(TSUNAGU_HOST 未指定時は同じ LAN の Mac を探します)");
+        }
+        match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 println!("[conn] connected ({a})");
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
@@ -1270,7 +1265,7 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
     // 端数は次イベントへ持ち越す。
     let mut accum = (0.0f64, 0.0f64);
     // 認証は session の前(client_session/server_loop)で完了している
-    let mut hello_done = true;
+    let hello_done = true;
     let mut last_return_notify = Instant::now() - Duration::from_secs(10);
     let running = Arc::new(AtomicBool::new(true));
     let running_w = running.clone();
