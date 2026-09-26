@@ -5,6 +5,11 @@
 ## [Unreleased]
 
 ### 追加
+- Continue Here(ブラウザの引継ぎ): Windows 画面操作中に ⌥⌘T で Mac の前面ブラウザ
+  (Safari/Chrome/Edge/Brave)の現在ページを Windows の既定ブラウザで開く。
+  osascript 取得はタップを塞がない別スレッド。URL は http/HTTPS・上限 2048 文字を
+  送受信両側で検査(Msg::OpenUrl を追加。版 11 のまま)。
+  `TSUNAGU_CONTINUE_HERE=0` で無効化
 - IME 状態の引継ぎ(IME Follow Cursor): Windows へ画面を移る瞬間、Mac の
   かな/英数の入力モードを Windows 側 IME の開閉へ反映(日本語入力の英数モード=OFF、
   ひらがな等=ON。英字レイアウトの間は相手を変えない)。

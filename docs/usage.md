@@ -122,6 +122,18 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   (開く時に OS の確認が出る)
 - Win→Mac は CRLF を LF へ正規化して書き込む。相手から受信した内容は送り返さない
 - 設定窓でクリップボード共有を OFF にすると、Windows 側も送らない
+## Continue Here(ブラウザの引継ぎ)
+
+Windows 画面を操作している時に **⌥⌘T** を押すと、Mac の前面ブラウザの現在ページを
+**Windows の既定ブラウザで開きます**。「Mac で見ていたページを Windows でもう一度
+探す」手間を 1 回で消します(ビジョン§11)。
+
+- 対応ブラウザ(Mac 側の読み取り): Safari / Google Chrome / Microsoft Edge / Brave
+  (Firefox は URL の AppleScript 対応が無いため対象外)
+- 開く側は Windows の**既定ブラウザ**に関連付けに従う
+- 転送は `http`/`https` のみ(上限 2048 文字)。送信側・受信側の両方で検査する
+- `TSUNAGU_CONTINUE_HERE=0` で無効化
+
 ## 音量・メディアキー(Windows 画面操作中)
 
 Windows 画面を操作している間、Mac 本体キーボードの音量キーとメディアキーは
@@ -188,6 +200,7 @@ fn を押さない F7〜F12 は従来どおり F キーとして渡ります。
 | `TSUNAGU_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
 | `TSUNAGU_LOCK_SYNC` | 1 | Mac の画面ロックで Windows もロックする。0 で無効 |
 | `TSUNAGU_IME_SYNC` | 1 | Windows へ入る時の IME 状態引継ぎ(かな=ON/英数=OFF)。0 で無効 |
+| `TSUNAGU_CONTINUE_HERE` | 1 | ⌥⌘T でのブラウザ引継ぎ(Continue Here)。0 で無効 |
 
 ## 機能別品質向上(開発者用)
 

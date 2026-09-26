@@ -644,6 +644,25 @@ fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
     })
 }
 
+/// 既定ブラウザで URL を開く(Continue Here)。ShellExecuteW の "open" 動詞は
+/// 拡張子/スキームの関連付けに従うため、ブラウザ選びは OS の既定に任せる
+fn open_default_browser(url: &str) -> bool {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            verb: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) > 32 }
+}
+
 fn inject_mouse_move_rel(dx: i32, dy: i32) -> bool {
     send_input_buf(InputBuf {
         itype: INPUT_MOUSE,
@@ -1053,7 +1072,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: const BUILD_ID: &str = "win-20260927-020513-7a817a6";str = "win-20260927-015233-b92f90a";
+const BUILD_ID: &str = "win-20260927-015233-b92f90a";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1737,6 +1756,19 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 // かな/英数キー単体の押下(トグル)とは違い、方向指定の設定
                 ime_set_open(kana);
                 println!("[ime] mac の状態へ同期: {}", if kana { "かな(ON)" } else { "英数(OFF)" });
+            }
+            Msg::OpenUrl { url } => {
+                // Continue Here: Mac の前面ブラウザの URL を既定ブラウザで開く。
+                // 相手から来る文字列のため、検査(common urlx)を通るものだけ開く
+                if tsunagu_common::urlx::transferable(&url) {
+                    if open_default_browser(&url) {
+                        println!("[url] Continue Here: 既定ブラウザで開きました");
+                    } else {
+                        println!("[url] Continue Here: ShellExecute 失敗");
+                    }
+                } else {
+                    println!("[url] 受け取り拒否(転送できない形式の URL)");
+                }
             }
             Msg::Bye => {
                 running_w.store(false, Ordering::Relaxed);

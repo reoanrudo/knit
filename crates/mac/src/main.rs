@@ -753,6 +753,9 @@ static LOCK_SYNC: AtomicBool = AtomicBool::new(true);
 /// IME 状態同期: Windows へ入る時に Mac のかな/英数を相手の IME 開閉へ反映
 ///(TSUNAGU_IME_SYNC=0 で無効)
 static IME_SYNC: AtomicBool = AtomicBool::new(true);
+/// Continue Here: Windows 画面操作中の ⌥⌘T で Mac の前面ブラウザの URL を
+/// Windows の既定ブラウザで開く(TSUNAGU_CONTINUE_HERE=0 で無効)
+static CONTINUE_HERE: AtomicBool = AtomicBool::new(true);
 
 #[link(name = "Carbon", kind = "framework")]
 unsafe extern "C" {
@@ -805,6 +808,44 @@ fn current_ime_state() -> Option<bool> {
         let n = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
         ime_mode_state(&String::from_utf8_lossy(&buf[..n]))
     }
+}
+
+/// 起動中ブラウザの前面タブの URL(Continue Here 用)。osascript で主要ブラウザの
+/// 順に試し、最初に取れた URL を返す。未起動・タブ無しは None。
+/// Firefox は URL の AppleScript 対応が無いため対象外
+fn frontmost_browser_url() -> Option<String> {
+    // Windows 画面を操作している間も Mac のブラウザは起動し続けており、
+    // front document / active tab は非アクティブでも読める
+    let script = r#"
+if application "Safari" is running then
+  tell application "Safari"
+    if (count of documents) > 0 then return URL of front document
+  end tell
+end if
+if application "Google Chrome" is running then
+  tell application "Google Chrome"
+    if (count of windows) > 0 then return URL of active tab of front window
+  end tell
+end if
+if application "Microsoft Edge" is running then
+  tell application "Microsoft Edge"
+    if (count of windows) > 0 then return URL of active tab of front window
+  end tell
+end if
+if application "Brave Browser" is running then
+  tell application "Brave Browser"
+    if (count of windows) > 0 then return URL of active tab of front window
+  end tell
+end if
+return ""
+"#;
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .ok()?;
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!url.is_empty()).then_some(url)
 }
 
 /// Secure Input(パスワード欄等でキー入力の横取りを OS が止める状態)の原因アプリ名。
@@ -1812,6 +1853,30 @@ unsafe extern "C" fn tap_callback(
                 }
                 return std::ptr::null_mut();
             }
+            // Continue Here(ビジョン§11): ⌥⌘T で Mac の前面ブラウザの URL を
+            // Windows の既定ブラウザで開く。「Mac で見ていたページを Windows でもう
+            // 一度探す」摩擦を 1 回で消す。osascript が 100-300ms かかるため
+            // タップを塞がないよう別スレッドで取得する
+            if event_type == EVT_KEY_DOWN
+                && kc == 17
+                && opt
+                && cmd
+                && !ctrl
+                && !shift
+                && CONTINUE_HERE.load(Ordering::Relaxed)
+            {
+                std::thread::spawn(|| {
+                    match frontmost_browser_url() {
+                        Some(url) if tsunagu_common::urlx::transferable(&url) => {
+                            send_msg(&Msg::OpenUrl { url });
+                            eprintln!("[url] Continue Here: 送信しました");
+                        }
+                        Some(_) => eprintln!("[url] Continue Here: 転送できない形式の URL"),
+                        None => eprintln!("[url] Continue Here: 起動中ブラウザの URL を取得できません"),
+                    }
+                });
+                return std::ptr::null_mut(); // T 自体は Windows へ送らない(専用ショートカット)
+            }
             // ---- Mac 流ショートカットの Windows 翻訳(指癖をそのまま通す) ----
             // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
             //   cmd→Win Ctrl / opt→Win Alt / ctrl→Win キー(既定マップ)
@@ -2126,6 +2191,9 @@ fn main() {
     }
     if envutil::get("TSUNAGU_IME_SYNC").as_deref() == Some("0") {
         IME_SYNC.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_CONTINUE_HERE").as_deref() == Some("0") {
+        CONTINUE_HERE.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);

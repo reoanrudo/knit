@@ -218,6 +218,10 @@ pub mod proto {
         /// Windows 側 IME の開閉へ反映する(ビジョン§7 IME Follow Cursor)
         #[serde(rename = "ime")]
         Ime { kana: bool },
+        /// Continue Here(ビジョン§11): 相手側の既定ブラウザで開く URL。
+        /// スキーム・長さの検査は urlx::transferable で両側で行う
+        #[serde(rename = "open_url")]
+        OpenUrl { url: String },
         #[serde(rename = "bye")]
         Bye,
     }
@@ -246,6 +250,17 @@ pub mod proto {
 
     pub fn decode(line: &str) -> Option<Msg> {
         serde_json::from_str(line.trim()).ok()
+    }
+}
+
+pub mod urlx {
+    //! Continue Here(ビジョン§11)で相手に開かせてよい URL の検査。
+    //! 送信側・受信側の両方で同じ規則を適用する(片側だけの検査に頼らない)
+
+    /// 相手に転送してよい URL か。http/https のみ・上限 2048 文字
+    ///(file: 等のローカルスキームや過大なクエリを流さない)
+    pub fn transferable(url: &str) -> bool {
+        url.len() <= 2048 && (url.starts_with("http://") || url.starts_with("https://"))
     }
 }
 
@@ -1292,6 +1307,22 @@ mod tests {
         assert_eq!(mac_kc_to_win_vk(104), None);
         assert_eq!(mac_kc_to_win_vk(102), None);
         assert_eq!(mac_kc_to_win_vk(200), None);
+    }
+
+    #[test]
+    fn url_transfer_accepts_only_web_urls() {
+        use super::urlx::transferable as ok;
+        assert!(ok("https://example.com/page?q=1"));
+        assert!(ok("http://192.168.0.5:8080/"));
+        // ローカルスキーム・変な先頭は拒否(受信側での意図しないプロトコル起動を塞ぐ)
+        assert!(!ok("file:///etc/passwd"));
+        assert!(!ok("javascript:alert(1)"));
+        assert!(!ok("about:blank"));
+        assert!(!ok("ftp://example.com/f"));
+        assert!(!ok(""));
+        // 過大な URL は拒否
+        let long = format!("https://example.com/{}", "a".repeat(2048));
+        assert!(!ok(&long));
     }
 
     #[test]
