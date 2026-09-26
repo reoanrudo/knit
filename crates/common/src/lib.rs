@@ -588,6 +588,34 @@ pub mod discover {
     pub fn seek_lan(port: u16, token: &str) -> Vec<IpAddr> {
         seek(SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)), token, Duration::from_millis(1500))
     }
+
+    /// 問い合わせ側(早期終了版)。最初の応答が届いた時点で返る。
+    /// 再接続のたびに呼ばれるため、LAN 内の実質レイテンシは応答 1 往復分で済む
+    pub fn seek_first(target: SocketAddr, token: &str, wait: Duration) -> Option<IpAddr> {
+        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return None };
+        let _ = sock.set_broadcast(true);
+        let ask = format!("TSUNAGU?{}", room_id(token));
+        let ans = format!("TSUNAGU!{}", room_id(token));
+        sock.send_to(ask.as_bytes(), target).ok()?;
+        let until = Instant::now() + wait;
+        let mut buf = [0u8; 128];
+        // 不正な応答を受け取るたびにタイムアウトが延びないよう、残り時間を都度計算し直す
+        while let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+            let _ = sock.set_read_timeout(Some(left));
+            match sock.recv_from(&mut buf) {
+                Ok((n, from)) if &buf[..n] == ans.as_bytes() => return Some(from.ip()),
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// LAN 全体へ問い合わせ、最初に応答した相手を 1 つ返す。
+    /// LAN 内なら応答は数 ms、誰もいなくても 600ms で諦める(再接続 1 回あたりの上乗せがこれ以下)
+    pub fn seek_first_lan(port: u16, token: &str) -> Option<IpAddr> {
+        seek_first(SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)), token, Duration::from_millis(600))
+    }
 }
 
 pub mod connect {
@@ -1251,6 +1279,46 @@ mod tests {
         assert!(rx.feed(BATCH_END, &[]).is_none());
         assert!(!base.join("x.bin").exists());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// seek_first: 応答があれば即座に返り、無ければタイムアウトで None を返す。
+    /// ループバックで応答側ソケットを立てて実動作を確認する
+    #[test]
+    fn seek_first_returns_first_answer_and_times_out() {
+        use super::discover::{room_id, seek_first};
+        use std::net::{SocketAddr, UdpSocket};
+        use std::time::{Duration, Instant};
+        let token = "seek-first-test-token";
+
+        // 応答側を立てて、そのポートへ問い合わせる
+        let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = responder.local_addr().unwrap().port();
+        let ask = format!("TSUNAGU?{}", room_id(token));
+        let ans = format!("TSUNAGU!{}", room_id(token));
+        let answerer = std::thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            let (n, from) = responder.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n], ask.as_bytes());
+            responder.send_to(ans.as_bytes(), from).unwrap();
+        });
+        let t0 = Instant::now();
+        let found = seek_first(SocketAddr::from(([127, 0, 0, 1], port)), token, Duration::from_secs(3));
+        assert!(found.is_some(), "応答があるのに None");
+        assert!(t0.elapsed() < Duration::from_secs(2), "応答があるなら長く待たない: {:?}", t0.elapsed());
+        answerer.join().unwrap();
+
+        // 応答が無ければ wait 経過で None。quiet は保持したまま(閉じたポートへ送ると
+        // ICMP unreachable が Err として即座に返り、タイムアウト計測が崩れる環境がある)
+        let quiet = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let quiet_port = quiet.local_addr().unwrap().port();
+        let t0 = Instant::now();
+        assert_eq!(
+            seek_first(SocketAddr::from(([127, 0, 0, 1], quiet_port)), token, Duration::from_millis(300)),
+            None,
+            "応答が無いのに Some"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(250), "タイムアウト前に返った: {:?}", t0.elapsed());
+        drop(quiet);
     }
 
     /// 実ソケットでの結合確認: 待受・接続・認証・送信・受信・誤トークン拒否
