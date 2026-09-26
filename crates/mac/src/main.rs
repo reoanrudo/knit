@@ -775,11 +775,11 @@ unsafe extern "C" {
 }
 
 /// 入力モード ID(InputModeID)から Windows の IME 開閉に対応する状態を引く。
-/// 日本語入力の Roman(英数)のみ OFF、他の日本語系(ひらがな/カタカナ/半角カナ/
-/// 全角英数)は ON。日本語入力以外(英字レイアウト等)は None=同期しない
-/// (Mac で IME を使っていない時に Windows 側を勝手に閉じないため)
+/// macOS 標準の日本語入力のみ対象(サードパーティ IME の ID は入力モードを
+/// 反映しないことがあるため、誤って ON を送らないよう対象外=同期しない)。
+/// Roman(英数)のみ OFF、他の日本語系(ひらがな/カタカナ/半角カナ/全角英数)は ON
 fn ime_mode_state(mode: &str) -> Option<bool> {
-    if !mode.contains("Japanese") {
+    if !mode.starts_with("com.apple.inputmethod.Japanese") {
         return None;
     }
     Some(!mode.ends_with(".Roman"))
@@ -810,34 +810,43 @@ fn current_ime_state() -> Option<bool> {
     }
 }
 
-/// 起動中ブラウザの前面タブの URL(Continue Here 用)。osascript で主要ブラウザの
-/// 順に試し、最初に取れた URL を返す。未起動・タブ無しは None。
-/// Firefox は URL の AppleScript 対応が無いため対象外
+/// 起動中ブラウザの前面タブの URL(Continue Here 用)。実際に前面にあるアプリを
+/// System Events で特定してから、そのブラウザの前面タブだけを読む(起動順で
+/// 固定探査すると、裏で起動したままのブラウザの古いページを誤って渡す)。
+/// 未起動・対象外のアプリ・タブ無しは None。Firefox は URL の AppleScript
+/// 対応が無いため対象外
 fn frontmost_browser_url() -> Option<String> {
-    // Windows 画面を操作している間も Mac のブラウザは起動し続けており、
-    // front document / active tab は非アクティブでも読める
+    // try で囲む: DevTools や PWA の特殊ウィンドウなど active tab が無い前面
+    // ウィンドウでエラーになっても、以降の処理が止まらないようにする
     let script = r#"
-if application "Safari" is running then
+tell application "System Events" to set frontApp to name of first application process whose frontmost is true
+set src to ""
+if frontApp is "Safari" then
   tell application "Safari"
-    if (count of documents) > 0 then return URL of front document
+    try
+      if (count of documents) > 0 then set src to URL of front document
+    end try
   end tell
-end if
-if application "Google Chrome" is running then
+else if frontApp is "Google Chrome" then
   tell application "Google Chrome"
-    if (count of windows) > 0 then return URL of active tab of front window
+    try
+      if (count of windows) > 0 then set src to URL of active tab of front window
+    end try
   end tell
-end if
-if application "Microsoft Edge" is running then
+else if frontApp is "Microsoft Edge" then
   tell application "Microsoft Edge"
-    if (count of windows) > 0 then return URL of active tab of front window
+    try
+      if (count of windows) > 0 then set src to URL of active tab of front window
+    end try
   end tell
-end if
-if application "Brave Browser" is running then
+else if frontApp is "Brave Browser" then
   tell application "Brave Browser"
-    if (count of windows) > 0 then return URL of active tab of front window
+    try
+      if (count of windows) > 0 then set src to URL of active tab of front window
+    end try
   end tell
 end if
-return ""
+return src
 "#;
     let out = std::process::Command::new("osascript")
         .arg("-e")
@@ -846,6 +855,30 @@ return ""
         .ok()?;
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!url.is_empty()).then_some(url)
+}
+
+/// Continue Here の本体(⌥⌘T の押下エッジで別スレッドから呼ぶ)。
+/// 失敗は TCC の自動化 未承認(初回に Mac 側で許可が必要)でも起きるため、
+/// 通知は 60 秒に 1 回に間引いて出す
+fn continue_here() {
+    static LAST_ERR_MS: AtomicU64 = AtomicU64::new(0);
+    match frontmost_browser_url() {
+        Some(url) if tsunagu_common::urlx::transferable(&url) => {
+            send_msg(&Msg::OpenUrl { url });
+            eprintln!("[url] Continue Here: 送信しました");
+        }
+        Some(_) => eprintln!("[url] Continue Here: 転送できない形式の URL"),
+        None => {
+            eprintln!("[url] Continue Here: 前面ブラウザの URL を取得できません");
+            let now = now_ms();
+            if now.saturating_sub(LAST_ERR_MS.swap(now, Ordering::Relaxed)) > 60_000 {
+                notify(
+                    "tsunagu",
+                    "ブラウザの URL を取得できませんでした(初回は Mac 側で自動化の許可が必要です)",
+                );
+            }
+        }
+    }
 }
 
 /// Secure Input(パスワード欄等でキー入力の横取りを OS が止める状態)の原因アプリ名。
@@ -1856,26 +1889,26 @@ unsafe extern "C" fn tap_callback(
             // Continue Here(ビジョン§11): ⌥⌘T で Mac の前面ブラウザの URL を
             // Windows の既定ブラウザで開く。「Mac で見ていたページを Windows でもう
             // 一度探す」摩擦を 1 回で消す。osascript が 100-300ms かかるため
-            // タップを塞がないよう別スレッドで取得する
-            if event_type == EVT_KEY_DOWN
-                && kc == 17
-                && opt
-                && cmd
-                && !ctrl
-                && !shift
-                && CONTINUE_HERE.load(Ordering::Relaxed)
-            {
-                std::thread::spawn(|| {
-                    match frontmost_browser_url() {
-                        Some(url) if tsunagu_common::urlx::transferable(&url) => {
-                            send_msg(&Msg::OpenUrl { url });
-                            eprintln!("[url] Continue Here: 送信しました");
-                        }
-                        Some(_) => eprintln!("[url] Continue Here: 転送できない形式の URL"),
-                        None => eprintln!("[url] Continue Here: 起動中ブラウザの URL を取得できません"),
+            // タップを塞がないよう別スレッドで取得する。
+            // 押下エッジだけで発火する(キーリピートで osascript とタブが
+            // 連発するのを防ぐ)。up も握る(down だけ握ると up 単体が
+            // Windows へ転送され、修飾の押し替えが前面アプリへ漏れる)
+            if kc == 17 && opt && cmd && !ctrl && !shift && CONTINUE_HERE.load(Ordering::Relaxed) {
+                static CONT_T_DOWN: AtomicBool = AtomicBool::new(false);
+                let down = event_type == EVT_KEY_DOWN;
+                if down && !CONT_T_DOWN.swap(true, Ordering::Relaxed) {
+                    // 直近の発火から 1.5 秒は再送しない(押し直しの連打対策)
+                    static LAST_FIRE_MS: AtomicU64 = AtomicU64::new(0);
+                    let now = now_ms();
+                    if now.saturating_sub(LAST_FIRE_MS.load(Ordering::Relaxed)) >= 1_500 {
+                        LAST_FIRE_MS.store(now, Ordering::Relaxed);
+                        std::thread::spawn(continue_here);
                     }
-                });
-                return std::ptr::null_mut(); // T 自体は Windows へ送らない(専用ショートカット)
+                }
+                if !down {
+                    CONT_T_DOWN.store(false, Ordering::Relaxed);
+                }
+                return std::ptr::null_mut();
             }
             // ---- Mac 流ショートカットの Windows 翻訳(指癖をそのまま通す) ----
             // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
@@ -2054,7 +2087,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-015453-b92f90a";
+const BUILD_ID: &str = "build-20260927-022422-80c867d";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -3052,10 +3085,11 @@ mod ime_tests {
         assert_eq!(st("com.apple.inputmethod.Japanese.FullWidthRoman"), Some(true));
         // 日本語入力の英数モードは OFF
         assert_eq!(st("com.apple.inputmethod.Japanese.Roman"), Some(false));
-        // サードパーティ IME(Google 日本語入力等)も "Japanese" を含む慣行に追従
-        assert_eq!(st("com.google.inputmethod.Japanese.base.Roman"), Some(false));
-        assert_eq!(st("com.google.inputmethod.Japanese.base"), Some(true));
-        // 日本語入力以外は None=同期しない(Windows 側を勝手に閉じない)
+        // サードパーティ IME は入力モードを反映しない ID を返すことがあるため
+        // 対象外(誤 ON を送らない。Apple 純正のみ同期)
+        assert_eq!(st("com.google.inputmethod.Japanese.base"), None);
+        assert_eq!(st("com.google.inputmethod.Japanese.base.Roman"), None);
+        // 日本語入力以外・レイアウト指定も None=同期しない(勝手に閉じない)
         assert_eq!(st("com.apple.keylayout.ABC"), None);
         assert_eq!(st("com.apple.keylayout.US"), None);
     }

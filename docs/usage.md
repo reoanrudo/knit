@@ -129,9 +129,15 @@ Windows 画面を操作している時に **⌥⌘T** を押すと、Mac の前�
 探す」手間を 1 回で消します(ビジョン§11)。
 
 - 対応ブラウザ(Mac 側の読み取り): Safari / Google Chrome / Microsoft Edge / Brave
-  (Firefox は URL の AppleScript 対応が無いため対象外)
+  (Firefox は URL の AppleScript 対応が無いため対象外)。**読み取るのは実際に
+  前面にあるブラウザ**です(裏で起動しているだけのブラウザは読み取りません)
 - 開く側は Windows の**既定ブラウザ**に関連付けに従う
 - 転送は `http`/`https` のみ(上限 2048 文字)。送信側・受信側の両方で検査する
+- 初回は Mac 側で「自動化の許可」(System Events とブラウザ)のダイアログが
+  出ます。Windows 画面を操作している間は気づきにくいため、失敗時は Mac に
+  通知を出します
+- ⌥⌘T は専用ショートカットとして Mac・Windows のどちらにも転送されません
+  (Ctrl+Alt+T 系のショートカットと衝突する場合は `TSUNAGU_CONTINUE_HERE=0`)
 - `TSUNAGU_CONTINUE_HERE=0` で無効化
 
 ## 音量・メディアキー(Windows 画面操作中)

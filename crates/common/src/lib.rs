@@ -258,9 +258,13 @@ pub mod urlx {
     //! 送信側・受信側の両方で同じ規則を適用する(片側だけの検査に頼らない)
 
     /// 相手に転送してよい URL か。http/https のみ・上限 2048 文字
-    ///(file: 等のローカルスキームや過大なクエリを流さない)
+    ///(file: 等のローカルスキームや過大なクエリを流さない)。
+    /// 制御文字・空白の混入も拒否する(受信側の文字列がそのまま
+    /// ShellExecuteW へ渡るため、改行入り等の偽装を塞ぐ)
     pub fn transferable(url: &str) -> bool {
-        url.len() <= 2048 && (url.starts_with("http://") || url.starts_with("https://"))
+        url.len() <= 2048
+            && (url.starts_with("http://") || url.starts_with("https://"))
+            && !url.chars().any(|c| c.is_control() || c.is_whitespace())
     }
 }
 
@@ -1325,9 +1329,12 @@ mod tests {
         assert!(!ok("about:blank"));
         assert!(!ok("ftp://example.com/f"));
         assert!(!ok(""));
-        // 過大な URL は拒否
+        // 過大な URL・空白/制御文字入り(ShellExecuteW への偽装)は拒否
         let long = format!("https://example.com/{}", "a".repeat(2048));
         assert!(!ok(&long));
+        assert!(!ok("https://example.com/a b"));
+        assert!(!ok("https://example.com/a\nb"));
+        assert!(!ok("https://example.com/a\u{0}b"));
     }
 
     #[test]
