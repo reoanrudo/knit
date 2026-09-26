@@ -793,6 +793,15 @@ fn screen_locked() -> bool {
 /// 本線がいま繋がっている Windows のアドレス(大容量経路の接続先・経路診断に使う)
 static PEER_IP: Mutex<Option<std::net::IpAddr>> = Mutex::new(None);
 
+/// 接続経路の短い表示(メニューバー用)。LAN 内なら "LAN 直"、100.x なら "Tailscale"
+pub fn route_label() -> &'static str {
+    match *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(ip) if tsunagu_common::net::is_tailscale(ip) => "Tailscale",
+        Some(_) => "LAN 直",
+        None => "",
+    }
+}
+
 /// Tailscale の経路状態(0=不明/Tailscale 外, 1=直結, 2=中継(DERP))。
 /// 中継は遅延が数倍になるため、切り替わった時に知らせる
 pub static TS_PATH: AtomicU8 = AtomicU8::new(0);

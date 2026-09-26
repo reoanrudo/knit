@@ -1014,7 +1014,14 @@ fn refresh_status() {
             } else {
                 String::new()
             };
-            let text = format!("{conn} ・ {mode}{rtt_s}");
+            // 経路(LAN 直 / Tailscale)も出す: 中継へ落ちていないかの常時確認用
+            let route = crate::route_label();
+            let route_s = if connected && !route.is_empty() {
+                format!("・{route}")
+            } else {
+                String::new()
+            };
+            let text = format!("{conn} ・ {mode}{rtt_s}{route_s}");
             msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
         }
         let toggle = GUI_TOGGLE_ITEM.load(Ordering::Relaxed) as ID;
