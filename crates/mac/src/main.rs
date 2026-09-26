@@ -2574,6 +2574,8 @@ fn on_disconnect() {
         *guard = None;
     }
     CONNECTED.store(false, Ordering::Relaxed);
+    // 旧セッションの RTT が再接続直後に「前の接続の値」として表示されるのを防ぐ
+    RTT_MS.store(0, Ordering::Relaxed);
     BULK_LINK.clear();
     // WIN モード中の切断は正規の leave 経由で復帰させる(カーソル表示・
     // EDGE_GUARD・CUR_POS 整合を自己修復スレッドの「たまたま」に任せない)
