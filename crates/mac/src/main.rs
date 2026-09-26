@@ -872,7 +872,11 @@ fn notify(title: &str, body: &str) {
     let body = body.to_string();
     // osascript の文字列リテラルで特別な意味を持つ文字を先に無効化する(流用時に
     // ファイル名等が入っても構文エラーで通知だけ落ちる、という事故を防ぐ)
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "'");
+    let esc = |s: &str| {
+        s.replace('\\', "\\\\")
+            .replace('"', "'")
+            .replace(['\n', '\r', '\t'], " ")
+    };
     std::thread::spawn(move || {
         let out = std::process::Command::new("osascript")
             .args([

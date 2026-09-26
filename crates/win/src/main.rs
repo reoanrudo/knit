@@ -164,6 +164,12 @@ pub static WTX: std::sync::Mutex<Option<std::sync::mpsc::Sender<String>>> =
 /// 本線を外から張り直す合図(トレイ/昇格監視 → writer スレッド)。ワイヤには出ない
 pub(crate) const MAIN_SHUTDOWN: &str = "\u{0}MAIN-SHUTDOWN";
 
+/// ログへ出してよい形へ整える(ピアが自由に送れる文字列の制御文字を置換。
+/// ターミナルエスケープによる表示偽装=ログインジェクション防止)
+fn log_safe(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+}
+
 /// 「Mac へ戻る」用の Return 行(高さは画面中央相当)
 pub fn proto_return() -> String {
     encode(&Msg::Return { ny: 0.5 })
@@ -1386,7 +1392,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     pre.read_line(&mut line)?;
     match decode(line.trim()) {
         Some(Msg::HelloOk { name, w: mw, h: mh }) => {
-            println!("[hello] ok from {name} (mac screen {mw}x{mh})");
+            println!("[hello] ok from {} (mac screen {mw}x{mh})", log_safe(&name));
         }
         _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hello_ok")),
     }
@@ -1525,7 +1531,7 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
         };
         match msg {
             Msg::HelloOk { name, w: mw, h: mh } => {
-                println!("[hello] (重複) ok from {name} (mac screen {mw}x{mh})");
+                println!("[hello] (重複) ok from {} (mac screen {mw}x{mh})", log_safe(&name));
             }
             Msg::Ping { ts } => {
                 let _ = wtx.send(encode(&Msg::Pong { ts }));
