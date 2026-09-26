@@ -175,6 +175,7 @@ unsafe fn capture_open() -> Result<Capture, String> {
         let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
         if hr < 0 || device.is_null() {
+            (evt.base.Release)(enumerator);
             return Err("既定オーディオデバイス取得失敗".into());
         }
         let dvt = &*(*(device as *mut ObjVt<IMMDeviceVtbl>)).lpVtbl;
@@ -187,6 +188,8 @@ unsafe fn capture_open() -> Result<Capture, String> {
             &mut client,
         );
         if hr < 0 || client.is_null() {
+            (dvt.base.Release)(device);
+            (evt.base.Release)(enumerator);
             return Err("IAudioClient 取得失敗".into());
         }
         let client = client as *mut ObjVt<IAudioClientVtbl>;
@@ -195,6 +198,9 @@ unsafe fn capture_open() -> Result<Capture, String> {
         let mut fmt: *mut WfxHead = std::ptr::null_mut();
         let hr = (cvt.GetMixFormat)(client as *mut _, &mut fmt);
         if hr < 0 || fmt.is_null() {
+            (cvt.base.Release)(client as *mut _);
+            (dvt.base.Release)(device);
+            (evt.base.Release)(enumerator);
             return Err("GetMixFormat 失敗".into());
         }
         let channels = (*fmt).channels as usize;
@@ -237,14 +243,23 @@ unsafe fn capture_open() -> Result<Capture, String> {
         );
         CoTaskMemFree(fmt as *mut core::ffi::c_void);
         if hr < 0 {
+            (cvt.base.Release)(client as *mut _);
+            (dvt.base.Release)(device);
+            (evt.base.Release)(enumerator);
             return Err(format!("IAudioClient::Initialize 失敗 hr={hr:08x}"));
         }
         let mut capture: *mut core::ffi::c_void = std::ptr::null_mut();
         let hr = (cvt.GetService)(client as *mut _, &IID_IAUDIO_CAPTURE, &mut capture);
         if hr < 0 || capture.is_null() {
+            (cvt.base.Release)(client as *mut _);
+            (dvt.base.Release)(device);
+            (evt.base.Release)(enumerator);
             return Err("IAudioCaptureClient 取得失敗".into());
         }
         let capture = capture as *mut ObjVt<IAudioCaptureClientVtbl>;
+        // ここから先 client と capture だけ使うため、直近の 2 参照を解放しておく
+        (dvt.base.Release)(device);
+        (evt.base.Release)(enumerator);
         (cvt.Start)(client as *mut _);
         // フォーマット診断(kind: 0=f32 / 1=s16 / 2=i32)
         println!(
