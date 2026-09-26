@@ -108,9 +108,12 @@ const IMC_SETOPENSTATUS: usize = 0x0006;
 
 /// フォアグラウンドウィンドウの IME を開(かな)/閉じ(英数)する。
 /// キーエミュレート(VK_KANJI 等)と違い方向指定が確実。
-/// IME コンテキストが取れないウィンドウでは半角/全角キー相当の
-/// VK_KANJI 注入へフォールバックする(トグル動作)。
-fn ime_set_open(open: bool) {
+/// IME ウィンドウが取れない場合の扱いは呼び出し側で選ぶ:
+/// - 手動のかな/英数キー → 半角/全角相当のキー注入(VK_KANJI)へフォールバック。
+///   押した本人の意図が明確なためトグル動作でも実用になる
+/// - 切替時の自動同期(Msg::Ime)→ 何もしない。フォールバックのトグルは方向を
+///   保証できないため、同期に使うと切替のたびに IME が反転し続ける
+fn ime_set_open_impl(open: bool, allow_toggle_fallback: bool) {
     unsafe {
         let hwnd = GetForegroundWindow();
         if !hwnd.is_null() {
@@ -123,15 +126,22 @@ fn ime_set_open(open: bool) {
                 println!("[ime] WM_IME_CONTROL open={open} -> sent");
                 return;
             }
-            println!("[ime] default IME wnd=null -> fallback");
+            println!("[ime] default IME wnd=null -> {}", if allow_toggle_fallback { "fallback" } else { "skip" });
         } else {
-            println!("[ime] no foreground window -> fallback");
+            println!("[ime] no foreground window -> {}", if allow_toggle_fallback { "fallback" } else { "skip" });
+        }
+        if !allow_toggle_fallback {
+            return;
         }
         // フォールバック: 半角/全角キー(VK_KANJI=0x19)の押し離し(トグル動作)。
         // かつて未定義の 0xF4 を使っていたが規格値ではないため修正
         inject_key(0x19, false);
         inject_key(0x19, true);
     }
+}
+
+fn ime_set_open(open: bool) {
+    ime_set_open_impl(open, true);
 }
 
 const CF_UNICODETEXT: u32 = 13;
@@ -1072,7 +1082,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-015233-b92f90a";
+const BUILD_ID: &str = "win-20260927-023615-3c3468f";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1753,8 +1763,9 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             }
             Msg::Ime { kana } => {
                 // Mac の IME 状態(かな/英数)を画面切替時に反映(IME Follow Cursor)。
-                // かな/英数キー単体の押下(トグル)とは違い、方向指定の設定
-                ime_set_open(kana);
+                // 方向指定で設定する。IME ウィンドウが取れない窓ではスキップ
+                //(トグルフォールバックは反転し続けるため手動キー専用)
+                ime_set_open_impl(kana, false);
                 println!("[ime] mac の状態へ同期: {}", if kana { "かな(ON)" } else { "英数(OFF)" });
             }
             Msg::OpenUrl { url } => {
