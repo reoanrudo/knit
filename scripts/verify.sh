@@ -143,7 +143,20 @@ fi
 echo "[verify] Mac→Win ファイル送信:"
 if [ "$WIN_OK" -eq 1 ]; then
   printf 'verify-mf-%s' "$TS" > "/tmp/mac_verify_$TS.txt"
-  osascript -e "set the clipboard to (POSIX file \"/tmp/mac_verify_$TS.txt\")" >/dev/null 2>&1
+  # osascript の「set the clipboard to (POSIX file …)」は型ゼロの空ペーストボードに
+  # なることがある(2026-09-26 実測: 5 回中 3 回。changeCount は増えるが型が宣言されず、
+  # アプリは正しく「載っていない」と判定する)。Finder の ⌘C と同じ NSPasteboard.writeObjects
+  # (NSURL) で載せる(アプリの Windows 受信時の書き込み経路と同一の方法)
+  if command -v swift >/dev/null 2>&1; then
+    swift - <<SWIFTEOF >/dev/null 2>&1
+import AppKit
+let pb = NSPasteboard.general
+pb.clearContents()
+_ = pb.writeObjects([NSURL(fileURLWithPath: "/tmp/mac_verify_$TS.txt")])
+SWIFTEOF
+  else
+    osascript -e "set the clipboard to (POSIX file \"/tmp/mac_verify_$TS.txt\")" >/dev/null 2>&1
+  fi
   toggle; sleep 4; toggle
   RAWF=$($SSH "type C:\\Users\\<user>\\Downloads\\Tsunagu\\mac_verify_$TS.txt" 2>/dev/null); RC=$?
   if [ "$RC" -eq 255 ]; then
