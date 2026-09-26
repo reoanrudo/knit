@@ -127,9 +127,10 @@ fn ime_set_open(open: bool) {
         } else {
             println!("[ime] no foreground window -> fallback");
         }
-        // フォールバック: 半角/全角キー(VK_KANJI)の押し離し(トグル動作)
-        inject_key(0xF4, false);
-        inject_key(0xF4, true);
+        // フォールバック: 半角/全角キー(VK_KANJI=0x19)の押し離し(トグル動作)。
+        // かつて未定義の 0xF4 を使っていたが規格値ではないため修正
+        inject_key(0x19, false);
+        inject_key(0x19, true);
     }
 }
 
