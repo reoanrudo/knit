@@ -164,9 +164,7 @@ unsafe extern "C" fn aq_callback(
             // なる(断続音=モールス音の原因)
             if !PRIMED.load(Ordering::Relaxed) {
                 if ring.len() < RING_PRE_ROLL {
-                    for i in 0..cap {
-                        dst.add(i).write(0);
-                    }
+                    std::ptr::write_bytes(dst, 0, cap);
                     (*buffer).mAudioDataByteSize = cap as u32;
                     PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);
                     AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
@@ -277,8 +275,8 @@ unsafe extern "C" fn aq_callback(
             }
         }
         // 残りは無音のまま(バッファは前回の内容が残るため明示的にゼロクリア)
-        for i in filled..cap {
-            dst.add(i).write(0);
+        if filled < cap {
+            std::ptr::write_bytes(dst.add(filled), 0, cap - filled);
         }
         (*buffer).mAudioDataByteSize = cap as u32;
         PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);

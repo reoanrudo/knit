@@ -98,6 +98,13 @@ struct IAudioEndpointVolumeVtbl {
 /// トレイ/設定から ON/OFF できる(既定 ON)
 pub static AUDIO_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+#[link(name = "winmm")]
+unsafe extern "system" {
+    /// スリープのタイマー分解能を 1ms へ(既定は約 15.6ms に量子化され、
+    /// 8ms ポーリングの実効間隔が伸びて音声の追加滞留になる)
+    fn timeBeginPeriod(ms: u32) -> u32;
+}
+
 const AUDCLNT_STREAMFLAGS_LOOPBACK: u32 = 0x0002_0000;
 const AUDCLNT_SHAREMODE_SHARED: i32 = 0;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
@@ -356,6 +363,7 @@ fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
 fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
     unsafe {
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
+        timeBeginPeriod(1);
     }
     println!("[audio] 開始(→{}:{port})", fixed_host.as_deref().unwrap_or("本線の接続先"));
     loop {
