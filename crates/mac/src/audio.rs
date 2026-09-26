@@ -463,18 +463,9 @@ pub fn start(token: String, port: u16) {
                     PRIMED.store(false, Ordering::Relaxed);
                     phase_store(0.0);
                 }
-                if last_diag.elapsed() >= std::time::Duration::from_secs(10) {
-                    last_diag = std::time::Instant::now();
-                    let rx = RX_BYTES.load(Ordering::Relaxed) / 1024;
-                    let play = PLAY_BYTES.load(Ordering::Relaxed) / 1024;
-                    let queued = RING.lock().unwrap_or_else(|e| e.into_inner()).len();
-                    // 滞留時間(=ここが実効的な追加遅延)。プリロールで ≈83ms に保たれる
-                    let lag_ms = queued as u64 * 1000 / (rate as u64 * 8);
-                    eprintln!(
-                        "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms",
-                        queued / 1024
-                    );
-                }
+                // 鳴っている間の diag(キープアライブ時と同じ関数・同じ形式で
+                // drop も出す。10 秒未満の呼び出しは内部で弾かれる)
+                diag_log(&mut last_diag, rate);
             }
             eprintln!("[audio] stream ended");
         }
