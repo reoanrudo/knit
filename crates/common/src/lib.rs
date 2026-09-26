@@ -1235,6 +1235,8 @@ pub mod keymap {
             76 => 0x0D, // テンキー Enter(Win 側で拡張キーフラグを付けて区別する)
             57 => 0x14, // Caps Lock(Mac 側は押下ごとに down+up の組で送る)
             114 => 0x2D, // Help(Mac の Ins 位置)→ Insert
+            // かな(104)/英数(102)はここを通らない: win 側の受信ループが先に
+            // 傍受して ime_set_open(IME 開閉)へ変換する
             // F13〜F20(F13 は既定ホットキーのため通常は Mac 側で握られる)
             105 => 0x7C,
             107 => 0x7D,
@@ -1282,6 +1284,9 @@ mod tests {
         // 数字row の取り違え実績(21=4, 23=5)の回帰防止
         assert_eq!(mac_kc_to_win_vk(21), Some(0x34));
         assert_eq!(mac_kc_to_win_vk(23), Some(0x35));
+        // かな/英数は win 側で IME 開閉へ変換されるため keymap の外(到達不能の固定)
+        assert_eq!(mac_kc_to_win_vk(104), None);
+        assert_eq!(mac_kc_to_win_vk(102), None);
         assert_eq!(mac_kc_to_win_vk(200), None);
     }
 
