@@ -1132,25 +1132,27 @@ MY DESK
 
 ---
 
-## 実装状況メモ(2026-09-26 時点・改善ループ460)
+## 実装状況メモ(2026-09-27 時点・改善ループ468)
 
 §19「下から順番に完成させる」に対する現在地。
 
 | レイヤー | テーマ | 状態 |
 |---|---|---|
-| Input | マウス/キーボード/ショートカット翻訳/音量・メディアキー | 実装済み・品質磨き中(改善ループ416〜459) |
+| Input | マウス/キーボード/ショートカット翻訳/音量・メディアキー | 実装済み・品質磨き中(改善ループ416〜469) |
 | Object | クリップボード同期(テキスト/画像/ファイル)・ドラッグ&ドロップ・掴みドラッグ | 実装済み(履歴 §10 は未) |
-| Context | Continue Here / App Handoff / Throw | 未実装 → 次の差別化候補 |
+| Context | Continue Here / App Handoff / Throw | **Continue Here(⌥⌘T)実装済み(468)**・Handoff/Throw は未 |
 | Workspace | Global Search / Audio Routing / Display | 未実装(Windows→Mac 音声転送のみ試験実装) |
 
-MVP(§20)との照合:
+MVP(§20)との照合 — **6 項目すべて実装済み**:
 
-1. **Mouse Continuity** — 済み(LAN直優先・経路昇格・遅延表示)
+1. **Mouse Continuity** — 済み(LAN直優先・経路昇格・遅延表示・解像度変化への追従)
 2. **Semantic Keyboard** — 基本の Ctrl/Cmd 変換は済み。アプリ別セマンティック(§6)は将来
-3. **Perfect Japanese Input** — キー転送は済み。IME状態同期(§7)は未
+3. **Perfect Japanese Input** — キー転送・かな/英数の IME 開閉に加え、**切替時の IME 状態
+   引継ぎ(IME Follow Cursor)を実装(467)**。逆方向(Win→Mac)はかな/英数キーで手動
 4. **Universal Clipboard** — 済み(画面を移る時だけ同期の設計)
 5. **Cross-PC Drag & Drop** — 済み
-6. **Continue Here** — 未実装
+6. **Continue Here** — **済み(⌥⌘T で Mac の前面ブラウザの URL を Windows の既定
+   ブラウザで開く。468)**
 
 §22「最初の5分」(自動発見・6桁コード)は並行作業(ペアリング)が対応中。
 §25「Connection設計」の「LAN最優先・ユーザーにはConnectedだけ」は
