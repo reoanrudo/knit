@@ -8,6 +8,10 @@ SSH="ssh -o BatchMode=yes -o ConnectTimeout=5 home"
 SCP="scp -q -o BatchMode=yes -o ConnectTimeout=5"
 
 pass=0; fail=0; warn=0
+# クリップボードは「画面を移る時」にだけ同期する(v0.23)。検証では Mac 側へ切替指示を出して
+# Windows へ入り、また戻る(restart-mac.sh --diag 起動時のみ有効な /tmp/tsunagu-cmd を使う)
+toggle() { echo toggle > /tmp/tsunagu-cmd; sleep 1; }
+round_trip() { toggle; toggle; }
 check() { # check "名前" "期待" "実際"
   if [ "$2" = "$3" ]; then echo "  OK  $1"; pass=$((pass+1)); else echo "  NG  $1 (expect=[$2] got=[$3])"; fail=$((fail+1)); fi
 }
@@ -30,8 +34,20 @@ fi
 echo "[verify] 接続状態(Macログ):"
 # 直近の接続イベントが established なら接続中(diag行で押し出されないよう
 # ログ全体から最後の conn 行を見る)
-LAST_CONN=$(grep -E "established|\[conn\] lost" /tmp/tsunagu-mac.log 2>/dev/null | tail -1)
+LAST_CONN=$(grep -E "\[conn\] established|\[conn\] lost" /tmp/tsunagu-mac.log 2>/dev/null | tail -1)
 [ -n "$LAST_CONN" ] && echo "$LAST_CONN" | grep -q established && { echo "  OK  established"; pass=$((pass+1)); } || { echo "  NG  未接続"; fail=$((fail+1)); }
+
+echo "[verify] 暗号化経路(ファイル転送 24902 / 音声 24901):"
+LAST_BULK=$(grep -E "\[bulk\] (established|受信経路が切れました)" /tmp/tsunagu-mac.log 2>/dev/null | tail -1)
+echo "$LAST_BULK" | grep -q established && { echo "  OK  ファイル転送経路 established"; pass=$((pass+1)); } || { echo "  NG  ファイル転送経路 未確立"; fail=$((fail+1)); }
+if grep -q "streaming started" /tmp/tsunagu-mac.log 2>/dev/null; then
+  echo "  OK  音声経路 streaming"; pass=$((pass+1))
+else
+  warn_msg "音声経路の開始ログなし(TSUNAGU_AUDIO=0 か未接続)"
+fi
+if grep -q "handshake 失敗\|ハンドシェイク失敗" /tmp/tsunagu-mac.log 2>/dev/null; then
+  warn_msg "暗号化ハンドシェイク失敗のログあり(トークン不一致や旧版の接続を確認)"
+fi
 
 echo "[verify] Windows プロセス:"
 if [ "$WIN_OK" -eq 1 ]; then
@@ -53,7 +69,9 @@ if [ "$WIN_OK" -eq 1 ]; then
   printf '@echo off\r\npowershell -NoProfile -Command "Set-Clipboard -Value '\''verify-wm-%s'\''"\r\n' "$TS" > /tmp/clip_set.bat
   if $SCP /tmp/clip_set.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null; then
     $SSH "schtasks /Run /TN tsunagu_clip_set" >/dev/null 2>&1
-    sleep 4
+    sleep 3
+    round_trip
+    sleep 2
     GOT=$(pbpaste 2>/dev/null | tr -d '\r\n')
     check "Win→Mac ペースト一致" "verify-wm-$TS" "$GOT"
   else
@@ -69,7 +87,7 @@ if [ "$WIN_OK" -eq 1 ]; then
   printf '@echo off\r\npowershell -NoProfile -Command "Get-Clipboard | Out-File -Encoding utf8 C:\\Users\\<user>\\tsunagu\\clip_get.txt"\r\n' > /tmp/clip_get.bat
   $SCP /tmp/clip_get.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null
   printf 'verify-mw-%s' "$TS" | pbcopy
-  sleep 3
+  toggle; sleep 2; toggle
   $SSH "schtasks /Run /TN tsunagu_clip_get" >/dev/null 2>&1
   sleep 3
   RAW=$($SSH "type C:\\Users\\<user>\\tsunagu\\clip_get.txt" 2>/dev/null); RC=$?
@@ -110,7 +128,9 @@ BAT
   if $SCP /tmp/clip_file_set.bat home:C:/Users/<user>/tsunagu/ 2>/dev/null; then
     $SSH 'schtasks /Create /TN tsunagu_clip_file /TR "cmd /c C:\Users\<user>\tsunagu\clip_file_set.bat" /SC ONCE /ST 23:59 /F' >/dev/null 2>&1
     $SSH "schtasks /Run /TN tsunagu_clip_file" >/dev/null 2>&1
-    sleep 8
+    sleep 3
+    round_trip
+    sleep 5
     GOT_FILE=$(cat "$HOME/Downloads/Tsunagu/win_verify_$TS.txt" 2>/dev/null | tr -d '\r\n')
     check "Win→Mac ファイル内容一致" "verify-wf-$TS" "$GOT_FILE"
   else
@@ -118,6 +138,22 @@ BAT
   fi
 else
   warn_msg "Win→Mac ファイル送信検証スキップ(接続失敗)"
+fi
+
+echo "[verify] Mac→Win ファイル送信:"
+if [ "$WIN_OK" -eq 1 ]; then
+  printf 'verify-mf-%s' "$TS" > "/tmp/mac_verify_$TS.txt"
+  osascript -e "set the clipboard to (POSIX file \"/tmp/mac_verify_$TS.txt\")" >/dev/null 2>&1
+  toggle; sleep 4; toggle
+  RAWF=$($SSH "type C:\\Users\\<user>\\Downloads\\Tsunagu\\mac_verify_$TS.txt" 2>/dev/null); RC=$?
+  if [ "$RC" -eq 255 ]; then
+    warn_msg "ssh エラーのため Mac→Win ファイル結果取得不能"
+  else
+    check "Mac→Win ファイル内容一致" "verify-mf-$TS" "$(printf '%s' "$RAWF" | tr -d '\r\n')"
+  fi
+  rm -f "/tmp/mac_verify_$TS.txt"
+else
+  warn_msg "Mac→Win ファイル送信検証スキップ(接続失敗)"
 fi
 
 echo "[verify] 配布物(リブランド後の一式):"
