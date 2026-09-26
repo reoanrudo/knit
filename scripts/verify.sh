@@ -37,6 +37,21 @@ echo "[verify] 接続状態(Macログ):"
 LAST_CONN=$(grep -E "\[conn\] established|\[conn\] lost" /tmp/tsunagu-mac.log 2>/dev/null | tail -1)
 [ -n "$LAST_CONN" ] && echo "$LAST_CONN" | grep -q established && { echo "  OK  established"; pass=$((pass+1)); } || { echo "  NG  未接続"; fail=$((fail+1)); }
 
+echo "[verify] 接続経路(LAN 直優先):"
+if [ "$WIN_OK" -eq 1 ]; then
+  WIN_CONN=$($SSH "type C:\\Users\\<user>\\tsunagu\\tsunagu-win.log" 2>/dev/null | grep -E "^\[conn\] connected" | tail -1)
+  case "$WIN_CONN" in
+    *"192.168."*|*"169.254."*)
+      echo "  OK  本線が LAN 直($WIN_CONN)"; pass=$((pass+1)) ;;
+    *"100."*)
+      warn_msg "本線が Tailscale 経由(同一 LAN なのに LAN 直でない)" ;;
+    *)
+      warn_msg "Windows の接続ログを読めません($WIN_CONN)" ;;
+  esac
+else
+  warn_msg "経路確認をスキップ(ssh 接続失敗)"
+fi
+
 echo "[verify] 暗号化経路(ファイル転送 24902 / 音声 24901):"
 LAST_BULK=$(grep -E "\[bulk\] (established|受信経路が切れました)" /tmp/tsunagu-mac.log 2>/dev/null | tail -1)
 echo "$LAST_BULK" | grep -q established && { echo "  OK  ファイル転送経路 established"; pass=$((pass+1)); } || { echo "  NG  ファイル転送経路 未確立"; fail=$((fail+1)); }
