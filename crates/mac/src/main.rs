@@ -672,6 +672,67 @@ fn mac_on_bulk(e: bulk::Event) {
     })
 }
 
+/// Mac 流ショートカットの翻訳対応表。(kc, 修飾) → 翻訳先 (kc, ctrl, opt, cmd, shift)。
+/// 翻訳先の修飾は「既定マップ(cmd→Ctrl / opt→Alt / ctrl→Win)」の意味で並べる
+/// (CMD_ALT 交換は tap 側の送信時に行う)。対応をテストで固定するため表へ切り出した。
+/// fn+F11 は FN フラグを見るためここに含めない
+pub(crate) fn mac_shortcut_translation(
+    kc: u16,
+    ctrl: bool,
+    opt: bool,
+    cmd: bool,
+    shift: bool,
+) -> Option<(u16, bool, bool, bool, bool)> {
+    if cmd && ctrl && !opt {
+        // ⌘Ctrl+Q = 画面ロック(Win+L)
+        return (kc == 12).then_some((37, true, false, false, false));
+    }
+    if cmd && opt && !ctrl {
+        // ⌘⌥Esc = タスクマネージャ(Ctrl+Shift+Esc)
+        return (kc == 53).then_some((53, false, false, true, true));
+    }
+    if cmd && !ctrl && !opt {
+        // 戻り値: (翻訳先 kc, ctrl, opt, cmd, shift)
+        let t = match kc {
+            // ⌘←→ = 行頭/行末(Home/End)。Shift は透過(行選択)
+            123 => Some((115, false, false, false, shift)),
+            124 => Some((119, false, false, false, shift)),
+            // ⌘↑↓ = 文書先頭/末尾(Ctrl+Home/End)。Shift 透過
+            126 => Some((115, false, false, true, shift)),
+            125 => Some((119, false, false, true, shift)),
+            // ⌘M/⌘H = 最小化(Win+Down)
+            43 | 4 => Some((125, true, false, false, false)),
+            // ⌘] / ⌘[ = 次タブ / 前タブ(Ctrl(+Shift)+Tab)。⌘⇧[ も「前タブ」
+            30 => Some((48, false, false, true, false)),
+            33 => Some((48, false, false, true, true)),
+            // ⌘⇧4 / ⌘⇧3 = スクリーンショット(Win+Shift+S)
+            21 | 18 if shift => Some((1, true, false, false, true)),
+            // ⌘⇧5 = 画面録画(Win+Alt+R)
+            23 if shift => Some((15, false, true, false, false)),
+            // ⌘Q = ウィンドウを閉じる(Alt+F4)
+            12 => Some((118, false, true, false, false)),
+            // ⌘G / ⌘⇧G = 次を検索 / 前を検索(F3 / Shift+F3)
+            32 => Some((99, false, false, false, shift)),
+            // ⌘. = キャンセル → Escape
+            47 => Some((53, false, false, false, false)),
+            // ⌘Space = IME/言語切替(Win+Space)
+            49 => Some((49, true, false, false, false)),
+            _ => None,
+        };
+        return t;
+    }
+    if opt && !cmd && !ctrl {
+        // ⌥←→ = 単語移動(Ctrl+←→)。Shift は透過(単語選択)
+        let t = match kc {
+            123 => Some((123, false, false, true, shift)),
+            124 => Some((124, false, false, true, shift)),
+            _ => None,
+        };
+        return t;
+    }
+    None
+}
+
 /// ゲームモード(Windows 側がカーソルの閉じ込め等を検知して要求)。true の間は
 /// 絶対位置ではなく相対移動で送る(FPS・3D ソフトの視点回転のため)
 static GAME_REL: AtomicBool = AtomicBool::new(false);
@@ -1686,66 +1747,13 @@ unsafe extern "C" fn tap_callback(
                     let (c2, o2, m2) = if swap { (c, m, o) } else { (c, o, m) };
                     send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c2, opt: o2, cmd: m2, shift: sh, tr: true });
                 };
-                // fn+F11(Mac のデスクトップ表示)= Win+D
+                // fn+F11(Mac のデスクトップ表示)= Win+D(FN フラグは表の外)
                 if kc == 103 && flags & FLAG_FN != 0 {
                     send(2, down, true, false, false, false); // D + ctrl フラグ(Win キー)
                     return std::ptr::null_mut();
                 }
-                let translated = if cmd && ctrl && !opt {
-                    // ⌘Ctrl+Q = 画面ロック(Win+L)
-                    match kc {
-                        12 => { send(37, down, true, false, false, false); true }
-                        _ => false,
-                    }
-                } else if cmd && opt && !ctrl {
-                    // ⌘⌥Esc = タスクマネージャ(Ctrl+Shift+Esc)
-                    match kc {
-                        53 => { send(53, down, false, false, true, true); true }
-                        _ => false,
-                    }
-                } else if cmd && !ctrl && !opt {
-                    match kc {
-                        // ⌘←→ = 行頭/行末(Windows の Home/End)。Shift は透過(行選択)
-                        123 => { send(115, down, false, false, false, shift); true }
-                        124 => { send(119, down, false, false, false, shift); true }
-                        // ⌘↑↓ = 文書先頭/末尾(Ctrl+Home/End)。Shift 透過(文書選択)
-                        126 => { send(115, down, false, false, true, shift); true }
-                        125 => { send(119, down, false, false, true, shift); true }
-                        // ⌘M/⌘H = 最小化(Win+Down = ctrl フラグ)
-                        43 | 4 => { send(125, down, true, false, false, false); true }
-                        // ⌘] / ⌘[ = ブラウザの次/前タブ(Ctrl(+Shift)+Tab)
-                        // Mac と同じく ⌘⇧[ も「前タブ」(shift 状態は見ない)
-                        30 => { send(48, down, false, false, true, false); true }
-                        33 => { send(48, down, false, false, true, true); true }
-                        // ⌘⇧4 / ⌘⇧3 = スクリーンショット(Win+Shift+S の切取り)
-                        21 | 18 if shift => { send(1, down, true, false, false, true); true }
-                        // ⌘⇧5 = 画面録画(Win+Alt+R)
-                        23 if shift => { send(15, down, false, true, false, false); true }
-                        // ⌘Q = ウィンドウを閉じる(Alt+F4 = opt フラグ+F4)
-                        12 => { send(118, down, false, true, false, false); true }
-                        // ⌘G / ⌘⇧G = 次を検索 / 前を検索(F3 / Shift+F3)
-                        // G の Mac keycode=32、F3=99
-                        32 if !shift => { send(99, down, false, false, false, false); true }
-                        32 => { send(99, down, false, false, false, true); true }
-                        // ⌘⇧N = シークレット/新規ウィンドウ系は Ctrl+Shift+N で自然に動く
-                        // ⌘. (kc47? . は47) = キャンセル→Escape 相当(Windows でも Esc)
-                        47 => { send(53, down, false, false, false, false); true }
-                        // ⌘Space = IME/言語切替(Win+Space = ctrl フラグ)
-                        49 => { send(49, down, true, false, false, false); true }
-                        _ => false,
-                    }
-                } else if opt && !cmd && !ctrl {
-                    match kc {
-                        // ⌥←→ = 単語移動(Windows では Ctrl+←→ = cmd フラグ)。
-                        // Shift は透過(⌥⇧←→ = 単語単位の選択)
-                        123 => { send(123, down, false, false, true, shift); true }
-                        124 => { send(124, down, false, false, true, shift); true }
-                        _ => false,
-                    }
-                } else {
-                    false
-                };
-                if translated {
+                if let Some((kc2, c, o, m, s)) = mac_shortcut_translation(kc, ctrl, opt, cmd, shift) {
+                    send(kc2, down, c, o, m, s);
                     return std::ptr::null_mut(); // 元キーは送らない
                 }
             }
@@ -2718,6 +2726,55 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::mac_shortcut_translation as tr;
+
+    /// 翻訳対応の固定(タップ実装と表の乖離を防ぐ)。kc は Mac keycode
+    #[test]
+    fn shortcut_table_matches_spec() {
+        // ⌘← = Home(Shift 透過: ⌘⇧← は Shift+Home)
+        assert_eq!(tr(123, false, false, true, false), Some((115, false, false, false, false)));
+        assert_eq!(tr(123, false, false, true, true), Some((115, false, false, false, true)));
+        // ⌘→ = End、⌘↑ = Ctrl+Home、⌘↓ = Ctrl+End
+        assert_eq!(tr(124, false, false, true, false), Some((119, false, false, false, false)));
+        assert_eq!(tr(126, false, false, true, false), Some((115, false, false, true, false)));
+        assert_eq!(tr(125, false, false, true, false), Some((119, false, false, true, false)));
+        // ⌘M / ⌘H = Win+Down(最小化)
+        assert_eq!(tr(43, false, false, true, false), Some((125, true, false, false, false)));
+        assert_eq!(tr(4, false, false, true, false), Some((125, true, false, false, false)));
+        // ⌘] = Ctrl+Tab / ⌘[ = Ctrl+Shift+Tab(⌘⇧[ も前タブ)
+        assert_eq!(tr(30, false, false, true, false), Some((48, false, false, true, false)));
+        assert_eq!(tr(33, false, false, true, false), Some((48, false, false, true, true)));
+        assert_eq!(tr(33, false, false, true, true), Some((48, false, false, true, true)));
+        // ⌘⇧4 / ⌘⇧3 = Win+Shift+S。⇧無しの ⌘4 は素の F4 相当へ翻訳しない
+        assert_eq!(tr(21, false, false, true, true), Some((1, true, false, false, true)));
+        assert_eq!(tr(18, false, false, true, true), Some((1, true, false, false, true)));
+        assert_eq!(tr(21, false, false, true, false), None);
+        // ⌘⇧5 = Win+Alt+R
+        assert_eq!(tr(23, false, false, true, true), Some((15, false, true, false, false)));
+        // ⌘Q = Alt+F4
+        assert_eq!(tr(12, false, false, true, false), Some((118, false, true, false, false)));
+        // ⌘G = F3 / ⌘⇧G = Shift+F3
+        assert_eq!(tr(32, false, false, true, false), Some((99, false, false, false, false)));
+        assert_eq!(tr(32, false, false, true, true), Some((99, false, false, false, true)));
+        // ⌘. = Esc
+        assert_eq!(tr(47, false, false, true, false), Some((53, false, false, false, false)));
+        // ⌘Space = Win+Space
+        assert_eq!(tr(49, false, false, true, false), Some((49, true, false, false, false)));
+        // ⌘⌥Esc = Ctrl+Shift+Esc
+        assert_eq!(tr(53, false, true, true, false), Some((53, false, false, true, true)));
+        // ⌘Ctrl+Q = Win+L(⌘Q より優先)
+        assert_eq!(tr(12, true, false, true, false), Some((37, true, false, false, false)));
+        // ⌥← = Ctrl+←(単語移動)
+        assert_eq!(tr(123, false, true, false, false), Some((123, false, false, true, false)));
+        // 翻訳対象外: 素の A、⌘A(そのまま渡る)、⌥A
+        assert_eq!(tr(0, false, false, false, false), None);
+        assert_eq!(tr(0, false, false, true, false), None);
+        assert_eq!(tr(0, false, true, false, false), None);
     }
 }
 
