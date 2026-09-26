@@ -2578,11 +2578,20 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         }
     };
     eprintln!("[info] server mode. listening on {bind_ip}:{port}");
+    let mut accept_errs: u32 = 0;
     loop {
         let (stream, peer) = match listener.accept() {
-            Ok(x) => x,
+            Ok(x) => {
+                accept_errs = 0;
+                x
+            }
             Err(e) => {
-                eprintln!("[conn] accept error: {e}");
+                // fd 枯渇等で失敗が続くと 500ms 毎の洪水になるため、最初と
+                // その後 20 回毎(≒10 秒)だけ出す
+                accept_errs += 1;
+                if accept_errs == 1 || accept_errs % 20 == 0 {
+                    eprintln!("[conn] accept error: {e}(連続 {accept_errs} 回目)");
+                }
                 std::thread::sleep(Duration::from_millis(500));
                 continue;
             }
