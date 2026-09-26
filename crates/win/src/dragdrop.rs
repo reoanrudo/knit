@@ -18,6 +18,7 @@ pub type HRESULT = i32;
 const S_OK: HRESULT = 0;
 const S_FALSE: HRESULT = 1;
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
+const E_NOINTERFACE: HRESULT = 0x8000_4002u32 as i32;
 const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
 const DV_E_FORMATETC: HRESULT = 0x8004_0064u32 as i32;
 const OLE_E_ADVISENOTSUPPORTED: HRESULT = 0x8004_0003u32 as i32;
@@ -48,6 +49,12 @@ const IID_IUNKNOWN: Guid = Guid {
 };
 const IID_IDATAOBJECT: Guid = Guid {
     data1: 0x0000_010E,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+const IID_IENUMFORMATETC: Guid = Guid {
+    data1: 0x0000_0103,
     data2: 0x0000,
     data3: 0x0000,
     data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
@@ -194,7 +201,8 @@ unsafe extern "system" fn ds_qi(
         DataSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
-    E_NOTIMPL
+    // COM 規約: QI の不支援は E_NOINTERFACE(E_NOTIMPL ではない)
+    E_NOINTERFACE
 }
 
 unsafe extern "system" fn ds_add_ref(this: *mut c_void) -> u32 {
@@ -342,12 +350,12 @@ unsafe extern "system" fn ef_qi(
         return E_FAIL;
     }
     *out = std::ptr::null_mut();
-    if guid_eq(&*iid, &IID_IUNKNOWN) {
+    if guid_eq(&*iid, &IID_IUNKNOWN) || guid_eq(&*iid, &IID_IENUMFORMATETC) {
         *out = this;
         EnumFmt::from_raw(this).refs.fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
-    E_NOTIMPL
+    E_NOINTERFACE
 }
 
 unsafe extern "system" fn ef_add_ref(this: *mut c_void) -> u32 {
@@ -437,7 +445,7 @@ unsafe extern "system" fn src_qi(
         DropSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
-    E_NOTIMPL
+    E_NOINTERFACE
 }
 
 unsafe extern "system" fn src_add_ref(this: *mut c_void) -> u32 {

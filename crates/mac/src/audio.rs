@@ -7,8 +7,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
-/// 既定のサンプリングレート(ハンドシェイクで上書きされる)
-static SAMPLE_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(48000);
 /// メニューからのミュート(受信は続くが再生しない)
 pub static MUTED: AtomicBool = AtomicBool::new(false);
 /// 診断カウンタ(受信/再生バイト数)。10秒毎にログへ出す
@@ -379,7 +377,10 @@ pub fn start(token: String) {
             }
             eprintln!("[audio] accepted from {peer}");
             stream.set_nodelay(true).ok();
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+            // 送信側は無音期間も 1 秒毎にキープアライブを送るため、12 秒無音は
+            // 相手の音声スレッド死亡。30 秒だと accept が直列のため再接続が
+            // その分遅れる(本線の生存監視 9〜10 秒とも整合させる)
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(12))).ok();
             let (r, mut w) = match tsunagu_common::secure::accept(stream, &token, b"tsunagu-audio") {
                 Ok(x) => x,
                 Err(e) => {
@@ -404,7 +405,6 @@ pub fn start(token: String) {
             if !(4000..=192_000).contains(&rate) {
                 continue;
             }
-            SAMPLE_RATE.store(rate, Ordering::Relaxed);
             if w.write_all(b"ok\n").and_then(|_| w.flush()).is_err() {
                 continue;
             }

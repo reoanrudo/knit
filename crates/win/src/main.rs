@@ -170,6 +170,11 @@ static BTN_W: [std::sync::atomic::AtomicBool; 3] = [
     std::sync::atomic::AtomicBool::new(false),
     std::sync::atomic::AtomicBool::new(false),
 ];
+/// XButton1/2 の押下状態(離脱時の up 注入漏れ防止。BTN_W と同じ運用)
+static XBTN_W: [std::sync::atomic::AtomicBool; 2] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// 累計ファイル受信数(ステータス窓の表示用)
@@ -403,6 +408,9 @@ fn clipboard_read_files() -> Option<Vec<String>> {
         if !h.is_null() {
             const COUNT: u32 = 0xFFFF_FFFF; // iFile=-1 で個数問い合わせ
             let n = DragQueryFileW(h, COUNT, std::ptr::null_mut(), 0);
+            if n > 64 {
+                println!("[clip] CF_HDROP {n} 件のうち先頭 64 件のみ扱います");
+            }
             let mut v = Vec::new();
             for i in 0..n.min(64) {
                 let len = DragQueryFileW(h, i, std::ptr::null_mut(), 0);
@@ -435,8 +443,9 @@ fn files_key(paths: &[String]) -> String {
 fn send_files_to_mac(paths: &[String]) {
     let paths: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
     let total = bulk::total_size(&paths);
-    if total == 0 || total > bulk::MAX_TOTAL {
-        println!("[file] win->mac skip(total={total} bytes)");
+    // 空ファイルのみの選択(total=0)は正当な送信のため、件数 0 だけを拒否する
+    if paths.is_empty() || total > bulk::MAX_TOTAL {
+        println!("[file] win->mac skip(件数 {} / 合計 {total} bytes)", paths.len());
         return;
     }
     match BULK_LINK.send(|w| bulk::send_files(w, &paths, false)) {
@@ -800,6 +809,11 @@ impl ModState {
                 inject_mouse_btn(b, false);
             }
         }
+        for i in 0u8..=1 {
+            if XBTN_W[i as usize].swap(false, Ordering::Relaxed) {
+                inject_xbutton(i, false);
+            }
+        }
         if ALT_TAB_ACTIVE.swap(false, Ordering::Relaxed) {
             inject_key(0x09, true);
             inject_key(VK_MENU, true);
@@ -1024,7 +1038,7 @@ fn main() {
         .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"));
     // 接続先の既定値(開発者の環境の固定 IP)は持たない。未指定なら LAN で自動発見する
     let host_label = host.clone().unwrap_or_else(|| "LAN から自動検出".into());
-    println!("[info] desktop attached. screen {w}x{h}. connecting to {host_label}");
+    println!("[info] connecting to {host_label}");
     *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = host_label;
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
@@ -1277,8 +1291,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
     // 端数は次イベントへ持ち越す。
     let mut accum = (0.0f64, 0.0f64);
-    // 認証は session の前(client_session/server_loop)で完了している
-    let hello_done = true;
     let mut last_return_notify = Instant::now() - Duration::from_secs(10);
     let running = Arc::new(AtomicBool::new(true));
     let running_w = running.clone();
@@ -1414,9 +1426,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 RTT_MS.store(rtt, Ordering::Relaxed);
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift, tr } => {
-                if !hello_done {
-                    continue;
-                }
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
                     let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
@@ -1480,9 +1489,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 }
             }
             Msg::MouseMove { dx, dy } => {
-                if !hello_done {
-                    continue;
-                }
                 accum.0 += dx;
                 accum.1 += dy;
                 // 異常な残高(1e6超)は何かの暴発なので捨てる
@@ -1500,9 +1506,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 }
             }
             Msg::MouseAbs { nx, ny } => {
-                if !hello_done {
-                    continue;
-                }
                 let x = (nx.clamp(0.0, 1.0) * 65535.0).round() as i32;
                 let y = (ny.clamp(0.0, 1.0) * 65535.0).round() as i32;
                 inject_mouse_move_abs(x, y);
@@ -1512,11 +1515,12 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 maybe_notify_return(&wtx, &mut last_return_notify, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
-                if !hello_done {
-                    continue;
-                }
                 if btn >= 3 {
-                    // XButton1/2(トラックパッドの戻る/進むスワイプ)
+                    // XButton1/2(トラックパッドの戻る/進むスワイプ)。押下状態を追跡して
+                    // 離脱時の up 注入に含める(スワイプ中の切断で押しっぱなし残留を防ぐ)
+                    if (btn as usize) < 5 {
+                        XBTN_W[btn as usize - 3].store(down, Ordering::Relaxed);
+                    }
                     inject_xbutton(btn - 3, down);
                 } else {
                     BTN_W[btn as usize].store(down, Ordering::Relaxed);
@@ -1524,9 +1528,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 }
             }
             Msg::Scroll { dx, dy } => {
-                if !hello_done {
-                    continue;
-                }
                 inject_scroll(dx, dy);
             }
             Msg::Lock => {
@@ -1541,9 +1542,6 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 sync_clipboard_to_mac();
             }
             Msg::Warp { nx, ny } => {
-                if !hello_done {
-                    continue;
-                }
                 let (vx, vy, vw, vh) = vscreen();
                 let x = vx + (nx.clamp(0.0, 1.0) * vw as f64) as i32;
                 let y = vy + (ny.clamp(0.0, 1.0) * vh as f64) as i32;

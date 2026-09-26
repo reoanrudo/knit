@@ -466,6 +466,10 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
     if n <= 0 {
         return None;
     }
+    // 65 件目以降は無通知で欠けるため打ち切りをログへ残す
+    if n > 64 {
+        eprintln!("[clip] ファイル参照 {n} 件のうち先頭 64 件のみ扱います");
+    }
     let at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
         std::mem::transmute(objc_msgSend as usize);
     let mut out = Vec::new();
@@ -564,7 +568,8 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
     }
     std::thread::spawn(move || {
         let total = bulk::total_size(&paths);
-        if total == 0 || total > bulk::MAX_TOTAL {
+        // 空ファイルのみの選択(total=0)は正当な送信のため、件数 0 だけを拒否する
+        if paths.is_empty() || total > bulk::MAX_TOTAL {
             eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
             notify(
                 "tsunagu",
@@ -754,14 +759,17 @@ static BULK: OnceLock<bulk::Endpoint> = OnceLock::new();
 fn notify(title: &str, body: &str) {
     let title = title.to_string();
     let body = body.to_string();
+    // osascript の文字列リテラルで特別な意味を持つ文字を先に無効化する(流用時に
+    // ファイル名等が入っても構文エラーで通知だけ落ちる、という事故を防ぐ)
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "'");
     std::thread::spawn(move || {
         let out = std::process::Command::new("osascript")
             .args([
                 "-e",
                 &format!(
                     "display notification \"{}\" with title \"{}\"",
-                    body.replace('"', "'"),
-                    title.replace('"', "'")
+                    esc(&body),
+                    esc(&title)
                 ),
             ])
             .output();
@@ -1857,7 +1865,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-143854-049c56c";
+const BUILD_ID: &str = "build-20260926-171337-f561628";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -2405,7 +2413,13 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
+            // 切断理由(EOF 以外)を残す: pong 途絶の張替えか read エラーかの区別が
+            // 「なぜ切れたか」の追跡に必要。不正行(decode 失敗)は既存どおり無視
+            Err(e) => {
+                eprintln!("[conn] read error: {e}(kind={:?})", e.kind());
+                break;
+            }
             Ok(_) if line.len() as u64 > MAX_LINE => {
                 eprintln!("[conn] line too large. dropping connection");
                 break;
@@ -2496,9 +2510,8 @@ fn on_disconnect() {
 /// (本環境では Mac 発コネクションが不通なため、Windows 発に限定した設計)
 fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
     use std::io::{BufRead, Read};
-    // 待受アドレス: 既定は Tailscale IF を想定した制限なし設定だが、
-    // restart-mac.sh が TSUNAGU_BIND=$(tailscale ip -4) を渡すため、
-    // 通常運用では Tailscale インタフェース以外で listen しない
+    // 待受アドレス: 既定は全インターフェース(LAN 直を受け入れる)。
+    // 防御は is_allowed(接続元絞り)+ Noise ハンドシェイクが担う
     let bind_ip = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
@@ -2645,6 +2658,13 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
     let mut backoff = 500u64;
     loop {
         let addrs = tsunagu_common::connect::resolve(host.as_deref(), port, &token);
+        if addrs.is_empty() {
+            // 候補が空なら first_reachable を呼ばない(Windows 側と同じ: 3.5 秒の空待ち防止)
+            eprintln!("[conn] 接続先が見つかりません");
+            std::thread::sleep(Duration::from_millis(backoff));
+            backoff = (backoff * 2).min(3000);
+            continue;
+        }
         match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 eprintln!("[conn] connected ({a})");

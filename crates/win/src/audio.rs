@@ -29,7 +29,7 @@ struct IMMDeviceEnumeratorVtbl {
     base: IUnknownVtbl,
     EnumAudioEndpoints: usize,
     GetDefaultAudioEndpoint: unsafe extern "system" fn(*mut core::ffi::c_void, i32, i32, *mut *mut core::ffi::c_void) -> HRESULT,
-    GetDevice: usize,
+    GetDevice: unsafe extern "system" fn(*mut core::ffi::c_void, *const u16, *mut *mut core::ffi::c_void) -> HRESULT,
     RegisterEndpointNotificationCallback: usize,
     UnregisterEndpointNotificationCallback: usize,
 }
@@ -484,11 +484,14 @@ pub fn start(host: Option<String>, token: String) {
 
 /// 音声転送が稼働している(=ミュート制御が意味を持つ)か
 pub static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// ミュート適用前のユーザー設定(切断時に元へ戻すため)。None=まだ記録していない
-static SPK_WAS_MUTED: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+/// ミュート適用前のユーザー設定と適用時のデバイス ID(切断時にその ID へ戻すため)。
+/// None=まだ記録していない
+static SPK_WAS_MUTED: std::sync::Mutex<Option<(bool, String)>> = std::sync::Mutex::new(None);
 
-/// 既定レンダリングデバイスの IAudioEndpointVolume を Activate して返す
-unsafe fn open_endpoint_volume() -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>, String> {
+/// エンドポイントの IAudioEndpointVolume を Activate して返す。
+/// want_id=Some ならそのデバイス ID へ(ミュート復元時の取り違え防止)、
+/// None なら現在の既定デバイスへ
+unsafe fn open_endpoint_volume(want_id: Option<&str>) -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>, String> {
     unsafe {
         // 呼び出し元スレッドで COM 未初期化の可能性がある(本体セッションのスレッド)
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
@@ -505,10 +508,23 @@ unsafe fn open_endpoint_volume() -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>,
         }
         let evt = &*(*(enumerator as *mut ObjVt<IMMDeviceEnumeratorVtbl>)).lpVtbl;
         let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
-        let _ = (evt.base.Release)(enumerator); // enumerator はもう要らない
-        if hr < 0 || device.is_null() {
-            return Err("既定オーディオデバイス取得失敗".into());
+        match want_id {
+            Some(id) => {
+                let mut w: Vec<u16> = id.encode_utf16().collect();
+                w.push(0);
+                let hr = (evt.GetDevice)(enumerator, w.as_ptr(), &mut device);
+                let _ = (evt.base.Release)(enumerator);
+                if hr < 0 || device.is_null() {
+                    return Err(format!("デバイス取得失敗(切替・抜去の可能性) hr={hr:08x}"));
+                }
+            }
+            None => {
+                let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
+                let _ = (evt.base.Release)(enumerator); // enumerator はもう要らない
+                if hr < 0 || device.is_null() {
+                    return Err("既定オーディオデバイス取得失敗".into());
+                }
+            }
         }
         let dvt = &*(*(device as *mut ObjVt<IMMDeviceVtbl>)).lpVtbl;
         let mut vol: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -534,15 +550,18 @@ pub fn speaker_connect_mute(mode_on: bool) {
         return;
     }
     unsafe {
-        let Ok(vol) = open_endpoint_volume() else {
+        let Ok(vol) = open_endpoint_volume(None) else {
             println!("[spk] エンドポイント取得失敗。ミュートせず継続します");
             return;
         };
+        // 適用時のデバイス ID を記録する: 接続中に既定出力が変わっても、
+        // 復元はミュートした同じデバイスへ向ける(別デバイスのミュートを触らない)
+        let dev_id = default_render_id();
         let vt = &*(*vol).lpVtbl;
         let mut now: i32 = 0;
         let got = (vt.GetMute)(vol as *mut core::ffi::c_void, &mut now);
         if got >= 0 {
-            let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = Some(now != 0));
+            let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = Some((now != 0, dev_id.unwrap_or_default())));
             let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, 1, std::ptr::null());
             println!("[spk] 接続中ミュートを適用 (was_muted={})", now != 0);
             if hr < 0 {
@@ -557,17 +576,28 @@ pub fn speaker_connect_mute(mode_on: bool) {
 
 /// 切断時: ミュートを適用した際の元状態へ戻す(元がミュートでなければ鳴らす)
 pub fn speaker_disconnect() {
-    let was = SPK_WAS_MUTED.lock().ok().and_then(|g| *g);
-    let Some(was) = was else { return }; // ミュートを適用していない
+    let was = SPK_WAS_MUTED.lock().ok().and_then(|g| g.clone());
+    let Some((was_muted, dev_id)) = was else { return }; // ミュートを適用していない
     let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = None);
     unsafe {
-        let Ok(vol) = open_endpoint_volume() else {
-            println!("[spk] 復元時のエンドポイント取得失敗");
-            return;
+        // まずミュートしたデバイスそのものへ戻す。デバイスが消えていれば既定へ
+        // フォールバックする(その場合の復元先は変わるが、触らないより良い)
+        let vol = match open_endpoint_volume(if dev_id.is_empty() { None } else { Some(&dev_id) }) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[spk] 復元先デバイスが取れません({e})。既定デバイスで試みます");
+                match open_endpoint_volume(None) {
+                    Ok(v) => v,
+                    Err(e2) => {
+                        println!("[spk] 復元時のエンドポイント取得失敗: {e2}");
+                        return;
+                    }
+                }
+            }
         };
         let vt = &*(*vol).lpVtbl;
-        let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, was as i32, std::ptr::null());
-        println!("[spk] 切断。ミュートを元へ戻しました (muted={was})");
+        let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, was_muted as i32, std::ptr::null());
+        println!("[spk] 切断。ミュートを元へ戻しました (muted={was_muted})");
         if hr < 0 {
             println!("[spk] SetMute(復元) 失敗 hr={hr:08x}");
         }
