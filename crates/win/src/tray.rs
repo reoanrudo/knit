@@ -5,36 +5,48 @@
 #![allow(non_snake_case)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+mod preferences;
+mod settings_ui;
+static UI_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub fn preview() {
+    UI_PREVIEW.store(true, Ordering::Relaxed);
+    unsafe {
+        tray_loop();
+    }
+}
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
-    RegisterClassW, SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, HMENU, WNDCLASSW, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
-    MF_GRAYED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
-    WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_TIMER,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW, RegisterClassW,
+    SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, TrackPopupMenu, TranslateMessage,
+    HMENU, IMAGE_ICON, LR_LOADFROMFILE, MF_GRAYED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
+    WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
 #[link(name = "shell32")]
 unsafe extern "system" {
     fn ShellExecuteW(
-        hwnd: HWND, verb: *const u16, file: *const u16, params: *const u16,
-        dir: *const u16, show: i32,
+        hwnd: HWND,
+        verb: *const u16,
+        file: *const u16,
+        params: *const u16,
+        dir: *const u16,
+        show: i32,
     ) -> isize;
 }
 
 const WM_TRAY: u32 = WM_APP + 1;
 
 // ---------- ダークテーマ(モダンUI)の色定義(0xRRGGBB) ----------
-const CLR_BG: u32 = 0xF0F0F0; // 窓背景(Windows 標準ライト)
+const CLR_BG: u32 = 0xF3F4F8; // 窓背景(Windows 標準ライト)
 const CLR_CARD: u32 = 0xFFFFFF; // カード面(白)
-const CLR_HEAD: u32 = 0x1A1A1A; // 見出し・状態行(黒)
-const CLR_TEXT: u32 = 0x444444; // 本文
-const CLR_SUB: u32 = 0x888888; // 補足
-const CLR_ACCENT: u32 = 0x0067C0; // 標準アクセント(Windows 11 青)
+const CLR_HEAD: u32 = 0x222638; // 見出し・状態行(黒)
+const CLR_TEXT: u32 = 0x424A5E; // 本文
+const CLR_SUB: u32 = 0x626B7D; // 補足
+const CLR_ACCENT: u32 = 0x515FD1; // 標準アクセント(Windows 11 青)
 const CLR_DANGER: u32 = 0xC2504B; // 終了ボタン(赤系)
 /// 0xRRGGBB → COLORREF(0x00BBGGRR)
 fn rgb(c: u32) -> u32 {
@@ -48,21 +60,36 @@ const TRANSPARENT_BK: i32 = 1;
 unsafe extern "system" {
     fn CreateSolidBrush(color: u32) -> *mut core::ffi::c_void;
     fn CreatePen(style: i32, width: i32, color: u32) -> *mut core::ffi::c_void;
-    fn SelectObject(hdc: *mut core::ffi::c_void, obj: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+    fn SelectObject(
+        hdc: *mut core::ffi::c_void,
+        obj: *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
     fn DeleteObject(obj: *mut core::ffi::c_void) -> i32;
     fn SetTextColor(hdc: *mut core::ffi::c_void, color: u32) -> u32;
     fn SetBkColor(hdc: *mut core::ffi::c_void, color: u32) -> u32;
     fn SetBkMode(hdc: *mut core::ffi::c_void, mode: i32) -> i32;
-    fn FillRect(hdc: *mut core::ffi::c_void, rect: *const Rect, brush: *mut core::ffi::c_void) -> i32;
+    fn FillRect(
+        hdc: *mut core::ffi::c_void,
+        rect: *const Rect,
+        brush: *mut core::ffi::c_void,
+    ) -> i32;
     fn RoundRect(
-        hdc: *mut core::ffi::c_void, l: i32, t: i32, r: i32, b: i32, ew: i32, eh: i32,
+        hdc: *mut core::ffi::c_void,
+        l: i32,
+        t: i32,
+        r: i32,
+        b: i32,
+        ew: i32,
+        eh: i32,
     ) -> i32;
     fn DrawTextW(
-        hdc: *mut core::ffi::c_void, text: *mut u16, count: i32, rect: *mut Rect, flags: u32,
+        hdc: *mut core::ffi::c_void,
+        text: *mut u16,
+        count: i32,
+        rect: *mut Rect,
+        flags: u32,
     ) -> i32;
-    fn SetWindowPos(
-        hwnd: HWND, after: HWND, x: i32, y: i32, w: i32, h: i32, flags: u32,
-    ) -> i32;
+    fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -94,21 +121,13 @@ struct DrawItemStruct {
 #[link(name = "dwmapi")]
 unsafe extern "system" {
     fn DwmSetWindowAttribute(
-        hwnd: HWND, attr: u32, val: *const core::ffi::c_void, size: u32,
+        hwnd: HWND,
+        attr: u32,
+        val: *const core::ffi::c_void,
+        size: u32,
     ) -> i32;
 }
-unsafe fn apply_dark_titlebar(hwnd: HWND) {
-    unsafe {
-        let dark: i32 = 1;
-        const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &dark as *const i32 as *const core::ffi::c_void,
-            4,
-        );
-    }
-}
+
 const MENU_QUIT: u32 = 1001;
 const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
@@ -211,9 +230,11 @@ fn rtt_line() -> String {
     }
 }
 /// exe と同じフォルダの .env の TSUNAGU_HOST 行を書き換える(無ければ追記)
-fn save_host_to_env(host: &str) {
-    let Ok(exe) = std::env::current_exe() else { return };
-    let Some(dir) = exe.parent() else { return };
+fn save_host_to_env(host: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("exe directory is unavailable"))?;
     let path = dir.join(".env");
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap_or_default()
@@ -222,7 +243,7 @@ fn save_host_to_env(host: &str) {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("TSUNAGU_HOST={host}"));
-    let _ = std::fs::write(&path, lines.join("\r\n") + "\r\n");
+    std::fs::write(&path, lines.join("\r\n") + "\r\n")
 }
 
 /// Mac 側の設定(画面位置・⌘キー割当)の表示。Mac から Cfg で同期された値
@@ -231,9 +252,17 @@ fn maccfg_line() -> String {
         1 => "左",
         2 => "上",
         3 => "下",
+        4 => "右上",
+        5 => "右下",
+        6 => "左上",
+        7 => "左下",
         _ => "右",
     };
-    let cmd = if crate::CMD_ALT.load(Ordering::Relaxed) { "Alt" } else { "Ctrl" };
+    let cmd = if crate::CMD_ALT.load(Ordering::Relaxed) {
+        "Alt"
+    } else {
+        "Ctrl"
+    };
     format!("Mac の設定: Windows は{side}・⌘キーは {cmd}")
 }
 
@@ -281,8 +310,12 @@ fn set_text(h: usize, s: &str) {
 }
 
 fn tray_status_text() -> String {
-    let conn = if crate::CONNECTED.load(Ordering::Relaxed) { "接続済" } else { "切断(再接続中)" };
-    format!("tsunagu: {conn} / {}", crate::BUILD_ID)
+    let conn = if crate::CONNECTED.load(Ordering::Relaxed) {
+        "接続済み"
+    } else {
+        "未接続 · 自動再接続中"
+    };
+    format!("Tsunagu · {conn}")
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -318,7 +351,12 @@ unsafe fn update_tip() {
     Shell_NotifyIconW(NIM_MODIFY, &mut nid);
 }
 
-unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn tray_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_TRAY => {
             let mouse = (lparam & 0xFFFF) as u32;
@@ -354,20 +392,39 @@ unsafe extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpa
 /// メニュー/ボタン共通のコマンド処理
 unsafe fn handle_command(id: u32) {
     match id {
+        3000..=3003 => settings_ui::select((id - settings_ui::NAV_FIRST) as usize),
         MENU_STATUS => open_status_window(),
         MENU_AUDIO => {
             let next = !crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed);
             crate::audio::AUDIO_ENABLED.store(next, Ordering::Relaxed);
+            if !UI_PREVIEW.load(Ordering::Relaxed) {
+                if let Err(e) = preferences::save() {
+                    eprintln!("[prefs] save failed: {e}");
+                    notify(
+                        "設定を保存できません",
+                        "変更は今回の起動中のみ有効です。ログを確認してください。",
+                    );
+                }
+            }
             println!("[tray] 音声転送 -> {next}");
             update_labels();
             update_tip();
         }
         MENU_OPENLOG => {
-            let mut log: Vec<u16> = r"C:\Users\<user>\tsunagu\tsunagu-win.log".encode_utf16().collect();
+            let mut log: Vec<u16> = r"C:\Users\<user>\tsunagu\tsunagu-win.log"
+                .encode_utf16()
+                .collect();
             log.push(0);
             let verb = wide("open");
             let np = wide("notepad.exe");
-            ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), np.as_ptr(), log.as_ptr(), std::ptr::null(), 5 /*SW_SHOW*/);
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                np.as_ptr(),
+                log.as_ptr(),
+                std::ptr::null(),
+                5, /*SW_SHOW*/
+            );
         }
         MENU_BACKMAC => {
             // Mac へ制御を返す(Return を送る=左端到達と同じ経路)
@@ -412,7 +469,17 @@ unsafe fn handle_command(id: u32) {
                 let text = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
                 let host = text.trim().to_string();
                 if !host.is_empty() {
-                    save_host_to_env(&host);
+                    if UI_PREVIEW.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if let Err(e) = save_host_to_env(&host) {
+                        eprintln!("[prefs] host save failed: {e}");
+                        notify(
+                            "接続先を保存できません",
+                            "アプリのフォルダへの書込み権限を確認してください。",
+                        );
+                        return;
+                    }
                     eprintln!("[tray] サーバーを {host} へ変更し再起動します");
                     std::process::exit(0);
                 }
@@ -431,7 +498,12 @@ unsafe fn handle_command(id: u32) {
     }
 }
 
-unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn status_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     const WM_PAINT2: u32 = 0x000F;
     const WM_ERASEBKGND2: u32 = 0x0014;
     const WM_CTLCOLORSTATIC2: u32 = 0x0138;
@@ -456,7 +528,7 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
             // サーバー編集欄: 白背景+黒文字(標準ライト)
             unsafe {
                 let hdc = wparam as *mut core::ffi::c_void;
-                SetTextColor(hdc, 0x1A1A1A);
+                SetTextColor(hdc, 0x222638);
                 SetBkColor(hdc, 0xFFFFFF);
                 static EDIT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
                 let b = *EDIT_BRUSH.get_or_init(|| CreateSolidBrush(0xFFFFFF) as usize);
@@ -475,20 +547,9 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 let id = GetDlgCtrlID(child);
                 // RTT は値で色分け(緑=快適/黄=やや遅延/赤=遅延)
                 let color = match id as u32 {
-                    ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT => rgb(CLR_HEAD),
-                    ID_LBL_BUILD | 1002 => rgb(CLR_SUB),
-                    ID_LBL_RTT => {
-                        let ms = crate::RTT_MS.load(Ordering::Relaxed);
-                        if !crate::CONNECTED.load(Ordering::Relaxed) || ms == 0 {
-                            rgb(CLR_TEXT)
-                        } else if ms <= 10 {
-                            0x53D769 // 緑
-                        } else if ms <= 40 {
-                            0xF5D547 // 黄
-                        } else {
-                            0xF26B5B // 赤
-                        }
-                    }
+                    ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT | 223 => rgb(CLR_HEAD),
+                    ID_LBL_BUILD | 221 | 222 => rgb(CLR_SUB),
+                    ID_LBL_RTT => rgb(CLR_SUB),
                     _ => rgb(CLR_TEXT),
                 };
                 SetTextColor(hdc, color);
@@ -496,8 +557,12 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 // 背景ブラシを窓背景色で返す: 透過(NULL_BRUSH)だと文字更新時に
                 // 古い文字が残って重なって見える(ゴースト)ため不透明で塗る
                 static BG_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                let b = *BG_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_BG)) as usize);
-                b as LRESULT
+                static CARD_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                if matches!(id, 220..=223) {
+                    *BG_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_BG)) as usize) as LRESULT
+                } else {
+                    *CARD_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_CARD)) as usize) as LRESULT
+                }
             }
         }
         WM_DRAWITEM2 => {
@@ -508,7 +573,30 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                     return 0;
                 }
                 let d = &*dis;
-                let brush_color = if d.ctl_id == MENU_QUIT { CLR_DANGER } else { CLR_ACCENT };
+                let nav = (3000..=3003).contains(&d.ctl_id);
+                let selected =
+                    nav && d.ctl_id as usize - 3000 == settings_ui::PAGE.load(Ordering::Relaxed);
+                let primary = matches!(d.ctl_id, MENU_SAVEHOST | MENU_AUDIO);
+                let brush_color = if nav {
+                    if selected {
+                        0xE2E6FA
+                    } else {
+                        CLR_BG
+                    }
+                } else if d.item_state & 1 != 0 {
+                    if primary {
+                        0x3C49AE
+                    } else {
+                        0xDFE3EF
+                    }
+                } else if primary {
+                    CLR_ACCENT
+                } else {
+                    0xEEF0F7
+                };
+                let base = CreateSolidBrush(rgb(if nav { CLR_BG } else { CLR_CARD }));
+                FillRect(d.hdc, &d.rc_item, base);
+                DeleteObject(base);
                 let brush = CreateSolidBrush(rgb(brush_color));
                 let pen = CreatePen(0 /*PS_SOLID*/, 1, rgb(brush_color));
                 let old_b = SelectObject(d.hdc, brush);
@@ -526,19 +614,52 @@ unsafe extern "system" fn status_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                 SelectObject(d.hdc, old_p);
                 DeleteObject(brush);
                 DeleteObject(pen);
-                SetTextColor(d.hdc, 0xFFFFFF);
+                SetTextColor(
+                    d.hdc,
+                    if nav {
+                        rgb(if selected { CLR_ACCENT } else { CLR_TEXT })
+                    } else if primary {
+                        0xFFFFFF
+                    } else {
+                        rgb(CLR_HEAD)
+                    },
+                );
+                if d.item_state & 0x10 != 0 {
+                    windows_sys::Win32::Graphics::Gdi::DrawFocusRect(
+                        d.hdc,
+                        &d.rc_item as *const Rect as *const windows_sys::Win32::Foundation::RECT,
+                    );
+                }
                 SetBkMode(d.hdc, TRANSPARENT_BK);
                 // ボタン文字はウィンドウテキストから取る
                 let mut buf = [0u16; 64];
                 extern "system" {
                     fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
                 }
+                let font = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(
+                    d.hwnd_item as HWND,
+                    0x0031, /*WM_GETFONT*/
+                    0,
+                    0,
+                );
+                if font != 0 {
+                    SelectObject(d.hdc, font as _);
+                }
+                if nav {
+                    settings_ui::nav_icon(d.hdc, (d.ctl_id - 3000) as usize, selected);
+                }
                 let len = GetWindowTextW(d.hwnd_item as HWND, buf.as_mut_ptr(), 64);
                 if len > 0 {
                     let mut r = d.rc_item;
-                    r.left += 4;
+                    r.left += if nav { 42 } else { 4 };
                     r.right -= 4;
-                    DrawTextW(d.hdc, buf.as_mut_ptr(), len, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                    DrawTextW(
+                        d.hdc,
+                        buf.as_mut_ptr(),
+                        len,
+                        &mut r,
+                        (if nav { 0 } else { DT_CENTER }) | DT_VCENTER | DT_SINGLELINE,
+                    );
                 }
             }
             1 // 描画済み
@@ -575,17 +696,8 @@ unsafe fn paint_status(hwnd: HWND) {
         let bg = CreateSolidBrush(rgb(CLR_BG));
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
-        // 接続カード(RTT/スピーカー/ファイル を囲む角丸面)
-        let card = Rect { left: 12, top: 72, right: rc.right - 12, bottom: 216 };
-        let card_brush = CreateSolidBrush(rgb(CLR_CARD));
-        let card_pen = CreatePen(0, 1, rgb(0xE0E0E0));
-        let ob = SelectObject(hdc, card_brush);
-        let op = SelectObject(hdc, card_pen);
-        RoundRect(hdc, card.left, card.top, card.right, card.bottom, 10, 10);
-        SelectObject(hdc, ob);
-        SelectObject(hdc, op);
-        DeleteObject(card_brush);
-        DeleteObject(card_pen);
+        settings_ui::paint_groups(hdc);
+        settings_ui::paint_layout(hdc);
         EndPaint(hwnd, &ps);
     }
 }
@@ -593,35 +705,44 @@ unsafe fn paint_status(hwnd: HWND) {
 /// モダンな見た目のための Segoe UI フォント生成(通常/太字)。
 /// 既定の DEFAULT_GUI_FONT は古いシステムフォントになるため使わない
 /// 近未来ロゴ用の等幅フォント(Consolas)
-unsafe fn segoe_mono(height: i32) -> *mut core::ffi::c_void {
-    unsafe {
-        let mut name: Vec<u16> = "Consolas".encode_utf16().collect();
-        name.push(0);
-        extern "system" {
-            fn CreateFontW(
-                height: i32, width: i32, escapement: i32, orientation: i32, weight: i32,
-                italic: u32, underline: u32, strikeout: u32, charset: u32, outprecision: u32,
-                clipprecision: u32, quality: u32, pitchandfamily: u32, face: *const u16,
-            ) -> *mut core::ffi::c_void;
-        }
-        CreateFontW(height, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, name.as_ptr())
-    }
-}
 
 unsafe fn segoe_font(bold: bool, height: i32) -> *mut core::ffi::c_void {
     unsafe {
-        let mut name: Vec<u16> = "Segoe UI".encode_utf16().collect();
+        let mut name: Vec<u16> = "Meiryo UI".encode_utf16().collect();
         name.push(0);
         extern "system" {
             fn CreateFontW(
-                height: i32, width: i32, escapement: i32, orientation: i32, weight: i32,
-                italic: u32, underline: u32, strikeout: u32, charset: u32, outprecision: u32,
-                clipprecision: u32, quality: u32, pitchandfamily: u32, face: *const u16,
+                height: i32,
+                width: i32,
+                escapement: i32,
+                orientation: i32,
+                weight: i32,
+                italic: u32,
+                underline: u32,
+                strikeout: u32,
+                charset: u32,
+                outprecision: u32,
+                clipprecision: u32,
+                quality: u32,
+                pitchandfamily: u32,
+                face: *const u16,
             ) -> *mut core::ffi::c_void;
         }
         CreateFontW(
-            height, 0, 0, 0, if bold { 700 } else { 400 }, 0, 0, 0, 1 /*DEFAULT_CHARSET*/,
-            0, 0, 5 /*CLEARTYPE_QUALITY*/, 0, name.as_ptr(),
+            -height,
+            0,
+            0,
+            0,
+            if bold { 700 } else { 400 },
+            0,
+            0,
+            0,
+            1, /*DEFAULT_CHARSET*/
+            0,
+            0,
+            5, /*CLEARTYPE_QUALITY*/
+            0,
+            name.as_ptr(),
         )
     }
 }
@@ -634,134 +755,12 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// ステータスウィンドウ(アプリ本体の画面)を開く。トレイ左クリック/メニューから
 unsafe fn open_status_window() {
-    unsafe {
-        let existing = STATUS_HWND.load(Ordering::Relaxed) as HWND;
-        if !existing.is_null() {
-            ShowWindow(existing, SW_SHOW);
-            windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(existing);
-            return;
-        }
-        let hinst = TRAY_HINST.load(Ordering::Relaxed) as *mut core::ffi::c_void;
-        let class = wide("SDWinStatusWnd");
-        let wc = WNDCLASSW {
-            style: 0,
-            lpfnWndProc: Some(status_wndproc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinst,
-            hIcon: TRAY_HICON.load(Ordering::Relaxed) as *mut core::ffi::c_void,
-            hCursor: std::ptr::null_mut(),
-            // 背景は WM_PAINT で自前描画するため未指定(WM_ERASEBKGND も抑制)
-            hbrBackground: std::ptr::null_mut(),
-            lpszMenuName: std::ptr::null(),
-            lpszClassName: class.as_ptr(),
-        };
-        RegisterClassW(&wc);
-        // 表示位置はカーソル(トレイ)の近く=画面内に収まる左上側(Windows 標準の
-        // トレイウィンドウ挙動)。座標系はそのままで十分実用
-        let mut wx: i32 = 60;
-        let mut wy: i32 = 60;
-        {
-            let mut pt = POINT { x: 0, y: 0 };
-            if GetCursorPos(&mut pt) != 0 {
-                wx = (pt.x - 480).max(0);
-                wy = (pt.y - 470).max(0);
-            }
-        }
-        let hwnd = CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wide("Tsunagu ステータス").as_ptr(),
-            WS_OVERLAPPEDWINDOW,
-            wx, wy, 460, 446,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            hinst,
-            std::ptr::null(),
-        );
-        if hwnd.is_null() {
-            eprintln!("[tray] ステータスウィンドウ生成失敗");
-            return;
-        }
-
-        let _ = STATUS_HWND.store(hwnd as usize, Ordering::Relaxed);
-        let font = segoe_font(false, 17);
-        let font_bold = segoe_font(true, 19);
-        let make_child = |class_name: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: usize| -> usize {
-            let child = CreateWindowExW(
-                0,
-                wide(class_name).as_ptr(),
-                wide(text).as_ptr(),
-                WS_CHILD | WS_VISIBLE | style,
-                x, y, w, h,
-                hwnd,
-                id as *mut core::ffi::c_void,
-                hinst,
-                std::ptr::null(),
-            );
-            if !child.is_null() {
-                PostMessageW(child, WM_SETFONT, font as usize, 1);
-            }
-            child as usize
-        };
-        // ヘッダー左にアプリアイコン(SS_ICON スタティック)
-        let icon32 = load_tray_icon_size(32);
-        if !icon32.is_null() {
-            let ic = make_child("STATIC", "", 0x3 /*SS_ICON*/, 18, 14, 34, 34, 0);
-            PostMessageW(ic as _, 0x0172 /*STM_SETICON*/, icon32 as usize, 0);
-        }
-        // 状態行は太字・大きめで最初に目に入るように。以降は通常行
-        let state_h = make_child("STATIC", "状態: …", 0, 60, 16, 378, 26, ID_LBL_STATE as usize);
-        PostMessageW(state_h as _, WM_SETFONT, font_bold as usize, 1);
-        let _ = LABEL_STATE.store(state_h, Ordering::Relaxed);
-        let _ = LABEL_BUILD.store(make_child("STATIC", &build_line(), 0, 18, 46, 420, 20, ID_LBL_BUILD as usize), Ordering::Relaxed);
-        // 見出し「接続」(太字)とカード内の項目(paint_status のカード矩形に合わせる)
-        let head_conn = make_child("STATIC", "接続", 0, 26, 80, 400, 18, ID_HEAD_CONN as usize);
-        PostMessageW(head_conn as _, WM_SETFONT, font_bold as usize, 1);
-        let _ = LABEL_RTT.store(make_child("STATIC", &rtt_line(), 0, 38, 102, 390, 20, ID_LBL_RTT as usize), Ordering::Relaxed);
-        let _ = LABEL_AUDIO.store(make_child("STATIC", &audio_line(), 0, 38, 124, 390, 20, ID_LBL_AUDIO as usize), Ordering::Relaxed);
-        let _ = LABEL_SPK.store(make_child("STATIC", &spk_line(), 0, 38, 146, 390, 20, ID_LBL_SPK as usize), Ordering::Relaxed);
-        let _ = LABEL_FILES.store(make_child("STATIC", &files_line(), 0, 38, 168, 390, 20, ID_LBL_FILES as usize), Ordering::Relaxed);
-        let _ = LABEL_MACCFG.store(make_child("STATIC", &maccfg_line(), 0, 38, 190, 390, 20, 1001 as usize), Ordering::Relaxed);
-        // 見出し「サーバー」(太字)+ 接続先(Mac)編集 + 保存して再接続
-        let head_srv = make_child("STATIC", "サーバー(Mac)", 0, 18, 228, 420, 18, 1000 as usize);
-        PostMessageW(head_srv as _, WM_SETFONT, font_bold as usize, 1);
-        let host_init = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let edit = make_child(
-            "EDIT",
-            &host_init,
-            0x0080 /*ES_AUTOHSCROLL*/ | 1 /*WS_BORDER*/,
-            18,
-            252,
-            250,
-            26,
-            0,
-        );
-        PostMessageW(edit as _, WM_SETFONT, font as usize, 1);
-        let _ = EDIT_HOST.store(edit, Ordering::Relaxed);
-        const BS_OWNERDRAW2: u32 = 0x000B;
-        make_child("BUTTON", "保存して再接続", 0, 276, 250, 144, 30, MENU_SAVEHOST as usize);
-        // 見出し「操作」(太字)
-        let head_act = make_child("STATIC", "操作", 0, 18, 294, 420, 18, ID_HEAD_ACT as usize);
-        PostMessageW(head_act as _, WM_SETFONT, font_bold as usize, 1);
-        // ボタンはオーナードロー(角丸フラット・WM_DRAWITEM で描画)
-        const BS_OWNERDRAW: u32 = 0x000B;
-        make_child("BUTTON", "Mac へ戻る", 0, 18, 316, 128, 36, MENU_BACKMAC as usize);
-        make_child("BUTTON", "受信フォルダ", 0, 152, 316, 124, 36, MENU_OPENFOLDER as usize);
-        make_child("BUTTON", "音声 ON/OFF", 0, 284, 316, 80, 36, MENU_AUDIO as usize);
-        make_child("BUTTON", "終了", 0, 370, 316, 50, 36, MENU_QUIT as usize);
-        make_child("BUTTON", "ログを開く", 0, 18, 358, 128, 36, MENU_OPENLOG as usize);
-        make_child("BUTTON", "再起動", 0, 152, 358, 124, 36, MENU_RESTART as usize);
-        // フッター(接続先と稼働時間)
-        let _ = LABEL_FOOTER.store(make_child("STATIC", &footer_line(), 0, 18, 406, 420, 20, 1002 as usize), Ordering::Relaxed);
-        ShowWindow(hwnd, SW_SHOW);
-        windows_sys::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-        update_labels();
-    }
+    settings_ui::build();
 }
 
 /// ラベル類の定期更新(WM_TIMER から)
 unsafe fn update_labels() {
+    settings_ui::sync();
     set_text(LABEL_STATE.load(Ordering::Relaxed), &tray_status_text());
     set_text(LABEL_BUILD.load(Ordering::Relaxed), &build_line());
     set_text(LABEL_AUDIO.load(Ordering::Relaxed), &audio_line());
@@ -783,7 +782,7 @@ unsafe fn open_menu(hwnd: HWND) {
     w.push(0);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    let mut open_w = wide("ステータスを開く");
+    let mut open_w = wide("設定を開く…");
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
     let mut audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
@@ -801,7 +800,15 @@ unsafe fn open_menu(hwnd: HWND) {
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     SetForegroundWindow(hwnd);
-    TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_BOTTOMALIGN, pt.x, pt.y, 0, hwnd, std::ptr::null());
+    TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_BOTTOMALIGN,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        std::ptr::null(),
+    );
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
 }
@@ -828,30 +835,26 @@ unsafe fn load_tray_icon_size(size: i32) -> *mut core::ffi::c_void {
                 }
             }
         }
-        LoadIconW(std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::IDI_APPLICATION)
+        let embedded = LoadImageW(
+            GetModuleHandleW(std::ptr::null()),
+            1usize as *const u16,
+            IMAGE_ICON,
+            size,
+            size,
+            0,
+        );
+        if !embedded.is_null() {
+            return embedded;
+        }
+        LoadIconW(
+            std::ptr::null_mut(),
+            windows_sys::Win32::UI::WindowsAndMessaging::IDI_APPLICATION,
+        )
     }
 }
 
 unsafe fn load_tray_icon() -> *mut core::ffi::c_void {
-    if let Ok(exe) = std::env::current_exe() {
-        let ico = exe.parent().map(|d| d.join("app.ico"));
-        if let Some(path) = ico.filter(|p| p.exists()) {
-            let mut w: Vec<u16> = path.as_os_str().to_string_lossy().encode_utf16().collect();
-            w.push(0);
-            let h = LoadImageW(
-                std::ptr::null_mut(),
-                w.as_ptr(),
-                IMAGE_ICON,
-                0,
-                0,
-                LR_LOADFROMFILE | LR_DEFAULTSIZE,
-            );
-            if !h.is_null() {
-                return h;
-            }
-        }
-    }
-    LoadIconW(std::ptr::null_mut(), windows_sys::Win32::UI::WindowsAndMessaging::IDI_APPLICATION)
+    load_tray_icon_size(24)
 }
 
 unsafe fn tray_loop() {
@@ -885,7 +888,10 @@ unsafe fn tray_loop() {
         class.as_ptr(),
         title.as_ptr(),
         0, // WS_OVERLAPPED(非表示のまま ShowWindow しない)
-        0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         hinst,
@@ -912,16 +918,23 @@ unsafe fn tray_loop() {
     SetTimer(hwnd, 1, 1000, None);
     eprintln!("[tray] タスクトレイに常駐しました");
     // デバッグ/スクリーンショット検証用: TSUNAGU_STATUS_SHOW=1 で起動時に窓を開く
-    if tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1") {
+    if UI_PREVIEW.load(Ordering::Relaxed)
+        || tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1")
+    {
         open_status_window();
     }
 
-    let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG =
-        std::mem::zeroed();
+    let mut msg: windows_sys::Win32::UI::WindowsAndMessaging::MSG = std::mem::zeroed();
     loop {
         let r = GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
         if r <= 0 {
             break;
+        }
+        let status = STATUS_HWND.load(Ordering::Relaxed) as HWND;
+        if !status.is_null()
+            && windows_sys::Win32::UI::WindowsAndMessaging::IsDialogMessageW(status, &msg) != 0
+        {
+            continue;
         }
         let _ = TranslateMessage(&msg);
         DispatchMessageW(&msg);
@@ -930,5 +943,6 @@ unsafe fn tray_loop() {
 
 /// トレイを開始(別スレッドでメッセージループ)。失敗しても本体は継続する
 pub fn start() {
+    preferences::restore();
     std::thread::spawn(|| unsafe { tray_loop() });
 }

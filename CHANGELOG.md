@@ -2,6 +2,24 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
+## [0.22.0] - 2026-09-26
+
+### 追加(ファイルを掴んだまま境界越え: Mac→Win ドラッグ&ドロップ)
+- Mac の Finder 等で**ファイルをドラッグしたまま画面端へ行くとそのファイルが
+  Windows へ流れ、押したままのカーソルで「掴んだまま」ドロップできる**体験を追加。
+  プロトコル VERSION 8(FileDropBegin / FileDropEnd)
+- Mac 側: ドラッグ用ペーストボード(NSPasteboardNameDrag)を 120ms 監視し、
+  「押下開始以降の changeCount 変化でファイルが載った」ことを掴みと判定
+  (押下前に載っていた残骸では誤検出しない=実測に基づく対策)
+- 切替時: 押下ボタンを Windows へ持ち込んだ上でファイルを転送し、Mac 側の
+  ドラッグは合成 LeftMouseUp で完結(kCGEventSourceUserData にマジックを刻み
+  tap で自己投稿を識別=Win 転送しない)
+- Windows 側: 受け取ったファイルで本物の OLE ドラッグ(DoDragDrop)を開始。
+  IDataObject / IDropSource / IEnumFORMATETC を vtbl 自前定義で実装。
+  離した位置の窓へ CF_HDROP として渡る(エクスプローラー等がそのまま受け取る)
+- ドロップ先が受けられない/ボタンを既に離していた場合は従来どおり
+  クリップボードへ載せ「Ctrl+V で貼り付け可」へフォールバック
+
 ## [0.21.0] - 2026-09-26
 
 ### 追加(モニター配置エディタ: Mac の「ディスプレイ配置」と同じ発想)

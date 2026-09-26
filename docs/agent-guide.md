@@ -54,6 +54,16 @@
 11. **PCM 音声は 8 バイト(f32×2ch)境界**を厳守。境界外ドロップは恒久位相ずれ=破壊音
 12. トークン(TSUNAGU_TOKEN)は画面出力しない。`.env`/`dist/` は gitignore 済み
 13. 音が出る E2E テストはユーザーの事前承認が必要(無断トーン事故の実績)
+14. **ドラッグ用ペーストボード(NSPasteboardNameDrag)はキャンセル後もクリアされず
+    残ることがある**(実測)。掴み判定は「押下開始時点からの changeCount 変化」基準に
+    すること(crates/mac/main.rs の掴み検出スレッド)。swift の writeObjects で載せる
+    URL はファイルが実在しないと readObjectsForClasses(FileURLsOnly)で読めない
+15. **CGEventPost したイベントは自分の HID タップを再通過する**(定番の再帰)。
+    自己投稿は kCGEventSourceUserData(41) にマジックを刻み tap 側で識別する
+    (掴み切替直後の Mac 完結用 LeftMouseUp = SYNTH_UP_MAGIC)
+16. **windows-sys に COM インターフェースの vtbl は無い**→自前定義
+    (crates/win/src/dragdrop.rs の IDataObject/IDropSource/IEnumFORMATETC)。
+    vtbl の並びは MSDN のメソッド順どおり。並びを間違えると即クラッシュ
 
 ## コード規約(このプロジェクト固有)
 

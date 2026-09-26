@@ -6,6 +6,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod dragdrop;
 mod tray;
 
 use tsunagu_common::keymap::mac_kc_to_win_vk;
@@ -173,6 +174,9 @@ static BTN_W: [std::sync::atomic::AtomicBool; 3] = [
 ];
 /// ファイル受信で保存したパス群(CF_HDROP でクリップボードへ載せる分)
 static PENDING_FILES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+/// ファイル掴みドラッグ越域: FileDropBegin を受けている間 true。
+/// FileBatchEnd でのクリップボード掲載を抑止し、FileDropEnd で OLE ドラッグへ流す
+static DROP_PENDING: AtomicBool = AtomicBool::new(false);
 /// 最後に Mac から受信してクリップボードへ載せたファイル群の指紋(エコーバック防止)
 static LAST_RECV_FILES: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// 累計ファイル受信数(ステータス窓の表示用)
@@ -268,12 +272,11 @@ fn clipboard_write_text(s: &str) -> bool {
     }
 }
 
-/// ファイルパス群をクリップボードへ(CF_HDROP)。Mac からのファイル受信完了時に
-/// 呼ぶ。受け取ったファイルは Windows 側でそのまま Ctrl+V で貼り付けられる
-fn clipboard_write_files(paths: &[String]) -> bool {
-    // DROPFILES ヘッダ(20byte): pFiles=20, pt=(0,0), fNC=0, fWide=1 の後ろに
-    // UTF16 パス群(\0 区切り、リスト終端に追加の \0)が続く。pack(1) レイアウトを
-    // 手動で書く(アライン未定義の packed 参照を避けるため)
+/// ファイルパス群を CF_HDROP の HGLOBAL へパックする(クリップボード操作を
+/// 含まない純粋な生成。ドラッグ越境の IDataObject::GetData でも使う)。
+/// DROPFILES ヘッダ(20byte): pFiles=20, pt=(0,0), fNC=0, fWide=1 の後ろに
+/// UTF16 パス群(\0 区切り、リスト終端に追加の \0)が続く
+pub(crate) fn make_hdrop_global(paths: &[String]) -> *mut core::ffi::c_void {
     const HEAD: usize = 20;
     let mut w: Vec<u16> = Vec::new();
     for p in paths {
@@ -283,20 +286,14 @@ fn clipboard_write_files(paths: &[String]) -> bool {
     w.push(0); // リスト終端
     let total = HEAD + w.len() * 2;
     unsafe {
-        if OpenClipboard(std::ptr::null_mut()) == 0 {
-            return false;
-        }
-        EmptyClipboard();
         let h = GlobalAlloc(GMEM_MOVEABLE, total);
         if h.is_null() {
-            CloseClipboard();
-            return false;
+            return std::ptr::null_mut();
         }
         let p = GlobalLock(h) as *mut u8;
         if p.is_null() {
             GlobalFree(h);
-            CloseClipboard();
-            return false;
+            return std::ptr::null_mut();
         }
         std::ptr::write_bytes(p, 0, total);
         let buf = std::slice::from_raw_parts_mut(p, total);
@@ -304,8 +301,25 @@ fn clipboard_write_files(paths: &[String]) -> bool {
         buf[16..20].copy_from_slice(&1i32.to_le_bytes()); // fWide = UTF16
         std::ptr::copy_nonoverlapping(w.as_ptr(), p.add(HEAD) as *mut u16, w.len());
         GlobalUnlock(h);
+        h
+    }
+}
+
+/// ファイルパス群をクリップボードへ(CF_HDROP)。Mac からのファイル受信完了時に
+/// 呼ぶ。受け取ったファイルは Windows 側でそのまま Ctrl+V で貼り付けられる
+pub(crate) fn clipboard_write_files(paths: &[String]) -> bool {
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let h = make_hdrop_global(paths);
+        if h.is_null() {
+            CloseClipboard();
+            return false;
+        }
         if SetClipboardData(CF_HDROP, h).is_null() {
-            GlobalFree(h);
+            GlobalFree(h); // 設定失敗時は呼び出し側の解放責任
             CloseClipboard();
             return false;
         }
@@ -684,9 +698,10 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-032145-ae3b5ec";
+const BUILD_ID: &str = "win-20260926-143916-049c56c";
 
 fn main() {
+    if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
     ensure_stdout();
     // コンソール付き起動なら DETACHED な自分へ置き換わって終了(常駐性の根保証)
     detach_if_console();
@@ -1062,7 +1077,7 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
             }
             Msg::Cfg { cmd_alt, spk_mute, side } => {
                 CMD_ALT.store(cmd_alt, Ordering::Relaxed);
-                SIDE_W.store(side.min(3), Ordering::Relaxed);
+                SIDE_W.store(side.min(7), Ordering::Relaxed);
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
                 if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
                     println!("[cfg] 接続中スピーカーミュート -> {}", if spk_mute { "ON" } else { "OFF" });
@@ -1128,11 +1143,21 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                 recv_file = None; // File の drop で閉じる(掲載は FileBatchEnd で一括)
                 recv_remain = 0;
             }
+            Msg::FileDropBegin => {
+                DROP_PENDING.store(true, Ordering::Relaxed);
+                println!("[drag] 掴みドラッグ受信開始(クリップボードではなく OLE ドラッグで渡します)");
+            }
             Msg::FileBatchEnd => {
                 let files = PENDING_FILES
                     .lock()
                     .map(|g| g.clone())
                     .unwrap_or_default();
+                if DROP_PENDING.load(Ordering::Relaxed) {
+                    // 掴みドラッグ: FileDropEnd で OLE ドラッグを開始するため
+                    // ここでは掲載しない(PENDING_FILES は温存)
+                    println!("[drag] ファイル受信完了: {} 件(ドロップ待ち)", files.len());
+                    continue;
+                }
                 if !files.is_empty() && clipboard_write_files(&files) {
                     let n = files.len();
                     FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
@@ -1141,6 +1166,29 @@ fn session(stream: TcpStream, w: i32, h: i32) -> std::io::Result<()> {
                     // 自分が載せた CF_HDROP を監視スレッドが検出しても送り返さない
                     *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) =
                         Some(files_key(&files));
+                }
+            }
+            Msg::FileDropEnd => {
+                let files = std::mem::take(&mut *PENDING_FILES.lock().unwrap_or_else(|e| e.into_inner()));
+                DROP_PENDING.store(false, Ordering::Relaxed);
+                if files.is_empty() {
+                    continue;
+                }
+                FILES_RX.fetch_add(files.len() as u64, Ordering::Relaxed);
+                // 自分が渡す CF_HDROP を監視スレッドが検出しても送り返さない
+                *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(files_key(&files));
+                if BTN_W[0].load(Ordering::Relaxed) {
+                    // まだ押している=掴んだまま → 本物の OLE ドラッグを開始
+                    dragdrop::start(files);
+                } else {
+                    // 転送中に既に離した(E2E の遅延やユーザー操作)→ 従来体験へ
+                    println!("[drag] 転送完了時点でボタン非押下のため Ctrl+V 形式へフォールバック");
+                    if clipboard_write_files(&files) {
+                        let n = files.len();
+                        println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
+                        tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+                    }
                 }
             }
             Msg::Key { kc, down, ctrl, opt, cmd, shift, tr } => {

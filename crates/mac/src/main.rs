@@ -75,10 +75,10 @@ const FLAG_FN: CGEventFlags = 0x8000_0000; // kCGEventFlagMaskSecondaryFn
 const KC_F13: i64 = 105;
 /// 切替ホットキー(Mac keycode)。TSUNAGU_HOTKEY_KC で変更可。
 /// MacBook 内蔵キーボードには F13 が無いため、例えば右Cmd(54)等に変えられる
-static HOTKEY_KC: OnceLock<i64> = OnceLock::new();
+static HOTKEY_KC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(KC_F13);
 
 fn hotkey_kc() -> i64 {
-    HOTKEY_KC.get().copied().unwrap_or(KC_F13)
+    HOTKEY_KC.load(Ordering::Relaxed)
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -105,6 +105,11 @@ unsafe extern "C" {
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
     fn CGEventCreate(allocator: CFAllocatorRef) -> CGEventRef;
+    fn CGEventCreateMouseEvent(
+        source: CFAllocatorRef, mouse_type: u32, mouse_position: CGPoint, button: u64,
+    ) -> CGEventRef;
+    fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
+    fn CGEventPost(tap: i32, event: CGEventRef);
     fn CFRelease(cf: *mut core::ffi::c_void);
     fn CFStringCreateWithCString(
         alloc: CFAllocatorRef, c_str: *const core::ffi::c_char, encoding: u32,
@@ -189,6 +194,18 @@ unsafe fn general_pasteboard() -> ID {
     msg0(
         objc_getClass(c"NSPasteboard".as_ptr()),
         sel_registerName(c"generalPasteboard".as_ptr()),
+    )
+}
+
+/// ドラッグ用ペーストボード(NSPasteboardNameDrag = "Apple CFPasteboard drag")。
+/// Finder 等のファイルドラッグ中のみファイル URL が載る。セレクタは
+/// pasteboardWithName:(クラスメソッド)。NSPasteboardNameDrag 定数の実体文字列を直接渡す
+unsafe fn drag_pasteboard() -> ID {
+    let name = nsstring("Apple CFPasteboard drag");
+    msg1_id(
+        objc_getClass(c"NSPasteboard".as_ptr()),
+        sel_registerName(c"pasteboardWithName:".as_ptr()),
+        name,
     )
 }
 
@@ -317,8 +334,7 @@ fn clipboard_change_count() -> isize {
 /// NSPasteboard にファイル参照(Finder の ⌘C 等)があるか調べ、パス群を返す。
 /// readObjectsForClasses:options:(NSURL + FileURLsOnly=YES)で読むことで
 /// NSFilenamesPboardType / public.file-url / alias のどの載せ方でも拾う
-unsafe fn mac_clipboard_files() -> Option<Vec<std::path::PathBuf>> {
-    let pb = general_pasteboard();
+unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
     if pb.is_null() {
         return None;
     }
@@ -393,6 +409,11 @@ unsafe fn mac_clipboard_files() -> Option<Vec<std::path::PathBuf>> {
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+/// general クリップボードのファイル参照(⌘C 検出用の既存経路)
+unsafe fn mac_clipboard_files() -> Option<Vec<std::path::PathBuf>> {
+    pb_files(general_pasteboard())
 }
 
 /// NSPasteboard へファイル参照を書き込む(Finder の ⌘C 相当)。
@@ -488,8 +509,10 @@ fn mac_file_begin(name: &str, size: u64) -> Option<(std::fs::File, std::path::Pa
 }
 
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
-/// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行
-pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
+/// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
+/// drop=true は「掴んだまま境界越え」: FileDropBegin で始め FileDropEnd で終わり、
+/// Windows 側はクリップボードではなく OLE ドラッグとして扱う
+pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
         eprintln!("[file] 送信中のため要求を無視しました");
         return;
@@ -520,7 +543,10 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
             FILE_TX_BUSY.store(false, Ordering::Relaxed);
             return;
         }
-        eprintln!("[file] 送信開始: {} 件 / 合計 {}KB", paths.len(), total / 1024);
+        if drop {
+            send_msg(&Msg::FileDropBegin);
+        }
+        eprintln!("[file] 送信開始: {} 件 / 合計 {}KB{}", paths.len(), total / 1024, if drop { "(掴みドラッグ)" } else { "" });
         use std::io::Read;
         let mut buf = vec![0u8; CHUNK];
         for p in &paths {
@@ -557,8 +583,17 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
             eprintln!("[file] 送信: {name} ({size} bytes)");
         }
         send_msg(&Msg::FileBatchEnd);
-        eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
-        notify("tsunagu", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
+        if drop {
+            send_msg(&Msg::FileDropEnd);
+            eprintln!(
+                "[file] 送信完了({} 件)。Windows 側で掴んだままドロップできます",
+                paths.len()
+            );
+            notify("tsunagu", &format!("{} 件のファイルを Windows へ掴んで渡しました", paths.len()));
+        } else {
+            eprintln!("[file] 送信完了({} 件)。Windows 側は Ctrl+V で貼り付けられます", paths.len());
+            notify("tsunagu", &format!("{} 件のファイルを Windows へ送信しました", paths.len()));
+        }
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
     });
 }
@@ -669,6 +704,15 @@ pub static CTRL_CLICK: AtomicBool = AtomicBool::new(false);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
 static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 
+/// ファイル掴みドラッグ越境: ドラッグペーストボードにファイルがあり左ボタン押下中
+/// (= Finder 等のファイルを掴んでいる)true。境界切替の許可と切替時の送信に使う
+static DRAG_FILE: AtomicBool = AtomicBool::new(false);
+/// 掴んでいるファイルのパス群(DRAG_FILE=true の間だけ有効)
+static DRAG_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
+/// 合成 LeftMouseUp(kCGEventSourceUserData=41)に刻む識別マジック。
+/// 掴み切替直後の Mac 側ドラッグ完結用投稿であり、Win へ転送してはならない
+const SYNTH_UP_MAGIC: i64 = 0x54554e41475550; // "TSUNAGUP" 的な一意値
+
 /// SIDE(0=右/1=左/2=上/3=下/4=右上/5=右下/6=左上/7=左下)を文字列表現で
 pub fn side_name() -> &'static str {
     match SIDE.load(Ordering::Relaxed) {
@@ -710,7 +754,7 @@ pub fn set_side(v: u8) {
     send_msg(&Msg::Cfg {
         cmd_alt: CMD_ALT.load(Ordering::Relaxed),
         spk_mute: SPK_MUTE.load(Ordering::Relaxed),
-        side: v.min(3),
+        side: v,
     });
     eprintln!("[cfg] Windows の位置 -> {}", side_name());
 }
@@ -1079,7 +1123,9 @@ unsafe extern "C" fn tap_callback(
         // Mac モード: 右端到達で Windows モードへ。
         // Deskflow onMouseMove 準拠: イベント位置はキュー滞留で数フレーム遅れるため、
         // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
-        let drag_ok = DRAG_SWITCH.load(Ordering::Relaxed);
+        // ファイル掴み中(ドラッグペーストボードにファイル+左ボタン押下)は設定に
+        // 依らず常に「掴んだまま境界越え」を許可する(掴んでいる意図が明確なため)
+        let drag_ok = DRAG_SWITCH.load(Ordering::Relaxed) || DRAG_FILE.load(Ordering::Relaxed);
         if (matches!(event_type, EVT_MOUSE_MOVED)
             || (drag_ok
                 && matches!(event_type, EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)))
@@ -1205,9 +1251,12 @@ unsafe extern "C" fn tap_callback(
 
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
                     // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
-                    // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験
-                    if event_type != EVT_MOUSE_MOVED {
-                        if DRAG_SWITCH.load(Ordering::Relaxed) {
+                    // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験。
+                    // 掴みドラッグ中は EVT_MOUSE_MOVED 由来の切替でも持ち込む
+                    // (押下直後の軽い移動は MOVED として届くことがある=実測。
+                    // 持ち込み漏れは Win 側のフォールバックを誘発する)
+                    if event_type != EVT_MOUSE_MOVED || DRAG_FILE.load(Ordering::Relaxed) {
+                        if drag_ok {
                             for b in 0u8..=2 {
                                 if BTN_DOWN[b as usize].load(Ordering::Relaxed) {
                                     send_msg(&Msg::MouseButton { btn: b, down: true });
@@ -1218,6 +1267,40 @@ unsafe extern "C" fn tap_callback(
                                 send_msg(&Msg::MouseButton { btn: b, down: false });
                             }
                         }
+                    }
+                    // ファイル掴み切替: 掴んだファイルを Windows へ流し、Mac 側の
+                    // ドラッグは合成 LeftMouseUp で完結させる(Finder の宙吊り防止)。
+                    // UP は tap コールバック内で post できないため別スレッド投稿。
+                    // 投稿イベントは自分の HID タップを再通過する(定番の再帰問題)ため
+                    // kCGEventSourceUserData にマジックを刻み、tap 側で識別して
+                    // 「Mac へ素通し・Windows へは転送しない」処理をする(転送すると
+                    // 押したままのユーザー意図に反して Win 側が離した扱いになる)
+                    if DRAG_FILE.swap(false, Ordering::Relaxed) {
+                        let files = std::mem::take(&mut *DRAG_FILES.lock().unwrap_or_else(|e| e.into_inner()));
+                        if !files.is_empty() {
+                            // ⌘C ポーリング経由の再送を指紋で抜く(通常は載らないが保険)
+                            let key = mac_files_key(&files);
+                            *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                            eprintln!("[file] 掴みドラッグ切替: {} 件を転送します", files.len());
+                            send_files_to_win(files, true);
+                        }
+                        std::thread::spawn(|| {
+                            std::thread::sleep(Duration::from_millis(60));
+                            unsafe {
+                                let pos = live_cursor().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
+                                let e = CGEventCreateMouseEvent(
+                                    std::ptr::null_mut(),
+                                    3, // kCGEventLeftMouseUp
+                                    pos,
+                                    0, // kCGMouseButtonLeft
+                                );
+                                if !e.is_null() {
+                                    CGEventSetIntegerValueField(e as CGEventRef, 41, SYNTH_UP_MAGIC);
+                                    CGEventPost(0 /* kCGHIDEventTap */, e);
+                                    CFRelease(e as *mut core::ffi::c_void);
+                                }
+                            }
+                        });
                     }
                     // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
                     // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
@@ -1408,6 +1491,15 @@ unsafe extern "C" fn tap_callback(
             // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
         }
         EVT_LEFT_DOWN | EVT_LEFT_UP => {
+            // 自分が投稿した合成 LeftMouseUp(掴み切替直後の Mac 側ドラッグ完結用)。
+            // Mac へ素通しし Win へは転送しない(ユーザーはまだ押している)
+            if event_type == EVT_LEFT_UP
+                && CGEventGetIntegerValueField(event, 41 /* kCGEventSourceUserData */)
+                    == SYNTH_UP_MAGIC
+            {
+                BTN_DOWN[0].store(false, Ordering::Relaxed);
+                return event;
+            }
             // Mac 流「Ctrl+クリック=右クリック」は TSUNAGU_CTRL_CLICK=1 のみ
             // (既定 OFF。右クリックは 2本指クリックが本体操作)
             let btn = if ctrl && CTRL_CLICK.load(Ordering::Relaxed) { 1u8 } else { 0 };
@@ -1499,11 +1591,21 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-035437-f5fdf0b";
+const BUILD_ID: &str = "build-20260926-143854-049c56c";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--preview-ui") {
+        gui::UI_PREVIEW.store(true, Ordering::Relaxed);
+        if gui::start() {
+            gui::SHOW_AT_START.store(true, Ordering::Relaxed);
+            unsafe { gui::run_app() };
+        }
+        return;
+    }
+    gui::restore_preferences();
+
     let _host = args
         .iter()
         .position(|a| a == "--host")
@@ -1595,7 +1697,7 @@ fn main() {
     }
     if let Some(k) = std::env::var("TSUNAGU_HOTKEY_KC").ok().and_then(|v| v.parse::<i64>().ok()) {
         if (1..=127).contains(&k) {
-            let _ = HOTKEY_KC.set(k);
+            HOTKEY_KC.store(k, Ordering::Relaxed);
         }
     }
     // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
@@ -1921,7 +2023,7 @@ fn main() {
                     if !dup {
                         *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
                         eprintln!("[file] クリップボードのファイル {} 件を検出", files.len());
-                        send_files_to_win(files);
+                        send_files_to_win(files, false);
                     }
                 }
                 continue;
@@ -1932,6 +2034,51 @@ fn main() {
             }
             eprintln!("[clip] mac->win {} bytes", text.len());
             send_msg(&Msg::Clip { text });
+        }
+    });
+
+    // ファイル掴み検出(Mac→Windows の掴みドラッグ越境): ドラッグ用ペーストボードに
+    // ファイル参照が載っており左ボタン押下中 = Finder 等でファイルを掴んでいる。
+    // 「押下開始時点からの changeCount 変化」を条件にする(ドラッグ開始で初めて
+    // ファイルが載るため)。押下前に載っていた残骸(キャンセル済みドラッグ等は
+    // クリアされないことがある=実測)での誤検出を構造的に防ぐ
+    std::thread::spawn(|| {
+        // None=非押下。Some(cnt)=押下中の基準値(押下開始時点の changeCount)
+        let mut baseline: Option<isize> = None;
+        loop {
+            std::thread::sleep(Duration::from_millis(120));
+            if !BTN_DOWN[0].load(Ordering::Relaxed) {
+                if DRAG_FILE.swap(false, Ordering::Relaxed) {
+                    eprintln!("[file] 掴み終了(ボタンを離した)");
+                }
+                baseline = None;
+                continue;
+            }
+            if DRAG_FILE.load(Ordering::Relaxed) {
+                continue; // 掴み確立済み(切替は tap 側が担う)
+            }
+            unsafe {
+                let pb = drag_pasteboard();
+                if pb.is_null() {
+                    continue;
+                }
+                let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
+                match baseline {
+                    None => {
+                        // 押下開始直後: 現在値を基準に取る(残骸では検出しない)
+                        baseline = Some(cnt);
+                    }
+                    Some(b) if cnt != b => {
+                        baseline = Some(cnt);
+                        if let Some(files) = pb_files(pb) {
+                            DRAG_FILES.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&files);
+                            DRAG_FILE.store(true, Ordering::Relaxed);
+                            eprintln!("[file] ファイル掴み検出: {} 件", files.len());
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
     });
 

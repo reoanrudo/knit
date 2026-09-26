@@ -98,7 +98,7 @@ pub mod proto {
     use serde::{Deserialize, Serialize};
 
     pub const PORT: u16 = 24900;
-    pub const VERSION: u32 = 7; // 7: Key に翻訳済みフラグ(tr)追加
+    pub const VERSION: u32 = 8; // 8: ファイル掴みドラッグ越境(FileDropBegin/End)追加
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
     #[serde(tag = "t")]
@@ -199,6 +199,15 @@ pub mod proto {
         /// 受信側はこの時点でクリップボードへファイル参照を載せ通知する
         #[serde(rename = "file_batch_end")]
         FileBatchEnd,
+        /// ファイル掴みドラッグ越境の開始合図。Mac が Finder 等のファイルドラッグ
+        /// 中に境界を越えた時に FileBegin 群の前に送る。受信側は続くファイル群を
+        /// 「ドロップ用」(クリップボードではなく OLE ドラッグで渡す)と扱う
+        #[serde(rename = "file_drop_begin")]
+        FileDropBegin,
+        /// ファイル掴みドラッグ越域の転送完了合図(FileBatchEnd の後)。
+        /// 受信側はこの時点で押下中ボタンの継続を前提に DoDragDrop を開始する
+        #[serde(rename = "file_drop_end")]
+        FileDropEnd,
         #[serde(rename = "bye")]
         Bye,
     }
