@@ -214,3 +214,20 @@ Deskflow 標準機能の搭載と、ユーザー体験重視の議論に基づ�
 - Mac→Win 方向の画像(TIFF→DIB 変換は GDI+ デコードが必要で保留)
 - スクリーンセーバー同期、TLS 暗号化(Deskflow 機能のうち価値の低い/ネットワークが既に Tailscale 暗号化のため後回し)
 - LaunchAgent 常駐化、メニューバーUI
+
+## 追記(2026-09-26 第11セッション: 改善ループ401〜412)
+
+v0.23.0(3 経路+暗号化)の実機配備検証と、接続経路の LAN 直優先化:
+
+| ループ | 内容 |
+|---|---|
+| 401〜403 | v0.23.0 の実機配備と検証。verify.sh 全項目 pass |
+| 404 | verify.sh の Mac→Win ファイル試験が osascript の型ゼロ空ペーストボードを掴む問題を修正(Swift writeObjects 方式) |
+| 405〜406 | 通信改善のブレインストーミング: B「RTT 品質監視」(不採択)→ A「LAN 直優先」設計へ差し替え |
+| 407 | 機能別品質向上プロンプト集(docs/feature-quality-prompts.md) |
+| 408〜412 | LAN 直優先の実装: discover::seek_first(最初の応答 or 600ms)、接続候補を「LAN 発見 ∪ TSUNAGU_HOST」へ併合(発見優先・重複排除。旧 seek/seek_lan は削除)、Mac 待受を 0.0.0.0 へ。プロトコル変更なし(版 11 のまま) |
+
+実機確認(2026-09-26 17:14 配備後): 本線・音声・bulk の 3 経路すべてが
+192.168.0.2 → 192.168.0.1 の LAN 直(Windows 配備前の過渡期は Tailscale 経由で、
+配備後の再接続で自動切替)。verify.sh pass=17 fail=0。
+Tailscale の DERP 中継へ落ちても tsunagu の通信品質に影響しなくなった。
