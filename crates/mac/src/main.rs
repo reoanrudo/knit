@@ -2155,6 +2155,24 @@ fn main() {
                                 Err(_) => break,
                             }
                         }
+                    } else {
+                        // mouse_abs は束ねない代わりに、キューに連なる古い位置を
+                        // 最新 1 件へ間引く(遅延バースト後の古い位置の逐次再生=
+                        // カクつきの防止)。move 以外の行は順序保存のため追記して終える
+                        while total <= 256 * 1024 {
+                            match rx.try_recv() {
+                                Ok(next) if next.starts_with("{\"t\":\"mouse_abs\"") => {
+                                    buf = next; // 古い位置は捨てて最新だけ送る
+                                    total = buf.len();
+                                }
+                                Ok(next) => {
+                                    total += next.len();
+                                    buf.push_str(&next);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
                     }
                     let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = guard.as_mut() {
