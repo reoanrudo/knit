@@ -411,7 +411,9 @@ pub mod secure {
         fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
             while self.pos >= self.plain.len() {
                 read_rec(&mut self.s, &mut self.cipher)?;
-                self.plain.resize(MAX_MSG, 0);
+                // 復号出力は暗号文長−タグ分に収まるため cipher 長だけで足りる。
+                // MAX_MSG(64KB)のゼロフィルは毎レコードの無駄なメモリ書き込みになる
+                self.plain.resize(self.cipher.len(), 0);
                 let n = self.st.read_message(self.nonce, &self.cipher, &mut self.plain).map_err(invalid)?;
                 self.nonce += 1;
                 self.plain.truncate(n);
