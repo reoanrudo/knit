@@ -27,9 +27,9 @@ done
 echo "[restart-mac] restarting (switch_mode=$SWITCH_MODE)..."
 pkill -9 -f "target/release/tsunagu-mac" 2>/dev/null || true
 sleep 1
-# 待受を Tailscale IF に限定(取得失敗時は 0.0.0.0 + ピア範囲判定で防御)
-BIND_IP=$(tailscale ip -4 2>/dev/null | head -1)
-[ -z "$BIND_IP" ] && BIND_IP="0.0.0.0"
+# 全 IF で待受ける(LAN 直を受け入れる)。Tailscale IP へ束ねると LAN からの直接が届かない。
+# 接続元の防御は is_allowed(LAN/直結/Tailscale 絞り)+ Noise ハンドシェイクが担う
+BIND_IP="0.0.0.0"
 TSUNAGU_BIND=$BIND_IP TSUNAGU_SWITCH_MODE=$SWITCH_MODE nohup ./target/release/tsunagu-mac $ARGS > /tmp/tsunagu-mac.log 2>&1 &
 disown
 sleep 4
