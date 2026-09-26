@@ -837,17 +837,49 @@ pub mod bulk {
         sink: Sink,
         paths: Vec<PathBuf>,
         drop: bool,
+        /// 接続(=Receiver の寿命)あたりの累積書き込みバイト。送信側の MAX_TOTAL
+        /// と同じ上限を検査側にも置く(正トークンの悪意ピアによるディスク消費攻撃対策)
+        written: u64,
+        limit: u64,
+        /// 上限超過後はバッチを問わず受け付けない(FILE_BEGIN の連打で上限を
+        /// 回避できないようにする)
+        tainted: bool,
     }
 
     impl Receiver {
         pub fn new(dir: &Path) -> Self {
-            Self { dir: dir.to_path_buf(), sink: Sink::None, paths: Vec::new(), drop: false }
+            Self {
+                dir: dir.to_path_buf(),
+                sink: Sink::None,
+                paths: Vec::new(),
+                drop: false,
+                written: 0,
+                limit: MAX_TOTAL,
+                tainted: false,
+            }
+        }
+
+        /// テスト用: 上限を縮小する
+        #[cfg(test)]
+        pub fn set_limit_for_test(&mut self, v: u64) {
+            self.limit = v;
+        }
+
+        /// 書き込み途中のファイルを破棄する(Drop から呼ぶ。完了済みは残す)
+        fn discard_open_file(&mut self) {
+            self.sink = Sink::None;
+            if let Some(p) = self.paths.pop() {
+                let _ = std::fs::remove_file(p);
+            }
         }
 
         pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
             match kind {
                 DROP_BEGIN => self.drop = true,
                 FILE_BEGIN => {
+                    if self.tainted {
+                        return None;
+                    }
                     self.sink = Sink::None;
                     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
                     let name = v["name"].as_str().unwrap_or("file");
@@ -863,12 +895,15 @@ pub mod bulk {
                     Sink::File { f, remain } => {
                         // 宣言サイズを超える・書けないデータは、そのファイルごと破棄する
                         if body.len() as u64 > *remain || f.write_all(body).is_err() {
-                            self.sink = Sink::None;
-                            if let Some(p) = self.paths.pop() {
-                                let _ = std::fs::remove_file(p);
-                            }
+                            self.discard_open_file();
                         } else {
                             *remain -= body.len() as u64;
+                            self.written += body.len() as u64;
+                            // 接続あたりの合計上限(送信側と同じ 200MB)を検査側にも置く
+                            if self.written > self.limit {
+                                self.tainted = true;
+                                self.discard_open_file();
+                            }
                         }
                     }
                     Sink::Image { data, remain } => {
@@ -885,9 +920,7 @@ pub mod bulk {
                     // 途中で切れた(宣言サイズに満たない)ファイルは残さない
                     if let Sink::File { remain, .. } = &self.sink {
                         if *remain > 0 {
-                            if let Some(p) = self.paths.pop() {
-                                let _ = std::fs::remove_file(p);
-                            }
+                            self.discard_open_file();
                         }
                     }
                     self.sink = Sink::None;
@@ -915,6 +948,16 @@ pub mod bulk {
                 _ => {}
             }
             None
+        }
+    }
+
+    impl Drop for Receiver {
+        /// 切断(接続断)時に書き込み途中のファイルが受信フォルダへ残留するのを防ぐ。
+        /// 完了済み(BATCH_END を迎えた)ファイルは保持する
+        fn drop(&mut self) {
+            if !matches!(self.sink, Sink::None) {
+                self.discard_open_file();
+            }
         }
     }
 
@@ -1390,6 +1433,64 @@ mod tests {
         assert_eq!(media_vk(0), None); // 音量 up は対象外
         assert_eq!(media_vk(2), None);
         assert_eq!(media_vk(6), None);
+    }
+
+    /// 受信側の合計上限: 超過で破棄し、以降の FILE_BEGIN も受け付けない
+    #[test]
+    fn bulk_receiver_caps_total_and_taints() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-cap-{}", std::process::id()));
+        let mut rx = Receiver::new(&base);
+        rx.set_limit_for_test(1_000);
+        // 600B × 2 ファイルで 1,200B > 上限 1,000B
+        for i in 0..2 {
+            rx.feed(FILE_BEGIN, format!("{{\"name\":\"c{i}.bin\",\"size\":600}}").as_bytes());
+            rx.feed(DATA, &[0u8; 600]);
+            rx.feed(FILE_END, &[]);
+        }
+        // 1 本目(600B)は正当に完了しているため、イベントは 1 件だけ返る
+        match rx.feed(BATCH_END, &[]) {
+            Some(Event::Files { paths, .. }) => {
+                assert_eq!(paths.len(), 1, "超過分を除いた 1 件のみ: {paths:?}");
+            }
+            _ => panic!("1 本目の完了イベントが出るべき"),
+        }
+        assert!(base.join("c0.bin").exists(), "上限内の 1 本目は保持");
+        assert!(!base.join("c1.bin").exists(), "2 本目(超過分)は破棄");
+        // 1 本目は上限内で完了済みでも、tainted 後の新しいバッチは拒否
+        let mut rx2 = Receiver::new(&base);
+        rx2.set_limit_for_test(1_000);
+        rx2.feed(FILE_BEGIN, br#"{"name":"x.bin","size":600}"#);
+        rx2.feed(DATA, &[0u8; 600]);
+        rx2.feed(FILE_END, &[]);
+        assert!(rx2.feed(BATCH_END, &[]).is_some());
+        rx2.feed(FILE_BEGIN, br#"{"name":"y.bin","size":600}"#);
+        rx2.feed(DATA, &[0u8; 600]);
+        rx2.feed(FILE_END, &[]);
+        rx2.feed(FILE_BEGIN, br#"{"name":"z.bin","size":1}"#);
+        rx2.feed(DATA, b"z");
+        rx2.feed(FILE_END, &[]);
+        assert!(rx2.feed(BATCH_END, &[]).is_none(), "累積上限後の後続バッチも拒否");
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 切断(Drop)時に書き込み途中のファイルを破棄し、完了済みは残す
+    #[test]
+    fn bulk_receiver_discards_partial_on_drop() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-drop-{}", std::process::id()));
+        let mut rx = Receiver::new(&base);
+        // 1 件目は完了、2 件目は DATA 途中で切断
+        rx.feed(FILE_BEGIN, br#"{"name":"done.bin","size":3}"#);
+        rx.feed(DATA, b"abc");
+        rx.feed(FILE_END, &[]);
+        assert!(rx.feed(BATCH_END, &[]).is_some());
+        rx.feed(FILE_BEGIN, br#"{"name":"half.bin","size":100}"#);
+        rx.feed(DATA, &[0u8; 10]);
+        drop(rx); // ここで切断
+        assert!(base.join("done.bin").exists(), "完了済みは残す");
+        assert!(!base.join("half.bin").exists(), "書き込み途中は破棄");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// 進捗コールバック: 単調非減少・最終値が合計に一致・チャンク毎に呼ばれる
