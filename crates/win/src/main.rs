@@ -1321,6 +1321,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             println!("[disc] {e}");
         }
         CONNECTED.store(false, Ordering::Relaxed);
+        RTT_MS.store(0, Ordering::Relaxed);
         *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
         BULK_LINK.clear();
         audio::speaker_disconnect();
@@ -1358,6 +1359,8 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(pre, writer);
     CONNECTED.store(false, Ordering::Relaxed);
+    // 旧セッションの RTT が再接続直後に「前の接続の値」として表示されるのを防ぐ
+    RTT_MS.store(0, Ordering::Relaxed);
     // 旧セッションの送信チャネルを外す(切断中にトレイ等が旧ソケットへ書き込むのを防ぐ)
     *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
     BULK_LINK.clear();
