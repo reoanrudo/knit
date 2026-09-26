@@ -349,10 +349,9 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
 }
 
 /// 音声受信サーバ(独立スレッド)。24901 で待ち受け、認証後に PCM を受け流す
-pub fn start(token: String) {
+pub fn start(token: String, port: u16) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read, Write};
-        let port: u16 = 24901;
         let bind_ip = crate::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
             Ok(l) => l,

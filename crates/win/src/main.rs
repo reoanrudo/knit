@@ -1091,8 +1091,8 @@ fn main() {
     if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
         // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
         match (tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"), role_server) {
-            (Some(h), _) => audio::start(Some(h), token.clone()),
-            (None, false) => audio::start(None, token.clone()),
+            (Some(h), _) => audio::start(Some(h), token.clone(), port),
+            (None, false) => audio::start(None, token.clone(), port),
             (None, true) => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
         }
     }
@@ -1126,7 +1126,7 @@ fn main() {
     std::thread::spawn(move || {
         bulk::connect_loop(
             bulk_ep,
-            || peer_ip().map(|ip| std::net::SocketAddr::new(ip, PORT + bulk::PORT_OFFSET)),
+            || peer_ip().map(|ip| std::net::SocketAddr::new(ip, port + bulk::PORT_OFFSET)),
             || CONNECTED.load(Ordering::Relaxed),
         )
     });

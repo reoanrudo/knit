@@ -1000,7 +1000,7 @@ pub mod bulk {
     /// 接続先は本線がいま使っている相手(複数経路のどれで繋がったか)に追従する
     pub fn connect_loop(
         ep: &'static Endpoint,
-        addr: fn() -> Option<std::net::SocketAddr>,
+        addr: impl Fn() -> Option<std::net::SocketAddr>,
         main_up: fn() -> bool,
     ) {
         let mut last_keepalive = std::time::Instant::now();

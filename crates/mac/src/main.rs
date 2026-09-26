@@ -2195,7 +2195,7 @@ fn main() {
 
     // 音声受信・再生(Windows→Mac。独立ポート 24901。TSUNAGU_AUDIO=0 で無効)
     if envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
-        audio::start(token.clone());
+        audio::start(token.clone(), port);
     }
 
     // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。TSUNAGU_ROLE=client +
@@ -2225,7 +2225,7 @@ fn main() {
                 bulk_ep,
                 || {
                     let ip = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
-                    ip.map(|ip| std::net::SocketAddr::new(ip, PORT + bulk::PORT_OFFSET))
+                    ip.map(|ip| std::net::SocketAddr::new(ip, port + bulk::PORT_OFFSET))
                 },
                 || CONNECTED.load(Ordering::Relaxed),
             )

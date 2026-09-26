@@ -338,11 +338,11 @@ fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
 /// 音声送信スレッド本体: キャプチャ初期化→Mac:24901 へ接続→ストリーミング。
 /// 切断/デバイス失効時は 2 秒後に全体をやり直す
 /// host=None は本線の接続先(複数経路のうち繋がったもの)へ追従する
-fn audio_run(fixed_host: Option<String>, token: String) {
+fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
     unsafe {
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
     }
-    println!("[audio] 開始(→{}:24901)", fixed_host.as_deref().unwrap_or("本線の接続先"));
+    println!("[audio] 開始(→{}:{port})", fixed_host.as_deref().unwrap_or("本線の接続先"));
     loop {
         let mut cap = unsafe {
             match capture_open() {
@@ -358,7 +358,7 @@ fn audio_run(fixed_host: Option<String>, token: String) {
         // 接続に失敗するたび PEER を引き直す(本線の再接続で Mac の IP が変わった後、
         // 旧アドレスへ無言で無限リトライして音声だけ復帰しないのを防ぐ)
         let fixed_addr = match &fixed_host {
-            Some(h) => match (h.as_str(), 24901u16).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+            Some(h) => match (h.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next()) {
                 Some(a) => Some(a),
                 None => {
                     println!("[audio] ホスト解決失敗: {h}");
@@ -371,7 +371,7 @@ fn audio_run(fixed_host: Option<String>, token: String) {
             let addr = match fixed_addr {
                 Some(a) => a,
                 None => match crate::peer_ip() {
-                    Some(ip) => std::net::SocketAddr::new(ip, 24901),
+                    Some(ip) => std::net::SocketAddr::new(ip, port),
                     None => {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         continue;
@@ -472,9 +472,9 @@ fn audio_run(fixed_host: Option<String>, token: String) {
 }
 
 /// 音声送信を開始(別スレッド)
-pub fn start(host: Option<String>, token: String) {
+pub fn start(host: Option<String>, token: String, port: u16) {
     AUDIO_ACTIVE.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || audio_run(host, token));
+    std::thread::spawn(move || audio_run(host, token, port));
 }
 
 // ---------- スピーカーミュート(音声出力の集中) ----------
