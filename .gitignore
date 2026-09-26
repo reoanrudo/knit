@@ -3,3 +3,4 @@ target/
 .env
 dist/
 *.exe
+win-dist/.env
