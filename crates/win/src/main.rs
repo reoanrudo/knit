@@ -193,15 +193,21 @@ fn clipboard_seq() -> u32 {
 }
 
 /// パスワードマネージャ等が「監視・共有しないで」と付ける登録形式があるか
-/// (KeePass/1Password/Bitwarden 等が付ける Windows の慣行)
+/// (KeePass/1Password/Bitwarden 等が付ける Windows の慣行)。
+/// 形式 ID の登録は不変のため 1 回だけ行いキャッシュする
 fn clipboard_is_excluded() -> bool {
-    ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"].iter().any(|n| {
-        let w: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
-        unsafe {
-            let fmt = RegisterClipboardFormatW(w.as_ptr());
-            fmt != 0 && IsClipboardFormatAvailable(fmt) != 0
-        }
-    })
+    static FMTS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    let fmts = FMTS.get_or_init(|| {
+        ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"]
+            .iter()
+            .filter_map(|n| {
+                let w: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+                let fmt = unsafe { RegisterClipboardFormatW(w.as_ptr()) };
+                (fmt != 0).then_some(fmt)
+            })
+            .collect()
+    });
+    fmts.iter().any(|&f| unsafe { IsClipboardFormatAvailable(f) } != 0)
 }
 
 /// Mac へ制御が戻る時に Windows のクリップボードを渡す(Deskflow と同じ「画面を
