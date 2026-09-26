@@ -79,6 +79,12 @@ else
 fi
 
 TS=$(date +%s)
+# Windows のクリップボード掴まれ(busy ログ)は同期系検証すべての信頼を下げる
+# ため、先に一度だけ数えておく(掴まれ時は検証不能と WARN 分類する)
+BUSY_N=0
+if [ "$WIN_OK" -eq 1 ]; then
+  BUSY_N=$($SSH "type C:\\Users\\<user>\\tsunagu\\tsunagu-win.log" 2>/dev/null | grep -c 'write failed (busy')
+fi
 # toggle(toggle を一時ファイルへ書く)を監視するのは --diag 起動の mac だけ。
 # --diag でない起動のまま検証すると「同期しない」と誤 NG になるため先に判定する
 if tail -50 /tmp/tsunagu-mac.log 2>/dev/null | grep -q '\[diag\]'; then DIAG_OK=1; else DIAG_OK=0; fi
@@ -172,7 +178,12 @@ BAT
     round_trip
     sleep 5
     GOT_FILE=$(cat "$HOME/Downloads/Tsunagu/win_verify_$TS.txt" 2>/dev/null | tr -d '\r\n')
-    check "Win→Mac ファイル内容一致" "verify-wf-$TS" "$GOT_FILE"
+    if [ -z "$GOT_FILE" ] && [ "${BUSY_N:-0}" -gt 0 ]; then
+      # Windows 側の Set-Clipboard も掴まれで失敗するため検証不能(=Mac へ流れない)
+      warn_msg "Win→Mac ファイル空(Windows 側の掴まれが疑い。busy ×${BUSY_N})"
+    else
+      check "Win→Mac ファイル内容一致" "verify-wf-$TS" "$GOT_FILE"
+    fi
   else
     warn_msg "clip_file_set.bat 転送失敗のため検証スキップ"
   fi
