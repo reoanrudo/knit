@@ -1944,7 +1944,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260926-171337-f561628";
+const BUILD_ID: &str = "build-20260926-234834-0da65e5";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -2221,7 +2221,8 @@ fn main() {
 
     // 音声受信・再生(Windows→Mac。独立ポート 24901。TSUNAGU_AUDIO=0 で無効)
     if envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
-        audio::start(token.clone(), port);
+        // 音声は本線ポートからの差分 +1(24900→24901)
+        audio::start(token.clone(), port + 1);
     }
 
     // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。TSUNAGU_ROLE=client +

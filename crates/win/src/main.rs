@@ -1056,7 +1056,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260926-171359-f561628";
+const BUILD_ID: &str = "win-20260926-234858-0da65e5";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1157,8 +1157,9 @@ fn main() {
     if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
         // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
         match (tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"), role_server) {
-            (Some(h), _) => audio::start(Some(h), token.clone(), port),
-            (None, false) => audio::start(None, token.clone(), port),
+            // 音声は本線ポートからの差分 +1(24900→24901)
+            (Some(h), _) => audio::start(Some(h), token.clone(), port + 1),
+            (None, false) => audio::start(None, token.clone(), port + 1),
             (None, true) => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
         }
     }
