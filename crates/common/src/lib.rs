@@ -338,6 +338,44 @@ pub mod net {
     }
 }
 
+pub mod connect {
+    //! 複数の接続候補(有線直結・LAN・Tailscale 等)へ同時に接続を試み、最初に
+    //! 繋がったものを使う。遅延の小さい経路ほど早く繋がるため、自然に最速経路が選ばれ、
+    //! 一つが使えなくなっても次回の接続で別経路へ切り替わる
+    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    /// "host1,host2:port" のようなカンマ区切りを解決する(ポート省略時は既定ポート)
+    pub fn parse_hosts(list: &str, port: u16) -> Vec<SocketAddr> {
+        list.split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .flat_map(|h| {
+                let with_port = if h.contains(':') && !h.starts_with('[') && h.matches(':').count() == 1 {
+                    h.to_string()
+                } else {
+                    format!("{h}:{port}")
+                };
+                with_port.to_socket_addrs().ok().and_then(|mut it| it.next())
+            })
+            .collect()
+    }
+
+    pub fn first_reachable(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for a in addrs.iter().copied() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
+                    let _ = tx.send((s, a));
+                }
+            });
+        }
+        drop(tx);
+        rx.recv_timeout(timeout + Duration::from_millis(500)).ok()
+    }
+}
+
 pub mod bulk {
     //! 大容量データ(ファイル・画像)専用の経路。本線(入力・制御の JSON Lines)と
     //! 別の TCP 接続に分けることで、転送中もマウス・キー・ping が詰まらない
@@ -668,8 +706,13 @@ pub mod bulk {
         }
     }
 
-    /// 接続側: 本線が繋がっている間、大容量経路が無ければ張り直し、キープアライブを送る
-    pub fn connect_loop(ep: &'static Endpoint, addr: std::net::SocketAddr, main_up: fn() -> bool) {
+    /// 接続側: 本線が繋がっている間、大容量経路が無ければ張り直し、キープアライブを送る。
+    /// 接続先は本線がいま使っている相手(複数経路のどれで繋がったか)に追従する
+    pub fn connect_loop(
+        ep: &'static Endpoint,
+        addr: fn() -> Option<std::net::SocketAddr>,
+        main_up: fn() -> bool,
+    ) {
         let mut last_keepalive = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
@@ -684,6 +727,7 @@ pub mod bulk {
                 }
                 continue;
             }
+            let Some(addr) = addr() else { continue };
             let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) else {
                 continue;
             };
@@ -1064,8 +1108,9 @@ mod tests {
             log: |_| {},
         });
         std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true));
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        std::thread::spawn(move || connect_loop(client, addr, || true));
+        static ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
+        let addr = *ADDR.get_or_init(|| format!("127.0.0.1:{port}").parse().unwrap());
+        std::thread::spawn(move || connect_loop(client, || ADDR.get().copied(), || true));
         let t0 = std::time::Instant::now();
         while !CLIENT_LINK.is_up() && t0.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1084,6 +1129,23 @@ mod tests {
         let mut bad = std::net::TcpStream::connect(addr).unwrap();
         assert!(client_handshake(&mut bad, "wrong").is_err());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn connect_picks_a_reachable_candidate() {
+        use super::connect::*;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let good = l.local_addr().unwrap();
+        // 閉じたポート(候補の 1 つ目)があっても、繋がる候補が選ばれる
+        let dead = {
+            let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            t.local_addr().unwrap()
+        };
+        let addrs = parse_hosts(&format!("127.0.0.1:{}, 127.0.0.1:{}", dead.port(), good.port()), 1);
+        assert_eq!(addrs.len(), 2);
+        let (_, picked) = first_reachable(&addrs, std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(picked, good);
+        assert_eq!(parse_hosts("127.0.0.1", 24900)[0].port(), 24900);
     }
 
     #[test]

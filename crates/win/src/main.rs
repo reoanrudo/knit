@@ -938,11 +938,11 @@ fn main() {
     // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
     // (サーバモードは TSUNAGU_AUDIO_HOST で明示指定した時のみ)
     if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
-        let audio_host = tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST")
-            .or_else(|| if role_server { None } else { Some(host.clone()) });
-        match audio_host {
-            Some(h) => audio::start(h, token.clone()),
-            None => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
+        // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
+        match (tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"), role_server) {
+            (Some(h), _) => audio::start(Some(h), token.clone()),
+            (None, false) => audio::start(None, token.clone()),
+            (None, true) => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
         }
     }
 
@@ -967,35 +967,46 @@ fn main() {
         return;
     }
 
-    use std::net::ToSocketAddrs;
-    let addr = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next());
-    let addr = match addr {
-        Some(a) => a,
-        None => {
-            eprintln!("[fatal] invalid host");
-            exit(1);
-        }
-    };
-    println!("[info] client mode: connecting to {host}:{port}");
-    let mut bulk_addr = addr;
-    bulk_addr.set_port(port + bulk::PORT_OFFSET);
-    std::thread::spawn(move || bulk::connect_loop(bulk_ep, bulk_addr, || CONNECTED.load(Ordering::Relaxed)));
-    client_loop(&addr, &token, w, h);
+    let addrs = tsunagu_common::connect::parse_hosts(&host, port);
+    if addrs.is_empty() {
+        eprintln!("[fatal] invalid host: {host}");
+        exit(1);
+    }
+    println!("[info] client mode: connecting to {addrs:?}");
+    std::thread::spawn(move || {
+        bulk::connect_loop(
+            bulk_ep,
+            || peer_ip().map(|ip| std::net::SocketAddr::new(ip, PORT + bulk::PORT_OFFSET)),
+            || CONNECTED.load(Ordering::Relaxed),
+        )
+    });
+    client_loop(&addrs, &token, w, h);
 }
 
 /// 接続モード(既定): 相手(Mac)へ接続し続ける。切断は指数バックオフで再接続
-fn client_loop(addr: &std::net::SocketAddr, token: &str, w: i32, h: i32) {
+/// 本線がいま繋がっている Mac のアドレス(大容量経路・音声はここへ追従する)
+static PEER: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
+
+pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
+    *PEER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 接続モード(既定): 候補(TSUNAGU_HOST のカンマ区切り)へ同時に接続を試み、
+/// 最初に繋がった経路を使う。切断は指数バックオフで再接続
+fn client_loop(addrs: &[std::net::SocketAddr], token: &str, w: i32, h: i32) {
     let mut backoff = 500u64;
     loop {
-        match std::net::TcpStream::connect_timeout(addr, Duration::from_secs(3)) {
-            Ok(s) => {
-                println!("[conn] connected");
+        match tsunagu_common::connect::first_reachable(addrs, Duration::from_secs(3)) {
+            Some((s, a)) => {
+                println!("[conn] connected ({a})");
+                *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
+                *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
                 if let Err(e) = client_session(s, token, w, h) {
                     println!("[disc] {e}");
                 }
                 backoff = 500;
             }
-            Err(e) => println!("[conn] failed: {e}"),
+            None => println!("[conn] failed: どの接続先にも繋がりません"),
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);
@@ -1138,7 +1149,7 @@ fn session(stream: TcpStream) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
     // 読み出しタイムアウト: Mac は3秒毎に ping を送るため 12秒無音は経路断。
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
-    stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
+    stream.set_read_timeout(Some(Duration::from_secs(9))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
@@ -1167,6 +1178,21 @@ fn session(stream: TcpStream) -> std::io::Result<()> {
 
     // (旧heartbeatスレッドは削除: ソケット生死は read のエラーで判定し、
     //  接続監視は Mac 側の ping/pong が担うため不要だった)
+
+    // Windows 側からも 3 秒毎に ping を送る(Mac の再起動・スリープで経路が死んだ時、
+    // 書き込み失敗として早く気づく。受信側は 9 秒=3 回分の無通信で切断扱い)
+    {
+        let tx = wtx.clone();
+        let running = running.clone();
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(3));
+                if tx.send(encode(&Msg::Ping { ts: 0 })).is_err() {
+                    break;
+                }
+            }
+        });
+    }
 
     // 画面構成(解像度・モニター抜き差し)の変化を 2 秒毎に確認し Mac へ知らせる
     // (Mac 側の速度換算と端の判定が古い大きさのままになるのを防ぐ)

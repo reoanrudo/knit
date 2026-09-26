@@ -668,6 +668,36 @@ fn mac_on_bulk(e: bulk::Event) {
     })
 }
 
+/// 本線がいま繋がっている Windows のアドレス(大容量経路の接続先・経路診断に使う)
+static PEER_IP: Mutex<Option<std::net::IpAddr>> = Mutex::new(None);
+
+/// Tailscale の経路状態(0=不明/Tailscale 外, 1=直結, 2=中継(DERP))。
+/// 中継は遅延が数倍になるため、切り替わった時に知らせる
+pub static TS_PATH: AtomicU8 = AtomicU8::new(0);
+
+/// 本線を確実に切る(スロットから外すだけでは受信スレッドが読み出しを待ち続ける)
+fn drop_stream(reason: &str) {
+    let taken = STREAM_SLOT.get().and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take());
+    if let Some(s) = taken {
+        eprintln!("[conn] {reason}。接続を張り直します");
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// `tailscale status --json` から相手への経路が直結か中継かを調べる
+fn tailscale_path(peer: std::net::IpAddr) -> Option<u8> {
+    let out = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
+        .iter()
+        .find_map(|bin| std::process::Command::new(bin).args(["status", "--json"]).output().ok())
+        .filter(|o| o.status.success())?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let ip = peer.to_string();
+    v["Peer"].as_object()?.values().find_map(|p| {
+        let has = p["TailscaleIPs"].as_array()?.iter().any(|x| x.as_str() == Some(ip.as_str()));
+        has.then(|| if p["CurAddr"].as_str().unwrap_or("").is_empty() { 2 } else { 1 })
+    })
+}
+
 /// 大容量経路(ファイル・画像)。本線とは別の TCP 接続
 static BULK_LINK: bulk::Link = bulk::Link::new();
 static BULK: OnceLock<bulk::Endpoint> = OnceLock::new();
@@ -1916,7 +1946,22 @@ fn main() {
     std::thread::spawn(move || {
         use std::io::Write;
         let mut ping_at = std::time::Instant::now();
+        // スリープ復帰の検知: 単調時計はスリープ中に進まないため、壁時計との差が
+        // 開いたら眠っていたと分かる。眠っている間に相手側の接続は切れているのが
+        // 普通で、単調時計基準の pong 監視では気づけないため、即座に張り直す
+        let mut wall = std::time::SystemTime::now();
+        let mut mono = std::time::Instant::now();
         loop {
+            let (wall_now, mono_now) = (std::time::SystemTime::now(), std::time::Instant::now());
+            let slept = wall_now
+                .duration_since(wall)
+                .unwrap_or_default()
+                .saturating_sub(mono_now.duration_since(mono));
+            (wall, mono) = (wall_now, mono_now);
+            if slept > Duration::from_secs(3) {
+                drop_stream(&format!("スリープ復帰を検知({}秒)", slept.as_secs()));
+                BULK_LINK.clear();
+            }
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(line) => {
                     // 送信の束ね(coalescing): 高頻度のマウス移動は 1 行 1 write+flush だと
@@ -1948,7 +1993,9 @@ fn main() {
                         // encode() が行末 \n を持つため writeln! だと二重改行で
                         // ワイヤが \n\n になる(受信側の空行パースが倍増する)。write_all で送る
                         if s.write_all(buf.as_bytes()).and_then(|_| s.flush()).is_err() {
-                            *guard = None; // 書けなくなったら外す(接続ループが検知)
+                            if let Some(s) = guard.take() {
+                                let _ = s.shutdown(std::net::Shutdown::Both);
+                            }
                         }
                     }
                 }
@@ -1960,17 +2007,35 @@ fn main() {
                 // 15 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う)
                 if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 10_000 {
-                    eprintln!("[conn] pong timeout. dropping stream");
-                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
-                    *guard = None;
+                    drop_stream("pong が 10 秒途絶");
                     continue;
                 }
                 let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = guard.as_mut() {
                     if s.write_all(encode(&Msg::Ping { ts: now_ms() }).as_bytes()).and_then(|_| s.flush()).is_err() {
-                        *guard = None;
+                        if let Some(s) = guard.take() {
+                            let _ = s.shutdown(std::net::Shutdown::Both);
+                        }
                     }
                 }
+            }
+        }
+    });
+
+    // Tailscale 経路の診断(30 秒毎)。直結から中継(DERP)へ落ちると遅延が数倍になり
+    // 「カクつき」の原因になるため、切り替わった時だけ通知する
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(30));
+        let peer = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(peer) = peer.filter(|p| CONNECTED.load(Ordering::Relaxed) && tsunagu_common::net::is_tailscale(*p)) else {
+            continue;
+        };
+        let Some(now) = tailscale_path(peer) else { continue };
+        let before = TS_PATH.swap(now, Ordering::Relaxed);
+        if before != now {
+            eprintln!("[net] Tailscale 経路: {}", if now == 1 { "直結" } else { "中継(DERP)" });
+            if now == 2 {
+                notify("tsunagu", "Windows との通信が中継経由になりました(遅延が増えます)。同じネットワークか有線直結を推奨します");
             }
         }
     });
@@ -1994,7 +2059,6 @@ fn main() {
         on_event: mac_on_bulk,
         log: |s| eprintln!("{s}"),
     });
-    use std::net::ToSocketAddrs;
     if client_role {
         let host = args
             .iter()
@@ -2010,12 +2074,16 @@ fn main() {
                 std::process::exit(1);
             });
         eprintln!("[info] client mode: connecting to {host}:{port}");
-        match (host.as_str(), port + bulk::PORT_OFFSET).to_socket_addrs().ok().and_then(|mut it| it.next()) {
-            Some(addr) => {
-                std::thread::spawn(move || bulk::connect_loop(bulk_ep, addr, || CONNECTED.load(Ordering::Relaxed)));
-            }
-            None => eprintln!("[bulk] 接続先を解決できません: {host}"),
-        }
+        std::thread::spawn(move || {
+            bulk::connect_loop(
+                bulk_ep,
+                || {
+                    let ip = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
+                    ip.map(|ip| std::net::SocketAddr::new(ip, PORT + bulk::PORT_OFFSET))
+                },
+                || CONNECTED.load(Ordering::Relaxed),
+            )
+        });
         std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
     } else {
         let bind = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
@@ -2394,6 +2462,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
             *guard = Some(stream);
         }
+        *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         // hello_ok 送信は送信スレッド経由で確実に
         send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
         // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
@@ -2409,14 +2478,13 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
 
 /// 接続モードの 1 セッション分(ハンドシェイク+本体)。Result はリトライ理由
 fn client_attempt(
-    addr: &std::net::SocketAddr,
+    s: TcpStream,
     token: &str,
     screen_w: f64,
     screen_h: f64,
 ) -> Result<(), String> {
     use std::io::{BufRead, Read, Write};
-    let s = std::net::TcpStream::connect_timeout(addr, Duration::from_secs(3))
-        .map_err(|e| format!("connect failed: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(12))).ok();
     eprintln!("[conn] connected");
     s.set_nodelay(true).ok();
     s.set_write_timeout(Some(Duration::from_secs(5))).ok();
@@ -2467,18 +2535,23 @@ fn client_attempt(
 
 /// 接続モード(TSUNAGU_ROLE=client): Windows(サーバ)へ接続し続ける
 fn client_thread(host: String, port: u16, token: String, screen_w: f64, screen_h: f64) {
-    use std::net::ToSocketAddrs;
-    let Some(addr) = (host.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next())
-    else {
+    let addrs = tsunagu_common::connect::parse_hosts(&host, port);
+    if addrs.is_empty() {
         eprintln!("[fatal] invalid host: {host}");
         std::process::exit(1);
-    };
+    }
     let mut backoff = 500u64;
     loop {
-        if let Err(e) = client_attempt(&addr, &token, screen_w, screen_h) {
-            eprintln!("[conn] {e}");
-        } else {
-            backoff = 500;
+        match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
+            Some((s, a)) => {
+                eprintln!("[conn] connected ({a})");
+                *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
+                match client_attempt(s, &token, screen_w, screen_h) {
+                    Ok(()) => backoff = 500,
+                    Err(e) => eprintln!("[conn] {e}"),
+                }
+            }
+            None => eprintln!("[conn] どの接続先にも繋がりません: {host}"),
         }
         std::thread::sleep(Duration::from_millis(backoff));
         backoff = (backoff * 2).min(3000);

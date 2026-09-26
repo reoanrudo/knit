@@ -337,11 +337,12 @@ fn push_converted(out: &mut Vec<u8>, src: &[u8], cap: &Capture) {
 
 /// 音声送信スレッド本体: キャプチャ初期化→Mac:24901 へ接続→ストリーミング。
 /// 切断/デバイス失効時は 2 秒後に全体をやり直す
-fn audio_run(host: String, token: String) {
+/// host=None は本線の接続先(複数経路のうち繋がったもの)へ追従する
+fn audio_run(fixed_host: Option<String>, token: String) {
     unsafe {
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
     }
-    println!("[audio] 開始(→{host}:24901)");
+    println!("[audio] 開始(→{}:24901)", fixed_host.as_deref().unwrap_or("本線の接続先"));
     loop {
         let mut cap = unsafe {
             match capture_open() {
@@ -353,12 +354,20 @@ fn audio_run(host: String, token: String) {
                 }
             }
         };
-        let addr = match (host.as_str(), 24901u16).to_socket_addrs().ok().and_then(|mut it| it.next()) {
-            Some(a) => a,
-            None => {
-                println!("[audio] ホスト解決失敗: {host}");
-                return;
-            }
+        let addr = match &fixed_host {
+            Some(h) => match (h.as_str(), 24901u16).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+                Some(a) => a,
+                None => {
+                    println!("[audio] ホスト解決失敗: {h}");
+                    return;
+                }
+            },
+            None => loop {
+                if let Some(ip) = crate::peer_ip() {
+                    break std::net::SocketAddr::new(ip, 24901);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            },
         };
         let stream = loop {
             match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) {
@@ -445,7 +454,7 @@ fn audio_run(host: String, token: String) {
 }
 
 /// 音声送信を開始(別スレッド)
-pub fn start(host: String, token: String) {
+pub fn start(host: Option<String>, token: String) {
     AUDIO_ACTIVE.store(true, Ordering::Relaxed);
     std::thread::spawn(move || audio_run(host, token));
 }
