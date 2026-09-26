@@ -1495,30 +1495,36 @@ fn session(reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std
                 const VK_VOL_UP: u16 = 0xAF;
                 const VK_VOL_DOWN: u16 = 0xAE;
                 const VK_VOL_MUTE: u16 = 0xAD;
-                if let Some(vk) = tsunagu_common::proto::media_vk(op) {
-                    inject_key(vk, false);
-                    inject_key(vk, true);
-                    println!("[vol] media op={op}");
-                } else {
-                    match op {
-                        0 => {
-                            for _ in 0..2 {
-                                inject_key(VK_VOL_UP, false);
-                                inject_key(VK_VOL_UP, true);
-                            }
-                        }
-                        1 => {
-                            for _ in 0..2 {
-                                inject_key(VK_VOL_DOWN, false);
-                                inject_key(VK_VOL_DOWN, true);
-                            }
-                        }
-                        _ => {
-                            inject_key(VK_VOL_MUTE, false);
-                            inject_key(VK_VOL_MUTE, true);
+                match op {
+                    3..=5 => {
+                        // メディア制御(前へ/再生切替/次へ)= Mac の F7/F8/F9 転送
+                        if let Some(vk) = tsunagu_common::proto::media_vk(op) {
+                            inject_key(vk, false);
+                            inject_key(vk, true);
+                            println!("[vol] media op={op}");
                         }
                     }
-                    println!("[vol] op={op}");
+                    0 => {
+                        for _ in 0..2 {
+                            inject_key(VK_VOL_UP, false);
+                            inject_key(VK_VOL_UP, true);
+                        }
+                        println!("[vol] op={op}");
+                    }
+                    1 => {
+                        for _ in 0..2 {
+                            inject_key(VK_VOL_DOWN, false);
+                            inject_key(VK_VOL_DOWN, true);
+                        }
+                        println!("[vol] op={op}");
+                    }
+                    2 => {
+                        inject_key(VK_VOL_MUTE, false);
+                        inject_key(VK_VOL_MUTE, true);
+                        println!("[vol] op={op}");
+                    }
+                    // 未知の op は無視(他の操作に化けさせない)
+                    _ => {}
                 }
             }
             Msg::Stat { rtt } => {
