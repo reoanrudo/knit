@@ -645,8 +645,10 @@ fn inject_mouse_move_rel(dx: i32, dy: i32) -> bool {
     })
 }
 
-/// 絶対位置移動(0..65535 座標、プライマリ画面)。MOUSEEVENTF_ABSOLUTE は
-/// Windows のポインタ加速曲線を通らないため、Mac の速度感がそのまま再現される
+/// 絶対位置移動(0..65535 座標、MOUSEEVENTF_VIRTUALDESK なので仮想デスクトップ
+/// 全体が対象。Mac 側の WIN_CUR も hello/Screen の仮想デスクトップサイズ基準で
+/// 積算しているため一致する)。MOUSEEVENTF_ABSOLUTE は Windows のポインタ加速曲線を
+/// 通らないため、Mac の速度感がそのまま再現される
 fn inject_mouse_move_abs(x: i32, y: i32) -> bool {
     const ABSOLUTE: u32 = 0x8000;
     const VIRTUALDESK: u32 = 0x4000;
@@ -1043,7 +1045,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-002228-24c4e71";
+const BUILD_ID: &str = "win-20260927-003145-7ce0525";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -1724,11 +1726,20 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
 /// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
 /// (連打防止 0.7 秒クールダウン)。境界に沿った比率も送り、Mac 側の復帰位置に
 /// 反映させる(境界の連続性)。side 0/1=縦比率、2/3=横比率を ny へ載せる
+/// ドラッグ中(ボタン押下中)は通知しない: Mac 側の abs-edge 復帰が
+/// EVT_MOUSE_MOVED 限定なのと同じ理由で、掴んでいる最中に制御が戻ると
+/// release_everything でドラッグが強制キャンセルされてしまう
 fn maybe_notify_return(
     wtx: &std::sync::mpsc::Sender<String>,
     last: &mut Instant,
     mods: &mut ModState,
 ) {
+    if BTN_W[0].load(Ordering::Relaxed)
+        || BTN_W[1].load(Ordering::Relaxed)
+        || BTN_W[2].load(Ordering::Relaxed)
+    {
+        return;
+    }
     let mut p = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut p) };
     let (vx, vy, w, h) = vscreen();
