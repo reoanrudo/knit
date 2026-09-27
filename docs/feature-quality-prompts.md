@@ -21,7 +21,7 @@
 
 ```text
 Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」セッションです。
-リポジトリ: ~/ZCodeProject/tsunagu
+リポジトリ: 
 
 最初に必ず docs/agent-guide.md を読んでください(構成・環境固有の罠 16 項目・
 コード規約・既知の制限の最重要事項が書いてあります)。

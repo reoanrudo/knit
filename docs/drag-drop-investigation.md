@@ -28,7 +28,7 @@ Macへの受信完了後にWindowsのOLE操作をコピーとして完了し、M
 追記（同日）：利用者の症状は「Mac→Windowsでファイルを掴むとカーソルも境界を越えない」と確認した。
 以下の項目4にある検出の基準値を、MouseDown時点で記録する実装へ修正。
 押下ごとの世代管理も追加し、キャンセル済みのファイルや遅れて届いた読み出し結果を除外する。
-検出処理は [file_drag.rs](~/ZCodeProject/tsunagu/crates/mac/src/file_drag.rs) に分離し、5件の回帰テストを追加した。
+検出処理は [file_drag.rs](crates/mac/src/file_drag.rs) に分離し、5件の回帰テストを追加した。
 本文とコード根拠一覧は調査時点の記録。この最初の修正では検出部分を扱い、その後の対応を続報と冒頭に記載した。
 
 ### 境界で止まる症状への修正と検証
@@ -36,7 +36,7 @@ Macへの受信完了後にWindowsのOLE操作をコピーとして完了し、M
 - ファイル一覧の監視は16ms間隔に変更。押下時の基準値と比較するため、最初の監視より前に始まったドラッグも検出できる。
 - Mac側のドラッグを終える合成MouseUpは、利用者が物理的にボタンを離した状態として扱わない。
 - `cargo test --locked` は50件成功。既存の個別実行用テスト2件（Keychain・10GiB転送）は通常実行では除外。
-- 修正を含むMac版を起動し、入力監視・Windowsとの接続・ファイル転送用接続の復帰を確認した。記録は [boundary-fix-runtime.json](~/ZCodeProject/tsunagu/output/2026-09-27-drag-drop-investigation/boundary-fix-runtime.json)。
+- 修正を含むMac版を起動し、入力監視・Windowsとの接続・ファイル転送用接続の復帰を確認した。記録は [boundary-fix-runtime.json](output/2026-09-27-drag-drop-investigation/boundary-fix-runtime.json)。
 - 実際のFinderからWindowsへの掴み操作は利用者の確認待ち。現在の境界へ2回当てて切り替える設定を維持している。
 
 ### 続報：カーソルだけ越える症状への修正
@@ -56,7 +56,7 @@ Windows実機では、修正前の形式列挙と `QueryInterface` が回帰テ�
 WindowsのShellが実装するフォルダの `IDropTarget` に製品の `IDataObject` を渡し、日本語名のファイルがコピーされ、内容と原本が保たれることも確認した。
 このShell試験は専用一時フォルダ内で完結し、カーソルやクリップボードを操作しない。
 修正済みの両アプリを配備し、本線とファイル転送経路の再接続を確認した。Windows配備先の実行ファイルはローカルのビルド産物とSHA-256が一致する。
-検証記録：[handoff-fix-verification.json](~/ZCodeProject/tsunagu/output/2026-09-27-drag-drop-investigation/handoff-fix-verification.json)。
+検証記録：[handoff-fix-verification.json](output/2026-09-27-drag-drop-investigation/handoff-fix-verification.json)。
 
 **未確認の範囲：** Finderで掴んで境界を越え、Windowsの画面上で離す一連の操作は、この修正後に改めて実機確認が必要。Shellへの受け渡し試験はマウス操作を含むE2E試験ではない。
 
@@ -107,29 +107,29 @@ sequenceDiagram
 
 ### 1 — 転送が終わるまで、本来のドラッグが始まらない【最優先】
 
-[Windowsの受信処理](~/ZCodeProject/tsunagu/crates/win/src/main.rs:597) は `Files` を受信してから `drop && BTN_W[0]` を確認し、押下中の場合だけ `dragdrop::start` を呼ぶ。[共通の受信処理](~/ZCodeProject/tsunagu/crates/common/src/lib.rs:913) がこのイベントを返すのは `BATCH_END` の時点だけ。
+[Windowsの受信処理](crates/win/src/main.rs:597) は `Files` を受信してから `drop && BTN_W[0]` を確認し、押下中の場合だけ `dragdrop::start` を呼ぶ。[共通の受信処理](crates/common/src/lib.rs:913) がこのイベントを返すのは `BATCH_END` の時点だけ。
 
 **結果：** ボタンを離すタイミングより転送完了が遅いと、狙った場所へのドロップにならず、クリップボードへの受け渡しになる。正しい操作が回線速度とファイル容量に左右される。共通層のイベント発火時点は実行確認済み。実際のOS画面上の再現は未実施。
 
 ### 2 — Windows→Macのファイルドラッグが成立する経路がない【最優先】
 
-[Windowsからの復帰判定](~/ZCodeProject/tsunagu/crates/win/src/main.rs:1832) はいずれかのマウスボタンが押されていると画面端からの復帰通知を出さない。Mac側の絶対座標による復帰も通常の移動イベントに限定される。[Macの受信処理](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:681) はファイルを常に一般クリップボードへ置き、ドラッグの印を扱わない。
+[Windowsからの復帰判定](crates/win/src/main.rs:1832) はいずれかのマウスボタンが押されていると画面端からの復帰通知を出さない。Mac側の絶対座標による復帰も通常の移動イベントに限定される。[Macの受信処理](crates/mac/src/main.rs:681) はファイルを常に一般クリップボードへ置き、ドラッグの印を扱わない。
 
 Windows側には元アプリのドラッグオブジェクトを受け取る `IDropTarget` がなく、Mac側にも受信ファイルから `NSDraggingSession` を開始する実装がない。接続のserver/clientを逆にしても、この不足は解消しない。
 
 ### 3 — 取り消し・操作の同一性・結果を共有できない【最優先】
 
-[本線プロトコル](~/ZCodeProject/tsunagu/crates/common/src/lib.rs:120) と [共通の完了イベント](~/ZCodeProject/tsunagu/crates/common/src/lib.rs:857) に、ドラッグ操作ID、受け入れ準備完了、ドロップ要求、取消、相手OSでの結果を表す仕組みがない。受信側が参照するのはその瞬間の共通ボタン状態。
+[本線プロトコル](crates/common/src/lib.rs:120) と [共通の完了イベント](crates/common/src/lib.rs:857) に、ドラッグ操作ID、受け入れ準備完了、ドロップ要求、取消、相手OSでの結果を表す仕組みがない。受信側が参照するのはその瞬間の共通ボタン状態。
 
 **コードから予測される失敗：** 最初のドラッグを離した後、別の操作で再び左ボタンを押したタイミングに転送が終わると、古いファイルでドラッグが始まり得る。これは実機再現待ちの競合条件であり、発生済みとは断定しない。
 
-[Windowsの取消判定](~/ZCodeProject/tsunagu/crates/win/src/dragdrop.rs:466) はEscを取消として返すが、[WindowsのOLE開始と終了](~/ZCodeProject/tsunagu/crates/win/src/dragdrop.rs:498) はコピー以外の結果を一律にクリップボードへ回す。利用者が取り消した場合も「ドロップ先が受けられなかった」と通知し、クリップボードを書き換える分岐になる。
+[Windowsの取消判定](crates/win/src/dragdrop.rs:466) はEscを取消として返すが、[WindowsのOLE開始と終了](crates/win/src/dragdrop.rs:498) はコピー以外の結果を一律にクリップボードへ回す。利用者が取り消した場合も「ドロップ先が受けられなかった」と通知し、クリップボードを書き換える分岐になる。
 
-[Macの送信処理](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:583) の成功通知は送信関数の終了で出る。相手アプリへのドロップ完了の確認は受けていない。
+[Macの送信処理](crates/mac/src/main.rs:583) の成功通知は送信関数の終了で出る。相手アプリへのドロップ完了の確認は受けていない。
 
 ### 4 — ドラッグ開始を120ms間隔の監視で推測している【高】
 
-[Macの掴み検出](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:2545) は最初の押下中ポーリングで `changeCount` を基準値として記録し、その後の変更がないとファイルを掴んだと判断しない。
+[Macの掴み検出](crates/mac/src/main.rs:2545) は最初の押下中ポーリングで `changeCount` を基準値として記録し、その後の変更がないとファイルを掴んだと判断しない。
 
 例：ボタン押下0ms → ドラッグ用ペーストボード更新20ms → 初回監視120ms。その初回監視が更新済みの値を基準にするため、以後更新がなければ検出されない。更新が150msなら次の240ms監視で検出される。時系列モデルでこの違いを確認した。
 
@@ -137,21 +137,21 @@ Windows側には元アプリのドラッグオブジェクトを受け取る `ID
 
 ### 5 — 元のドラッグを終える条件が相手の準備と結びついていない【高】
 
-[Macの境界切替](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:1840) は送信関数を呼んだ後、約60ms待って合成MouseUpをMacへ投稿する。[Macの送信処理](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:583) が送信中として要求を拒否しても、呼び出し元には結果が返らず、この終了処理へ進む。
+[Macの境界切替](crates/mac/src/main.rs:1840) は送信関数を呼んだ後、約60ms待って合成MouseUpをMacへ投稿する。[Macの送信処理](crates/mac/src/main.rs:583) が送信中として要求を拒否しても、呼び出し元には結果が返らず、この終了処理へ進む。
 
-さらに、Windowsへのボタン押下注入がカーソルのワープとOLE開始より先に送られる。[MacからWindowsへの位置決定](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:1874) は以前のWindowsカーソル位置を優先するため、ドラッグ中も境界に対応した位置から入るとは限らない。
+さらに、Windowsへのボタン押下注入がカーソルのワープとOLE開始より先に送られる。[MacからWindowsへの位置決定](crates/mac/src/main.rs:1874) は以前のWindowsカーソル位置を優先するため、ドラッグ中も境界に対応した位置から入るとは限らない。
 
 **実機確認が必要：** 元画面での意図しないドロップ、移動先での通常クリックや選択操作への混入、カーソルの飛び。現時点ではコードから特定した危険な順序であり、実害の発生を確認したわけではない。
 
 ### 6 — ファイル形式とフォルダの表現が足りない【高】
 
-[Macのファイル一覧取得](~/ZCodeProject/tsunagu/crates/mac/src/main.rs:445) はファイルURLを最大64件まで取り出す。[共通送信処理](~/ZCodeProject/tsunagu/crates/common/src/lib.rs:794) は通常ファイルだけを扱い、フォルダを読み飛ばす。子ファイルを1件含むフォルダで `Ok(0)`・受信イベント0件を実行確認した。
+[Macのファイル一覧取得](crates/mac/src/main.rs:445) はファイルURLを最大64件まで取り出す。[共通送信処理](crates/common/src/lib.rs:794) は通常ファイルだけを扱い、フォルダを読み飛ばす。子ファイルを1件含むフォルダで `Ok(0)`・受信イベント0件を実行確認した。
 
-[Windowsの提供形式](~/ZCodeProject/tsunagu/crates/win/src/dragdrop.rs:184) は受信済みのローカルファイルパスを渡す `CF_HDROP` だけを提供する。未受信ファイル、アプリ内で生成するファイル、元アプリのFile Promise、画像・URLなどを同じドラッグ処理で扱う仕組みはない。
+[Windowsの提供形式](crates/win/src/dragdrop.rs:184) は受信済みのローカルファイルパスを渡す `CF_HDROP` だけを提供する。未受信ファイル、アプリ内で生成するファイル、元アプリのFile Promise、画像・URLなどを同じドラッグ処理で扱う仕組みはない。
 
 ### 7 — 保存先と完了の意味が操作に合っていない【高】
 
-受信先はいったん `Downloads/Tsunagu`。その後にコピーとしてドロップするため、受信先と最終保存先に二重保管され得る。[WindowsのOLE開始と終了](~/ZCodeProject/tsunagu/crates/win/src/dragdrop.rs:498) も元の受信ファイルを残すと明記している。
+受信先はいったん `Downloads/Tsunagu`。その後にコピーとしてドロップするため、受信先と最終保存先に二重保管され得る。[WindowsのOLE開始と終了](crates/win/src/dragdrop.rs:498) も元の受信ファイルを残すと明記している。
 
 「送信完了」「相手側でファイルの検証完了」「OSがドロップを受理」「Photoshopが読み込み完了」「Webへのアップロード完了」は別の事実。現在の送信通知では区別できない。任意の相手アプリの内部処理完了まで、OSのドロップ結果だけから保証することはできない。
 
@@ -233,9 +233,9 @@ Waylandの条件は[公式プロトコル仕様](https://wayland.freedesktop.org
 
 ## 7. 再現用の成果物
 
-- [診断コード](~/ZCodeProject/tsunagu/crates/common/examples/drag_protocol_probe.rs)：現在の共通受信イベントとフォルダ送信の診断コード。
-- [共通層の実行結果](~/ZCodeProject/tsunagu/output/2026-09-27-drag-drop-investigation/probe-results.json)：実行結果。`BATCH_END`だけがイベントを返し、フォルダ送信は0件。
-- [ポーリングの時系列モデル](~/ZCodeProject/tsunagu/output/2026-09-27-drag-drop-investigation/poll-timing-model.json)：ドラッグ検出の時系列モデル。OSイベントの測定結果ではない。
-- [コード根拠一覧](~/ZCodeProject/tsunagu/output/2026-09-27-drag-drop-investigation/code-evidence.json)：参照箇所とソースハッシュ。
+- [診断コード](crates/common/examples/drag_protocol_probe.rs)：現在の共通受信イベントとフォルダ送信の診断コード。
+- [共通層の実行結果](output/2026-09-27-drag-drop-investigation/probe-results.json)：実行結果。`BATCH_END`だけがイベントを返し、フォルダ送信は0件。
+- [ポーリングの時系列モデル](output/2026-09-27-drag-drop-investigation/poll-timing-model.json)：ドラッグ検出の時系列モデル。OSイベントの測定結果ではない。
+- [コード根拠一覧](output/2026-09-27-drag-drop-investigation/code-evidence.json)：参照箇所とソースハッシュ。
 
 実行コマンド：`cargo run --locked -q -p tsunagu-common --example drag_protocol_probe`。作成する小さなファイルは専用の一時フォルダ内だけで、終了時に削除する。
