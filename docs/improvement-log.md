@@ -473,3 +473,9 @@ declareTypes で書けば付かない)。物理 ⌘C では付かないため実
 
 M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap-analysis の次段)で
 対応する。0.24.0 の zip は dist/ に SHA-256 付きで保管(0.23.0 は保持)。
+
+## 第23セッション(2026-09-27・567): 配布総合チェック(v0.24.0)
+
+| ループ | 内容 |
+|---|---|
+| 567 | 配布前の総合チェック: zip 完全性・check-release 再合格・トークン不混入を3経路で再照合(全差分・展開全ファイル・両 exe の strings)・スクリプト可搬性(install/uninstall/run は %USERPROFILE% と %~dp0 基準で固定パス無し)・バージョン整合(exe/plist/manifest とも 0.24.0)・Gatekeeper 実証(ad-hoc 署名=rejected→右クリック開くが必要、既知の制限)。発見した3件を修正: ①Win zip へ AppleDouble(._xxx)が混入(ditto が拡張属性を格納)→package-win.sh に --norsrc を追加し再生成(16→10ファイル) ②README-win.txt のライセンス表記を「同梱の LICENSE.txt」へ(リポジトリはプライベートのため) ③distribution.md のメニューバー表記が旧「SD·Mac」のまま→現状(アイコン+未接続表示)へ更新。修正コミット後に両 zip を再生成し manifest の source_commit=HEAD・working_tree_modified=false を確認(ソース完全一致のトレーサブルなビルド)。リポジトリは dist/zip を管理外、win-dist/tsunagu-win.exe は tracked(プライベートのため実害なし・公開時に要検討) |
