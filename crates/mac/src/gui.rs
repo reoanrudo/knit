@@ -549,11 +549,10 @@ fn sync_prefs_state() {
                 crate::SIDE.load(Ordering::Relaxed) as isize,
             );
         }
-        // 状態行(接続・操作中・遅延)
+        // 状態行(接続・操作中・遅延)。操作中の表示はモード名なしで統一
         let st = PREFS_STATE.load(Ordering::Relaxed) as ID;
         if !st.is_null() {
             let connected = crate::CONNECTED.load(Ordering::Relaxed);
-            let win = crate::WIN_MODE.load(Ordering::Relaxed);
             let rtt = crate::RTT_MS.load(Ordering::Relaxed);
             let conn = if connected {
                 if rtt > 0 {
@@ -564,11 +563,7 @@ fn sync_prefs_state() {
             } else {
                 "切断(再接続待機中)".to_string()
             };
-            let mode = if win {
-                "Windows 操作中"
-            } else {
-                "Mac 操作中"
-            };
+            let mode = "操作中";
             msg1_void_id(
                 st,
                 sel(c"setStringValue:"),
@@ -976,15 +971,9 @@ fn refresh_status() {
             return;
         }
         let connected = crate::CONNECTED.load(Ordering::Relaxed);
-        let win = crate::WIN_MODE.load(Ordering::Relaxed);
-        // Mac 画面(通常時)はアイコンのみ。Windows 操作中と未接続の時だけ文字を出す
-        let title = if !connected {
-            "未接続"
-        } else if win {
-            "Windows"
-        } else {
-            ""
-        };
+        // 未接続の時だけ文字を出し、接続中は常時アイコンのみ
+        //(どちらの画面を見ているかは操作の結果で分かる。ユーザー指示 459/494)
+        let title = if !connected { "未接続" } else { "" };
         msg1_void_id(button, sel(c"setTitle:"), nsstring(title));
 
         let state = GUI_STATE_ITEM.load(Ordering::Relaxed) as ID;
@@ -994,7 +983,8 @@ fn refresh_status() {
             } else {
                 "切断(再接続待機中)"
             };
-            let mode = if win { "Windows 操作中" } else { "Mac" };
+            // 操作中の表示はモード名を挟まず「操作中」に統一する
+            let mode = "操作中";
             let rtt = crate::RTT_MS.load(Ordering::Relaxed);
             let rtt_s = if connected && rtt > 0 {
                 format!("・遅延 {rtt}ms")
