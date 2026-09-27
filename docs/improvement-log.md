@@ -497,3 +497,10 @@ M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap
 | ループ | 内容 |
 |---|---|
 | 570 | v0.24.0 の Windows zip を実機で消去→クリーン→導入試験。消去=tsunagu 系タスク 11件・プロセス・C:\Users\<user>\tsunagu(検証遺物の clip_* 系スクリプト含む)・%LOCALAPPDATA%\Tsunagu(履歴・設定)・Downloads\Tsunagu(受信・検証遺物)。導入=配布 zip を scp→Expand-Archive→配置→.env(トークン+TSUNAGU_HOST)を Mac から合成転送→install.bat 実行。**発見**: install.bat の schtasks /SC ONLOGON(ログオン時自動起動)は非昇格では作成できず、ssh からは UAC 昇格できないため同タスクのみ未作成(README の「管理者として実行」が必要な理由を実証)。ONCE/MINUTE タスク(tsunagu_run・tsunagu_watch)は手動作成して起動。**結果**: トレイ常駐→LAN 直(192.168.0.1)で Mac へ接続→本線・音声・bulk 確立→15秒間の切断ゼロ・exe の SHA-256 が manifest と一致。Mac 側クリーン試験(569)と合わせ、両 OS の配布 zip がクリーン環境で機能することを実証。Windows 側のデータ(履歴・設定)もクリーンスタート |
+
+## 第27セッション(2026-09-27・571〜572): 接続台数の拡張とモニター自動認知
+
+| ループ | 内容 |
+|---|---|
+| 571 | **プロトコル版 13**: hello/hello_ok に端末識別子 id(起動ごとに生成・splitmix64)と全モニター Vec<Monitor>{x,y,w,h}(仮想画面座標系)を追加。serde(default)付きで旧版(12)と双方向互換(旧相手は空=従来の w/h 1 画面扱い・Mac 側は IP 由来の代替 id)。テスト追加(往復・旧形式 JSON の受入・device_id 安定性) |
+| 572 | **Mac のマルチピア化**: server_thread のセッション処理をスレッドへ分離し、PEERS(Vec)+ACTIVE_PEER(添字)で複数 Windows を同時保持。writer はアクティブ時のみ STREAM_SLOT へ貸し出す設計で既存送信系(send_msg 等)を無変更のまま、activate_peer() で送り先・画面・PEER_*・bulk 経路・⌘設定を一括切替。メニューバーに「接続先」サブメニュー(履歴サブメニューと同じ変化検知再構築・アクティブにチェック)。**実機で発見**: Windows の「経路昇格」は Tailscale と LAN 直の 2 本を同時に張るため、旧実装の「最後の確立が差し替え」方式と違い新実装は 2 本目の writer が行き場を失い pong 不応答→再接続ループ。世代番号(PEER_GEN)で新しいセッションを正とし、旧セッションは終了時に世代不一致で一覧を触らず静かに退出するよう修正→実機でループ解消(昇格 1 回で収束・以後安定)。非アクティブ peers へ 10 秒毎の keepalive ping(ping へは自分のセッションの writer へ直接 pong・pong の LAST_PONG 反映はアクティブのみ)。Windows は EnumDisplayMonitors・Mac は CGGetActiveDisplayList でモニター列挙を搭載。実機: Mac 2 面(2056x1329+2560x1080)・Win 1 面(1920x1080)の相互認識と旧 exe 相手(legacy-id)との後方互換を確認 |

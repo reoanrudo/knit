@@ -1,0 +1,52 @@
+# タグ(v*)の push で両OSの配布 zip をビルドして GitHub Releases へ公開する。
+# ビルドは CI 上で公開コードから行われるため、配布物の再現性の担保になる
+# (署名なし OSS の標準形。Mac は ad-hoc 署名、Windows は未署名)。
+# 将来コード署名を導入する場合は各 package スクリプトの環境変数
+# (TSUNAGU_SIGN_IDENTITY / TSUNAGU_NOTARY_PROFILE 等)を Secrets へ登録する。
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash scripts/package-mac.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos
+          path: |
+            dist/Tsunagu-*.zip
+            dist/Tsunagu-*.zip.sha256
+  windows:
+    # Windows 用も macos runner から x86_64-pc-windows-gnu へクロスビルドする
+    # (ローカル開発と同一手法。rust のセルフコンテインドな MinGW リンカで完結する)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - run: bash scripts/package-win.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows
+          path: |
+            dist/Tsunagu-win-*.zip
+            dist/Tsunagu-win-*.zip.sha256
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist-all
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist-all/*
+          generate_release_notes: true

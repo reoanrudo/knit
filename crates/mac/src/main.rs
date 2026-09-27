@@ -1385,6 +1385,144 @@ fn screen_locked() -> bool {
 /// 本線がいま繋がっている Windows のアドレス(大容量経路の接続先・経路診断に使う)
 static PEER_IP: Mutex<Option<std::net::IpAddr>> = Mutex::new(None);
 
+// ---- 複数台接続(ビジョン: 台数制限の撤回)。Mac=サーバは複数の Windows を
+// 同時に保持し、アクティブな 1 台へ入力を送る。切替はメニューバーの「接続先」から ----
+
+/// 接続中の相手 1 台分。writer はアクティブ時のみ STREAM_SLOT へ貸し出し、
+/// 非アクティブ時はここで待機する
+pub(crate) struct PeerEntry {
+    /// 端末識別子(hello の id。旧版相手は IP 由来の代替値)
+    pub id: String,
+    pub name: String,
+    pub ip: std::net::IpAddr,
+    /// 相手の代表画面サイズ(スケール算出用)
+    pub screen: (f64, f64),
+    /// 相手の全モニター構成(版 13 以降で自動交換。旧版相手は空)
+    pub monitors: Vec<tsunagu_common::proto::Monitor>,
+    /// 非アクティブ時の送信口(アクティブ時は None: STREAM_SLOT が保持する)
+    pub writer: Option<secure::Writer>,
+    /// セッションの世代(同一端末の再接続で置き換えを判別する。大きいほど新しい)
+    pub gen: u64,
+}
+pub(crate) static PEERS: Mutex<Vec<PeerEntry>> = Mutex::new(Vec::new());
+/// アクティブなピアの添字(未接続は usize::MAX)
+pub(crate) static ACTIVE_PEER: Mutex<usize> = Mutex::new(usize::MAX);
+/// セッション世代の採番(同一端末への重複接続で、古い方を正しく破棄するため)
+static PEER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 自分(Mac)の全モニターを列挙する(自動認知。CG 座標系のまま相手へ渡す)
+fn mac_monitors() -> Vec<tsunagu_common::proto::Monitor> {
+    let mut out = Vec::new();
+    unsafe {
+        let mut ids = [0u32; 16];
+        let mut n = 0;
+        if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+            for id in &ids[..(n as usize).min(16)] {
+                let b = CGDisplayBounds(*id);
+                out.push(tsunagu_common::proto::Monitor {
+                    x: b.origin.x as i32,
+                    y: b.origin.y as i32,
+                    w: b.size.w as i32,
+                    h: b.size.h as i32,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// my_id がいまアクティブなピアか(pong の反映先判定などに使う)。
+/// 空 id はクライアントモード(単一接続)を表し、常にアクティブ扱い
+fn is_active_peer(my_id: &str) -> bool {
+    if my_id.is_empty() {
+        return true;
+    }
+    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+    peers.get(act).is_some_and(|p| p.id == my_id)
+}
+
+/// ピアをアクティブへ切り替える(送信口・画面・設定同期・通知)。
+/// ロック順は STREAM_SLOT → PEERS → ACTIVE_PEER で統一し、逆順で取得しないこと
+pub(crate) fn activate_peer(new: usize, reason: &str) {
+    let slot_arc = STREAM_SLOT.get().unwrap();
+    let mut slot = slot_arc.lock().unwrap_or_else(|e| e.into_inner());
+    let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut act = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+    if new >= peers.len() {
+        return;
+    }
+    if *act < peers.len() {
+        if let Some(w) = slot.take() {
+            peers[*act].writer = Some(w);
+        }
+    }
+    let Some(w) = peers[new].writer.take() else {
+        return;
+    };
+    *slot = Some(w);
+    let (name, ip, screen) = (peers[new].name.clone(), peers[new].ip, peers[new].screen);
+    *act = new;
+    drop(act);
+    drop(peers);
+    drop(slot);
+    *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = screen;
+    *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = name.clone();
+    *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(ip);
+    CONNECTED.store(true, Ordering::Relaxed);
+    LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+    RTT_MS.store(0, Ordering::Relaxed);
+    // 旧相手のファイル転送経路を切る(接続側は本線の接続先へ追従して張り直す)
+    BULK_LINK.clear();
+    send_cfg();
+    eprintln!("[conn] 接続先を {name} へ切り替え({reason})");
+    // 再接続・経路昇格の置き換えは頻発するため通知は出さない(明示的な切替だけ知らせる)
+    if !reason.contains("再接続") {
+        notify("tsunagu", &format!("{name} へ切り替えました({reason})"));
+    }
+}
+
+/// 非アクティブピアへの間欠 ping(生存確認)。書けなくなった相手は一覧から外す。
+/// アクティブ 1 台の旧構成では「繋いでいない相手が黙って消える」検知が無かった
+fn keepalive_inactive_peers() {
+    std::thread::spawn(|| {
+        use std::io::Write as _;
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+            let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut dead: Vec<String> = Vec::new();
+            for (i, p) in peers.iter_mut().enumerate() {
+                if i == act {
+                    continue;
+                }
+                let Some(w) = p.writer.as_mut() else { continue };
+                let wire = encode(&Msg::Ping { ts: now_ms() });
+                if w.write_all(wire.as_bytes())
+                    .and_then(|_| w.flush())
+                    .is_err()
+                {
+                    dead.push(p.id.clone());
+                }
+            }
+            let mut removed_before_active = 0usize;
+            for id in &dead {
+                if let Some(i) = peers.iter().position(|p| &p.id == id) {
+                    if act != usize::MAX && i < act {
+                        removed_before_active += 1;
+                    }
+                    peers.remove(i);
+                    eprintln!("[conn] 相手(id={id})が応答しなくなったため一覧から外しました");
+                }
+            }
+            if removed_before_active > 0 {
+                *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner()) =
+                    act - removed_before_active;
+            }
+        }
+    });
+}
+
 /// 接続経路の短い表示(メニューバー用)。LAN 内なら "LAN 直"、100.x なら "Tailscale"
 pub fn route_label() -> &'static str {
     match *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -4318,7 +4456,7 @@ fn main() {
 const MAX_LINE: u64 = 8 * 1024 * 1024;
 
 /// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)
-fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
+fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>, my_id: &str) {
     use std::io::BufRead;
     let mut line = String::new();
     loop {
@@ -4400,15 +4538,36 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
                             }
                         }
                         Msg::Pong { ts } => {
-                            let now = now_ms();
-                            LAST_PONG_MS.store(now, Ordering::Relaxed);
-                            // ping/pong の往復時間を RTT として保持し、Windows 側の
-                            // ステータス窓表示にも回す(接続品質の見える化)
-                            let rtt = now.saturating_sub(ts).min(60_000);
-                            RTT_MS.store(rtt, Ordering::Relaxed);
-                            send_msg(&Msg::Stat { rtt });
+                            // アクティブな相手の pong だけ生存時刻・RTT に反映する
+                            // (非アクティブ peers への keepalive 応答で上書めないように)
+                            if is_active_peer(my_id) {
+                                let now = now_ms();
+                                LAST_PONG_MS.store(now, Ordering::Relaxed);
+                                // ping/pong の往復時間を RTT として保持し、Windows 側の
+                                // ステータス窓表示にも回す(接続品質の見える化)
+                                let rtt = now.saturating_sub(ts).min(60_000);
+                                RTT_MS.store(rtt, Ordering::Relaxed);
+                                send_msg(&Msg::Stat { rtt });
+                            }
                         }
-                        Msg::Ping { ts } => send_msg(&Msg::Pong { ts }),
+                        Msg::Ping { ts } => {
+                            // アクティブなら既定の送信経路。非アクティブな相手からの
+                            // keepalive には、そのセッション自身の writer へ直接返す
+                            if is_active_peer(my_id) {
+                                send_msg(&Msg::Pong { ts });
+                            } else {
+                                use std::io::Write as _;
+                                let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(w) = peers
+                                    .iter_mut()
+                                    .find(|p| p.id == my_id)
+                                    .and_then(|p| p.writer.as_mut())
+                                {
+                                    let wire = encode(&Msg::Pong { ts });
+                                    let _ = w.write_all(wire.as_bytes()).and_then(|_| w.flush());
+                                }
+                            }
+                        }
                         Msg::Rel { on } => {
                             if GAME_REL.swap(on, Ordering::Relaxed) != on {
                                 eprintln!(
@@ -4483,6 +4642,8 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
     let mut accept_errs: u32 = 0;
     // 認証に失敗し続ける接続の連打を鈍らせる(正規の接続が成功すれば即回復)
     let mut throttle = secure::FailThrottle::new();
+    // 非アクティブピアへの生存確認(複数台保持のために一度だけ起こす)
+    keepalive_inactive_peers();
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(x) => {
@@ -4509,7 +4670,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        let (r, w) = match secure::accept(stream, &token, b"tsunagu-main") {
+        let (r, mut w) = match secure::accept(stream, &token, b"tsunagu-main") {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
@@ -4534,70 +4695,156 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             }
             Ok(_) => {}
         }
-        let ok = match decode(&line) {
+        let parsed = match decode(&line) {
             Some(Msg::Hello {
-                ver, w, h, name, ..
+                ver,
+                w,
+                h,
+                name,
+                id,
+                monitors,
+                ..
             }) if compatible(ver) => {
-                // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
-                if w > 0 && h > 0 {
-                    *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
-                    eprintln!("[info] win screen {w}x{h}");
-                }
                 // 表示名は制御文字・Bidi オーバーライドを除去してから載せる
-                *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
+                let disp = {
                     let n = safe_peer_name(name.trim());
                     if n.is_empty() {
-                        "Windows".into()
+                        "Windows".to_string()
                     } else {
                         n
                     }
                 };
-                true
+                // 端末 id は再接続の紐付けに使う。旧版(版 12 以前)は空=IP 由来の代替
+                let dev = if id.is_empty() {
+                    format!("legacy-{}", peer.ip())
+                } else {
+                    id
+                };
+                Some((disp, dev, monitors, w.max(1) as f64, h.max(1) as f64))
             }
-            _ => false,
+            _ => None,
         };
-        if !ok {
+        let Some((disp, dev, mons, win_w, win_h)) = parsed else {
             eprintln!("[conn] invalid hello");
             std::thread::sleep(throttle.fail());
             continue;
-        }
-        LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
-        {
-            let mut guard = STREAM_SLOT
-                .get()
-                .unwrap()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = Some(w);
-        }
-        *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
-        // hello_ok 送信は送信スレッド経由で確実に
-        send_msg(&Msg::HelloOk {
-            name: hostname_label(),
-            w: screen_w as i32,
-            h: screen_h as i32,
-            ver: VERSION,
-        });
-        // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
-        send_cfg();
-        CONNECTED.store(true, Ordering::Relaxed);
-        LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+        };
         throttle.success();
-        eprintln!("[conn] established");
-        let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
-        notify(
-            "tsunagu",
-            &format!(
-                "{} と接続しました",
-                if peer.is_empty() {
-                    "Windows".into()
-                } else {
-                    peer
-                }
-            ),
+        eprintln!(
+            "[conn] established: {disp} (id={dev}) 画面 {}x{} モニター: {}",
+            win_w as i32,
+            win_h as i32,
+            tsunagu_common::proto::Monitor::summary(&mons)
         );
-        session_receive_loop(&mut reader);
-        on_disconnect();
+        // セッションはスレッドへ分離し、accept 側は次の接続を待つ(複数台の同時保持)
+        std::thread::spawn(move || {
+            use std::io::Write as _;
+            // hello_ok はこのセッションの writer へ直接返す(アクティブ化前でも届くように)
+            let ok = encode(&Msg::HelloOk {
+                name: hostname_label(),
+                w: screen_w as i32,
+                h: screen_h as i32,
+                ver: VERSION,
+                id: tsunagu_common::proto::device_id(),
+                monitors: mac_monitors(),
+            });
+            if w.write_all(ok.as_bytes()).and_then(|_| w.flush()).is_err() {
+                eprintln!("[conn] hello_ok 送信に失敗しました");
+                return;
+            }
+            // 同一端末の重複接続(経路昇格で Tailscale と LAN 直の 2 本が同時に
+            // 張られる等)は「新しい世代で置き換える」。古いセッションは終了時に
+            // 世代が一致しないため一覧を触らず静かに終わる
+            let my_gen = PEER_GEN.fetch_add(1, Ordering::Relaxed) + 1;
+            let (idx, replace_active, make_first);
+            {
+                let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+                match peers.iter().position(|p| p.id == dev) {
+                    // 再接続: 名前・画面構成は前回と変わっている可能性があるため更新する
+                    Some(i) => {
+                        let was_active = act == i;
+                        if !was_active {
+                            // 待機中の旧 writer があれば破棄する
+                            if let Some(old) = peers[i].writer.take() {
+                                old.shutdown();
+                            }
+                        }
+                        peers[i].name = disp.clone();
+                        peers[i].ip = peer.ip();
+                        peers[i].screen = (win_w, win_h);
+                        peers[i].monitors = mons.clone();
+                        peers[i].gen = my_gen;
+                        peers[i].writer = None;
+                        idx = i;
+                        replace_active = was_active;
+                    }
+                    None => {
+                        peers.push(PeerEntry {
+                            id: dev.clone(),
+                            name: disp.clone(),
+                            ip: peer.ip(),
+                            screen: (win_w, win_h),
+                            monitors: mons.clone(),
+                            writer: None,
+                            gen: my_gen,
+                        });
+                        idx = peers.len() - 1;
+                        replace_active = false;
+                    }
+                }
+                make_first = act >= peers.len();
+            }
+            if replace_active {
+                // アクティブだった旧セッションの TCP を先に切る(旧セッションは
+                // まもなく終了し、世代不一致のため一覧を触らない)
+                drop_stream("同一端末の新しい接続に置き換え");
+            }
+            // 新しいセッションの writer を預けてからアクティブへ切り替える。
+            // 既に他の端末がアクティブでも、後から確立した接続を正とする
+            // (経路昇格の張替えで古い経路が残らないようにする)
+            {
+                let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                peers[idx].writer = Some(w);
+            }
+            activate_peer(
+                idx,
+                if make_first {
+                    "初回接続"
+                } else {
+                    "再接続"
+                },
+            );
+            session_receive_loop(&mut reader, &dev);
+            // ---- 切断: 世代が一致する場合だけこのピアを一覧から外し、アクティブ
+            // だった場合は残りへ自動で切り替える(残りが無ければ従来どおりの切断扱い) ----
+            let mut next = None;
+            {
+                let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(i) = peers.iter().position(|p| p.id == dev && p.gen == my_gen) else {
+                    // 新しい接続へ置き換え済み。一覧は触らない
+                    eprintln!("[conn] セッション終了(新しい接続へ置き換え済み)");
+                    return;
+                };
+                let was_active = act == i;
+                peers.remove(i);
+                if was_active {
+                    if peers.is_empty() {
+                        *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner()) = usize::MAX;
+                    } else {
+                        next = Some(i.min(peers.len() - 1));
+                    }
+                } else if act > i {
+                    // 前詰めで添字がずれる分を補正する
+                    *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner()) = act - 1;
+                }
+            }
+            match next {
+                Some(i) => activate_peer(i, "自動切替"),
+                None => on_disconnect(),
+            }
+        });
     }
 }
 
@@ -4617,6 +4864,8 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
         token: String::new(),
         w: screen_w as i32,
         h: screen_h as i32,
+        id: tsunagu_common::proto::device_id(),
+        monitors: mac_monitors(),
     });
     hw.write_all(hello.as_bytes())
         .and_then(|_| hw.flush())
@@ -4633,7 +4882,11 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
     }
     match decode(&line) {
         Some(Msg::HelloOk {
-            w: mw, h: mh, name, ..
+            w: mw,
+            h: mh,
+            name,
+            monitors,
+            ..
         }) if mw > 0 && mh > 0 => {
             *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (mw as f64, mh as f64);
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
@@ -4644,7 +4897,10 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
                     n
                 }
             };
-            eprintln!("[info] win screen {mw}x{mh}");
+            eprintln!(
+                "[info] win screen {mw}x{mh} モニター: {}",
+                tsunagu_common::proto::Monitor::summary(&monitors)
+            );
         }
         _ => return Err("invalid hello_ok".into()),
     }
@@ -4674,7 +4930,8 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
             }
         ),
     );
-    session_receive_loop(&mut reader);
+    // クライアントモードは単一接続のため my_id 空(=常にアクティブ扱い)
+    session_receive_loop(&mut reader, "");
     on_disconnect();
     Ok(())
 }

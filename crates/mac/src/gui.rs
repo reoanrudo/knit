@@ -123,6 +123,9 @@ static GUI_SCROLL_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SPK_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// クリップボード履歴のサブメニュー(項目は refresh_status が変化時だけ作り直す)
 static GUI_HISTORY_MENU: AtomicUsize = AtomicUsize::new(0);
+static GUI_PEERS_MENU: AtomicUsize = AtomicUsize::new(0);
+static GUI_PEERS_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_PEERS_SIG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// 変化検知の初期値は最大値にして、起動直後の 1 回目で必ず作り直させる
 static GUI_HISTORY_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
 /// 履歴の見出し項目(件数表示を setTitle で更新する)
@@ -1812,6 +1815,97 @@ fn refresh_status() {
                 rebuild_history_menu(history_menu);
             }
         }
+
+        // 接続先メニュー(複数台保持。接続の一覧・切替)。履歴と同じく変化時だけ作り直す
+        let peers_menu = GUI_PEERS_MENU.load(Ordering::Relaxed) as ID;
+        if !peers_menu.is_null() {
+            let sig = {
+                let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+                peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| format!("{}|{}", i == act, p.name))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let mut seen = GUI_PEERS_SIG.lock().unwrap_or_else(|e| e.into_inner());
+            if *seen != sig {
+                *seen = sig;
+                rebuild_peers_menu(peers_menu);
+            }
+        }
+    }
+}
+
+/// 接続先サブメニューの項目を作り直す。アクティブな相手はチェックを付け、
+/// 選択で representedObject の id を sdPeerActivate: へ渡す
+unsafe fn rebuild_peers_menu(menu: ID) {
+    msg0(menu, sel(c"removeAllItems"));
+    let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+    let entries: Vec<(bool, String, String)> = {
+        let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+        peers
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mons = tsunagu_common::proto::Monitor::summary(&p.monitors);
+                let title = if p.monitors.len() > 1 {
+                    format!("{} ・{}面", p.name, p.monitors.len())
+                } else if p.monitors.len() == 1 {
+                    format!("{} ・{}", p.name, mons)
+                } else {
+                    p.name.clone()
+                };
+                (i == act, title, p.id.clone())
+            })
+            .collect()
+    };
+    if entries.is_empty() {
+        let item = menu_item("接続はまだありません", None, "");
+        msg1_void_u8(item, sel(c"setEnabled:"), 0);
+        add_item(menu, item);
+        return;
+    }
+    for (active, title, id) in entries {
+        let item = menu_item(&title, Some(c"sdPeerActivate:"), "");
+        if item.is_null() {
+            continue;
+        }
+        msg1_void_id(item, sel(c"setTarget:"), target);
+        if active {
+            // アクティブな相手にはチェックを付ける(NSOnState)
+            msg1_void_i64(item, sel(c"setState:"), 1);
+        }
+        msg1_void_id(item, sel(c"setRepresentedObject:"), crate::nsstring(&id));
+        add_item(menu, item);
+    }
+}
+
+/// 接続先メニューの選択: representedObject の端末 id でピアを探してアクティブへ
+unsafe extern "C" fn imp_peer_activate(_s: ID, _c: SEL, sender: ID) {
+    if sender.is_null() {
+        return;
+    }
+    let obj = msg0(sender, sel(c"representedObject"));
+    if obj.is_null() {
+        return;
+    }
+    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
+    if utf8.is_null() {
+        return;
+    }
+    let id = std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned();
+    let idx = crate::PEERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .position(|p| p.id == id);
+    if let Some(i) = idx {
+        crate::activate_peer(i, "接続先メニュー");
     }
 }
 
@@ -1958,6 +2052,7 @@ unsafe fn make_target() -> ID {
             imp_history_restore as *const () as usize,
         ),
         (c"sdHistoryClear:", imp_history_clear as *const () as usize),
+        (c"sdPeerActivate:", imp_peer_activate as *const () as usize),
         (c"sdShowSearch:", imp_show_search as *const () as usize),
         (c"sdSearchPick:", imp_search_pick as *const () as usize),
         (c"sdSearchGo:", imp_search_go as *const () as usize),
@@ -2104,6 +2199,20 @@ pub fn start() -> bool {
                 add_item(menu, holder);
                 let _ = GUI_HISTORY_ITEM.store(holder as usize, Ordering::Relaxed);
                 let _ = GUI_HISTORY_MENU.store(history_menu as usize, Ordering::Relaxed);
+            }
+        }
+
+        // 接続先(複数台の Windows を同時保持し、ここから切替える)。
+        // 項目は refresh_status が接続一覧の変化だけ検知して作り直す
+        let peers_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
+        if !peers_menu.is_null() {
+            msg1_void_u8(peers_menu, sel(c"setAutoenablesItems:"), 0);
+            let holder = menu_item("接続先", None, "");
+            if !holder.is_null() {
+                msg1_void_id(holder, sel(c"setSubmenu:"), peers_menu);
+                add_item(menu, holder);
+                let _ = GUI_PEERS_ITEM.store(holder as usize, Ordering::Relaxed);
+                let _ = GUI_PEERS_MENU.store(peers_menu as usize, Ordering::Relaxed);
             }
         }
 

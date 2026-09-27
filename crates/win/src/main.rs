@@ -1577,6 +1577,37 @@ fn vscreen() -> (i32, i32, i32, i32) {
     *VSCREEN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 自環境の全モニターを仮想画面座標系で列挙する(接続先へ自動通知)。
+/// モニターの増減は接続の再確立時に相手へ反映される
+fn list_monitors() -> Vec<tsunagu_common::proto::Monitor> {
+    unsafe extern "system" fn cb(
+        _hm: *mut std::ffi::c_void,
+        _hdc: *mut std::ffi::c_void,
+        rect: *mut windows_sys::Win32::Foundation::RECT,
+        ctx: isize,
+    ) -> i32 {
+        let out = unsafe { &mut *(ctx as *mut Vec<tsunagu_common::proto::Monitor>) };
+        let r = unsafe { &*rect };
+        out.push(tsunagu_common::proto::Monitor {
+            x: r.left,
+            y: r.top,
+            w: r.right - r.left,
+            h: r.bottom - r.top,
+        });
+        1
+    }
+    let mut out: Vec<tsunagu_common::proto::Monitor> = Vec::new();
+    unsafe {
+        windows_sys::Win32::Graphics::Gdi::EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(cb),
+            std::ptr::addr_of_mut!(out) as isize,
+        );
+    }
+    out
+}
+
 /// 仮想デスクトップの範囲を取り直す(変化があれば true を返せるよう値を返す)
 fn refresh_vscreen() -> (i32, i32, i32, i32) {
     const SM_XVIRTUALSCREEN: i32 = 76;
@@ -1982,7 +2013,12 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             continue;
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, name, .. }) if compatible(ver) => {
+            Some(Msg::Hello {
+                ver,
+                name,
+                monitors,
+                ..
+            }) if compatible(ver) => {
                 dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
                 // 表示名は制御文字・Bidi オーバーライドを除去してから載せる
                 *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
@@ -1993,7 +2029,11 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
                         n
                     }
                 };
-                println!("[hello] from {}", log_safe(&name));
+                println!(
+                    "[hello] from {} モニター: {}",
+                    log_safe(&name),
+                    tsunagu_common::proto::Monitor::summary(&monitors)
+                );
                 true
             }
             _ => false,
@@ -2003,7 +2043,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             std::thread::sleep(throttle.fail());
             continue;
         }
-        // hello_ok(相手=Mac が画面サイズを得られるよう自画面 w/h を含める)
+        // hello_ok(相手=Mac が画面サイズを得られるよう自画面 w/h と全モニターを含める)
         if wr
             .write_all(
                 encode(&Msg::HelloOk {
@@ -2011,6 +2051,8 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
                     w,
                     h,
                     ver: VERSION,
+                    id: tsunagu_common::proto::device_id(),
+                    monitors: list_monitors(),
                 })
                 .as_bytes(),
             )
@@ -2068,6 +2110,8 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
         token: String::new(),
         w,
         h,
+        id: tsunagu_common::proto::device_id(),
+        monitors: list_monitors(),
     });
     writer
         .write_all(hello.as_bytes())
@@ -2083,6 +2127,8 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
             w: mw,
             h: mh,
             ver,
+            monitors,
+            ..
         }) => {
             dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
@@ -2093,7 +2139,11 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
                     n
                 }
             };
-            println!("[hello] ok from {} (mac screen {mw}x{mh})", log_safe(&name));
+            println!(
+                "[hello] ok from {} (mac screen {mw}x{mh}) モニター: {}",
+                log_safe(&name),
+                tsunagu_common::proto::Monitor::summary(&monitors)
+            );
         }
         _ => {
             return Err(std::io::Error::new(
@@ -2277,6 +2327,7 @@ fn session(
                 w: mw,
                 h: mh,
                 ver,
+                ..
             } => {
                 dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
                 println!(

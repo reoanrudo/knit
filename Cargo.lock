@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagu-mac"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "serde_json",
  "tsunagu-common",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "tsunagu-win"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "serde_json",
  "tsunagu-common",

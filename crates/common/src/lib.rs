@@ -109,9 +109,10 @@ pub mod proto {
     pub const PORT: u16 = 24900;
     /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入。
     /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除。
-    /// 11: 全経路を Noise で暗号化(認証はハンドシェイクで行い hello のトークンは空)
+    /// 11: 全経路を Noise 暗号化(認証はハンドシェイクで行い hello のトークンは空)
     /// 12: Windows→Macの操作ID付きファイルドラッグ。
-    pub const VERSION: u32 = 12;
+    /// 13: hello/hello_ok に端末 id と全モニター構成(monitors)を追加(複数台接続の土台)。
+    pub const VERSION: u32 = 13;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
@@ -120,6 +121,56 @@ pub mod proto {
     /// 相手の版を受け入れてよいか
     pub fn compatible(peer: u32) -> bool {
         peer >= MIN_VERSION
+    }
+
+    /// 1 枚のモニター(仮想画面座標系での位置とサイズ。Mac は CG 座標系のまま)。
+    /// 版 13 以降の hello/hello_ok で交換し、複数モニターの自動認知に使う。
+    /// 旧版からの受信は空配列(既定)になり、従来どおり w/h の 1 画面扱い
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct Monitor {
+        #[serde(default)]
+        pub x: i32,
+        #[serde(default)]
+        pub y: i32,
+        pub w: i32,
+        pub h: i32,
+    }
+
+    impl Monitor {
+        /// モニター群の合計面積を本文として表す(ログ・表示用の 1 行)
+        pub fn summary(monitors: &[Monitor]) -> String {
+            if monitors.is_empty() {
+                return "不明".to_string();
+            }
+            monitors
+                .iter()
+                .map(|m| format!("{}x{}@{},{}", m.w, m.h, m.x, m.y))
+                .collect::<Vec<_>>()
+                .join(" + ")
+        }
+    }
+
+    /// 端末識別子(プロセスの起動ごとに生成)。暗号用途ではなく、同じ Mac へ
+    /// 接続した複数端末と、同一端末の再接続を区別するためだけの値
+    pub fn device_id() -> String {
+        static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        ID.get_or_init(|| {
+            let mut seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0)
+                ^ ((std::process::id() as u64) << 32);
+            let mut next = move || {
+                // splitmix64: 識別子生成には十分な拡散
+                seed = seed.wrapping_add(0x9e3779b97f4a7c15);
+                let mut z = seed;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+                z ^ (z >> 31)
+            };
+            format!("{:016x}", next())
+        })
+        .clone()
     }
 
     /// 通信で受け取った表示名を UI・ログへ載せられる形にする: 制御文字と
@@ -149,6 +200,12 @@ pub mod proto {
             w: i32,
             #[serde(default)]
             h: i32,
+            /// 端末識別子(版 13 以降)。複数台の区別と再接続の紐付けに使う
+            #[serde(default)]
+            id: String,
+            /// 送信側の全モニター(版 13 以降)。旧版からの受信は空
+            #[serde(default)]
+            monitors: Vec<Monitor>,
         },
         #[serde(rename = "hello_ok")]
         HelloOk {
@@ -157,6 +214,12 @@ pub mod proto {
             h: i32,
             #[serde(default)]
             ver: u32,
+            /// 端末識別子(版 13 以降)
+            #[serde(default)]
+            id: String,
+            /// 受け側の全モニター(版 13 以降)
+            #[serde(default)]
+            monitors: Vec<Monitor>,
         },
         #[serde(rename = "drag_offer")]
         DragOffer {
@@ -1667,6 +1730,73 @@ mod tests {
         assert_eq!(safe_peer_name("  \u{7}\t".trim()), "");
         // 長さは 48 文字で切る
         assert_eq!(safe_peer_name(&"x".repeat(60)).chars().count(), 48);
+    }
+
+    #[test]
+    fn hello_carries_monitors_and_stays_wire_compatible() {
+        // 版 13: 端末 id と全モニター構成が hello で往復する
+        let m = Monitor {
+            x: -1080,
+            y: 0,
+            w: 1080,
+            h: 1920,
+        };
+        let wire = encode(&Msg::Hello {
+            ver: 13,
+            name: "win-a".into(),
+            token: String::new(),
+            w: 1920,
+            h: 1080,
+            id: "abc123".into(),
+            monitors: vec![m.clone()],
+        });
+        match decode(&wire) {
+            Some(Msg::Hello {
+                monitors, id, ver, ..
+            }) => {
+                assert_eq!(
+                    (ver, id.as_str(), monitors),
+                    (13, "abc123", vec![m.clone()])
+                );
+            }
+            other => panic!("hello が復元できない: {other:?}"),
+        }
+        // 旧版(12)の形式: id・monitors 無しの JSON も警告なく読める(空になる)
+        let legacy = r#"{"t":"hello","ver":12,"name":"old","w":1920,"h":1080}"#;
+        match decode(legacy) {
+            Some(Msg::Hello {
+                monitors, id, ver, ..
+            }) => {
+                assert_eq!(ver, 12);
+                assert!(monitors.is_empty() && id.is_empty());
+            }
+            other => panic!("旧形式 hello が読めない: {other:?}"),
+        }
+        // hello_ok も同様に monitors を往復する
+        let ok_wire = encode(&Msg::HelloOk {
+            name: "mac".into(),
+            w: 2056,
+            h: 1329,
+            ver: 13,
+            id: "m1".into(),
+            monitors: vec![m.clone()],
+        });
+        match decode(&ok_wire) {
+            Some(Msg::HelloOk { monitors, id, .. }) => {
+                assert_eq!((id.as_str(), monitors), ("m1", vec![m]));
+            }
+            other => panic!("hello_ok が復元できない: {other:?}"),
+        }
+        // 端末識別子は呼び出し間で安定し、表示用サマリも動く
+        assert_eq!(device_id(), device_id());
+        assert_eq!(Monitor::summary(&[]), "不明");
+        assert!(Monitor::summary(&[Monitor {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080
+        }])
+        .contains("1920x1080"));
     }
 
     #[test]
