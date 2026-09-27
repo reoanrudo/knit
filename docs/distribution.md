@@ -36,7 +36,8 @@
 - ログイン時に自動起動(LaunchAgent `local.tsunagu`)。ログは /tmp/tsunagu-mac.log
 - 初回起動時、アクセシビリティ権限の許可を求められたら許可する
   (許可がないと `[fatal] CGEventTapCreate failed` で終了する)
-- メニューバーに「SD·Mac / SD·Win / SD·✕」が表示されれば起動完了
+- メニューバーに Tsunagu のアイコンが出れば起動完了(未接続の間は「未接続」と
+  併記。接続中はアイコンのみで、メニュー内に状態・遅延・履歴件数が出る)
 - アンインストール: `launchctl unload ~/Library/LaunchAgents/local.tsunagu.plist`
   → plist と ~/Applications/Tsunagu.app を削除
 

@@ -21,7 +21,9 @@ out=pathlib.Path(sys.argv[1]); binary=out/'tsunagu-win.exe'
 data=dict(schema_version=1, version=sys.argv[2], platform='windows-x64', source_commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(), working_tree_modified=bool(subprocess.check_output(['git','status','--porcelain'],text=True)), built_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), binary_sha256=hashlib.sha256(binary.read_bytes()).hexdigest(), distribution='development-candidate')
 (out/'release-manifest.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n')
 PY
-ditto -c -k --keepParent "$OUT" "$STAGE/Tsunagu-win-$VER.zip"
+# --norsrc: Mac の拡張属性(._xxx の AppleDouble)を入れない。Windows 向け配布物に
+# リソースフォークは無意味で、展開先にゴミファイルが残るのを防ぐ
+ditto -c -k --keepParent --norsrc "$OUT" "$STAGE/Tsunagu-win-$VER.zip"
 python3 scripts/check-release.py "$STAGE/Tsunagu-win-$VER.zip"
 mv "$STAGE/Tsunagu-win-$VER.zip" "dist/Tsunagu-win-$VER.zip"
 (cd dist && shasum -a 256 "Tsunagu-win-$VER.zip" > "Tsunagu-win-$VER.zip.sha256")

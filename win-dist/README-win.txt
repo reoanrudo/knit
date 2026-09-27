@@ -48,4 +48,4 @@ WindowsでTsunaguを起動し、見つかったMacを選んで6桁コードを�
 ----------------
 uninstall.bat をダブルクリックしてください(常駐停止・登録解除・ファイル削除)。
 
-ライセンス: MIT(公式リポジトリの LICENSE)
+ライセンス: MIT(同梱の LICENSE.txt)
