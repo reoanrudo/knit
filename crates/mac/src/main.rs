@@ -1157,6 +1157,18 @@ static EDGE_GUARD_UNTIL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// 自前管理のカーソル位置(delta 積算)。タップ内での毎イベント CGEventCreate は
 /// 負荷としてカクつきに効くため、積算+間欠同期(Deskflow の m_xCursor 方式)にする。
 static CUR_POS: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
+/// 直近 100ms の移動量(px)と窓の開始時刻(ms)。切替時の速度計装用
+///(§24 Crossing Intelligence: 実機の速い/遅い到達の分布を見てから誤 Cross
+/// 判定のしきい値を設計する。現状は判定には使わない)
+static RECENT_PX: Mutex<(f64, u64)> = Mutex::new((0.0, 0));
+
+/// 100ms 窓の移動量から速度(px/秒)を引く(計装ログと単体テストで使う)
+fn px_per_sec(px: f64, window_ms: u64) -> f64 {
+    if window_ms == 0 {
+        return 0.0;
+    }
+    px * 1000.0 / window_ms as f64
+}
 /// 接続相手(Windows)の画面サイズ(px)。hello で受信しスケール自動算出に使う
 pub(crate) static WIN_SCREEN: Mutex<(f64, f64)> = Mutex::new((1920.0, 1080.0));
 /// WIN モード中の Windows 仮想カーソル位置(px)。絶対位置送信モードで使う
@@ -1671,6 +1683,15 @@ unsafe extern "C" fn tap_callback(
                 // 32イベントに1回ライブ位置へ同期しドリフトを補正する
                 let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
                 let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
+                // 速度計装: 100ms を超えたら窓を作り直す(§24 のデータ取り)
+                {
+                    let now = now_ms();
+                    let mut r = RECENT_PX.lock().unwrap_or_else(|e| e.into_inner());
+                    if now.saturating_sub(r.1) > 100 {
+                        *r = (0.0, now);
+                    }
+                    r.0 += dx.abs() + dy.abs();
+                }
                 let n = CUR_SYNC_N.fetch_add(1, Ordering::Relaxed);
                 let mut pos = CUR_POS.lock().unwrap_or_else(|e| e.into_inner());
                 pos.0 += dx;
@@ -1768,7 +1789,13 @@ unsafe extern "C" fn tap_callback(
                     }
                     WIN_MODE.store(true, Ordering::Relaxed);
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0})", loc.x, loc.y);
+                    // 到達時の速度を添える(§24 用の計装。速い=意図的な越え、
+                    // 遅い=停止しようとして端に触れた、の分布を実機で見る)
+                    let v = {
+                        let r = *RECENT_PX.lock().unwrap_or_else(|e| e.into_inner());
+                        px_per_sec(r.0, now_ms().saturating_sub(r.1))
+                    };
+                    eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0}) v={v:.0}px/s", loc.x, loc.y);
 
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
                     // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
@@ -2087,7 +2114,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-022422-80c867d";
+const BUILD_ID: &str = "build-20260927-023559-3c3468f";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -3069,6 +3096,15 @@ mod win_cur_tests {
         // 初期値(0x0)や不正値はそのまま(0 除算・暴発写像の防止)
         assert_eq!(rs((10.0, 20.0), (0.0, 0.0), (1920.0, 1080.0)), (10.0, 20.0));
         assert_eq!(rs((10.0, 20.0), (1920.0, 1080.0), (0.0, 1080.0)), (10.0, 20.0));
+    }
+
+    #[test]
+    fn px_per_sec_converts_window_to_seconds() {
+        use super::px_per_sec as v;
+        assert_eq!(v(120.0, 100), 1200.0);
+        assert_eq!(v(3.0, 30), 100.0);
+        // 窓が 0ms(初回イベント等)は速度不定ではなく 0 扱い(0 除算回避)
+        assert_eq!(v(50.0, 0), 0.0);
     }
 }
 
