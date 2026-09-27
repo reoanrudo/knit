@@ -4,9 +4,10 @@
 // 呼び出し規約: このモジュールの全関数はメインスレッドから呼ぶこと
 // (start() は main() の末尾、IMP は AppKit のイベント配信=メインRunLoop)。
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
-use crate::{msg0, msg0_cstr, nsstring, objc_getClass};
+use crate::{msg0, msg0_cstr, msg0_isize, nsstring, objc_getClass, CGPoint, CGRect, CGSize};
 
 type ID = *mut core::ffi::c_void;
 type SEL = *mut core::ffi::c_void;
@@ -36,7 +37,7 @@ unsafe extern "C" {
         name: *const core::ffi::c_char,
         extra_bytes: usize,
     ) -> CLS;
-    fn class_addMethod(cls: CLS, name: SEL, imp: usize, types: *const core::ffi::c_char) -> i32;
+    fn class_addMethod(cls: CLS, name: SEL, imp: usize, types: *const core::ffi::c_char) -> u8;
     fn objc_registerClassPair(cls: CLS);
     // メニューバーアイコンを CoreGraphics で描くための最小セット
     fn CGColorSpaceCreateDeviceRGB() -> *mut core::ffi::c_void;
@@ -64,23 +65,28 @@ unsafe extern "C" {
 // ---------- 固定シグネチャ呼び出しヘルパ(この画面で必要なものだけ) ----------
 
 unsafe fn msg0_void(target: ID, cmd: SEL) {
-    let f: unsafe extern "C" fn(ID, SEL) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd)
 }
 unsafe fn msg1_void_id(target: ID, cmd: SEL, a: ID) {
-    let f: unsafe extern "C" fn(ID, SEL, ID) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL, ID) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_sel(target: ID, cmd: SEL, a: SEL) {
-    let f: unsafe extern "C" fn(ID, SEL, SEL) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL, SEL) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_u8(target: ID, cmd: SEL, a: u8) {
-    let f: unsafe extern "C" fn(ID, SEL, u8) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL, u8) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg1_void_i64(target: ID, cmd: SEL, a: i64) {
-    let f: unsafe extern "C" fn(ID, SEL, i64) = std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL, i64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(target, cmd, a)
 }
 unsafe fn msg2_void_id_id(target: ID, cmd: SEL, a: ID, b: ID) {
@@ -115,6 +121,138 @@ static GUI_AUDIO_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_CMD_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SCROLL_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_SPK_ITEM: AtomicUsize = AtomicUsize::new(0);
+/// クリップボード履歴のサブメニュー(項目は refresh_status が変化時だけ作り直す)
+static GUI_HISTORY_MENU: AtomicUsize = AtomicUsize::new(0);
+/// 変化検知の初期値は最大値にして、起動直後の 1 回目で必ず作り直させる
+static GUI_HISTORY_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// 履歴の見出し項目(件数表示を setTitle で更新する)
+static GUI_HISTORY_ITEM: AtomicUsize = AtomicUsize::new(0);
+
+// ---------- Search My Desk(ビジョン§14) ----------
+static SEARCH_WINDOW: AtomicUsize = AtomicUsize::new(0);
+static SEARCH_FIELD: AtomicUsize = AtomicUsize::new(0);
+static SEARCH_BUTTONS: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+/// 現在の候補(kind, 表示タイトル, 本文)。タイトルは ↑↓ の選択表示の
+/// 書き換えに使うため本文と分けて持つ
+static SEARCH_HITS: Mutex<Vec<(u8, String, String)>> = Mutex::new(Vec::new());
+/// ↑↓ で動く選択位置。クエリが変わったら先頭へ戻す。Enter はこの位置を実行
+static SEARCH_SEL: AtomicUsize = AtomicUsize::new(0);
+/// 検索窓が開いている間 true。tap が文字キーを横取りする判定に使う(AppKit に
+/// 觸れない tap スレッドからも読めるようフラグで管理)
+pub static SEARCH_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// 選択位置を 1 つ動かす(端では反対側へ折り返す。Spotlight と同じ挙動)。
+/// 候補が無いときは動かさない
+pub(crate) fn next_sel(cur: usize, len: usize, down: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if down {
+        (cur + 1) % len
+    } else {
+        cur.checked_sub(1).unwrap_or(len - 1)
+    }
+}
+
+/// 候補ボタンのタイトルを選択位置に合わせて書き換える(► 前置)。
+/// クエリ再計算を伴わないため ↑↓ の反映は軽い
+unsafe fn search_highlight_buttons() {
+    let hits = SEARCH_HITS.lock().unwrap_or_else(|e| e.into_inner());
+    let sel_idx = SEARCH_SEL.load(Ordering::Relaxed);
+    for (i, btn_slot) in SEARCH_BUTTONS.iter().enumerate() {
+        let btn = btn_slot.load(Ordering::Relaxed) as ID;
+        if btn.is_null() {
+            continue;
+        }
+        if let Some((_, title, _)) = hits.get(i) {
+            let shown = if i == sel_idx {
+                format!("► {title}")
+            } else {
+                format!("  {title}")
+            };
+            msg1_void_id(btn, sel(c"setTitle:"), nsstring(&shown));
+        }
+    }
+}
+
+/// ↑↓ キー 1 回分(メインスレッドで実行される)
+unsafe fn imp_search_arrow(down: bool) {
+    let len = SEARCH_HITS.lock().unwrap_or_else(|e| e.into_inner()).len();
+    let cur = SEARCH_SEL.load(Ordering::Relaxed);
+    let next = next_sel(cur, len, down);
+    SEARCH_SEL.store(next, Ordering::Relaxed);
+    search_highlight_buttons();
+    let titles = SEARCH_HITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(next)
+        .map(|(_, t, _)| t.clone())
+        .unwrap_or_default();
+    eprintln!("[search] 選択 #{next}: {titles}");
+}
+
+/// tap スレッドから: 検索窓が開いているか
+pub fn search_open() -> bool {
+    SEARCH_OPEN.load(Ordering::Relaxed)
+}
+
+pub fn target_id() -> ID {
+    GUI_TARGET.load(Ordering::Relaxed) as ID
+}
+
+/// Search My Desk の実機検証(--probe-search)。
+/// AppKit の生成・空クエリの候補・絞り込みを 1 回確認して閉じる。
+/// 対話セッション(GUI)でのみ成功する(SSH では AppKit が使えない)
+pub fn probe_search() -> bool {
+    // AppKit のオブジェクトは autorelease pool の内側で作る(無いと
+    // 終了時の dealloc で例外が出る=実測)
+    crate::with_pool(|| unsafe { probe_search_inner() })
+}
+
+unsafe fn probe_search_inner() -> bool {
+    // start() が既に target を登録している。同じ名前のクラスは
+    // 2 度は作れないため、既存の GUI_TARGET を優先して使う
+    let target = match target_id().is_null() {
+        false => target_id(),
+        true => {
+            let t = make_target();
+            if t.is_null() {
+                eprintln!("[probe-search] target クラスを生成できません");
+                return false;
+            }
+            let _ = GUI_TARGET.store(t as usize, Ordering::Relaxed);
+            t
+        }
+    };
+    let _ = target;
+    if !build_search_window() {
+        eprintln!("[probe-search] 検索窓(NSPanel/入力/8 ボタン)の生成に失敗");
+        return false;
+    }
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    let window = SEARCH_WINDOW.load(Ordering::Relaxed) as ID;
+    let buttons = SEARCH_BUTTONS
+        .iter()
+        .filter(|b| b.load(Ordering::Relaxed) != 0)
+        .count();
+    refresh_search_results("");
+    let initial = SEARCH_HITS.lock().map(|h| h.len()).unwrap_or(0);
+    let ok =
+        !field.is_null() && !window.is_null() && buttons == SEARCH_BUTTONS.len() && initial > 0;
+    if ok {
+        refresh_search_results("term");
+        let narrowed = SEARCH_HITS.lock().map(|h| h.len()).unwrap_or(0);
+        eprintln!(
+            "[probe-search] 窓/入力/8 ボタン OK、初期候補 {initial} 件、絞り込み後 {narrowed} 件"
+        );
+    }
+    // orderOut は表示中の窓だけに限る(非表示窓への orderOut は
+    // WindowServer 未接続の環境で例外になった=実測)
+    if !window.is_null() && msg0_isize(window, sel(c"isVisible")) != 0 {
+        msg1_void_id(window, sel(c"orderOut:"), std::ptr::null_mut());
+    }
+    ok
+}
 
 // ---------- 設定ウィンドウ(メニュー「設定…」で開く) ----------
 static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
@@ -204,6 +342,571 @@ unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
     let _ = std::process::Command::new("open")
         .args(["-a", "Console", "/tmp/tsunagu-mac.log"])
         .spawn();
+}
+
+/// 履歴メニューの「消す」クリック。本文は不要(メニュー操作で即反映)
+unsafe extern "C" fn imp_history_clear(_s: ID, _c: SEL, _sender: ID) {
+    crate::history_clear();
+    crate::HISTORY_LAST_ID.store(0, Ordering::Relaxed);
+}
+
+// ---------- Search My Desk(ビジョン§14) ----------
+
+/// 検索窓を(無ければ作って)開く。表示中なら閉じる(トグル)。
+/// メインスレッドからのみ呼ぶ(performSelectorOnMainThread 経由)
+unsafe extern "C" fn imp_show_search(_s: ID, _c: SEL, _n: ID) {
+    let window = SEARCH_WINDOW.load(Ordering::Relaxed) as ID;
+    if window.is_null() && !build_search_window() {
+        eprintln!("[search] 検索窓を生成できませんでした");
+        return;
+    }
+    let window = SEARCH_WINDOW.load(Ordering::Relaxed) as ID;
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    if msg0_isize(window, sel(c"isVisible")) != 0 {
+        eprintln!("[search] 検索窓を閉じます(トグル)");
+        msg1_void_id(window, sel(c"orderOut:"), std::ptr::null_mut());
+        SEARCH_OPEN.store(false, Ordering::Relaxed);
+        return;
+    }
+    // 開くたびに候補を初期化し、Windows 側のアプリ一覧も問い合わせる
+    //(応答は非同期。届いたら sdSearchRefresh: で絞り込みをやり直す)
+    msg1_void_id(field, sel(c"setStringValue:"), nsstring(""));
+    refresh_search_results("");
+    crate::send_msg(&crate::Msg::AppsQuery);
+    // デスクのファイル/フォルダ索引を裏で更新する(10 分キャッシュ。初回は
+    // 空のまま出て、索引が揃った次回の絞り込みから候補に混ざる)
+    std::thread::spawn(|| crate::refresh_desk_files());
+    // 開いている間は tap が文字キーを横取りして直接 field へ積む(IME を
+    // 通さない=Spotlight 型。inputContext は get-only で無効化できないため)
+    SEARCH_OPEN.store(true, Ordering::Relaxed);
+    // 前回 closed 状態で握り損ねた up の残りを消す(詳細は main.rs の宣言コメント)
+    crate::SEARCH_ENTER_DOWN.store(false, Ordering::Relaxed);
+    crate::SEARCH_ESC_DOWN.store(false, Ordering::Relaxed);
+    // カーソルがある画面の中央へ(Spotlight の体感。多画面で見えない場所に
+    // 出ないようにする)
+    let (x, y) = crate::cursor_screen_center_appkit(520.0, 344.0);
+    let set_origin: unsafe extern "C" fn(ID, SEL, f64, f64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    set_origin(window, sel(c"setFrameOrigin:"), x, y);
+    let app = msg0(
+        objc_getClass(c"NSApplication".as_ptr()),
+        sel(c"sharedApplication"),
+    );
+    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    // macOS 14+ では旧 API(activateIgnoringOtherApps:)が効かないことがあるため
+    // モダンな activate() も併用する(key になれないと入力欄に打てない)
+    msg0_void(app, sel(c"activate"));
+    msg1_void_id(window, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
+    msg0_void(window, sel(c"makeKeyWindow")); // 引数なし(makeKeyWindow: は実在しない)
+    msg1_void_id(window, sel(c"makeFirstResponder:"), field);
+    // key 化の成否を記録する(accessory 常駐アプリは activation が拒否されて
+    // 入力欄に打てないことがあるため、実機診断の鍵になる)
+    let keywin = msg0(app, sel(c"keyWindow"));
+    eprintln!(
+        "[search] 検索窓を開きました(visible={}) keyWindow一致={}",
+        msg0_isize(window, sel(c"isVisible")),
+        keywin == window
+    );
+}
+
+/// Windows 側アプリ一覧が届いたときの再絞り込み(メインスレッドから呼ばれる)
+unsafe extern "C" fn imp_search_refresh(_s: ID, _c: SEL, _n: ID) {
+    let window = SEARCH_WINDOW.load(Ordering::Relaxed) as ID;
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    if window.is_null() || field.is_null() {
+        return;
+    }
+    if msg0_isize(window, sel(c"isVisible")) == 0 {
+        return;
+    }
+    let value = msg0(field, sel(c"objectValue"));
+    let utf8 = if value.is_null() {
+        std::ptr::null()
+    } else {
+        msg0_cstr(value, sel(c"UTF8String"))
+    };
+    let query = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    };
+    refresh_search_results(&query);
+}
+
+/// tap から渡された文字を入力欄へ積む(IMO を通さない直接入力)。
+/// tap 側で kc→文字に変換済みの文字列を受け取る
+unsafe extern "C" fn imp_search_char(_s: ID, _c: SEL, text: ID) {
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    if field.is_null() || text.is_null() {
+        return;
+    }
+    let cur = msg0(field, sel(c"stringValue"));
+    let joined = if cur.is_null() {
+        text
+    } else {
+        crate::msg1_id(cur, sel(c"stringByAppendingString:"), text)
+    };
+    msg1_void_id(field, sel(c"setStringValue:"), joined);
+    let utf8 = msg0_cstr(joined, sel(c"UTF8String"));
+    let query = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    };
+    eprintln!("[search] 直接入力「{query}」で絞り込み(tap 経由)");
+    refresh_search_results(&query);
+}
+
+/// tap から: 入力欄の末尾 1 文字を削除(Backspace)
+unsafe extern "C" fn imp_search_backspace(_s: ID, _c: SEL, _n: ID) {
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    if field.is_null() {
+        return;
+    }
+    let cur = msg0(field, sel(c"stringValue"));
+    let utf8 = if cur.is_null() {
+        std::ptr::null()
+    } else {
+        msg0_cstr(cur, sel(c"UTF8String"))
+    };
+    if utf8.is_null() {
+        return;
+    }
+    let mut query = std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned();
+    if query.pop().is_none() {
+        return;
+    }
+    msg1_void_id(field, sel(c"setStringValue:"), nsstring(&query));
+    refresh_search_results(&query);
+}
+
+/// tap スレッドから: 1 文字をメインスレッドで field へ積むよう依頼する
+pub fn dispatch_search_text(text: &str) {
+    unsafe {
+        let target = target_id();
+        if target.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        f(
+            target,
+            crate::sel_registerName(
+                c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr(),
+            ),
+            crate::sel_registerName(c"sdSearchChar:".as_ptr()),
+            nsstring(text),
+            0,
+        );
+    }
+}
+
+/// tap スレッドから: Backspace(1 文字削除)を依頼する
+pub fn dispatch_search_backspace() {
+    unsafe {
+        let target = target_id();
+        if target.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        f(
+            target,
+            crate::sel_registerName(
+                c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr(),
+            ),
+            crate::sel_registerName(c"sdSearchBackspace:".as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// tap スレッドから: Enter(選択候補を実行)を依頼する
+pub fn dispatch_search_enter() {
+    unsafe {
+        let target = target_id();
+        if target.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        f(
+            target,
+            crate::sel_registerName(
+                c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr(),
+            ),
+            crate::sel_registerName(c"sdSearchGo:".as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// tap スレッドから: ↑↓(選択を 1 つ動かす)を依頼する
+pub fn dispatch_search_arrow(down: bool) {
+    let name = if down {
+        c"sdSearchArrowDown:"
+    } else {
+        c"sdSearchArrowUp:"
+    };
+    unsafe {
+        let target = target_id();
+        if target.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        f(
+            target,
+            crate::sel_registerName(
+                c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr(),
+            ),
+            crate::sel_registerName(name.as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// sdSearchArrowDown: / sdSearchArrowUp: の受け口
+unsafe extern "C" fn imp_search_arrow_down(_s: ID, _c: SEL, _n: ID) {
+    imp_search_arrow(true);
+}
+unsafe extern "C" fn imp_search_arrow_up(_s: ID, _c: SEL, _n: ID) {
+    imp_search_arrow(false);
+}
+
+/// 入力のたびに候補を絞り直す(NSTextField の delegate)
+unsafe extern "C" fn imp_control_text_did_change(_s: ID, _c: SEL, _note: ID) {
+    let field = SEARCH_FIELD.load(Ordering::Relaxed) as ID;
+    if field.is_null() {
+        return;
+    }
+    let value = msg0(field, sel(c"objectValue"));
+    let utf8 = if value.is_null() {
+        std::ptr::null()
+    } else {
+        msg0_cstr(value, sel(c"UTF8String"))
+    };
+    let query = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned()
+    };
+    eprintln!("[search] 入力「{query}」で絞り込み");
+    refresh_search_results(&query);
+}
+
+/// 候補のクリック(タグ=index+1)
+unsafe extern "C" fn imp_search_pick(_s: ID, _c: SEL, sender: ID) {
+    if sender.is_null() {
+        return;
+    }
+    let tag = msg0_isize(sender, sel(c"tag"));
+    run_search_hit(tag.max(1) as usize - 1, false);
+}
+
+/// Enter(入力欄の action)= 選択位置の候補を実行。⌥Enter は候補を Windows へ投げる
+unsafe extern "C" fn imp_search_go(_s: ID, _c: SEL, _sender: ID) {
+    let throw = crate::SEARCH_ENTER_OPT.swap(false, Ordering::Relaxed);
+    let sel = SEARCH_SEL.load(Ordering::Relaxed);
+    eprintln!(
+        "[search] Enter 受付: 選択候補 #{sel} を実行します{}",
+        if throw {
+            "(⌥: Windows へ投げます)"
+        } else {
+            ""
+        }
+    );
+    run_search_hit(sel, throw);
+}
+
+/// kind: 0=アプリ/1=履歴/2=URL/3=Windows アプリ/4=ファイル/5=コマンド。
+/// throw は ⌥Enter(候補を Windows へ投げる=ビジョン§13 のファイル版)
+unsafe fn run_search_hit(index: usize, throw: bool) {
+    let hit = SEARCH_HITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(index)
+        .map(|(k, _, t)| (*k, t.clone()));
+    let Some((kind, text)) = hit else {
+        eprintln!("[search] 候補が空のため実行を中止(#{index})");
+        return;
+    };
+    match kind {
+        0 | 4 => {
+            if kind == 4 && throw {
+                // ファイル/フォルダ候補を Windows へ投げる(Throw)。送信経路は
+                // Finder の ⌘C 同期と同じ(FileBegin→FileEnd、Ctrl+V で貼り付け可)
+                eprintln!("[search] ファイルを Windows へ投げます: {text}");
+                crate::send_files_to_win(vec![std::path::PathBuf::from(&text)], false);
+            } else {
+                // 既定アプリで開く(.app は NSWorkspace が起動、フォルダは Finder)
+                let url = crate::msg1_id(
+                    objc_getClass(c"NSURL".as_ptr()),
+                    crate::sel_registerName(c"fileURLWithPath:".as_ptr()),
+                    nsstring(&text),
+                );
+                let ws = msg0(
+                    objc_getClass(c"NSWorkspace".as_ptr()),
+                    sel(c"sharedWorkspace"),
+                );
+                let open: unsafe extern "C" fn(ID, crate::SEL, ID) -> u8 =
+                    std::mem::transmute(crate::objc_msgSend as *const () as usize);
+                let _ = open(ws, sel(c"openURL:"), url);
+                eprintln!(
+                    "[search] {}: {text}",
+                    if kind == 4 {
+                        "ファイル/フォルダを開く"
+                    } else {
+                        "アプリを起動"
+                    }
+                );
+            }
+        }
+        1 => crate::history_restore(text),
+        2 => {
+            // URL は相手 PC(Windows)の既定ブラウザで開く(Continue Here と同じ経路)
+            if crate::send_msg_reported(&crate::Msg::OpenUrl { url: text.clone() }) {
+                eprintln!("[search] Windows で開くよう送信: {text}");
+            } else {
+                crate::notify("Tsunagu", "未接続のため Windows で開けませんでした");
+            }
+        }
+        3 => {
+            // Windows アプリの起動。受け側は列挙済みパスと完全一致だけ実行する
+            if crate::send_msg_reported(&crate::Msg::RunApp { path: text.clone() }) {
+                eprintln!("[search] Windows へ起動指示: {text}");
+            } else {
+                crate::notify("Tsunagu", "未接続のため Windows で起動できませんでした");
+            }
+        }
+        5 => crate::run_desk_command(&text),
+        _ => {}
+    }
+    let window = SEARCH_WINDOW.load(Ordering::Relaxed) as ID;
+    if !window.is_null() {
+        msg1_void_id(window, sel(c"orderOut:"), std::ptr::null_mut());
+    }
+    SEARCH_OPEN.store(false, Ordering::Relaxed);
+}
+
+unsafe fn refresh_search_results(query: &str) {
+    // 候補 1 行あたりの内部表現(kind: 0=アプリ/1=履歴/2=URL/3=Windows アプリ/
+    // 4=ファイル/5=コマンド)
+    struct Row {
+        kind: u8,
+        title: String,
+        text: String,
+    }
+    let apps = crate::list_apps();
+    let files = crate::DESK_FILES
+        .lock()
+        .map(|f| f.clone())
+        .unwrap_or_default();
+    let commands = crate::desk_commands();
+    let entries: Vec<(u64, String)> = crate::HISTORY
+        .lock()
+        .map(|h| h.entries().iter().map(|e| (e.id, e.text.clone())).collect())
+        .unwrap_or_default();
+    let mut rows: Vec<Row> = tsunagu_common::desksearch::search(
+        query,
+        &apps,
+        &files,
+        &commands,
+        &entries,
+        SEARCH_BUTTONS.len(),
+    )
+    .into_iter()
+    .map(|h| {
+        let kind = match h.kind {
+            tsunagu_common::desksearch::Kind::App => 0u8,
+            tsunagu_common::desksearch::Kind::History => 1,
+            tsunagu_common::desksearch::Kind::Url => 2,
+            tsunagu_common::desksearch::Kind::File => 4,
+            tsunagu_common::desksearch::Kind::Cmd => 5,
+        };
+        Row {
+            kind,
+            title: h.title,
+            text: h.text,
+        }
+    })
+    .collect();
+    // Windows 側のアプリを同じ枠へ混ぜる(どちらの PC かはタイトル前置で分かる)。
+    // 残り枠だけ使うため、手元の候補が優先される。
+    // App の Hit だけを混ぜる: search は URL クエリで kind=Url の行も返すため
+    // そのまま足すと Mac 側で出した URL 行と重複する(実測)
+    if rows.len() < SEARCH_BUTTONS.len() {
+        let win_apps = crate::WIN_APPS
+            .lock()
+            .map(|a| a.clone())
+            .unwrap_or_default();
+        if !win_apps.is_empty() {
+            let remain = SEARCH_BUTTONS.len() - rows.len();
+            for h in tsunagu_common::desksearch::search(query, &win_apps, &[], &[], &[], remain) {
+                if !matches!(h.kind, tsunagu_common::desksearch::Kind::App) {
+                    continue;
+                }
+                rows.push(Row {
+                    kind: 3,
+                    title: format!("Windows・{}", h.title),
+                    text: h.text,
+                });
+            }
+        }
+    }
+    rows.truncate(SEARCH_BUTTONS.len());
+    *SEARCH_HITS.lock().unwrap_or_else(|e| e.into_inner()) = rows
+        .iter()
+        .map(|r| (r.kind, r.title.clone(), r.text.clone()))
+        .collect();
+    // クエリが変わったので選択は先頭へ戻す(以前の選択位置が新しい候補数を
+    // 超えている事故も防ぐ)。タイトルの描画は search_highlight_buttons が
+    // 選択位置込みで行うため、ここでは表示/非表示だけ切り替える
+    SEARCH_SEL.store(0, Ordering::Relaxed);
+    for (i, btn_slot) in SEARCH_BUTTONS.iter().enumerate() {
+        let btn = btn_slot.load(Ordering::Relaxed) as ID;
+        if btn.is_null() {
+            continue;
+        }
+        match rows.get(i) {
+            Some(_) => msg1_void_u8(btn, sel(c"setHidden:"), 0),
+            None => msg1_void_u8(btn, sel(c"setHidden:"), 1),
+        }
+    }
+    search_highlight_buttons();
+    // 候補の実機検証用ログ(上位 3 件。0=Mac アプリ/1=履歴/2=URL/3=Win アプリ/
+    // 4=ファイル/5=コマンド)
+    if !rows.is_empty() {
+        let top: Vec<String> = rows
+            .iter()
+            .take(3)
+            .map(|r| format!("[{}]", r.title))
+            .collect();
+        eprintln!("[search] 候補{}件: {}", rows.len(), top.join(" "));
+    }
+}
+
+/// 検索窓を 1 回だけ組み立てる(以後は再利用)。
+/// Cocoa 座標は左下原点: 上に入力、下に候補ボタン 8 件を並べる
+unsafe fn build_search_window() -> bool {
+    let frame = CGRect {
+        origin: CGPoint { x: 0.0, y: 0.0 },
+        size: CGSize { w: 520.0, h: 344.0 },
+    };
+    let init: unsafe extern "C" fn(ID, SEL, CGRect, usize, usize, u8) -> ID =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let panel = init(
+        msg0(objc_getClass(c"NSPanel".as_ptr()), sel(c"alloc")),
+        sel(c"initWithContentRect:styleMask:backing:defer:"),
+        frame,
+        // Titled | Closable | UtilityWindow | NonactivatingPanel(0x80)。
+        // NonactivatingPanel は常駐(accessory)アプリの窓をアプリのアクティブ化
+        // なしで key にできる(Spotlight 型ランチャーの定石)。無いと
+        // 他アプリが前面の間に入力欄へキーが届かない(実測)
+        1 | 2 | 16 | (1 << 7),
+        2,
+        0,
+    );
+    if panel.is_null() {
+        return false;
+    }
+    msg1_void_u8(panel, sel(c"setReleasedWhenClosed:"), 0);
+    // NSPanel は既定で hidesOnDeactivate=YES のため、別アプリが前面に来た瞬間
+    // 窓が勝手に隠れて isVisible==0 になり、トグル閉鎖と再オープンが壊れる(実測)。
+    // ランチャー窓は他アプリの上に開いたまま残るべきなので無効化する
+    msg1_void_u8(panel, sel(c"setHidesOnDeactivate:"), 0);
+    msg1_void_id(panel, sel(c"setTitle:"), nsstring("Search My Desk"));
+    // 位置は開くたびに imp_show_search がカーソル画面の中央へ置く(center は
+    // main 以外の画面を見ているときに窓が見えない場所へ出ることがある=実測)
+    let content = msg0(panel, sel(c"contentView"));
+    if content.is_null() {
+        return false;
+    }
+    let target = target_id();
+    if target.is_null() {
+        return false;
+    }
+    let subview: unsafe extern "C" fn(ID, SEL, CGRect) -> ID =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    // 入力欄
+    let field = subview(
+        msg0(objc_getClass(c"NSTextField".as_ptr()), sel(c"alloc")),
+        sel(c"initWithFrame:"),
+        CGRect {
+            origin: CGPoint { x: 16.0, y: 296.0 },
+            size: CGSize { w: 488.0, h: 30.0 },
+        },
+    );
+    if field.is_null() {
+        return false;
+    }
+    msg1_void_id(content, sel(c"addSubview:"), field);
+    msg1_void_id(field, sel(c"setTarget:"), target);
+    msg1_void_sel(field, sel(c"setAction:"), sel(c"sdSearchGo:"));
+    msg1_void_id(field, sel(c"setDelegate:"), target);
+    msg1_void_id(
+        field,
+        sel(c"setPlaceholderString:"),
+        nsstring("アプリ・履歴・URL を検索(Enter で先頭候補を実行)"),
+    );
+    // 候補ボタン 8 件
+    for i in 0..SEARCH_BUTTONS.len() {
+        let y = 256.0 - i as f64 * 34.0;
+        let btn = subview(
+            msg0(objc_getClass(c"NSButton".as_ptr()), sel(c"alloc")),
+            sel(c"initWithFrame:"),
+            CGRect {
+                origin: CGPoint { x: 16.0, y },
+                size: CGSize { w: 488.0, h: 30.0 },
+            },
+        );
+        if btn.is_null() {
+            continue;
+        }
+        msg1_void_id(content, sel(c"addSubview:"), btn);
+        msg1_void_id(btn, sel(c"setTarget:"), target);
+        msg1_void_sel(btn, sel(c"setAction:"), sel(c"sdSearchPick:"));
+        msg1_void_i64(btn, sel(c"setTag:"), i as i64 + 1);
+        msg1_void_id(btn, sel(c"setTitle:"), nsstring(""));
+        msg1_void_u8(btn, sel(c"setHidden:"), 1);
+        SEARCH_BUTTONS[i].store(btn as usize, Ordering::Relaxed);
+    }
+    SEARCH_FIELD.store(field as usize, Ordering::Relaxed);
+    SEARCH_WINDOW.store(panel as usize, Ordering::Relaxed);
+    true
+}
+
+/// クリップボード履歴メニューの項目クリック。representedObject(NSString)から
+/// 本文を取り出して Mac のクリップボードへ復元する
+unsafe extern "C" fn imp_history_restore(_s: ID, _c: SEL, sender: ID) {
+    if sender.is_null() {
+        return;
+    }
+    let obj = msg0(sender, sel(c"representedObject"));
+    if obj.is_null() {
+        return;
+    }
+    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
+    if utf8.is_null() {
+        return;
+    }
+    let text = std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned();
+    if !text.is_empty() {
+        crate::history_restore(text);
+    }
 }
 unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
@@ -411,7 +1114,6 @@ unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
     crate::send_msg(&crate::Msg::Vol { op });
 }
 
-
 unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
     // accessory アプリでも明示アクティベートすればモーダルパネルは出せる
     let app = msg0(
@@ -430,10 +1132,31 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
     msg1_void_u8(panel, sel(c"setCanChooseFiles:"), 1);
     msg1_void_u8(panel, sel(c"setCanChooseDirectories:"), 0);
     msg1_void_u8(panel, sel(c"setAllowsMultipleSelection:"), 1);
+    // 送信の起点をデスクトップへ合わせる(手元で作った一時ファイルの定位置)
+    let fm = msg0(
+        objc_getClass(c"NSFileManager".as_ptr()),
+        sel(c"defaultManager"),
+    );
+    if !fm.is_null() {
+        let at: unsafe extern "C" fn(ID, SEL, usize, usize) -> ID =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        let desktop = at(
+            fm,
+            sel(c"URLsForDirectory:inDomains:"),
+            12, /*NSDesktopDirectory*/
+            1,  /*NSUserDomainMask*/
+        );
+        if !desktop.is_null() {
+            msg1_void_id(panel, sel(c"setDirectoryURL:"), desktop);
+        }
+    }
     msg1_void_id(
         panel,
         sel(c"setMessage:"),
-        crate::nsstring("Windows へ送信します(合計 200MB まで)"),
+        crate::nsstring(&format!(
+            "Windows へ送信します(1回の合計 {} まで)",
+            tsunagu_common::bulk::file_limit_label()
+        )),
     );
     // runModal は選択が確定するまで戻らない(メイン RunLoop を内回りする)
     let resp = crate::msg0_isize(panel, sel(c"runModal"));
@@ -624,7 +1347,10 @@ const LAY_VH: f64 = 320.0;
 
 /// Mac/Win 両画面の実ピクセルサイズ(hello 受信値。未接続時は一般値)
 fn lay_px() -> ((f64, f64), (f64, f64)) {
-    let mac = { let g = crate::geo(); (g.main_w, g.main_h) };
+    let mac = {
+        let g = crate::geo();
+        (g.main_w, g.main_h)
+    };
     let win = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
     (mac, win)
 }
@@ -981,7 +1707,7 @@ fn refresh_status() {
             let conn = if connected {
                 "接続済"
             } else {
-                "切断(再接続待機中)"
+                "切断(自動再接続中・Windows アプリの起動を確認)"
             };
             // 操作中の表示はモード名を挟まず「操作中」に統一する
             let mode = "操作中";
@@ -998,7 +1724,16 @@ fn refresh_status() {
             } else {
                 String::new()
             };
-            let text = format!("{conn} ・ {mode}{rtt_s}{route_s}");
+            let history = crate::HISTORY
+                .lock()
+                .map(|h| h.entries().len())
+                .unwrap_or(0);
+            let history_s = if history > 0 {
+                format!("・履歴{history}件")
+            } else {
+                String::new()
+            };
+            let text = format!("{conn} ・ {mode}{rtt_s}{route_s}{history_s}");
             msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
         }
         let mode_item = GUI_MODE_ITEM.load(Ordering::Relaxed) as ID;
@@ -1066,6 +1801,68 @@ fn refresh_status() {
         }
         // 設定ウィンドウが開いていればチェック状態も保ち直す
         sync_prefs_state();
+
+        // クリップボード履歴メニュー(push があったときだけ作り直す。
+        // 開いているメニューのちらつきを避けるため変化検知する)
+        let history_menu = GUI_HISTORY_MENU.load(Ordering::Relaxed) as ID;
+        if !history_menu.is_null() {
+            let last = crate::HISTORY_LAST_ID.load(Ordering::Relaxed);
+            if last != GUI_HISTORY_SEEN.load(Ordering::Relaxed) {
+                GUI_HISTORY_SEEN.store(last, Ordering::Relaxed);
+                rebuild_history_menu(history_menu);
+            }
+        }
+    }
+}
+
+/// 履歴サブメニューの項目を作り直す(新しい順 10 件+「消す」)。
+/// 本文は representedObject に載せ、クリックで sdHistoryRestore: へ渡す
+unsafe fn rebuild_history_menu(menu: ID) {
+    msg0(menu, sel(c"removeAllItems"));
+    let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+    let count = crate::HISTORY
+        .lock()
+        .map(|h| h.entries().len())
+        .unwrap_or(0);
+    // 見出しに件数を出す(メニューバー本体の項目タイトルも更新)
+    let holder = GUI_HISTORY_ITEM.load(Ordering::Relaxed) as ID;
+    if !holder.is_null() {
+        let t = if count > 0 {
+            format!("クリップボード履歴({count}件)")
+        } else {
+            "クリップボード履歴".to_string()
+        };
+        msg1_void_id(holder, sel(c"setTitle:"), nsstring(&t));
+    }
+    let items = crate::HISTORY.lock().ok().map(|h| {
+        let now = tsunagu_common::history::now_epoch_ms();
+        h.recent(tsunagu_common::history::MENU_ITEMS)
+            .into_iter()
+            .map(|e| (tsunagu_common::history::label(e, now, 34), e.text.clone()))
+            .collect::<Vec<_>>()
+    });
+    let items = items.unwrap_or_default();
+    if items.is_empty() {
+        let item = menu_item("履歴はまだありません(画面を越えると記録されます)", None, "");
+        msg1_void_u8(item, sel(c"setEnabled:"), 0);
+        add_item(menu, item);
+        return;
+    }
+    for (title, text) in items {
+        let item = menu_item(&title, Some(c"sdHistoryRestore:"), "");
+        if item.is_null() {
+            continue;
+        }
+        msg1_void_id(item, sel(c"setTarget:"), target);
+        msg1_void_id(item, sel(c"setRepresentedObject:"), crate::nsstring(&text));
+        add_item(menu, item);
+    }
+    let sep = msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem"));
+    add_item(menu, sep);
+    let clear = menu_item("履歴を消す", Some(c"sdHistoryClear:"), "");
+    if !clear.is_null() {
+        msg1_void_id(clear, sel(c"setTarget:"), target);
+        add_item(menu, clear);
     }
 }
 
@@ -1148,11 +1945,43 @@ unsafe fn make_target() -> ID {
             prefs::switch_method as *const () as usize,
         ),
         (c"sdReturnMac:", prefs::return_mac as *const () as usize),
-        (c"sdRegistration:", setup::show_registration as *const () as usize),
+        (
+            c"sdRegistration:",
+            setup::show_registration as *const () as usize,
+        ),
         (c"sdScrollSpeed:", prefs::scroll_speed as *const () as usize),
         (c"sdSwitchMode:", imp_switch_mode as *const () as usize),
         (c"sdEdgeTaps:", imp_edge_taps as *const () as usize),
         (c"sdOpenLog:", imp_open_log as *const () as usize),
+        (
+            c"sdHistoryRestore:",
+            imp_history_restore as *const () as usize,
+        ),
+        (c"sdHistoryClear:", imp_history_clear as *const () as usize),
+        (c"sdShowSearch:", imp_show_search as *const () as usize),
+        (c"sdSearchPick:", imp_search_pick as *const () as usize),
+        (c"sdSearchGo:", imp_search_go as *const () as usize),
+        (
+            c"sdSearchRefresh:",
+            imp_search_refresh as *const () as usize,
+        ),
+        (c"sdSearchChar:", imp_search_char as *const () as usize),
+        (
+            c"sdSearchBackspace:",
+            imp_search_backspace as *const () as usize,
+        ),
+        (
+            c"sdSearchArrowDown:",
+            imp_search_arrow_down as *const () as usize,
+        ),
+        (
+            c"sdSearchArrowUp:",
+            imp_search_arrow_up as *const () as usize,
+        ),
+        (
+            c"controlTextDidChange:",
+            imp_control_text_did_change as *const () as usize,
+        ),
         (c"sdRestart:", imp_restart as *const () as usize),
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
         (c"sdCmdMap:", imp_cmd_map as *const () as usize),
@@ -1173,6 +2002,10 @@ unsafe fn make_target() -> ID {
         (c"sdEdgePx:", imp_edge_px as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"updateStatus:", imp_update as *const () as usize),
+        (
+            c"pollIncomingDrag:",
+            crate::incoming_drag::poll as *const () as usize,
+        ),
     ];
     for (name, imp) in methods {
         if class_addMethod(cls, sel(name), *imp, types) == 0 {
@@ -1243,6 +2076,14 @@ pub fn start() -> bool {
             msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
         );
 
+        // Search My Desk(⌥⌘S でも開ける)。アクセサリアプリのキー等価は
+        // 自身がアクティブな時しか効かないため、メニューからの導線を主にする
+        let search = menu_item("Search My Desk…(⌥⌘S)", Some(c"sdShowSearch:"), "");
+        if !search.is_null() {
+            msg1_void_id(search, sel(c"setTarget:"), target);
+            msg1_void_sel(search, sel(c"setAction:"), sel(c"sdShowSearch:"));
+            add_item(menu, search);
+        }
 
         let prefs = menu_item("設定…", Some(c"sdShowPrefs:"), ",");
         if prefs.is_null() {
@@ -1251,6 +2092,20 @@ pub fn start() -> bool {
         msg1_void_id(prefs, sel(c"setTarget:"), target);
         msg1_void_sel(prefs, sel(c"setAction:"), sel(c"sdShowPrefs:"));
         add_item(menu, prefs);
+
+        // クリップボード履歴(送信・受信したテキストから選んで復元)。
+        // 項目は refresh_status が履歴の変化だけ検知して作り直す
+        let history_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
+        if !history_menu.is_null() {
+            msg1_void_u8(history_menu, sel(c"setAutoenablesItems:"), 0);
+            let holder = menu_item("クリップボード履歴", None, "");
+            if !holder.is_null() {
+                msg1_void_id(holder, sel(c"setSubmenu:"), history_menu);
+                add_item(menu, holder);
+                let _ = GUI_HISTORY_ITEM.store(holder as usize, Ordering::Relaxed);
+                let _ = GUI_HISTORY_MENU.store(history_menu as usize, Ordering::Relaxed);
+            }
+        }
 
         add_item(
             menu,
@@ -1308,6 +2163,15 @@ pub fn start() -> bool {
                 kCFRunLoopCommonModes as ID,
             );
         }
+        msg5_timer(
+            objc_getClass(c"NSTimer".as_ptr()),
+            sel(c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+            0.016,
+            target,
+            sel(c"pollIncomingDrag:"),
+            std::ptr::null_mut(),
+            1,
+        );
         refresh_status();
         true
     }
@@ -1325,4 +2189,22 @@ pub unsafe fn run_app() {
     // Accessory ポリシー = Dock アイコン非表示(メニューバー常駐型の標準)
     msg1_void_i64(app, sel(c"setActivationPolicy:"), 1);
     msg0_void(app, sel(c"run"));
+}
+
+#[cfg(test)]
+mod search_sel_tests {
+    use super::next_sel;
+
+    #[test]
+    fn arrow_moves_and_wraps_like_spotlight() {
+        // ↓で進み、末尾で先頭へ折り返す
+        assert_eq!(next_sel(0, 3, true), 1);
+        assert_eq!(next_sel(2, 3, true), 0, "末尾の↓は先頭へ折り返す");
+        // ↑で戻り、先頭で末尾へ折り返す
+        assert_eq!(next_sel(2, 3, false), 1);
+        assert_eq!(next_sel(0, 3, false), 2, "先頭の↑は末尾へ折り返す");
+        // 候補が無いときは動かさない(範囲外を選択させない)
+        assert_eq!(next_sel(0, 0, true), 0);
+        assert_eq!(next_sel(0, 0, false), 0);
+    }
 }

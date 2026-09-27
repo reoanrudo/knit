@@ -43,7 +43,7 @@ schtasks /Run /TN tsunagu_run
 REM 初回導入だけは登録画面を開く。自動復帰からは繰り返し表示しない。
 start "" "%DIR%\tsunagu-win.exe" --retry-setup
 if not exist %DIR%\.env (
-  echo SETUP: Tsunaguの画面にMacの接続キーを貼り付けてください
+  echo SETUP: TsunaguでMacを選び、表示された6桁コードを入力してください
 ) else (
   echo INSTALL_DONE
 )

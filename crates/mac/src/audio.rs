@@ -15,8 +15,7 @@ static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 再生リングバッファ(音声スレッド→AudioQueue コールバック)。
 /// 溢れたら古い方を捨てる。実効的な滞留は aq_callback の 2 段階クリップで
 /// 「目標 ≈83ms・上限 333ms」に保つ(下記定数参照)
-static RING: Mutex<std::collections::VecDeque<u8>> =
-    Mutex::new(std::collections::VecDeque::new());
+static RING: Mutex<std::collections::VecDeque<u8>> = Mutex::new(std::collections::VecDeque::new());
 const RING_CAP: usize = 192 * 1024;
 /// プリロール量(48kHz f32/stereo で ≈83ms)。ストリーム開始/ミュート明けに
 /// これだけ溜まるまで再生を始めない。ネットワークの到着むら(バースト)を
@@ -120,7 +119,10 @@ fn ensure_playback(rate: u32) {
             AudioQueueStop(old as AudioQueueRef, 1);
             AudioQueueDispose(old as AudioQueueRef, 1);
         }
-        eprintln!("[audio] サンプリングレート変更 {} → {rate}Hz。再生キューを作り直します", AQ_RATE.load(Ordering::Relaxed));
+        eprintln!(
+            "[audio] サンプリングレート変更 {} → {rate}Hz。再生キューを作り直します",
+            AQ_RATE.load(Ordering::Relaxed)
+        );
     }
     if let Some(aq) = start_playback(rate) {
         AQ.store(aq as usize, Ordering::Relaxed);
@@ -152,7 +154,10 @@ unsafe extern "C" fn aq_callback(
 ) {
     unsafe {
         if !CB_FIRED.swap(true, Ordering::Relaxed) {
-            eprintln!("[audio] callback alive (cap={})", (*buffer).mAudioDataBytesCapacity);
+            eprintln!(
+                "[audio] callback alive (cap={})",
+                (*buffer).mAudioDataBytesCapacity
+            );
         }
         let cap = (*buffer).mAudioDataBytesCapacity as usize;
         let dst = (*buffer).mAudioData;
@@ -201,7 +206,12 @@ unsafe extern "C" fn aq_callback(
             if src_frames >= 2 {
                 let dst_f = dst as *mut f32;
                 let sample = |i: usize| -> f32 {
-                    f32::from_le_bytes([ring[i * 4], ring[i * 4 + 1], ring[i * 4 + 2], ring[i * 4 + 3]])
+                    f32::from_le_bytes([
+                        ring[i * 4],
+                        ring[i * 4 + 1],
+                        ring[i * 4 + 2],
+                        ring[i * 4 + 3],
+                    ])
                 };
                 // sp はフレーム単位の読み出し位置(整数部=フレーム、端数=補間位相)。
                 // L(偶数サンプル)は L 同士、R は R 同士で補間するため L/R は混ざらない。
@@ -209,9 +219,8 @@ unsafe extern "C" fn aq_callback(
                 // ほぼ劣化させない(音質優先)。frac=0 のときは厳密に素通り
                 let mut sp = phase_load();
                 let mut written_bytes = 0usize;
-                let fidx = |k: i64| -> usize {
-                    (k.max(0) as usize).min(src_frames.saturating_sub(1))
-                };
+                let fidx =
+                    |k: i64| -> usize { (k.max(0) as usize).min(src_frames.saturating_sub(1)) };
                 for o in 0..out_frames {
                     let i0 = sp as usize;
                     if i0 + 1 >= src_frames {
@@ -290,7 +299,7 @@ unsafe extern "C" fn aq_callback(
 fn start_playback(rate: u32) -> Option<AudioQueueRef> {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
-        // 15ms 分。奇数サンプルレート環境で L/R が割れないよう 8 バイト境界へ丸める
+                                      // 15ms 分。奇数サンプルレート環境で L/R が割れないよう 8 バイト境界へ丸める
         let frame_bytes = (rate as usize * bytes_per_frame as usize * 15 / 1000) & !7usize;
         let desc = AudioStreamBasicDescription {
             mSampleRate: rate as f64,
@@ -359,6 +368,8 @@ pub fn start(token: String, port: u16) {
             }
         };
         eprintln!("[audio] listening on {bind_ip}:{port}");
+        // 本線と同じ連続失敗スロットル(認証失敗の連打を鈍らせる)
+        let mut throttle = tsunagu_common::secure::FailThrottle::new();
         loop {
             let (stream, peer) = match listener.accept() {
                 Ok(x) => x,
@@ -370,6 +381,7 @@ pub fn start(token: String, port: u16) {
             // 本線と同じ接続元制限と暗号化(トークン不一致はハンドシェイクで弾かれる)
             if !tsunagu_common::net::is_allowed(peer.ip()) {
                 eprintln!("[audio] rejected: {peer}");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             eprintln!("[audio] accepted from {peer}");
@@ -377,11 +389,15 @@ pub fn start(token: String, port: u16) {
             // 送信側は無音期間も 1 秒毎にキープアライブを送るため、12 秒無音は
             // 相手の音声スレッド死亡。30 秒だと accept が直列のため再接続が
             // その分遅れる(本線の生存監視 9〜10 秒とも整合させる)
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(12))).ok();
-            let (r, mut w) = match tsunagu_common::secure::accept(stream, &token, b"tsunagu-audio") {
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(12)))
+                .ok();
+            let (r, mut w) = match tsunagu_common::secure::accept(stream, &token, b"tsunagu-audio")
+            {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");
+                    std::thread::sleep(throttle.fail());
                     continue;
                 }
             };
@@ -389,6 +405,7 @@ pub fn start(token: String, port: u16) {
             // 形式の申告: "SDAUDIO3 <rate> s16\n" → "ok\n"(認証は暗号化で済んでいる)
             let mut line = String::new();
             if (&mut reader).take(512).read_line(&mut line).unwrap_or(0) == 0 {
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             let parts: Vec<&str> = line.trim().split_whitespace().collect();
@@ -396,15 +413,22 @@ pub fn start(token: String, port: u16) {
             if !s16 {
                 eprintln!("[audio] invalid handshake");
                 let _ = w.write_all(b"ng\n");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
-            let Ok(rate) = parts[1].parse::<u32>() else { continue };
+            let Ok(rate) = parts[1].parse::<u32>() else {
+                std::thread::sleep(throttle.fail());
+                continue;
+            };
             if !(4000..=192_000).contains(&rate) {
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             if w.write_all(b"ok\n").and_then(|_| w.flush()).is_err() {
+                std::thread::sleep(throttle.fail());
                 continue;
             }
+            throttle.success();
             ensure_playback(rate);
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
             PRIMED.store(false, Ordering::Relaxed);
@@ -436,7 +460,9 @@ pub fn start(token: String, port: u16) {
                     // 再生リングは f32 のまま(補間・追い込み処理を共通にする)
                     frame = frame
                         .chunks_exact(2)
-                        .flat_map(|b| (i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).to_le_bytes())
+                        .flat_map(|b| {
+                            (i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).to_le_bytes()
+                        })
                         .collect();
                 }
                 // フレーム整合の防御: 8 バイト(f32×2ch)境界に切り詰める。

@@ -282,3 +282,194 @@ Tailscale の DERP 中継へ落ちても tsunagu の通信品質に影響しな�
 
 テストは 38 件(common 30+1 無視視 / mac 7)。verify.sh は **pass=19 fail=0**。
 プロトコルは版 11 のまま(ime/open_url は旧側が未知行として無視する拡張)。
+
+## 第13セッション(2026-09-27・476〜525): 操作性の向上 50 件
+
+ドラッグ&ドロップ越境の修正に続いて、通知・履歴・メニュー・キー・表示の
+操作性を横断的に 50 件磨いた。プロトコル変更なし(版 12 のまま)。
+
+| ループ | 内容 |
+|---|---|
+| 476 | 履歴の永続化を共通化(save_to/load_from。一時ファイル差し替えで破損防止・壊れたファイルは空で起動・上限維持・id 連続) |
+| 477 | 履歴ラベルに URL 種別(「URL・」前置)。回帰テストを 7 件へ |
+| 478 | Win: 履歴を push 時保存・起動時読込・「消す」で保存ファイル削除(%LOCALAPPDATA%\Tsunagu\history.json) |
+| 479 | Win: 接続通知に相手名(hello で受信し保持) |
+| 480 | Win: 接続・切断通知を 60 秒間引き(種別が変われば必ず通知) |
+| 481 | Win: 切断通知文言を「自動で再接続します」へ統一(2 経路) |
+| 482 | Win: ファイル受信通知に保存先フルパス |
+| 483 | Win: smartguard 通知に「履歴にも載りません」を明記 |
+| 484 | Win: 受信テキストの LF→CRLF 正規化(メモ帳等の貼り付け品質) |
+| 485 | Win: 1MB 超の受信テキストを通知で明示(60 秒間引き) |
+| 486 | Win: 受信フォルダの起動時自動作成(通知のパスが必ず有効) |
+| 487 | Win: 起動ログに操作ガイド 1 行 |
+| 488 | Win: ⌘Space(Spotlight)→Win キー翻訳(⌘ 分の Ctrl を先に離す) |
+| 489 | Win: トレイツールチップに遅延・経路・履歴件数 |
+| 490 | Win: 履歴メニューに件数表示・空時の説明・「履歴を消す」・復元/消去後の即反映 |
+| 491 | Win: トレイアイコンのダブルクリックでも設定窓 |
+| 492 | Win: 通知タイトル表記を「Tsunagu」へ統一(6 箇所) |
+| 493 | Mac: 履歴の push 時保存・起動時読込・「消す」で保存ファイル削除(~/.config/tsunagu/history.json) |
+| 494 | Mac: 接続通知に相手名(サーバ/クライアント両経路) |
+| 495 | Mac: hello の自己名を固定"macbook"から実ホスト名へ(kern.hostname) |
+| 496 | Mac: ファイル受信通知に件数+合計サイズ+保存先パス(human_bytes を追加) |
+| 497 | Mac: 掴みドラッグ転送完了通知に合計サイズ |
+| 498 | Mac: smartguard 通知に「履歴にも載せません」を明記 |
+| 499 | Mac: 1MB 超の受信テキストを通知で明示(60 秒間引き) |
+| 500 | Mac: 受信フォルダの起動時自動作成+起動ログに操作ガイド |
+| 501 | Mac: 履歴メニューに件数表示(見出し)+「履歴を消す」+クリア後即再構築 |
+| 502 | Mac: メニューバー状態行に履歴件数・未接続文言に「Windows アプリの起動を確認」 |
+| 503 | Mac: 受信ドラッグ中に境界へ触れた時のガイド通知(120 秒間引き。掴んだままの意味を伝える) |
+| 504 | Mac: 「Windows へ送る」パネルの初期ディレクトリをデスクトップへ |
+| 505 | Win: 「Mac へ戻る」未接続文言に自動再接続の旨 |
+| 506 | Win: 大容量転送開始通知に読みやすいサイズ(human_bytes) |
+| 507 | Win: ドロップ失敗通知に「掴んだまま境界を越え、相手の画面上で離す」ガイド |
+| 508 | Win: 設定窓フッターに受信フォルダパス |
+| 509 | usage.md に履歴セクション+LF/CRLF 正規化の記載 |
+| 510 | README.md 機能一覧・README-win.txt に履歴とトレイ表示を追加 |
+| 511 | agent-guide.md に履歴の設計規約(保存先・変化検知・検査位置) |
+| 512 | 共通: History::clear API(両側の消去操作で使用) |
+| 513 | Mac: 履歴メニューを起動直後に確実に構築(変化検知の初期値を u64::MAX へ。load 済み履歴がすぐ見える) |
+| 514 | Win: 履歴復元後にトレイツールチップへ即反映(update_tip) |
+| 515 | Win: 「履歴を消す」実行後にツールチップ・設定窓へ即反映 |
+| 516 | Mac: 履歴メニューは push による世代変化時だけ作り直す(開いているメニューのちらつき防止) |
+| 517 | 共通: History::last_id を GUI 変化検知の世代として両側で使用 |
+| 518 | Win: hello の相手名を 40 字へ丸め・空なら「Mac」へフォールバック(通知崩れ防止) |
+| 519 | Mac: hello の相手名を同様に整形(空なら「Windows」) |
+| 520 | Win: 起動順序を保証(受信フォルダ作成→履歴読込→ログ。表示が最初から最新) |
+| 521 | Mac: 同上の起動順序保証(history_load でメニュー世代も更新) |
+| 522 | Win: 履歴メニューの復元を index→id 対応表方式に固定(表示順と実体のずれを構造的に排除) |
+| 523 | CHANGELOG に履歴の操作性強化を追記 |
+| 524 | Mac: 受信ドラッグ中の境界抑制を利用者へ通知する設計を確定(初回+120 秒間引き。誤解を防ぐ) |
+| 525 | 改善ログへ本セッションを記録+実機反映(Mac build-20260927-163710 / Win 同日) |
+
+テストは 66 件(common 47+2 無視・handoff 5・mac 14 / win 実機 7+1 無視)。
+プロトコルは版 12 のまま。実機で本線・bulk 接続とホスト名表示を確認。
+
+## 第14セッション(2026-09-27・526〜531): 未実装機能 2 本(Search My Desk・速度越境)
+
+「まだできない機能」から、この環境で実装・検証できる 2 本を実装した。
+プロトコル変更なし(版 12 のまま)。
+
+| ループ | 内容 |
+|---|---|
+| 526 | 共通: desksearch モジュール(検索ロジック。前方一致>部分一致・大文字小文字なし・URL 全文入力は先頭に「相手で開く」・空クエリは提案)。6 件のテスト |
+| 527 | Mac: アプリ列挙(/Applications・~/Applications の .app、名前順)と ⌥⌘S ホットキー(down/up を握る押下エッジ。Continue Here と同型) |
+| 528 | Mac: 検索窓(NSPanel+入力+候補ボタン 8 件)。tap スレッドから performSelectorOnMainThread で開く。delegate(controlTextDidChange)で逐次絞り込み、Enter=先頭候補、クリックで実行(アプリ起動/履歴復元/Windows で開く)。窓は再利用し表示中はトグルで閉じる |
+| 529 | Mac: send_msg_reported(送信成否を返す版)。未接続時の検索実行に通知 |
+| 530 | Mac: 速度越境(§24)。境界への速度 ≥1200px/s なら switchDelay/ダブルタップをスキップして即切替。ログに (edge, fast) を記録。TSUNAGU_FAST_EDGE=0/TSUNAGU_DESK_SEARCH=0 で無効化 |
+| 531 | usage.md に Search My Desk・速度越えのセクション、メニューバーへ「Search My Desk…(⌥⌘S)」導線、CHANGELOG 追記、Mac へ反映(build-20260927-172725) |
+
+テストは 72 件(common 53+2 無視・handoff 5・mac 14)。Windows 側は変更なしのため再配備せず。
+未確認の範囲: 検索窓の実際の操作(⌥⌘S で開く・絞り込み・実行)は利用者の確認待ち。
+
+## 第15セッション(2026-09-27・532〜540): 未確認の解消と Search My Desk の横断化
+
+| ループ | 内容 |
+|---|---|
+| 532 | 共通: proto へ AppsQuery/AppsReply/RunApp を追加(serde rename。旧側は未知行として無視。版 12 のまま)。round-trip テスト追加 |
+| 533 | Win: スタートメニューの .lnk 列挙(共通+ユーザー配下・再帰・Uninstall 除外・上限 200 件)と AppsQuery への別スレッド応答 |
+| 534 | Win: RunApp 受信は「直前に列挙したパスと完全一致」だけ ShellExecuteW で実行(任意パス実行の拒否。起動は通知+ログ) |
+| 535 | Mac: 検索窓を開くと AppsQuery を送り、AppsReply 到着で performSelectorOnMainThread で再絞り込み(sdSearchRefresh:)。窓が閉じているなら何もしない |
+| 536 | Mac: 候補に Windows アプリを混ぜる(kind=3。「Windows・アプリ・名前」)。実行は RunApp 送信(未接続は通知) |
+| 537 | probe(--probe-search)を追加: AppKit 生成・候補・絞り込みを実機検証する CLI(リリースでも実行可) |
+| 538 | probe の実機検証で 2 件の実バグを修正: (1)target クラスの二重生成で必ず失敗 → 既存 GUI_TARGET を優先、(2)非表示窓への orderOut で WindowServer 未接続環境が例外 → 表示中のみ orderOut |
+| 539 | アプリ列挙を /System/Applications(Utilities 含む 1 階層)へ拡張(Terminal が見つからなかった=実測) |
+| 540 | probe 再実行で OK: 窓/入力/8 ボタン生成・初期候補 5 件・"term"の絞り込み 1 件(Terminal)。usage.md 更新、両側へ反映(本線・bulk 接続確認) |
+
+テストは 75 件(common 55+2 無視・handoff 5・mac 14 / win 実機 7+1 無視)。
+検索窓の実際の操作(⌥⌘S→入力→起動)と Windows 側の起動通知は利用者の確認待ち。
+
+## 第16セッション(2026-09-27・541〜545): 検索窓が実機で開かない不具合の解消
+
+| ループ | 内容 |
+|---|---|
+| 541 | ⌥⌘S 検出処理が tap 内のマウス系 if ブロック(境界判定)の内側にあり KEY_DOWN が絶対に到達不能だった → Mac モード素通し経路へ移動(窓自体が開かなかった根本原因) |
+| 542 | 未認識セレクタで NSException → "panic in a function that cannot unwind" で abort(実測): makeKeyAndOrderFront(正: makeKeyAndOrderFront:)・orderOut(正: orderOut:)・makeKeyWindow:(正: makeKeyWindow)。NSWindow.instancesRespond(to:) で全確認のうえ修正 |
+| 543 | NSPanel は hidesOnDeactivate=YES が既定で、別アプリが前面になると窓が勝手に隠れ isVisible が 0 になりトグル閉鎖が壊れる(実測) → setHidesOnDeactivate: false |
+| 544 | accessory 常駐アプリは activate が拒否され key にならず入力が届かない(実測 keyWindow一致=false) → styleMask へ NonactivatingPanel(0x80) 追加+makeKeyWindow で、非アクティブのまま合成キーが検索窓へ届くようになった |
+| 545 | 日本語 IME が検索入力を吸収し Enter も確定に消費される(実測入力「tえrw」) → 検索窓表示中は tap が文字キー(Enter/Backspace/Esc 含む)を握って field へ直接積む(Spotlight 型)。kc→文字変換は US/JIS 共通 QWERTY 位置・Shift は US 記号。SEARCH_OPEN フラグで tap と GUI を連携 |
+| 検証 | 合成 ⌥⌘S→term→Enter で Terminal 実起動まで確認(ログ: ⌥⌘S 検出→窓 visible=1→AppsReply 196 件→Enter 受付→アプリを起動)。プロセス安定・トグル閉鎖も確認。テスト 14 件 |
+
+## 第17セッション(2026-09-27・546〜548): 「理想が体現できているか」の実機検証
+
+| ループ | 内容 |
+|---|---|
+| 546 | 検証中に発見: 検索窓が center 依存で main 以外の画面を見ているとき別モニタへ出る(実測 Y=-519)→ カーソル所在画面の中央へ配置(cursor_screen_center_appkit。CG→AppKit y 反転は appkit_y=max_y-cg_y)。CGWindowList で実機確認: カーソル(2251,-1060)に対し窓中心が同モニタ中央へ |
+| 547 | 検証中に発見: URL クエリで候補が「URL・…」と「Windows・URL・…」の 2 行に重複(Windows 側マージでも URL 判定が走るため)→ Windows マージは Kind::App のみに限定 |
+| 548 | 検証中に発見: 実行して窓が閉じた後、Enter の up を tap が受け取れず押下フラグ(true)が残り、開き直し後の初回 Enter が「2 回目」として無視される → Enter/Esc フラグをモジュール公開 static へ移し、開くたびリセット |
+| 検証 | §14: ⌥⌘S→入力→Terminal 起動(Mac)、「powershell」→Windows 候補 8 件→Enter→pwsh.exe 実起動(Windows 側ログ+プロセス、検証後 taskkill)。§11/§14: 「http://127.0.0.1/」入力→Enter→Windows 既定ブラウザで開く(Windows 側ログ)。§10: F13 トグルで同期を発生させ両側 history.json へ記録(device=Mac)・検索窓から「abc123」で履歴候補が出る・Esc 閉鎖。§1/§7: IME 状態同期(かなON)・⌘→Ctrl 翻訳の実績。§16: 音声ストリーミング確立(音を出さずログで)。§24: 過去ログに (edge, fast) v=24375px/s の実績 |
+
+テストは 74 件(common 55+2 無視・handoff 5・mac 14)。
+
+## 第18セッション(2026-09-27・549〜555): 「理想に届いていない部分」の実装
+
+前回の正直な評価(§14 検索対象が限定的・§10 テキストのみ・§12/§13 未実装)への対応。
+§19「下から順番に完成させる」に沿って Object(§10)→Workspace(§14)→Context(§13)の順で実装。
+
+| ループ | 内容 |
+|---|---|
+| 549 | 履歴(§10)へ File 種別を追加: common::history に Kind::file と push_files(パスの改行区切り)・looks_like_file_paths(全行が絶対パスならファイル参照。Windows ドライブレターも判定)・label に「ファイル・名前 ほかN件」。テスト 4 件追加 |
+| 550 | 両側のファイル同期経路へ履歴記録を接続: Mac 送信(⌘C 同期・掴みドラッグ)・Mac 受信・Windows 送信・Windows 受信の 4 箇所。復元は history_restore が本文を判定してファイル参照なら ⌘C 相当(NSPasteboard writeObjects / CF_HDROP)へ載せ直す。存在しないパスは通知して復元しない |
+| 551 | 検索(§14)へ File と Cmd 種別を追加: desksearch は apps→files→commands→履歴の順(各カテゴリ内は前方→部分一致)。テスト 3 件追加・既存 7 件を引数並びへ更新 |
+| 552 | Mac 側にデスクファイル索引(Desktop/Downloads/Documents の直下+1 階層、隠し・node_modules 等除外、上限 4000 件、変更時刻降順)を 10 分キャッシュで実装。検索窓を開くたび裏スレッドで更新し、索引が揃ったら候補へ自動反映(sdSearchRefresh:) |
+| 553 | 検索窓へ内蔵コマンド(§14 Commands)5 件: Windows をロック(Msg::Lock 流用)・画面を暗くする(pmset displaysleepnow)・クリップボード共有を切替・履歴を消去・Windows アプリ一覧を更新 |
+| 554 | §13 Throw の第一歩として ⌥Enter: ファイル候補を Windows へ投げる(既存のファイル転送経路へ乗せ、受信側は Ctrl+V で貼り付け可)。tap は ⌥Enter を装飾キーなし判定の前に専用処理 |
+| 555 | 実機検証で発見: 索引が一度も走らない(now_ms は起動からの経過時間のため、初回の「前回=0」との差が常に 10 分未満と判定され早期 return)→ 未走査(0)なら必ず走査するよう修正 |
+| 検証 | §14: 「image」で[ファイル・image.png]・「win」で[コマンド・Windows をロック]が候補に出る(索引 130 件)。§10: ファイル参照をクリップボードへ載せ F13 切替 → 送信・両側 history.json に kind=file(Mac パス/C:\ 受信パス)・検索窓の履歴候補→Enter→「履歴からファイル 1 件を復元」+実クリップボード確認。§13: 「erif」→[ファイル・win_verify…]先頭→⌥Enter→送信完了・Windows「受信完了: 1 件」+履歴追記。コマンド実行(ロック等)は副作用を避け候補表示までの検証にとどめた |
+
+テストは 80 件(common 61+1 無視・handoff 5・mac 14)。
+§17 Display Control / §18 Workspace は規模が大きく今回も見送り(品質を落とさない範囲の判断)。
+
+## 第19セッション(2026-09-27・556〜559): 画像のクリップボード履歴(§10 の残り)
+
+第18セッションの残項目のうち §10「画像は履歴に残せない」を解消し、
+Object 層(§10)のテキスト・ファイル・画像が揃った。
+
+| ループ | 内容 |
+|---|---|
+| 556 | common::history へ Kind::Image と push_image を追加: 画像本体は端末ごとのデータ領域(Mac は ~/.config/tsunagu/images、Windows は %LOCALAPPDATA%\Tsunagu\images)へ内容ハッシュ(FNV-1a)のファイル名で保存し、履歴 JSON には「ファイル名\tバイト数」だけ残す。Mac は BMP・Windows は CF_DIB の生バイトのため復元時に変換が要らない。形式検証を厳格化(parse_image_entry)して通常テキストを画像扱いしない。label/検索窓は「画像・NKB」。実体は prune_image_store で新しい 60 件へ刈り込み。テスト 4 件追加 |
+| 557 | 両側の画像同期 4 箇所(Mac 送信/受信・Windows 送信/受信)へ履歴記録を接続。復元は Mac が history_restore で本文の形式判定、Windows が kind==Image で分岐し、images/ から読み戻してクリップボードへ(CF_DIB / NSPasteboard BMP)。復元後は同期基準を進めてエコー防止 |
+| 558 | 実機検証で発見: Windows が biSize=40+BI_BITFIELDS で出す DIB(クリップボード画像)は INFOHEADER 直後に 12 バイトのカラーマスクが付くのに、dib_to_bmp の offbits 計算がそれを無視し画像全体が 3px ずれる(緑画像が赤に化けた)→ マスク分を加算するよう修正+テスト 2 件。実機で dataoff 54→66・色が正確に戻ることを確認 |
+| 559 | 検証中に発見: 検索窓に ↑↓ による候補移動が無く Enter は常に先頭候補(誤って先頭の LogiMgr Uninstaller を起動してしまった。即 kill して事なきを得た)→ 今後の改善項目として記録。クエリを「img-」などに絞ることで画像履歴を先頭にして検証完結 |
+| 検証 | §10: Mac で画像をクリップボードへ→F13 切替→「mac->win image」で送信、両側 images/ に実体・history.json に kind=image(サイズ整合: BMP 1162=DIB 1148+ファイルヘッダ14)。Windows で青画像を設定→F13 往復→「win->mac image」→ Mac の履歴に device=Windows の画像。検索窓「img」で[履歴・画像・1KB]が候補に出る・「19c」で絞り込み→Enter→クリップボードへ復元、中心ピクセル r=4 g=50 b=255≒青(指定色と一致)。Windows トレイからの復元は GUI 操作が必要なため未確認(コード・ビルドは同じ共通モジュール経由) |
+
+テストは 86 件(common 65+1 無視・handoff 5・mac 16・win は cargo check)。
+補足: Mac でプログラム(NSPasteboard API 直叩き)が画像を書くと
+org.nspasteboard.TransientType が付いて秘匿扱いで送信されない(macOS の仕様。
+declareTypes で書けば付かない)。物理 ⌘C では付かないため実運用への影響は軽微。
+
+## 第20セッション(2026-09-27・560〜562): 正直な評価の残項目(操作性と検証の穴)
+
+第19セッション報告の「残る部分」のうち、事故防止と未確認の解消を優先して対応。
+
+| ループ | 内容 |
+|---|---|
+| 560 | 検索窓に **↑↓ での候補移動**を追加: tap が矢印キー(125/126)を握り、選択位置 SEARCH_SEL を Spotlight と同じ折り返し付きで動かす。ボタンには「► 」前置で選択を示し、クエリ変更で先頭へ戻す。Enter は選択位置の候補を実行(従来は常に先頭=誤起動事故の原因)。next_sel を純関数化しテスト固定 |
+| 561 | Windows に `--probe-history-image <id>` を追加(トレイと同じ history_restore_by_id を呼ぶ検証用サブコマンド)。id 無しで最近 5 件を一覧。第19セッションで未確認だった Windows 側の画像復元を実機検証: 復元前にテキスト(ContainsImage=False)→復元後に True を確認 |
+| 562 | 越境 App Handoff(§12 の第一歩・実験的): Windows へ切替えたとき Mac の最前面アプリ(NSWorkspace。権限不要)と Windows のアプリ列挙を照合し、ヒットすれば RunApp で起動。完全一致(大小無視)→部分一致(Mac 名 4 文字以上)。一覧未取得なら AppsQuery を送り次回に備える。勝手にアプリが開く驚きを避けるため `TSUNAGU_APP_HANDOFF=1` で有効(既定 OFF)。照合は app_handoff_match として純関数化しテスト固定 |
+| 検証 | ↑↓: 検索窓「img」→↓×2→↑ で選択 #2→#1 に移動し、Enter で「選択候補 #1 を実行」→履歴画像の復元(先頭の LogiMgr は実行されず事故防止を確認)。Windows 復元: 前述の before/after。Handoff: 既定 OFF のまま F13 切替でログなし→有効化起動で「一覧未取得で照合スキップ+AppsQuery」→受信(196 件)後の切替で「Mac 最前面『Brave Browser』に対応する Windows アプリはありません」(実際の照合動作)。起動経路(RunApp)は検索窓で第17セッションに実証済みのため、Mac 側の前面アプリ変更と Windows での窓という副作用を避けて照合までの確認とした |
+
+テストは 89 件(common 65+1 無視・handoff 5・mac 19・win は cargo check)。
+§13 視覚版 Throw・§17 Display Control・§18 Workspace・§14 Browser tabs/Projects は
+引き続き見送り(§13 は §12 の文脈取得と合成マウス移動を伴う検証が必要、§17 は
+画面切替の副作用、§14 Browser tabs は Apple Events 権限プロンプトの問題)。
+
+## 第21セッション(2026-09-27・563): 理想の再確認(ギャップ分析)
+
+| ループ | 内容 |
+|---|---|
+| 563 | ユーザー指摘「もっと理想を再確認」を受けて vision.md 冒頭の方針更新(2026-09-27: 世界向け・OS/台数限定解除)と product-definition.md・requirements.json(33 要件)・feasibility.json を精読。旧 § 番号基準だった「正直な評価」を新基準で再判定し対応表 docs/gap-analysis-20260927.md を作成。実装済み 5・部分 16・未実装 12・再設計前提 3。D03 の旧評価(ハッシュ検証あり)を訂正(Blake2 は PSK/AEAD 用でファイル内容検証は無い)。次の設計作業(端末モデルと操作権→My Desk→OS 境界→タブレット/品質)を優先順位付きで提案 |
+
+## 第22セッション(2026-09-27・564〜566): セキュリティ指摘の修正と 0.24.0 パッケージ
+
+セキュリティレビュー(第21セッション後の依頼)の指摘 M1・L2・L1 を実装し、
+配布候補 v0.24.0 として両 OS のパッケージを作成した。
+
+| ループ | 内容 |
+|---|---|
+| 564 | **M1: 履歴・設定の保存権限を所有者のみへ**。history::write_private/restrict/restrict_dir を追加し、save_to(tmp 600→rename)・load_from(読み後に既存 644→600 是正)・両 OS の画像保存・Mac の preferences.json 書き込みへ適用。Windows は %LOCALAPPDATA%/%USERPROFILE% の既定 ACL に任せる(cfg 分岐で no-op)。権限を固定するテストを追加(600/700 を実測) |
+| 565 | **L2: hello 表示名の無害化**。pairing の safe_name を proto::safe_peer_name として共通化(制御文字・Bidi オーバーライド除去+48字)し、Mac/Win の hello・hello_ok 受信 4 箇所と Win の hello ログ(log_safe 未適用だった 1 箇所)へ適用。テスト追加(Bidi 偽装\u{202e}・U+2066 系を除去) |
+| 566 | **L1: 待受ループの連続失敗スロットル**。secure::FailThrottle(5 回目から失敗 1 回 250ms ずつ・上限 5 秒・成功で即回復)を追加し、本線(Mac server_thread・Win サーバー)・音声(mac/audio.rs)・大容量(bulk::serve)の拒否・ハンドシェイク失敗・invalid hello/handshake 系に組込。確立時 success() で解除 |
+| 検証 | テスト 88 件合格(common 67+1 無視・mac 19・win は x86_64-pc-windows-gnu クロスビルド)。package-mac.sh・package-win.sh で 0.24.0 を生成し check-release.py 合格(Mac 13 ファイル・Win 16 ファイル・マニフェスト SHA-256 一致)。実機 ~/.config/tsunagu の history.json・preferences.json・images/*.bmp を 600、images/ を 700 へ手動是正(env=600 と揃った) |
+
+M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap-analysis の次段)で
+対応する。0.24.0 の zip は dist/ に SHA-256 付きで保管(0.23.0 は保持)。

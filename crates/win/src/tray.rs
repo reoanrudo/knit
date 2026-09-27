@@ -136,6 +136,11 @@ const MENU_SAVEHOST: u32 = 1006;
 const MENU_BACKMAC: u32 = 1007;
 const MENU_OPENFOLDER: u32 = 1008;
 const MENU_REGISTER: u32 = 1012;
+/// クリップボード履歴の項目(MENU_HISTORY_FIRST + 表示順 index)。
+/// index→履歴 id の対応は開くたびに MENU_HISTORY_IDS へ保存する
+const MENU_HISTORY_FIRST: u32 = 1100;
+const MENU_HISTORY_CLEAR: u32 = 1110;
+static MENU_HISTORY_IDS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
 // ラベルのコントロール ID(WM_CTLCOLORSTATIC での色分けに使う)
 const ID_LBL_STATE: u32 = 210;
 const ID_HEAD_CONN: u32 = 211;
@@ -279,7 +284,15 @@ fn footer_line() -> String {
         .elapsed()
         .as_secs();
     let (h, m) = (up / 3600, (up % 3600) / 60);
-    format!("接続先: {host} ・ 稼働 {h}時間{m:02}分")
+    let recv = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Downloads")
+        .join("Tsunagu");
+    format!(
+        "接続先: {host} ・ 稼働 {h}時間{m:02}分\n受信フォルダ: {}",
+        recv.display()
+    )
 }
 
 /// ファイル受信の累計(ステータス窓の表示)
@@ -320,7 +333,34 @@ fn tray_status_text() -> String {
     } else {
         "未接続 · 自動再接続中"
     };
-    format!("Tsunagu · {conn}")
+    // 遅延と経路(接続中のみ。履歴件数は接続の有無に関係なく役立つ)
+    let rtt = crate::RTT_MS.load(Ordering::Relaxed);
+    let rtt_s = if crate::CONNECTED.load(Ordering::Relaxed) && rtt > 0 {
+        format!(" · 遅延{}ms", rtt)
+    } else {
+        String::new()
+    };
+    let route = crate::PEER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|ip| {
+            if tsunagu_common::net::is_tailscale(ip) {
+                " · Tailscale"
+            } else {
+                " · LAN 直"
+            }
+        })
+        .unwrap_or_default();
+    let history = crate::HISTORY
+        .lock()
+        .map(|h| h.entries().len())
+        .unwrap_or(0);
+    let history_s = if history > 0 {
+        format!(" · 履歴{history}件")
+    } else {
+        String::new()
+    };
+    format!("Tsunagu · {conn}{rtt_s}{route}{history_s}")
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -365,8 +405,10 @@ unsafe extern "system" fn tray_wndproc(
     match msg {
         WM_TRAY => {
             let mouse = (lparam & 0xFFFF) as u32;
-            if mouse == WM_LBUTTONUP {
-                open_status_window(); // 左クリック=アプリ画面(Windows 標準操作)
+            if mouse == WM_LBUTTONUP || mouse == 0x0203
+            /*WM_LBUTTONDBLCLK*/
+            {
+                open_status_window(); // 左クリック/ダブルクリック=アプリ画面(Windows 標準操作)
             } else if mouse == WM_RBUTTONUP {
                 open_menu(hwnd);
             }
@@ -397,6 +439,23 @@ unsafe extern "system" fn tray_wndproc(
 /// メニュー/ボタン共通のコマンド処理
 unsafe fn handle_command(id: u32) {
     match id {
+        id if id >= MENU_HISTORY_FIRST && id < MENU_HISTORY_CLEAR => {
+            // 履歴からの復元。index→id はメニューを開いた時点の対応を使う
+            let idx = (id - MENU_HISTORY_FIRST) as usize;
+            let target = MENU_HISTORY_IDS
+                .lock()
+                .ok()
+                .and_then(|g| g.get(idx).copied());
+            if let Some(entry_id) = target {
+                crate::history_restore_by_id(entry_id);
+                update_tip();
+            }
+        }
+        MENU_HISTORY_CLEAR => {
+            crate::history_clear();
+            update_tip();
+            update_labels();
+        }
         3000..=3003 => settings_ui::select((id - settings_ui::NAV_FIRST) as usize),
         MENU_STATUS => open_status_window(),
         MENU_AUDIO => {
@@ -442,7 +501,10 @@ unsafe fn handle_command(id: u32) {
                 println!("[tray] Mac へ戻る");
             } else {
                 println!("[tray] Mac へ戻る: 未接続のため何も起きません");
-                notify("tsunagu", "未接続のため戻れません");
+                notify(
+                    "Tsunagu",
+                    "未接続のため戻れません(Mac側アプリが起動していれば自動で再接続します)",
+                );
             }
         }
         MENU_OPENFOLDER => {
@@ -498,7 +560,10 @@ unsafe fn handle_command(id: u32) {
             }
         }
         MENU_REGISTER => {
-            notify("このWindowsは登録済みです", "暗号化キーはアプリが管理しています。接続先を探せない場合はIPを設定してください。");
+            notify(
+                "このWindowsは登録済みです",
+                "暗号化キーはアプリが管理しています。接続先を探せない場合はIPを設定してください。",
+            );
         }
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
@@ -801,6 +866,48 @@ unsafe fn open_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
     let open_w = wide("設定を開く…");
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
+    // クリップボード履歴(送信・受信したテキストから選んで復元)
+    {
+        let now = tsunagu_common::history::now_epoch_ms();
+        let count = crate::HISTORY
+            .lock()
+            .map(|h| h.entries().len())
+            .unwrap_or(0);
+        let entries: Vec<(u64, String)> = crate::HISTORY
+            .lock()
+            .map(|h| {
+                h.recent(tsunagu_common::history::MENU_ITEMS)
+                    .into_iter()
+                    .map(|e| (e.id, tsunagu_common::history::label(e, now, 34)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !entries.is_empty() {
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            let head = wide(&format!("クリップボード履歴 {count}件(クリックで貼り付け)"));
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, head.as_ptr());
+            let mut ids = Vec::new();
+            for (i, (entry_id, label)) in entries.iter().enumerate() {
+                let w = wide(label);
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    (MENU_HISTORY_FIRST + i as u32) as usize,
+                    w.as_ptr(),
+                );
+                ids.push(*entry_id);
+            }
+            let clear = wide("履歴を消す");
+            AppendMenuW(menu, MF_STRING, MENU_HISTORY_CLEAR as usize, clear.as_ptr());
+            if let Ok(mut g) = MENU_HISTORY_IDS.lock() {
+                *g = ids;
+            }
+        } else {
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            let head = wide("クリップボード履歴(まだありません。画面を越えると記録されます)");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, head.as_ptr());
+        }
+    }
     let audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
     let bm = wide("Mac へ戻る");

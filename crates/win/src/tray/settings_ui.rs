@@ -149,7 +149,18 @@ pub(super) unsafe fn build() {
         }
         child as usize
     };
-    make(None, "STATIC", "Tsunagu", 0, 68, 32, 114, 32, 220, segoe_font(true, 22));
+    make(
+        None,
+        "STATIC",
+        "Tsunagu",
+        0,
+        68,
+        32,
+        114,
+        32,
+        220,
+        segoe_font(true, 22),
+    );
     make(
         None,
         "STATIC",
@@ -256,7 +267,7 @@ pub(super) unsafe fn build() {
         label(0, &rtt_line(), 236, 480, 150, ID_LBL_RTT),
         Ordering::Relaxed,
     );
-    btn(0, "キーを再入力", 400, 476, 136, MENU_REGISTER);
+    btn(0, "登録情報", 400, 476, 136, MENU_REGISTER);
     btn(0, "ログ", 548, 476, 96, MENU_OPENLOG);
     btn(0, "再起動", 656, 476, 96, MENU_RESTART);
     LABEL_MACCFG.store(

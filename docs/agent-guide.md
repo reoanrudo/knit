@@ -46,7 +46,10 @@
    DISABLE し完了後に戻す
 5. Windows の実行中 exe はロックされる。taskkill → sleep → scp の順を守る
 6. **objc セレクタ名は実在確認してから書く**(swift -e で1行検証)。
-   実績: `labelWithString:`(≠labelWithTitle:)、`checkboxWithTitle:`(≠checkWithTitle:)。
+   実績: `labelWithString:`(≠labelWithTitle:)、`checkboxWithTitle:`(≠checkWithTitle:)、
+   **引数の有無も注意**: `makeKeyAndOrderFront:`(≠makeKeyAndOrderFront)、
+   `orderOut:`(≠orderOut)、`makeKeyWindow`(≠makeKeyWindow:)。
+   確認は `NSWindow.instancesRespond(to: Selector("..."))`(実測: 検索窓が abort した)。
    未認識セレクタは NSException → Rust の "panic in a function that cannot unwind" で abort
 7. **objc の構造体渡し**: NSRect(f64×4)は repr(C) の型付き transmute で OK(HFA)。
    ただし `setContentMinSize:` の引数は **NSSize(f64×2)** — fn(ID,SEL,f64,f64) で渡す
@@ -61,10 +64,15 @@
 13. 音が出る E2E テストはユーザーの事前承認が必要(無断トーン事故の実績)
 14. **ドラッグ用ペーストボード(NSPasteboardNameDrag)はキャンセル後もクリアされず
     残ることがある**(実測)。掴み判定は「押下開始時点からの changeCount 変化」基準に
-    すること(crates/mac/main.rs の掴み検出スレッド)。swift の writeObjects で載せる
+    すること。基準値は **MouseDownを元アプリへ渡す前** に取得し、URL読み出しは
+    別スレッドへ分ける。押下後の最初のポーリングで基準値を作ると、高速なドラッグを
+    検出できず境界で止まる。読み出し結果は押下の世代を確認してから採用する
+    (crates/mac/src/file_drag.rs)。swift の writeObjects で載せる
     URL はファイルが実在しないと readObjectsForClasses(FileURLsOnly)で読めない
 15. **CGEventPost したイベントは自分の HID タップを再通過する**(定番の再帰)。
-    自己投稿は kCGEventSourceUserData(41) にマジックを刻み tap 側で識別する
+    自己投稿は kCGEventSourceUserData(42) にマジックを刻み tap 側で識別する。
+    41 は UnixProcessID であり、64bit の識別値を保持できない。左ボタン解放は
+    kCGEventLeftMouseUp(2) を使う(3 は右ボタン押下)
     (掴み切替直後の Mac 完結用 LeftMouseUp = SYNTH_UP_MAGIC)
 16. **windows-sys に COM インターフェースの vtbl は無い**→自前定義
     (crates/win/src/dragdrop.rs の IDataObject/IDropSource/IEnumFORMATETC)。
@@ -95,6 +103,17 @@
     2 段階なら tell 先は必ず起動中=インストール済みのため用語解決が成功する
 
 ## コード規約(このプロジェクト固有)
+
+- Windows→Macのファイルドラッグは `dragdrop/edge.rs` のOLE受け取り領域と
+  `incoming_drag.rs` のNSDraggingSessionで引き継ぐ。普通のReturnでボタンを離して
+  戻す経路とは分ける。本線の操作IDとbulkのDROP_ID_BEGINを必ず一致させ、古い転送を
+  新しい押下へ結びつけない。MacのAppKit呼び出しはGUIタイマーのメインスレッドで行う。
+
+- クリップボード履歴は `common/src/history.rs` に本体(蓄積・保存・ラベル)があり、
+  両側は push 時に保存、起動時に読むだけ。保存先は Win: %LOCALAPPDATA%\Tsunagu\history.json、
+  Mac: ~/.config/tsunagu/history.json。機密・秘匿指定は push 前に除外済みなので
+  history.rs には検査を足さない。Mac の履歴メニューは GUI_HISTORY_SEEN(初期 u64::MAX)で
+  変化検知し、push が HISTORY_LAST_ID を上げた時だけ項目を作り直す。
 
 - objc は依存追加なしの「objc_msgSend 固定シグネチャ transmute」方式。ヘルパは
   main.rs の msg0/msg1 系、gui.rs のローカル sel()

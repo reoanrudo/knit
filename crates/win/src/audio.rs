@@ -9,14 +9,20 @@ use std::io::{BufRead, Write};
 use std::net::ToSocketAddrs;
 use std::sync::atomic::Ordering;
 
-use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL};
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL,
+};
 // windows-sys は COM インターフェース構造体を提供しないため、WASAPI の
 // vtbl を自前定義する(ABI は固定。NOTIFYICONDATAW と同じ手法)
 type HRESULT = i32;
 type VtblPtr<T> = *const T;
 #[repr(C)]
 struct IUnknownVtbl {
-    QueryInterface: unsafe extern "system" fn(*mut core::ffi::c_void, *const windows_sys::core::GUID, *mut *mut core::ffi::c_void) -> HRESULT,
+    QueryInterface: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_sys::core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT,
     AddRef: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
     Release: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32,
 }
@@ -28,15 +34,30 @@ struct ObjVt<T> {
 struct IMMDeviceEnumeratorVtbl {
     base: IUnknownVtbl,
     EnumAudioEndpoints: usize,
-    GetDefaultAudioEndpoint: unsafe extern "system" fn(*mut core::ffi::c_void, i32, i32, *mut *mut core::ffi::c_void) -> HRESULT,
-    GetDevice: unsafe extern "system" fn(*mut core::ffi::c_void, *const u16, *mut *mut core::ffi::c_void) -> HRESULT,
+    GetDefaultAudioEndpoint: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        i32,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT,
+    GetDevice: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const u16,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT,
     RegisterEndpointNotificationCallback: usize,
     UnregisterEndpointNotificationCallback: usize,
 }
 #[repr(C)]
 struct IMMDeviceVtbl {
     base: IUnknownVtbl,
-    Activate: unsafe extern "system" fn(*mut core::ffi::c_void, *const windows_sys::core::GUID, u32, *mut core::ffi::c_void, *mut *mut core::ffi::c_void) -> HRESULT,
+    Activate: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_sys::core::GUID,
+        u32,
+        *mut core::ffi::c_void,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT,
     OpenPropertyStore: usize,
     GetId: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut u16) -> HRESULT,
     GetState: usize,
@@ -44,7 +65,15 @@ struct IMMDeviceVtbl {
 #[repr(C)]
 struct IAudioClientVtbl {
     base: IUnknownVtbl,
-    Initialize: unsafe extern "system" fn(*mut core::ffi::c_void, i32, u32, i64, i64, *const WfxHead, *const windows_sys::core::GUID) -> HRESULT,
+    Initialize: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        u32,
+        i64,
+        i64,
+        *const WfxHead,
+        *const windows_sys::core::GUID,
+    ) -> HRESULT,
     GetBufferSize: usize,
     GetStreamLatency: usize,
     GetCurrentPadding: usize,
@@ -55,20 +84,36 @@ struct IAudioClientVtbl {
     Stop: unsafe extern "system" fn(*mut core::ffi::c_void) -> HRESULT,
     Reset: usize,
     SetEventHandle: usize,
-    GetService: unsafe extern "system" fn(*mut core::ffi::c_void, *const windows_sys::core::GUID, *mut *mut core::ffi::c_void) -> HRESULT,
+    GetService: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_sys::core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> HRESULT,
 }
 #[repr(C)]
 struct IAudioCaptureClientVtbl {
     base: IUnknownVtbl,
-    GetBuffer: unsafe extern "system" fn(*mut core::ffi::c_void, *mut *mut u8, *mut u32, *mut u32, *mut u64, *mut u64) -> HRESULT,
+    GetBuffer: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *mut *mut u8,
+        *mut u32,
+        *mut u32,
+        *mut u64,
+        *mut u64,
+    ) -> HRESULT,
     ReleaseBuffer: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> HRESULT,
     GetNextPacketSize: usize,
 }
-const CLSID_MMDEVICE_ENUMERATOR: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
-const IID_IMMDEVICE_ENUMERATOR: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
-const IID_IAUDIO_CLIENT: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x1CB9AD4C_DBFA_4C32_B178_C2F568A703B2);
-const IID_IAUDIO_CAPTURE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0xC8ADBD64_E71E_48A0_A4DE_185C395CD317);
-const IID_IAUDIO_ENDPOINT_VOLUME: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x5CDF2C82_841E_4546_9722_0CF74078229A);
+const CLSID_MMDEVICE_ENUMERATOR: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0xBCDE0395_E52F_467C_8E3D_C4579291692E);
+const IID_IMMDEVICE_ENUMERATOR: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0xA95664D2_9614_4F35_A746_DE8DB63617E6);
+const IID_IAUDIO_CLIENT: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x1CB9AD4C_DBFA_4C32_B178_C2F568A703B2);
+const IID_IAUDIO_CAPTURE: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0xC8ADBD64_E71E_48A0_A4DE_185C395CD317);
+const IID_IAUDIO_ENDPOINT_VOLUME: windows_sys::core::GUID =
+    windows_sys::core::GUID::from_u128(0x5CDF2C82_841E_4546_9722_0CF74078229A);
 
 /// IAudioEndpointVolume(エンドポイントのマスター音量/ミュート操作)。
 /// base(IUnknown) 3つの後、13個のメソッドが続いて SetMute=14 / GetMute=15
@@ -86,7 +131,11 @@ struct IAudioEndpointVolumeVtbl {
     SetChannelVolumeLevelScalar: usize,
     GetChannelVolumeLevel: usize,
     GetChannelVolumeLevelScalar: usize,
-    SetMute: unsafe extern "system" fn(*mut core::ffi::c_void, i32, *const windows_sys::core::GUID) -> HRESULT,
+    SetMute: unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        i32,
+        *const windows_sys::core::GUID,
+    ) -> HRESULT,
     GetMute: unsafe extern "system" fn(*mut core::ffi::c_void, *mut i32) -> HRESULT,
     GetVolumeStepInfo: usize,
     VolumeStepUp: usize,
@@ -137,7 +186,13 @@ struct Capture {
 fn default_render_id() -> Option<String> {
     unsafe {
         let mut enumerator: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hr = CoCreateInstance(&CLSID_MMDEVICE_ENUMERATOR, std::ptr::null_mut(), CLSCTX_ALL, &IID_IMMDEVICE_ENUMERATOR, &mut enumerator);
+        let hr = CoCreateInstance(
+            &CLSID_MMDEVICE_ENUMERATOR,
+            std::ptr::null_mut(),
+            CLSCTX_ALL,
+            &IID_IMMDEVICE_ENUMERATOR,
+            &mut enumerator,
+        );
         if hr < 0 || enumerator.is_null() {
             return None;
         }
@@ -180,7 +235,12 @@ unsafe fn capture_open() -> Result<Capture, String> {
         }
         let evt = &*(*(enumerator as *mut ObjVt<IMMDeviceEnumeratorVtbl>)).lpVtbl;
         let mut device: *mut core::ffi::c_void = std::ptr::null_mut();
-        let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
+        let hr = (evt.GetDefaultAudioEndpoint)(
+            enumerator,
+            0, /*eRender*/
+            0, /*eConsole*/
+            &mut device,
+        );
         if hr < 0 || device.is_null() {
             (evt.base.Release)(enumerator);
             return Err("既定オーディオデバイス取得失敗".into());
@@ -221,18 +281,26 @@ unsafe fn capture_open() -> Result<Capture, String> {
             0 // f32
         } else if fmt_tag == 0xFFFE && (*fmt).cb_size >= 22 {
             let p = fmt as *const u8;
-            let sub1 = u32::from_le_bytes([
-                *p.add(24), *p.add(25), *p.add(26), *p.add(27),
-            ]);
+            let sub1 = u32::from_le_bytes([*p.add(24), *p.add(25), *p.add(26), *p.add(27)]);
             println!("[audio] extensible subformat data1=0x{sub1:x}");
             match (sub1, bits) {
-                (3, 32) => 0,     // IEEE float
-                (1, 16) => 1,     // 16bit PCM
-                (1, 32) => 2,     // 32bit PCM(整数)
-                _ => if bits == 16 { 1 } else { 2 },
+                (3, 32) => 0, // IEEE float
+                (1, 16) => 1, // 16bit PCM
+                (1, 32) => 2, // 32bit PCM(整数)
+                _ => {
+                    if bits == 16 {
+                        1
+                    } else {
+                        2
+                    }
+                }
             }
         } else if fmt_tag == 1 {
-            if bits == 16 { 1 } else { 2 }
+            if bits == 16 {
+                1
+            } else {
+                2
+            }
         } else {
             2 // 不明: 整数側とみなす
         };
@@ -273,7 +341,14 @@ unsafe fn capture_open() -> Result<Capture, String> {
             "[audio] mix format: tag={} ch={} rate={} bits={} kind={}",
             fmt_tag, channels, rate, bits, fmt_kind
         );
-        Ok(Capture { client, capture, channels, sample_rate: rate, fmt_kind, bytes_per_frame })
+        Ok(Capture {
+            client,
+            capture,
+            channels,
+            sample_rate: rate,
+            fmt_kind,
+            bytes_per_frame,
+        })
     }
 }
 
@@ -365,7 +440,10 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
         timeBeginPeriod(1);
     }
-    println!("[audio] 開始(→{}:{port})", fixed_host.as_deref().unwrap_or("本線の接続先"));
+    println!(
+        "[audio] 開始(→{}:{port})",
+        fixed_host.as_deref().unwrap_or("本線の接続先")
+    );
     loop {
         let mut cap = unsafe {
             match capture_open() {
@@ -381,7 +459,11 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         // 接続に失敗するたび PEER を引き直す(本線の再接続で Mac の IP が変わった後、
         // 旧アドレスへ無言で無限リトライして音声だけ復帰しないのを防ぐ)
         let fixed_addr = match &fixed_host {
-            Some(h) => match (h.as_str(), port).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+            Some(h) => match (h.as_str(), port)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+            {
                 Some(a) => Some(a),
                 None => {
                     println!("[audio] ホスト解決失敗: {h}");
@@ -410,7 +492,9 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
             }
         };
         stream.set_nodelay(true).ok();
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .ok();
         let (r, mut w) = match tsunagu_common::secure::connect(stream, &token, b"tsunagu-audio") {
             Ok(x) => x,
             Err(e) => {
@@ -430,7 +514,10 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
             std::thread::sleep(std::time::Duration::from_secs(2));
             continue;
         }
-        println!("[audio] ストリーミング開始({}Hz s16/stereo)", cap.sample_rate);
+        println!(
+            "[audio] ストリーミング開始({}Hz s16/stereo)",
+            cap.sample_rate
+        );
         let dev_id = default_render_id();
         let mut last_dev_check = std::time::Instant::now();
         let mut sent_bytes: u64 = 0;
@@ -519,7 +606,9 @@ static SPK_WAS_MUTED: std::sync::Mutex<Option<(bool, String)>> = std::sync::Mute
 /// エンドポイントの IAudioEndpointVolume を Activate して返す。
 /// want_id=Some ならそのデバイス ID へ(ミュート復元時の取り違え防止)、
 /// None なら現在の既定デバイスへ
-unsafe fn open_endpoint_volume(want_id: Option<&str>) -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>, String> {
+unsafe fn open_endpoint_volume(
+    want_id: Option<&str>,
+) -> Result<*mut ObjVt<IAudioEndpointVolumeVtbl>, String> {
     unsafe {
         // 呼び出し元スレッドで COM 未初期化の可能性がある(本体セッションのスレッド)
         CoInitializeEx(std::ptr::null_mut(), 0 /*COINIT_MULTITHREADED*/);
@@ -547,7 +636,12 @@ unsafe fn open_endpoint_volume(want_id: Option<&str>) -> Result<*mut ObjVt<IAudi
                 }
             }
             None => {
-                let hr = (evt.GetDefaultAudioEndpoint)(enumerator, 0 /*eRender*/, 0 /*eConsole*/, &mut device);
+                let hr = (evt.GetDefaultAudioEndpoint)(
+                    enumerator,
+                    0, /*eRender*/
+                    0, /*eConsole*/
+                    &mut device,
+                );
                 let _ = (evt.base.Release)(enumerator); // enumerator はもう要らない
                 if hr < 0 || device.is_null() {
                     return Err("既定オーディオデバイス取得失敗".into());
@@ -589,7 +683,9 @@ pub fn speaker_connect_mute(mode_on: bool) {
         let mut now: i32 = 0;
         let got = (vt.GetMute)(vol as *mut core::ffi::c_void, &mut now);
         if got >= 0 {
-            let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = Some((now != 0, dev_id.unwrap_or_default())));
+            let _ = SPK_WAS_MUTED
+                .lock()
+                .map(|mut g| *g = Some((now != 0, dev_id.unwrap_or_default())));
             let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, 1, std::ptr::null());
             println!("[spk] 接続中ミュートを適用 (was_muted={})", now != 0);
             if hr < 0 {
@@ -605,12 +701,18 @@ pub fn speaker_connect_mute(mode_on: bool) {
 /// 切断時: ミュートを適用した際の元状態へ戻す(元がミュートでなければ鳴らす)
 pub fn speaker_disconnect() {
     let was = SPK_WAS_MUTED.lock().ok().and_then(|g| g.clone());
-    let Some((was_muted, dev_id)) = was else { return }; // ミュートを適用していない
+    let Some((was_muted, dev_id)) = was else {
+        return;
+    }; // ミュートを適用していない
     let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = None);
     unsafe {
         // まずミュートしたデバイスそのものへ戻す。デバイスが消えていれば既定へ
         // フォールバックする(その場合の復元先は変わるが、触らないより良い)
-        let vol = match open_endpoint_volume(if dev_id.is_empty() { None } else { Some(&dev_id) }) {
+        let vol = match open_endpoint_volume(if dev_id.is_empty() {
+            None
+        } else {
+            Some(&dev_id)
+        }) {
             Ok(v) => v,
             Err(e) => {
                 println!("[spk] 復元先デバイスが取れません({e})。既定デバイスで試みます");
@@ -624,7 +726,11 @@ pub fn speaker_disconnect() {
             }
         };
         let vt = &*(*vol).lpVtbl;
-        let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, was_muted as i32, std::ptr::null());
+        let hr = (vt.SetMute)(
+            vol as *mut core::ffi::c_void,
+            was_muted as i32,
+            std::ptr::null(),
+        );
         println!("[spk] 切断。ミュートを元へ戻しました (muted={was_muted})");
         if hr < 0 {
             println!("[spk] SetMute(復元) 失敗 hr={hr:08x}");

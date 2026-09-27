@@ -11,12 +11,12 @@ static LAYOUT_CANVAS: AtomicUsize = AtomicUsize::new(0);
 
 unsafe fn frame(v: ID, r: NSRect) {
     let f: unsafe extern "C" fn(ID, SEL, NSRect) =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(v, sel(c"setFrame:"), r);
 }
 unsafe fn view(parent: ID, r: NSRect) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let v = f(
         msg0(objc_getClass(c"NSView".as_ptr()), sel(c"alloc")),
         sel(c"initWithFrame:"),
@@ -34,7 +34,8 @@ unsafe fn surface(v: ID, color: &std::ffi::CStr, radius: f64) {
         sel(c"setBackgroundColor:"),
         msg0(color, sel(c"CGColor")),
     );
-    let f: unsafe extern "C" fn(ID, SEL, f64) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, f64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(layer, sel(c"setCornerRadius:"), radius);
 }
 unsafe fn group(parent: ID, y: f64, h: f64) {
@@ -49,7 +50,8 @@ unsafe fn group(parent: ID, y: f64, h: f64) {
     );
     surface(v, c"controlBackgroundColor", 12.0);
     let layer = msg0(v, sel(c"layer"));
-    let f: unsafe extern "C" fn(ID, SEL, f64) = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL, f64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     f(layer, sel(c"setBorderWidth:"), 0.5);
     let color = msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"separatorColor"));
     msg1_void_id(layer, sel(c"setBorderColor:"), msg0(color, sel(c"CGColor")));
@@ -68,7 +70,7 @@ unsafe fn divider(parent: ID, y: f64) {
 }
 unsafe fn symbol(parent: ID, name: &str, x: f64, y: f64, size: f64) {
     let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let image = f(
         objc_getClass(c"NSImage".as_ptr()),
         sel(c"imageWithSystemSymbolName:accessibilityDescription:"),
@@ -96,7 +98,7 @@ unsafe fn symbol(parent: ID, name: &str, x: f64, y: f64, size: f64) {
 }
 unsafe fn label(parent: ID, text: &str, x: f64, y: f64, w: f64, size: f64, muted: bool) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, ID) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let v = f(
         objc_getClass(c"NSTextField".as_ptr()),
         sel(c"labelWithString:"),
@@ -135,7 +137,7 @@ unsafe fn label(parent: ID, text: &str, x: f64, y: f64, w: f64, size: f64, muted
 }
 unsafe fn button(parent: ID, target: ID, title: &str, action: &std::ffi::CStr, r: NSRect) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, ID, ID, SEL) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let b = f(
         objc_getClass(c"NSButton".as_ptr()),
         sel(c"buttonWithTitle:target:action:"),
@@ -168,7 +170,7 @@ unsafe fn check(
     );
     msg1_void_id(b, sel(c"setTarget:"), target);
     let action_fn: unsafe extern "C" fn(ID, SEL, SEL) =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     action_fn(b, sel(c"setAction:"), sel(action));
     msg1_void_id(b, sel(c"setAccessibilityLabel:"), nsstring(title));
     msg1_void_id(parent, sel(c"addSubview:"), b);
@@ -176,7 +178,7 @@ unsafe fn check(
 }
 unsafe fn popup(parent: ID, target: ID, titles: &[&str], action: &std::ffi::CStr, r: NSRect) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, NSRect, u8) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let p = f(
         msg0(objc_getClass(c"NSPopUpButton".as_ptr()), sel(c"alloc")),
         sel(c"initWithFrame:pullsDown:"),
@@ -204,7 +206,7 @@ unsafe fn slider(
 ) {
     label(parent, title, 40.0, y, 285.0, 13.0, false);
     let f: unsafe extern "C" fn(ID, SEL, f64, f64, f64, ID, SEL) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let s = f(
         objc_getClass(c"NSSlider".as_ptr()),
         sel(c"sliderWithValue:minValue:maxValue:target:action:"),
@@ -240,7 +242,7 @@ pub(super) unsafe fn select_page(index: usize) {
             msg1_void_i64(b, sel(c"setState:"), (i == index) as i64);
             let color_cls = objc_getClass(c"NSColor".as_ptr());
             let color: unsafe extern "C" fn(ID, SEL, f64, f64, f64, f64) -> ID =
-                std::mem::transmute(crate::objc_msgSend as usize);
+                std::mem::transmute(crate::objc_msgSend as *const () as usize);
             let accent = color(
                 color_cls,
                 sel(c"colorWithCalibratedRed:green:blue:alpha:"),
@@ -251,7 +253,7 @@ pub(super) unsafe fn select_page(index: usize) {
             );
             msg1_void_u8(b, sel(c"setWantsLayer:"), 1);
             let radius: unsafe extern "C" fn(ID, SEL, f64) =
-                std::mem::transmute(crate::objc_msgSend as usize);
+                std::mem::transmute(crate::objc_msgSend as *const () as usize);
             radius(msg0(b, sel(c"layer")), sel(c"setCornerRadius:"), 7.0);
             msg1_void_id(
                 msg0(b, sel(c"layer")),
@@ -303,7 +305,7 @@ pub(super) unsafe extern "C" fn switch_method(_s: ID, _c: SEL, sender: ID) {
     let slider = PREFS_DELAY_SLIDER.load(Ordering::Relaxed) as ID;
     if !slider.is_null() {
         let f: unsafe extern "C" fn(ID, SEL, f64) =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         f(
             slider,
             sel(c"setDoubleValue:"),
@@ -323,7 +325,8 @@ pub(super) unsafe extern "C" fn return_mac(_s: ID, _c: SEL, _sender: ID) {
     refresh_status();
 }
 pub(super) unsafe extern "C" fn scroll_speed(_s: ID, _c: SEL, sender: ID) {
-    let f: unsafe extern "C" fn(ID, SEL) -> f64 = std::mem::transmute(crate::objc_msgSend as usize);
+    let f: unsafe extern "C" fn(ID, SEL) -> f64 =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     crate::set_scroll_div(260.0 - f(sender, sel(c"doubleValue")));
     preferences::save();
 }
@@ -374,7 +377,7 @@ pub(super) unsafe fn sync() {
 
 pub(super) unsafe fn build(target: ID) -> ID {
     let f: unsafe extern "C" fn(ID, SEL, NSRect, u64, u64, u8) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let win = f(
         msg0(objc_getClass(c"NSWindow".as_ptr()), sel(c"alloc")),
         sel(c"initWithContentRect:styleMask:backing:defer:"),
@@ -407,7 +410,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
     surface(sidebar, c"windowBackgroundColor", 0.0);
     let bytes = include_bytes!("../../../../assets/AppIcon.iconset/icon_128x128.png");
     let data_fn: unsafe extern "C" fn(ID, SEL, *const u8, usize) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let data = data_fn(
         objc_getClass(c"NSData".as_ptr()),
         sel(c"dataWithBytes:length:"),
@@ -415,7 +418,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
         bytes.len(),
     );
     let init_image: unsafe extern "C" fn(ID, SEL, ID) -> ID =
-        std::mem::transmute(crate::objc_msgSend as usize);
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let icon = init_image(
         msg0(objc_getClass(c"NSImage".as_ptr()), sel(c"alloc")),
         sel(c"initWithData:"),
@@ -459,7 +462,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
         msg1_void_u8(b, sel(c"setBordered:"), 0);
         msg1_void_i64(b, sel(c"setAlignment:"), 0);
         let image_fn: unsafe extern "C" fn(ID, SEL, ID, ID) -> ID =
-            std::mem::transmute(crate::objc_msgSend as usize);
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let symbol = image_fn(
             objc_getClass(c"NSImage".as_ptr()),
             sel(c"imageWithSystemSymbolName:accessibilityDescription:"),
@@ -584,7 +587,18 @@ pub(super) unsafe fn build(target: ID) -> ID {
             h: 32.0,
         },
     );
-    button(p,target,"Windowsを登録…",c"sdRegistration:",NSRect{x:380.0,y:47.0,w:192.0,h:32.0});
+    button(
+        p,
+        target,
+        "Windowsを登録…",
+        c"sdRegistration:",
+        NSRect {
+            x: 380.0,
+            y: 47.0,
+            w: 192.0,
+            h: 32.0,
+        },
+    );
     let p = pages[1];
     let lay = make_layout_view(p);
     frame(

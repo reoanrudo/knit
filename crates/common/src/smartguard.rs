@@ -48,8 +48,7 @@ pub fn decide_at(
         "questions": questions,
     })
     .to_string();
-    let mut s =
-        TcpStream::connect_timeout(&addr, timeout.min(Duration::from_millis(500))).ok()?;
+    let mut s = TcpStream::connect_timeout(&addr, timeout.min(Duration::from_millis(500))).ok()?;
     s.set_read_timeout(Some(timeout)).ok();
     s.set_write_timeout(Some(timeout)).ok();
     let req = format!(
@@ -165,15 +164,24 @@ mod tests {
     fn high_confidence_blocks_and_low_confidence_passes() {
         let json = r#"{"answers":{"kind":{"choice":"secret_credential","probabilities":{"secret_credential":0.97,"normal_text":0.02,"source_code":0.01}}}}"#;
         let addr = mock_server(body_chunked(json));
-        assert_eq!(looks_secret_with(addr, "token", Duration::from_secs(2)), Some(true));
+        assert_eq!(
+            looks_secret_with(addr, "token", Duration::from_secs(2)),
+            Some(true)
+        );
 
         let json = r#"{"answers":{"kind":{"choice":"normal_text","probabilities":{"secret_credential":0.18,"normal_text":0.55,"source_code":0.27}}}}"#;
         let addr = mock_server(body_chunked(json));
-        assert_eq!(looks_secret_with(addr, "hello", Duration::from_secs(2)), Some(false));
+        assert_eq!(
+            looks_secret_with(addr, "hello", Duration::from_secs(2)),
+            Some(false)
+        );
         // コード断片(secret でない)=送る
         let json = r#"{"answers":{"kind":{"choice":"source_code","probabilities":{"secret_credential":0.01,"normal_text":0.02,"source_code":0.97}}}}"#;
         let addr = mock_server(body_chunked(json));
-        assert_eq!(looks_secret_with(addr, "code", Duration::from_secs(2)), Some(false));
+        assert_eq!(
+            looks_secret_with(addr, "code", Duration::from_secs(2)),
+            Some(false)
+        );
     }
 
     #[test]
@@ -181,7 +189,10 @@ mod tests {
         let addr = mock_server(
             "HTTP/1.1 200 OK\r\nContent-Length: 94\r\n\r\n{\"answers\":{\"kind\":{\"choice\":\"secret_credential\",\"probabilities\":{\"secret_credential\":0.95}}}}".into(),
         );
-        assert_eq!(looks_secret_with(addr, "x", Duration::from_secs(2)), Some(true));
+        assert_eq!(
+            looks_secret_with(addr, "x", Duration::from_secs(2)),
+            Some(true)
+        );
         // 非 200・JSON 壊れは None(=現行動作にフォールバック)
         let addr = mock_server("HTTP/1.1 500 Err\r\n\r\n".into());
         assert_eq!(looks_secret_with(addr, "x", Duration::from_secs(2)), None);
@@ -195,7 +206,10 @@ mod tests {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = l.local_addr().unwrap();
         drop(l);
-        assert_eq!(looks_secret_with(addr, "x", Duration::from_millis(300)), None);
+        assert_eq!(
+            looks_secret_with(addr, "x", Duration::from_millis(300)),
+            None
+        );
     }
 
     #[test]
@@ -203,7 +217,13 @@ mod tests {
         let addr = mock_server(
             "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n{}}\r\n0\r\n\r\n".into(),
         );
-        let v = decide_at(addr, "laya", "x", &serde_json::json!({}), Duration::from_secs(2));
+        let v = decide_at(
+            addr,
+            "laya",
+            "x",
+            &serde_json::json!({}),
+            Duration::from_secs(2),
+        );
         assert!(v.is_none());
     }
 }

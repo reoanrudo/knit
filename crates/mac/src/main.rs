@@ -3,15 +3,17 @@
 #![allow(non_camel_case_types)]
 
 mod audio;
+mod file_drag;
 mod gui;
+mod incoming_drag;
 
-use tsunagu_common::{bulk, envutil, secure};
-use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tsunagu_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
+use tsunagu_common::{bulk, envutil, secure};
 
 // ---------- CoreGraphics C API 直宣言 ----------
 #[repr(C)]
@@ -88,9 +90,15 @@ fn hotkey_kc() -> i64 {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CGEventTapCreate(
-        tap: i32, place: i32, options: u32, events_of_interest: CGEventMask,
+        tap: i32,
+        place: i32,
+        options: u32,
+        events_of_interest: CGEventMask,
         callback: unsafe extern "C" fn(
-            proxy: *mut core::ffi::c_void, event_type: u32, event: CGEventRef, user_info: *mut core::ffi::c_void,
+            proxy: *mut core::ffi::c_void,
+            event_type: u32,
+            event: CGEventRef,
+            user_info: *mut core::ffi::c_void,
         ) -> CGEventRef,
         user_info: *mut core::ffi::c_void,
     ) -> CFMachPortRef;
@@ -100,7 +108,11 @@ unsafe extern "C" {
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGMainDisplayID() -> u32;
     fn CGDisplayBounds(display: u32) -> CGRect;
-    fn CGGetActiveDisplayList(max_displays: u32, active_displays: *mut u32, display_count: *mut u32) -> i32;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        active_displays: *mut u32,
+        display_count: *mut u32,
+    ) -> i32;
     fn CGDisplayRegisterReconfigurationCallback(
         callback: unsafe extern "C" fn(u32, u32, *mut core::ffi::c_void),
         user_info: *mut core::ffi::c_void,
@@ -112,21 +124,33 @@ unsafe extern "C" {
     fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i32;
     fn CGEventCreate(allocator: CFAllocatorRef) -> CGEventRef;
     fn CGEventCreateMouseEvent(
-        source: CFAllocatorRef, mouse_type: u32, mouse_position: CGPoint, button: u64,
+        source: CFAllocatorRef,
+        mouse_type: u32,
+        mouse_position: CGPoint,
+        button: u64,
     ) -> CGEventRef;
     fn CGEventSetIntegerValueField(event: CGEventRef, field: i32, value: i64);
     fn CGEventPost(tap: i32, event: CGEventRef);
     fn CFRelease(cf: *mut core::ffi::c_void);
     fn CFStringCreateWithCString(
-        alloc: CFAllocatorRef, c_str: *const core::ffi::c_char, encoding: u32,
+        alloc: CFAllocatorRef,
+        c_str: *const core::ffi::c_char,
+        encoding: u32,
     ) -> CFStringRef;
     static kCFBooleanTrue: *const core::ffi::c_void;
     // Deskflow hideCursor/showCursor が使う非公開 CGS API(カーソル非表示の安定化)
     fn _CGSDefaultConnection() -> i32;
     fn CGSSetConnectionProperty(
-        cid: i32, target_cid: i32, key: CFStringRef, value: *const core::ffi::c_void,
+        cid: i32,
+        target_cid: i32,
+        key: CFStringRef,
+        value: *const core::ffi::c_void,
     ) -> i32;
-    fn CFMachPortCreateRunLoopSource(alloc: CFAllocatorRef, port: CFMachPortRef, order: isize) -> CFRunLoopSourceRef;
+    fn CFMachPortCreateRunLoopSource(
+        alloc: CFAllocatorRef,
+        port: CFMachPortRef,
+        order: isize,
+    ) -> CFRunLoopSourceRef;
     fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopRun();
@@ -170,71 +194,347 @@ unsafe fn pb_is_concealed(pb: ID) -> bool {
     if types.is_null() {
         return false;
     }
-    ["org.nspasteboard.ConcealedType", "org.nspasteboard.TransientType", "com.agilebits.onepassword"]
-        .iter()
-        .any(|t| {
-            let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 = std::mem::transmute(objc_msgSend as *const () as usize);
-            f(types, sel_registerName(c"containsObject:".as_ptr()), nsstring(t)) != 0
-        })
+    [
+        "org.nspasteboard.ConcealedType",
+        "org.nspasteboard.TransientType",
+        "com.agilebits.onepassword",
+    ]
+    .iter()
+    .any(|t| {
+        let f: unsafe extern "C" fn(ID, SEL, ID) -> u8 =
+            std::mem::transmute(objc_msgSend as *const () as usize);
+        f(
+            types,
+            sel_registerName(c"containsObject:".as_ptr()),
+            nsstring(t),
+        ) != 0
+    })
 }
 
 /// 最後に Windows と同期したクリップボードの changeCount
 static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 
+// ---------- クリップボード履歴(Universal Clipboard History) ----------
+/// 送信・受信したテキストの履歴。メニューバーから選んで Mac のクリップボードへ
+/// 復元できる。機密判定(smartguard)と秘匿指定は送信側で弾くため、履歴へは届かない
+pub static HISTORY: Mutex<tsunagu_common::history::History> =
+    Mutex::new(tsunagu_common::history::History::new(50));
+/// GUI の履歴メニュー再構築用の世代(push で更新、gui.rs が変化検知に使う)
+pub static HISTORY_LAST_ID: AtomicU64 = AtomicU64::new(0);
+/// 接続相手の名前(hello で受け取る)。通知へ出す
+pub static PEER_NAME: Mutex<String> = Mutex::new(String::new());
+
+/// 履歴の保存先(env と同じ ~/.config/tsunagu/)。アプリバンドルには書かない
+pub fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(|home| std::path::Path::new(&home).join(".config/tsunagu/history.json"))
+}
+
+pub fn history_save() {
+    let Some(path) = history_path() else { return };
+    if let Ok(h) = HISTORY.lock() {
+        h.save_to(&path);
+    }
+}
+
+pub fn history_load() {
+    let Some(path) = history_path() else { return };
+    if let Ok(mut h) = HISTORY.lock() {
+        h.load_from(&path);
+        HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+    }
+}
+
+/// 履歴の全消去(メニューバー)。保存ファイルも消して次回起動に残さない
+pub fn history_clear() {
+    if let Ok(mut h) = HISTORY.lock() {
+        h.clear();
+    }
+    if let Some(path) = history_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    eprintln!("[clip] 履歴を消しました");
+}
+
+fn history_push(text: &str, device: &str) {
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_text(text, device, ts).is_some() {
+            HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// ファイル群を履歴へ載せる(ビジョン§10 の File 分類)。送信・受信・掴み投げの
+/// すべてのファイル移動で呼ぶ
+fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_files(paths, device, ts).is_some() {
+            HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// 画像履歴の本体を置くディレクトリ(env と同じ ~/.config/tsunagu/images/)
+fn image_store_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".config/tsunagu/images"))
+}
+
+/// images/ に残す実体の上限。履歴 cap(50)より少し余裕を持たせた件数
+const IMAGE_KEEP: usize = 60;
+
+/// 画像を履歴へ載せる(ビジョン§10 の Image 分類)。本体は BMP バイトを
+/// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ
+/// 残す。同名=同一内容のため二重保存は起きない
+fn history_push_image(bmp: &[u8], device: &str) {
+    let Some(dir) = image_store_dir() else { return };
+    let name =
+        tsunagu_common::history::image_file_name(tsunagu_common::history::fnv1a64(bmp), "bmp");
+    let _ = std::fs::create_dir_all(&dir);
+    tsunagu_common::history::restrict_dir(&dir);
+    let path = dir.join(&name);
+    if !path.exists() {
+        if tsunagu_common::history::write_private(&path, bmp).is_err() {
+            eprintln!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
+            return;
+        }
+        tsunagu_common::history::prune_image_store(&dir, IMAGE_KEEP);
+    }
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_image(&name, bmp.len(), device, ts).is_some() {
+            HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// 履歴から Mac のクリップボードへ復元する。受信ループ防止のため
+/// 同期基準を先に進め、自分の履歴へ「Mac」のコピーとして載せる。
+/// 本文が画像保存名(img-….bmp\tサイズ)なら images/ から本体を、
+/// 絶対パスの並び(ファイル参照)なら Finder の ⌘C 相当へ載せ直す
+pub fn history_restore(text: String) {
+    // 画像の履歴(ビジョン§10): images/ から本体を読み戻してクリップボードへ
+    if let Some((name, _size)) = tsunagu_common::history::parse_image_entry(&text) {
+        let path = image_store_dir().map(|d| d.join(&name));
+        let bmp = path.and_then(|p| std::fs::read(p).ok());
+        let Some(bmp) = bmp else {
+            eprintln!("[clip] 履歴の画像本体が見つからないため復元しません");
+            notify(
+                "tsunagu",
+                "履歴の画像が見つからないため復元できませんでした(削除済み)",
+            );
+            return;
+        };
+        let ok = with_pool(|| unsafe { mac_set_clipboard_image_bmp(&bmp) });
+        if ok {
+            *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+            // 受信画像と同じく、載せ直しをきっかけにした送り返しを二重に防ぐ
+            LAST_IMG_RX_MS.store(now_ms(), Ordering::Relaxed);
+            history_push_image(&bmp, "Mac");
+            eprintln!(
+                "[clip] 履歴から Mac のクリップボードへ画像を復元({}KB)",
+                bmp.len() / 1024
+            );
+        }
+        return;
+    }
+    if tsunagu_common::history::looks_like_file_paths(&text) {
+        let paths: Vec<std::path::PathBuf> = text
+            .lines()
+            .map(|l| std::path::PathBuf::from(l.trim()))
+            .collect();
+        if !paths.iter().all(|p| p.exists()) {
+            eprintln!("[clip] 履歴のファイル参照の一部が見つからないため復元しません");
+            notify(
+                "tsunagu",
+                "履歴のファイルが見つからないため復元できませんでした(移動・削除済み)",
+            );
+            return;
+        }
+        let ok = with_pool(|| unsafe { mac_clipboard_write_files(&paths) });
+        if ok {
+            *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+            history_push_files(&paths, "Mac");
+            eprintln!(
+                "[clip] 履歴から Mac のクリップボードへファイル {} 件を復元",
+                paths.len()
+            );
+        }
+        return;
+    }
+    let ok = with_pool(|| unsafe { mac_set_clipboard(&text) });
+    if ok {
+        *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
+        LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+        history_push(&text, "Mac");
+        eprintln!(
+            "[clip] 履歴から Mac のクリップボードへ復元({} bytes)",
+            text.len()
+        );
+    }
+}
+
+/// Mac の最前面アプリ名(NSWorkspace。権限不要)
+unsafe fn mac_frontmost_app_name() -> Option<String> {
+    let ws = msg0(
+        objc_getClass(c"NSWorkspace".as_ptr()),
+        sel_registerName(c"sharedWorkspace".as_ptr()),
+    );
+    if ws.is_null() {
+        return None;
+    }
+    let app = msg0(ws, sel_registerName(c"frontmostApplication".as_ptr()));
+    if app.is_null() {
+        return None;
+    }
+    let name = msg0(app, sel_registerName(c"localizedName".as_ptr()));
+    if name.is_null() {
+        return None;
+    }
+    let utf8 = msg0_cstr(name, sel_registerName(c"UTF8String".as_ptr()));
+    if utf8.is_null() {
+        return None;
+    }
+    Some(
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// 最前面アプリと Windows のアプリ列挙を名前で照合する(越境 App Handoff 用)。
+/// 完全一致(大小無視)を優先し、次に Windows 側名前の部分一致(Mac 名が
+/// 4 文字以上のときだけ。短い名前の誤爆を防ぐ下限)
+pub(crate) fn app_handoff_match<'a>(
+    mac_name: &str,
+    win_apps: &'a [(String, String)],
+) -> Option<&'a (String, String)> {
+    let mac = mac_name.trim().to_lowercase();
+    if mac.is_empty() {
+        return None;
+    }
+    if let Some(hit) = win_apps
+        .iter()
+        .find(|(n, _)| n.trim().to_lowercase() == mac)
+    {
+        return Some(hit);
+    }
+    if mac.chars().count() >= 4 {
+        if let Some(hit) = win_apps
+            .iter()
+            .find(|(n, _)| n.trim().to_lowercase().contains(&mac))
+        {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// Windows へ入る時の App Handoff: 最前面アプリを相手でも開く。
+/// クリップボード同期とは独立した実験的機能
+fn try_app_handoff() {
+    if !APP_HANDOFF.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let name = with_pool(|| unsafe { mac_frontmost_app_name() }).unwrap_or_default();
+    if name.is_empty() {
+        return;
+    }
+    let win_apps = WIN_APPS.lock().map(|a| a.clone()).unwrap_or_default();
+    if win_apps.is_empty() {
+        // 検索窓を一度も開いていなければ列挙が無い。要求だけ投げておく
+        eprintln!("[handoff] Windows のアプリ一覧が未取得のため照合を飛ばします");
+        let _ = send_msg(&Msg::AppsQuery);
+        return;
+    }
+    match app_handoff_match(&name, &win_apps) {
+        Some((win_name, path)) => {
+            eprintln!("[handoff] Mac 最前面「{name}」→ Windows「{win_name}」を起動します");
+            let _ = send_msg_reported(&Msg::RunApp { path: path.clone() });
+        }
+        None => eprintln!("[handoff] Mac 最前面「{name}」に対応する Windows アプリはありません"),
+    }
+}
+
 /// Windows へ入る時に Mac のクリップボードを渡す(Deskflow と同じ「画面を離れる時に
 /// 同期」方式)。コピーのたびに送る旧方式は、Mac 内だけのコピペでも最大 200MB の
 /// ファイルを流し、パスワード等も即座に相手へ渡っていた
 fn sync_clipboard_to_win() {
+    try_app_handoff();
     if !CLIP_SHARE.load(Ordering::Relaxed) || !CONNECTED.load(Ordering::Relaxed) {
         return;
     }
     // 貼り付け元アプリの遅延提供データ読み出しでタップを止めないよう別スレッドで行う
-    std::thread::spawn(move || with_pool(|| unsafe {
-        let cnt = clipboard_change_count();
-        if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt {
-            return;
-        }
-        if pb_is_concealed(general_pasteboard()) {
-            eprintln!("[clip] 秘匿指定のコピー(パスワード等)のため送りません");
-            return;
-        }
-        let text = mac_get_clipboard().filter(|t| !t.is_empty() && t.len() <= CLIP_MAX_BYTES);
-        let Some(text) = text else {
-            if let Some(files) = mac_clipboard_files() {
-                let key = mac_files_key(&files);
-                let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
-                if !dup {
-                    *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
-                    eprintln!("[file] クリップボードのファイル {} 件を渡します", files.len());
-                    send_files_to_win(files, false);
-                }
-            } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
-                // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る
-                eprintln!("[clip] 画像受信直後のため同期を控えます");
+    std::thread::spawn(move || {
+        with_pool(|| unsafe {
+            let cnt = clipboard_change_count();
+            if LAST_SYNC_COUNT.swap(cnt, Ordering::Relaxed) == cnt {
                 return;
-            } else if let Some(dib) = mac_clipboard_image_dib() {
-                match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => eprintln!("[clip] mac->win image {}KB", dib.len() / 1024),
-                    Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
-                }
             }
-            return;
-        };
-        // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
-        if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
-            return;
-        }
-        // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
-        // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結し
-        // 入力経路(タップ)は塞がない
-        if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
-            eprintln!("[clip] smartguard: 機密の可能性が高いため Windows へ送りません");
-            smart_secret_notify("Windows へは送りませんでした");
-            return;
-        }
-        eprintln!("[clip] mac->win {} bytes", text.len());
-        send_msg(&Msg::Clip { text });
-    }));
+            if pb_is_concealed(general_pasteboard()) {
+                eprintln!("[clip] 秘匿指定のコピー(パスワード等)のため送りません");
+                return;
+            }
+            let text = mac_get_clipboard().filter(|t| !t.is_empty() && t.len() <= CLIP_MAX_BYTES);
+            let Some(text) = text else {
+                if let Some(files) = mac_clipboard_files() {
+                    let key = mac_files_key(&files);
+                    let dup = *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) == key;
+                    if !dup {
+                        *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                        eprintln!(
+                            "[file] クリップボードのファイル {} 件を渡します",
+                            files.len()
+                        );
+                        history_push_files(&files, "Mac");
+                        send_files_to_win(files, false);
+                    }
+                } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
+                    // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る
+                    eprintln!("[clip] 画像受信直後のため同期を控えます");
+                    return;
+                } else if let Some(dib) = mac_clipboard_image_dib() {
+                    match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
+                        Ok(()) => {
+                            eprintln!("[clip] mac->win image {}KB", dib.len() / 1024);
+                            history_push_image(&dib_to_bmp(&dib), "Mac");
+                        }
+                        Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
+                    }
+                }
+                return;
+            };
+            // 自分が Windows から受信して書き込んだ内容は送り返さない(ループ防止)
+            if LAST_RECV_CLIP
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_deref()
+                == Some(text.as_str())
+            {
+                return;
+            }
+            // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
+            // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結し
+            // 入力経路(タップ)は塞がない
+            if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
+                eprintln!("[clip] smartguard: 機密の可能性が高いため Windows へ送りません");
+                smart_secret_notify("Windows へは送りませんでした");
+                return;
+            }
+            eprintln!("[clip] mac->win {} bytes", text.len());
+            history_push(&text, "Mac");
+            send_msg(&Msg::Clip { text });
+        })
+    });
 }
 
 /// smartguard の通知間引き(誤検知の連打防止。60 秒に 1 回)
@@ -246,7 +546,7 @@ fn smart_secret_notify(detail: &str) {
     }
     notify(
         "tsunagu",
-        &format!("クリップボードに機密の可能性があるため {detail}(TSUNAGU_SMART_SECRET=0 で無効化)"),
+        &format!("クリップボードに機密の可能性があるため {detail}、履歴にも載せません(TSUNAGU_SMART_SECRET=0 で無効化)"),
     );
 }
 
@@ -264,11 +564,13 @@ type SEL = *mut core::ffi::c_void;
 // objc_msgSend は可変引数宣言のまま呼ぶと引数の渡りが壊れる(SIGSEGV実績あり)ため、
 // 呼び出しシグネチャごとに transmute した固定シグネチャで呼ぶ(rust-objc 界の定番方式)
 unsafe fn msg0(target: ID, sel: SEL) -> ID {
-    let f: unsafe extern "C" fn(ID, SEL) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL) -> ID =
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel)
 }
 unsafe fn msg1_id(target: ID, sel: SEL, a: ID) -> ID {
-    let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel, a)
 }
 unsafe fn msg1_cstr(target: ID, sel: SEL, p: *const core::ffi::c_char) -> ID {
@@ -282,7 +584,8 @@ unsafe fn msg2_bool(target: ID, sel: SEL, a: ID, b: ID) -> u8 {
     f(target, sel, a, b)
 }
 unsafe fn msg0_isize(target: ID, sel: SEL) -> isize {
-    let f: unsafe extern "C" fn(ID, SEL) -> isize = std::mem::transmute(objc_msgSend as *const () as usize);
+    let f: unsafe extern "C" fn(ID, SEL) -> isize =
+        std::mem::transmute(objc_msgSend as *const () as usize);
     f(target, sel)
 }
 unsafe fn msg0_cstr(target: ID, sel: SEL) -> *const core::ffi::c_char {
@@ -332,7 +635,11 @@ unsafe fn mac_set_clipboard(text: &str) -> bool {
     let uti = nsstring("public.utf8-plain-text");
     let ok = msg2_bool(pb, sel_registerName(c"setString:forType:".as_ptr()), s, uti);
     if ok == 0 {
-        eprintln!("[clip] set failed: str={} uti={}", !s.is_null(), !uti.is_null());
+        eprintln!(
+            "[clip] set failed: str={} uti={}",
+            !s.is_null(),
+            !uti.is_null()
+        );
     }
     ok != 0
 }
@@ -346,6 +653,7 @@ fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     // BITMAPINFOHEADER: biSize は先頭4バイト(旧実装は誤って biWidth を読んでいた)
     let header_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
     let bpp = u16::from_le_bytes([dib[14], dib[15]]) as usize;
+    let comp = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
     let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]) as usize;
     let palette = if clr_used > 0 {
         clr_used * 4
@@ -354,7 +662,15 @@ fn dib_to_bmp(dib: &[u8]) -> Vec<u8> {
     } else {
         0
     };
-    let off = 14 + header_size + palette;
+    // BI_BITFIELDS(biCompression=3) が biSize=40 で来た場合だけ、ヘッダ直後に
+    // 12 バイトのカラーマスクが付く(Windows のクリップボードが実際に出す形。
+    // これを飛ばさないと画像全体が 3px ずれる。biSize>=52 はマスク込みのサイズ)
+    let masks = if comp == 3 && header_size == 40 {
+        12
+    } else {
+        0
+    };
+    let off = 14 + header_size + palette + masks;
     let mut out = Vec::with_capacity(14 + dib.len());
     out.extend_from_slice(b"BM");
     out.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
@@ -387,7 +703,8 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
     }
     // NSBitmapImageRep imageRepWithData:
     let rep = {
-        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
+        let f: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+            std::mem::transmute(objc_msgSend as *const () as usize);
         f(
             objc_getClass(c"NSBitmapImageRep".as_ptr()),
             sel_registerName(c"imageRepWithData:".as_ptr()),
@@ -406,8 +723,14 @@ unsafe fn mac_set_clipboard_image_bmp(bmp: &[u8]) -> bool {
     }
     msg0(pb, sel_registerName(c"clearContents".as_ptr()));
     let uti = nsstring("public.tiff");
-    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 = std::mem::transmute(objc_msgSend as *const () as usize);
-    let ok = f(pb, sel_registerName(c"setData:forType:".as_ptr()), tiff, uti);
+    let f: unsafe extern "C" fn(ID, SEL, ID, ID) -> u8 =
+        std::mem::transmute(objc_msgSend as *const () as usize);
+    let ok = f(
+        pb,
+        sel_registerName(c"setData:forType:".as_ptr()),
+        tiff,
+        uti,
+    );
     if ok == 0 {
         eprintln!(
             "[clip] image FAILED at setData (data={} rep={} tiff={} bmp={}B)",
@@ -435,11 +758,20 @@ unsafe fn mac_get_clipboard() -> Option<String> {
     if utf8.is_null() {
         return None;
     }
-    Some(std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned())
+    Some(
+        std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn clipboard_change_count() -> isize {
-    unsafe { msg0_isize(general_pasteboard(), sel_registerName(c"changeCount".as_ptr())) }
+    unsafe {
+        msg0_isize(
+            general_pasteboard(),
+            sel_registerName(c"changeCount".as_ptr()),
+        )
+    }
 }
 
 /// NSPasteboard にファイル参照(Finder の ⌘C 等)があるか調べ、パス群を返す。
@@ -506,7 +838,11 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
         std::mem::transmute(objc_msgSend as *const () as usize);
     let mut out = Vec::new();
     for i in 0..n.min(64) {
-        let url = at(urls, sel_registerName(c"objectAtIndex:".as_ptr()), i as usize);
+        let url = at(
+            urls,
+            sel_registerName(c"objectAtIndex:".as_ptr()),
+            i as usize,
+        );
         if url.is_null() {
             continue;
         }
@@ -518,7 +854,9 @@ unsafe fn pb_files(pb: ID) -> Option<Vec<std::path::PathBuf>> {
         if utf8.is_null() {
             continue;
         }
-        let s = std::ffi::CStr::from_ptr(utf8).to_string_lossy().into_owned();
+        let s = std::ffi::CStr::from_ptr(utf8)
+            .to_string_lossy()
+            .into_owned();
         if !s.is_empty() {
             out.push(std::path::PathBuf::from(s));
         }
@@ -575,7 +913,10 @@ unsafe fn mac_clipboard_write_files(paths: &[std::path::PathBuf]) -> bool {
 
 /// ファイル群の指紋(パス+合計サイズ)。形式は common::files::key に統一
 fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
-    let v: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let v: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     bulk::files_key(&v)
 }
 
@@ -595,33 +936,46 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
             eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
             notify(
                 "tsunagu",
-                &format!("ファイルを送信できません(合計 {}MB。上限 200MB)", total / 1024 / 1024),
+                &format!(
+                    "ファイルを送信できません(合計 {}MiB。1回の上限 {})",
+                    total / 1024 / 1024,
+                    bulk::file_limit_label()
+                ),
             );
             FILE_TX_BUSY.store(false, Ordering::Relaxed);
             return;
         }
-        eprintln!("[file] 送信開始: {} 件 / 合計 {}KB{}", paths.len(), total / 1024, if drop { "(掴みドラッグ)" } else { "" });
+        eprintln!(
+            "[file] 送信開始: {} 件 / 合計 {}KB{}",
+            paths.len(),
+            total / 1024,
+            if drop { "(掴みドラッグ)" } else { "" }
+        );
         let t0 = std::time::Instant::now();
         // 進捗は 10% 刻みでログへ(巨大転送中に固まって見えるのを防ぐ)。
         // クロージャは send で消費されるため、再試行側にも同じ形を書く
         macro_rules! send_with_progress {
-            () => { BULK_LINK.send(|w| {
-                let mut last_step = 0u64;
-                bulk::send_files_with_progress(w, &paths, drop, |sent, total| {
-                    if total > 0 {
-                        let step = sent * 10 / total.max(1);
-                        if step > last_step {
-                            last_step = step;
-                            eprintln!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+            () => {
+                BULK_LINK.send(|w| {
+                    let mut last_step = 0u64;
+                    bulk::send_files_with_progress(w, &paths, drop, |sent, total| {
+                        if total > 0 {
+                            let step = sent * 10 / total.max(1);
+                            if step > last_step {
+                                last_step = step;
+                                eprintln!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+                            }
                         }
-                    }
+                    })
                 })
-            }) };
+            };
         }
         // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓(最大約 5 秒)で起きる。
         // ユーザー操作がログ 1 行で失われるのを防ぐため、少し待って 1 回だけやり直す
         let mut r = send_with_progress!();
-        if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
+        if r.as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+        {
             eprintln!("[file] bulk 経路の再接続を待って再試行します");
             std::thread::sleep(Duration::from_millis(2500));
             r = send_with_progress!();
@@ -634,14 +988,29 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
                 if drop {
-                    notify("tsunagu", &format!("{n} 件のファイルを Windows へ掴んで渡しました"));
+                    notify(
+                        "tsunagu",
+                        &format!(
+                            "{n} 件({})を Windows へ掴んで渡しました",
+                            human_bytes(total)
+                        ),
+                    );
                 } else {
-                    notify("tsunagu", &format!("{n} 件のファイルを Windows へ送信しました(Ctrl+V で貼り付け)"));
+                    notify(
+                        "tsunagu",
+                        &format!(
+                            "{n} 件({})を Windows へ送信しました(Ctrl+V で貼り付け)",
+                            human_bytes(total)
+                        ),
+                    );
                 }
             }
             Err(e) => {
                 eprintln!("[file] 送信失敗: {e}");
-                notify("tsunagu", "Windows へファイルを送れませんでした(ファイル転送経路が未接続)");
+                notify(
+                    "tsunagu",
+                    "Windows へファイルを送れませんでした(ファイル転送経路が未接続)",
+                );
             }
         }
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
@@ -665,10 +1034,19 @@ unsafe fn mac_clipboard_image_dib() -> Option<Vec<u8>> {
     if rep.is_null() {
         return None;
     }
-    let props = msg0(objc_getClass(c"NSDictionary".as_ptr()), sel_registerName(c"dictionary".as_ptr()));
-    let repr: unsafe extern "C" fn(ID, SEL, usize, ID) -> ID = std::mem::transmute(objc_msgSend as *const () as usize);
+    let props = msg0(
+        objc_getClass(c"NSDictionary".as_ptr()),
+        sel_registerName(c"dictionary".as_ptr()),
+    );
+    let repr: unsafe extern "C" fn(ID, SEL, usize, ID) -> ID =
+        std::mem::transmute(objc_msgSend as *const () as usize);
     // NSBitmapImageFileTypeBMP = 1
-    let bmp = repr(rep, sel_registerName(c"representationUsingType:properties:".as_ptr()), 1, props);
+    let bmp = repr(
+        rep,
+        sel_registerName(c"representationUsingType:properties:".as_ptr()),
+        1,
+        props,
+    );
     if bmp.is_null() {
         return None;
     }
@@ -683,6 +1061,11 @@ unsafe fn mac_clipboard_image_dib() -> Option<Vec<u8>> {
 /// 大容量経路の受信完了(Windows からのファイル・画像)
 fn mac_on_bulk(e: bulk::Event) {
     with_pool(|| match e {
+        bulk::Event::Files {
+            paths,
+            drag_id: Some(id),
+            ..
+        } => incoming_drag::receive(id, paths),
         bulk::Event::Files { paths, .. } => {
             let n = paths.len();
             let ok = unsafe { mac_clipboard_write_files(&paths) };
@@ -691,7 +1074,19 @@ fn mac_on_bulk(e: bulk::Event) {
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
-                notify("tsunagu", &format!("ファイルを受信: {n} 件(⌘V で貼り付け可)"));
+                history_push_files(&paths, "Windows");
+                let dir = std::env::var_os("HOME")
+                    .map(|h| std::path::Path::new(&h).join("Downloads/Tsunagu"))
+                    .unwrap_or_default();
+                let total = tsunagu_common::bulk::total_size(&paths);
+                notify(
+                    "tsunagu",
+                    &format!(
+                        "ファイルを受信: {n} 件({})(⌘V で貼り付け可)。実体は {}",
+                        human_bytes(total),
+                        dir.display()
+                    ),
+                );
             } else {
                 eprintln!("[file] win->mac 受信: {n} 件(クリップボード載せ失敗)");
             }
@@ -701,9 +1096,17 @@ fn mac_on_bulk(e: bulk::Event) {
                 return;
             }
             LAST_IMG_RX_MS.store(now_ms(), Ordering::Relaxed);
-            let ok = unsafe { mac_set_clipboard_image_bmp(&dib_to_bmp(&dib)) };
+            let bmp = dib_to_bmp(&dib);
+            let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-            eprintln!("[clip] win->mac image {}KB {}", dib.len() / 1024, if ok { "ok" } else { "FAILED" });
+            if ok {
+                history_push_image(&bmp, "Windows");
+            }
+            eprintln!(
+                "[clip] win->mac image {}KB {}",
+                dib.len() / 1024,
+                if ok { "ok" } else { "FAILED" }
+            );
         }
     })
 }
@@ -918,7 +1321,10 @@ fn secure_input_app() -> Option<String> {
     if unsafe { IsSecureEventInputEnabled() } == 0 {
         return None;
     }
-    let out = std::process::Command::new("ioreg").args(["-l", "-w", "0", "-d", "1"]).output().ok()?;
+    let out = std::process::Command::new("ioreg")
+        .args(["-l", "-w", "0", "-d", "1"])
+        .output()
+        .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let pid = text
         .split("kCGSSessionSecureInputPID\"=")
@@ -926,8 +1332,15 @@ fn secure_input_app() -> Option<String> {
         .and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next())
         .filter(|s| !s.is_empty());
     let name = pid.and_then(|pid| {
-        let o = std::process::Command::new("ps").args(["-p", pid, "-o", "comm="]).output().ok()?;
-        let n = String::from_utf8_lossy(&o.stdout).trim().rsplit('/').next()?.to_string();
+        let o = std::process::Command::new("ps")
+            .args(["-p", pid, "-o", "comm="])
+            .output()
+            .ok()?;
+        let n = String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .rsplit('/')
+            .next()?
+            .to_string();
         (!n.is_empty()).then_some(n)
     });
     Some(name.unwrap_or_else(|| "不明なアプリ".into()))
@@ -936,7 +1349,10 @@ fn secure_input_app() -> Option<String> {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGSessionCopyCurrentDictionary() -> *const core::ffi::c_void;
-    fn CFDictionaryGetValue(d: *const core::ffi::c_void, key: *const core::ffi::c_void) -> *const core::ffi::c_void;
+    fn CFDictionaryGetValue(
+        d: *const core::ffi::c_void,
+        key: *const core::ffi::c_void,
+    ) -> *const core::ffi::c_void;
     fn CFBooleanGetValue(b: *const core::ffi::c_void) -> u8;
 }
 
@@ -947,8 +1363,16 @@ fn screen_locked() -> bool {
         if d.is_null() {
             return false;
         }
-        let key = CFStringCreateWithCString(std::ptr::null_mut(), c"CGSSessionScreenIsLocked".as_ptr(), 0x0800_0100);
-        let v = if key.is_null() { std::ptr::null() } else { CFDictionaryGetValue(d, key as *const _) };
+        let key = CFStringCreateWithCString(
+            std::ptr::null_mut(),
+            c"CGSSessionScreenIsLocked".as_ptr(),
+            0x0800_0100,
+        );
+        let v = if key.is_null() {
+            std::ptr::null()
+        } else {
+            CFDictionaryGetValue(d, key as *const _)
+        };
         let locked = !v.is_null() && CFBooleanGetValue(v) != 0;
         if !key.is_null() {
             CFRelease(key as *mut _);
@@ -976,7 +1400,9 @@ pub static TS_PATH: AtomicU8 = AtomicU8::new(0);
 
 /// 本線を確実に切る(スロットから外すだけでは受信スレッドが読み出しを待ち続ける)
 fn drop_stream(reason: &str) {
-    let taken = STREAM_SLOT.get().and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take());
+    let taken = STREAM_SLOT
+        .get()
+        .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).take());
     if let Some(s) = taken {
         eprintln!("[conn] {reason}。接続を張り直します");
         s.shutdown();
@@ -985,15 +1411,32 @@ fn drop_stream(reason: &str) {
 
 /// `tailscale status --json` から相手への経路が直結か中継かを調べる
 fn tailscale_path(peer: std::net::IpAddr) -> Option<u8> {
-    let out = ["tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale"]
-        .iter()
-        .find_map(|bin| std::process::Command::new(bin).args(["status", "--json"]).output().ok())
-        .filter(|o| o.status.success())?;
+    let out = [
+        "tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ]
+    .iter()
+    .find_map(|bin| {
+        std::process::Command::new(bin)
+            .args(["status", "--json"])
+            .output()
+            .ok()
+    })
+    .filter(|o| o.status.success())?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let ip = peer.to_string();
     v["Peer"].as_object()?.values().find_map(|p| {
-        let has = p["TailscaleIPs"].as_array()?.iter().any(|x| x.as_str() == Some(ip.as_str()));
-        has.then(|| if p["CurAddr"].as_str().unwrap_or("").is_empty() { 2 } else { 1 })
+        let has = p["TailscaleIPs"]
+            .as_array()?
+            .iter()
+            .any(|x| x.as_str() == Some(ip.as_str()));
+        has.then(|| {
+            if p["CurAddr"].as_str().unwrap_or("").is_empty() {
+                2
+            } else {
+                1
+            }
+        })
     })
 }
 
@@ -1028,6 +1471,673 @@ fn notify(title: &str, body: &str) {
             .output();
         let _ = out;
     });
+}
+
+// ---------- Search My Desk(ビジョン§14: デスク横断検索) ----------
+/// Mac 操作中の ⌥⌘S で開く検索窓。アプリ・デスクのファイル/フォルダ・コマンド・
+/// 履歴・URL を 1 つの窓から扱う。`TSUNAGU_DESK_SEARCH=0` で無効化
+pub static DESK_SEARCH: AtomicBool = AtomicBool::new(true);
+/// Windows 側のアプリ候補(AppsReply で受け取る。検索窓が開いている間に届く)
+pub static WIN_APPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 越境 App Handoff(ビジョン§12 の第一歩・実験的): Windows へ切り替えたとき
+/// Mac の最前面アプリと同じアプリを Windows で起動する。勝手にアプリが
+/// 開く驚きを避けるため既定は無効(`TSUNAGU_APP_HANDOFF=1` で有効)
+static APP_HANDOFF: AtomicBool = AtomicBool::new(false);
+/// デスクのファイル/フォルダ候補(検索窓の Files/Folders 対象)。
+/// 走査が重いため 10 分キャッシュし、検索窓を開くたびに裏で更新する
+pub static DESK_FILES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static DESK_FILES_TS: AtomicU64 = AtomicU64::new(0);
+/// 検索窓の Enter 押下時に ⌥(option)が押されていたか(=Windows へ投げる)。
+/// tap スレッドが立てて gui スレッドが読む
+pub(crate) static SEARCH_ENTER_OPT: AtomicBool = AtomicBool::new(false);
+
+/// /Applications・/System/Applications・~/Applications の .app を
+/// (表示名, パス)で列挙する。名前順でソートする(検索の順位安定のため)。
+/// 標準アプリ(Terminal 等)は /System/Applications 側にある
+pub fn list_apps() -> Vec<(String, String)> {
+    // Utilities 等、1 階層深い場所にある .app も含める(Terminal は
+    // /System/Applications/Utilities/ にある)
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("app") {
+                out.push(p);
+            } else if p.is_dir() {
+                if let Ok(sub) = std::fs::read_dir(&p) {
+                    for e2 in sub.flatten() {
+                        let p2 = e2.path();
+                        if p2.extension().and_then(|x| x.to_str()) == Some("app") {
+                            out.push(p2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for root in ["/Applications", "/System/Applications"] {
+        collect(std::path::Path::new(root), &mut paths);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        collect(
+            &std::path::Path::new(&home).join("Applications"),
+            &mut paths,
+        );
+    }
+    let mut out = Vec::new();
+    for p in paths {
+        if p.extension().and_then(|x| x.to_str()) == Some("app") {
+            let name = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                out.push((name, p.to_string_lossy().into_owned()));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// 検索窓の Files/Folders 候補(ビジョン§14)。Desktop・Downloads・Documents の
+/// 直下と 1 階層下のサブフォルダを走査する。ホーム全体を走ると dotfiles や
+/// 巨大フォルダ(Library 等)に時間がかかるため、日常的に探す場所に絞る。
+/// 呼び出し側は検索窓を開くタイミングで別スレッドから呼ぶ(走査中も入力は止めない)
+pub fn refresh_desk_files() {
+    let now = now_ms();
+    // 0=未走査(now_ms は起動からの経過時間のため、初回を 10 分待たせない)。
+    // 二重起動の抑止は store で間に合う(競合で走査が重なっても結果は同じ)
+    let last = DESK_FILES_TS.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < 600_000 {
+        return;
+    }
+    DESK_FILES_TS.store(now, Ordering::Relaxed);
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let home = std::path::PathBuf::from(home);
+    // (表示名, パス, 変更時刻)。新しいもの順に並べてから名前・パスへ落とす
+    let mut items: Vec<(String, String, u64)> = Vec::new();
+    for root in ["Desktop", "Downloads", "Documents"] {
+        collect_desk_files(&home.join(root), 0, &mut items);
+    }
+    items.sort_by(|a, b| b.2.cmp(&a.2));
+    let n = items.len();
+    let mapped: Vec<(String, String)> = items
+        .into_iter()
+        .map(|(name, path, _)| (name, path))
+        .collect();
+    let changed = DESK_FILES
+        .lock()
+        .map(|mut f| std::mem::replace(&mut *f, mapped).len() != n)
+        .unwrap_or(false);
+    eprintln!("[search] デスクのファイル/フォルダ {} 件を索引しました", n);
+    // 検索窓が開いている間に索引が揃ったら候補へ反映する(閉じていれば何もしない)
+    if changed {
+        dispatch_search_refresh();
+    }
+}
+
+/// collect の上限。巨大フォルダで検索窓の起動が重くならないための保険
+const DESK_FILES_MAX: usize = 4000;
+/// 走査しない(候補にも出さない)ディレクトリ名
+const DESK_FILES_SKIP: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "Library",
+    "dist",
+    "build",
+];
+
+fn collect_desk_files(dir: &std::path::Path, depth: u8, out: &mut Vec<(String, String, u64)>) {
+    if out.len() >= DESK_FILES_MAX {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if out.len() >= DESK_FILES_MAX {
+            return;
+        }
+        let p = e.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || DESK_FILES_SKIP.contains(&name) {
+            continue;
+        }
+        let meta = match e.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        out.push((name.to_string(), p.to_string_lossy().into_owned(), mtime));
+        if meta.is_dir() && depth == 0 {
+            collect_desk_files(&p, 1, out);
+        }
+    }
+}
+
+/// 検索窓の Commands 候補(ビジョン§14)。(表示名, コマンド ID)
+pub fn desk_commands() -> Vec<(String, String)> {
+    vec![
+        ("Windows をロック".to_string(), "win_lock".to_string()),
+        ("画面を暗くする".to_string(), "display_sleep".to_string()),
+        (
+            "クリップボード共有を切替".to_string(),
+            "clip_share_toggle".to_string(),
+        ),
+        (
+            "クリップボード履歴を消去".to_string(),
+            "history_clear".to_string(),
+        ),
+        (
+            "Windows のアプリ一覧を更新".to_string(),
+            "win_apps_refresh".to_string(),
+        ),
+    ]
+}
+
+/// コマンド候補の実行。ID は desk_commands が列挙したものだけ
+pub fn run_desk_command(id: &str) {
+    match id {
+        "win_lock" => {
+            // 画面ロックの連動(既存の Msg::Lock と同じ経路)
+            if send_msg_reported(&Msg::Lock) {
+                eprintln!("[cmd] Windows をロックしました");
+            } else {
+                notify("Tsunagu", "未接続のため Windows をロックできませんでした");
+            }
+        }
+        "display_sleep" => {
+            // ディスプレイだけスリープ(ロックはしない。任意のキーで復帰)
+            let _ = std::process::Command::new("/usr/bin/pmset")
+                .arg("displaysleepnow")
+                .spawn();
+            eprintln!("[cmd] ディスプレイをスリープさせました");
+        }
+        "clip_share_toggle" => {
+            let next = !CLIP_SHARE.load(Ordering::Relaxed);
+            CLIP_SHARE.store(next, Ordering::Relaxed);
+            notify(
+                "tsunagu",
+                if next {
+                    "クリップボード共有をオンにしました"
+                } else {
+                    "クリップボード共有をオフにしました"
+                },
+            );
+            eprintln!(
+                "[cmd] クリップボード共有: {}",
+                if next { "オン" } else { "オフ" }
+            );
+        }
+        "history_clear" => history_clear(),
+        "win_apps_refresh" => {
+            send_msg(&Msg::AppsQuery);
+            eprintln!("[cmd] Windows のアプリ一覧を問い合わせました");
+        }
+        other => eprintln!("[cmd] 未知のコマンド: {other}"),
+    }
+}
+
+/// 検索窓の Enter/Esc 押下状態。窓を閉じると tap の握り範囲外になるため
+/// up を受け取れないことがあり、開き直し時に残った true が初回 Enter を
+/// 「2 回目の押下」として無視する(実測)。開くたび gui 側からリセットする
+pub(crate) static SEARCH_ENTER_DOWN: AtomicBool = AtomicBool::new(false);
+pub(crate) static SEARCH_ESC_DOWN: AtomicBool = AtomicBool::new(false);
+
+/// 検索窓の表示をメインスレッドへ依頼する(tap はバックグラウンドスレッド。
+/// AppKit の窓操作は必ずメインスレッドで行う)
+fn dispatch_show_search() {
+    unsafe {
+        let target = gui::target_id();
+        if target.is_null() {
+            eprintln!("[search] GUI target 未初期化のため検索窓を開けません");
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(objc_msgSend as *const () as usize);
+        f(
+            target,
+            sel_registerName(c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr()),
+            sel_registerName(c"sdShowSearch:".as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// 検索窓用: キーコードを文字へ変換する(US/JIS 共通の QWERTY 位置)。
+/// IME を bypass して検索窓に直接積むための最小変換(shift は US 記号)
+fn keychar(kc: u16, shift: bool) -> Option<&'static str> {
+    Some(match kc {
+        0 => {
+            if shift {
+                "A"
+            } else {
+                "a"
+            }
+        }
+        1 => {
+            if shift {
+                "S"
+            } else {
+                "s"
+            }
+        }
+        2 => {
+            if shift {
+                "D"
+            } else {
+                "d"
+            }
+        }
+        3 => {
+            if shift {
+                "F"
+            } else {
+                "f"
+            }
+        }
+        4 => {
+            if shift {
+                "H"
+            } else {
+                "h"
+            }
+        }
+        5 => {
+            if shift {
+                "G"
+            } else {
+                "g"
+            }
+        }
+        6 => {
+            if shift {
+                "Z"
+            } else {
+                "z"
+            }
+        }
+        7 => {
+            if shift {
+                "X"
+            } else {
+                "x"
+            }
+        }
+        8 => {
+            if shift {
+                "C"
+            } else {
+                "c"
+            }
+        }
+        9 => {
+            if shift {
+                "V"
+            } else {
+                "v"
+            }
+        }
+        11 => {
+            if shift {
+                "B"
+            } else {
+                "b"
+            }
+        }
+        12 => {
+            if shift {
+                "Q"
+            } else {
+                "q"
+            }
+        }
+        13 => {
+            if shift {
+                "W"
+            } else {
+                "w"
+            }
+        }
+        14 => {
+            if shift {
+                "E"
+            } else {
+                "e"
+            }
+        }
+        15 => {
+            if shift {
+                "R"
+            } else {
+                "r"
+            }
+        }
+        16 => {
+            if shift {
+                "Y"
+            } else {
+                "y"
+            }
+        }
+        17 => {
+            if shift {
+                "T"
+            } else {
+                "t"
+            }
+        }
+        18 => {
+            if shift {
+                "!"
+            } else {
+                "1"
+            }
+        }
+        19 => {
+            if shift {
+                "@"
+            } else {
+                "2"
+            }
+        }
+        20 => {
+            if shift {
+                "#"
+            } else {
+                "3"
+            }
+        }
+        21 => {
+            if shift {
+                "$"
+            } else {
+                "4"
+            }
+        }
+        22 => {
+            if shift {
+                "^"
+            } else {
+                "6"
+            }
+        }
+        23 => {
+            if shift {
+                "%"
+            } else {
+                "5"
+            }
+        }
+        24 => {
+            if shift {
+                "+"
+            } else {
+                "="
+            }
+        }
+        25 => {
+            if shift {
+                "("
+            } else {
+                "9"
+            }
+        }
+        26 => {
+            if shift {
+                "&"
+            } else {
+                "7"
+            }
+        }
+        27 => {
+            if shift {
+                "_"
+            } else {
+                "-"
+            }
+        }
+        28 => {
+            if shift {
+                "*"
+            } else {
+                "8"
+            }
+        }
+        29 => {
+            if shift {
+                ")"
+            } else {
+                "0"
+            }
+        }
+        30 => {
+            if shift {
+                "}"
+            } else {
+                "]"
+            }
+        }
+        31 => {
+            if shift {
+                "O"
+            } else {
+                "o"
+            }
+        }
+        32 => {
+            if shift {
+                "U"
+            } else {
+                "u"
+            }
+        }
+        33 => {
+            if shift {
+                "{"
+            } else {
+                "["
+            }
+        }
+        34 => {
+            if shift {
+                "I"
+            } else {
+                "i"
+            }
+        }
+        35 => {
+            if shift {
+                "P"
+            } else {
+                "p"
+            }
+        }
+        37 => {
+            if shift {
+                "L"
+            } else {
+                "l"
+            }
+        }
+        38 => {
+            if shift {
+                "J"
+            } else {
+                "j"
+            }
+        }
+        39 => {
+            if shift {
+                "\""
+            } else {
+                "'"
+            }
+        }
+        40 => {
+            if shift {
+                "K"
+            } else {
+                "k"
+            }
+        }
+        41 => {
+            if shift {
+                ":"
+            } else {
+                ";"
+            }
+        }
+        42 => {
+            if shift {
+                "|"
+            } else {
+                "\\"
+            }
+        }
+        43 => {
+            if shift {
+                "<"
+            } else {
+                ","
+            }
+        }
+        44 => {
+            if shift {
+                "?"
+            } else {
+                "/"
+            }
+        }
+        45 => {
+            if shift {
+                "N"
+            } else {
+                "n"
+            }
+        }
+        46 => {
+            if shift {
+                "M"
+            } else {
+                "m"
+            }
+        }
+        47 => {
+            if shift {
+                ">"
+            } else {
+                "."
+            }
+        }
+        49 => " ",
+        50 => {
+            if shift {
+                "~"
+            } else {
+                "`"
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Windows 側アプリ候補の到着を検索窓へ反映する(メインスレッドで再絞り込み)。
+/// 窓が閉じていれば何もしない
+fn dispatch_search_refresh() {
+    unsafe {
+        let target = gui::target_id();
+        if target.is_null() {
+            return;
+        }
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(objc_msgSend as *const () as usize);
+        f(
+            target,
+            sel_registerName(c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr()),
+            sel_registerName(c"sdSearchRefresh:".as_ptr()),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// バイト数を通知・表示用に整形する(2048→"2 KB"、3_500_000→"3.3 MB")
+pub fn human_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", n as f64 / (1024 * 1024 * 1024) as f64)
+    } else if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024 * 1024) as f64)
+    } else if n >= 1024 {
+        format!("{} KB", (n + 1023) / 1024)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// この Mac のホスト名(kern.hostname、ドメイン部は除く)。hello で相手へ出す
+pub fn hostname_label() -> String {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *mut core::ffi::c_void,
+            newlen: usize,
+        ) -> i32;
+    }
+    unsafe {
+        let name = c"kern.hostname";
+        let mut size = 0usize;
+        if sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return "Mac".into();
+        }
+        let mut buf = vec![0u8; size];
+        if sysctlbyname(
+            name.as_ptr(),
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return "Mac".into();
+        }
+        let s = std::ffi::CStr::from_bytes_until_nul(&buf)
+            .map(|c| c.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let short = s.split('.').next().unwrap_or("").trim().to_string();
+        if short.is_empty() {
+            "Mac".into()
+        } else {
+            short.chars().take(40).collect()
+        }
+    }
 }
 
 // ---------- 共有状態 ----------
@@ -1105,22 +2215,36 @@ static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
 /// ドラッグ中切替(TSUNAGU_DRAG_SWITCH=1): 押したまま境界を越えられる
 pub static DRAG_SWITCH: AtomicBool = AtomicBool::new(false);
+/// 速度越境(Crossing Intelligence・ビジョン§24): 境界への速度が十分大きい越えは
+/// 滞在待ち/ダブルタップをスキップする。`TSUNAGU_FAST_EDGE=0` で無効化
+pub static FAST_EDGE: AtomicBool = AtomicBool::new(true);
 /// Mac 流ショートカット翻訳(TSUNAGU_MAC_KEYS=0 で無効)。タップ内で毎イベント
 /// 設定を引かないよう起動時にキャッシュする
 static MAC_KEYS: AtomicBool = AtomicBool::new(true);
 /// 2本指横スワイプ→戻る/進む(TSUNAGU_SWIPE_NAV=0 で横ホイールのまま)
 static SWIPE_NAV: AtomicBool = AtomicBool::new(true);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
-static BTN_DOWN: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+static BTN_DOWN: [AtomicBool; 3] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
-/// ファイル掴みドラッグ越境: ドラッグペーストボードにファイルがあり左ボタン押下中
-/// (= Finder 等のファイルを掴んでいる)true。境界切替の許可と切替時の送信に使う
-static DRAG_FILE: AtomicBool = AtomicBool::new(false);
-/// 掴んでいるファイルのパス群(DRAG_FILE=true の間だけ有効)
-static DRAG_FILES: Mutex<Vec<std::path::PathBuf>> = Mutex::new(Vec::new());
-/// 合成 LeftMouseUp(kCGEventSourceUserData=41)に刻む識別マジック。
+/// 押下時の基準値・取得中の世代・ファイル群を同じ状態で管理し、遅い読み出しが
+/// 次のクリックに混ざらないようにする。境界切替の許可と切替時の送信に使う
+static FILE_DRAG: Mutex<file_drag::FileDrag> = Mutex::new(file_drag::FileDrag::new());
+/// 合成 LeftMouseUp(kCGEventSourceUserData=42)に刻む識別マジック。
 /// 掴み切替直後の Mac 側ドラッグ完結用投稿であり、Win へ転送してはならない
 const SYNTH_UP_MAGIC: i64 = 0x54554e41475550; // "TSUNAGUP" 的な一意値
+const FIELD_EVENT_SOURCE_USER_DATA: i32 = 42;
+
+unsafe fn make_drag_end_event(pos: CGPoint) -> CGEventRef {
+    let event = CGEventCreateMouseEvent(std::ptr::null_mut(), EVT_LEFT_UP, pos, 0);
+    if !event.is_null() {
+        CGEventSetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA, SYNTH_UP_MAGIC);
+    }
+    event
+}
 
 /// SIDE(0=右/1=左/2=上/3=下/4=右上/5=右下/6=左上/7=左下)を文字列表現で
 pub fn side_name() -> &'static str {
@@ -1180,7 +2304,10 @@ static LAST_PONG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// 0 を「未設定」の意味で使う箇所があるため 1 秒のオフセットを足す
 fn now_ms() -> u64 {
     static T0: OnceLock<std::time::Instant> = OnceLock::new();
-    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1_000
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1_000
 }
 
 /// 復帰直後は右端判定を一定時間無効化する(再突入チャタリング防止)
@@ -1239,7 +2366,8 @@ static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。設定ウィンドウの
 /// スライダーからも可変(TSUNAGU_SCROLL_DIV は初期値)。f64 を AtomicU64 ビットで保持
-static SCROLL_DIV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(60.0f64.to_bits());
+static SCROLL_DIV: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(60.0f64.to_bits());
 
 /// 現在のスクロール除数を f64 で読む
 pub fn scroll_div() -> f64 {
@@ -1268,8 +2396,7 @@ pub fn set_mouse_scale(v: f64) {
 }
 /// 境界切替の判定閾値(px、境界からの距離)。設定窓スライダーで可変。
 /// f64 を AtomicU64 ビットで保持
-static EDGE_PX: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(2.0f64.to_bits());
+static EDGE_PX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2.0f64.to_bits());
 
 /// 現在の境界判定閾値(px)
 pub fn edge_px() -> f64 {
@@ -1311,7 +2438,39 @@ const GEO_DEFAULT: Geo = Geo {
 static GEO: Mutex<Option<Geo>> = Mutex::new(None);
 
 pub(crate) fn geo() -> Geo {
-    GEO.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(GEO_DEFAULT)
+    GEO.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(GEO_DEFAULT)
+}
+
+/// 検索窓を置くべき位置(AppKit 座標): カーソルがある画面の中央。
+/// CG 座標系(top-left origin)と AppKit(bottom-left origin)は y 軸が逆向き
+/// ため appkit_y = geo().max_y - cg_y で変換する。
+/// 多画面環境で main 以外を見ているときに窓が見えない場所へ出るのを防ぐ(実測)
+pub(crate) fn cursor_screen_center_appkit(win_w: f64, win_h: f64) -> (f64, f64) {
+    unsafe {
+        let cur = live_cursor().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
+        let mut ids = [0u32; 16];
+        let mut n = 0u32;
+        let b = if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
+            ids[..(n as usize).min(16)]
+                .iter()
+                .map(|id| CGDisplayBounds(*id))
+                .find(|b| {
+                    cur.x >= b.origin.x
+                        && cur.x < b.origin.x + b.size.w
+                        && cur.y >= b.origin.y
+                        && cur.y < b.origin.y + b.size.h
+                })
+                .unwrap_or_else(|| CGDisplayBounds(CGMainDisplayID()))
+        } else {
+            CGDisplayBounds(CGMainDisplayID())
+        };
+        let g = geo();
+        let cx = b.origin.x + (b.size.w - win_w) / 2.0;
+        let cy = g.max_y - (b.origin.y + b.size.h / 2.0) - win_h / 2.0;
+        (cx, cy)
+    }
 }
 
 impl Geo {
@@ -1332,13 +2491,19 @@ impl Geo {
     fn along_ratio(&self, dir: u8, x: f64, y: f64) -> f64 {
         let (lo, hi) = self.exit_span(dir);
         let v = if dir >= 2 { x } else { y };
-        if hi > lo { ((v - lo) / (hi - lo)).clamp(0.0, 1.0) } else { 0.5 }
+        if hi > lo {
+            ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
+        } else {
+            0.5
+        }
     }
     /// 比率から境界に沿った座標へ(端から 20px は避ける)
     fn along_pos(&self, dir: u8, r: Option<f64>) -> f64 {
         let (lo, hi) = self.exit_span(dir);
         match r {
-            Some(n) => (lo + n.clamp(0.0, 1.0) * (hi - lo)).clamp(lo + 20.0, (hi - 20.0).max(lo + 20.0)),
+            Some(n) => {
+                (lo + n.clamp(0.0, 1.0) * (hi - lo)).clamp(lo + 20.0, (hi - 20.0).max(lo + 20.0))
+            }
             None => (lo + hi) / 2.0,
         }
     }
@@ -1376,7 +2541,12 @@ fn compute_geo() -> Geo {
         if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
             for id in &ids[..(n as usize).min(16)] {
                 let b = CGDisplayBounds(*id);
-                let (l, r, t, btm) = (b.origin.x, b.origin.x + b.size.w, b.origin.y, b.origin.y + b.size.h);
+                let (l, r, t, btm) = (
+                    b.origin.x,
+                    b.origin.x + b.size.w,
+                    b.origin.y,
+                    b.origin.y + b.size.h,
+                );
                 // 同じ辺を複数のディスプレイが共有する(縦に並べた外部モニター等)場合は
                 // 出口の範囲を合算する
                 let widen = |e: &mut (f64, f64), lo: f64, hi: f64| *e = (e.0.min(lo), e.1.max(hi));
@@ -1420,7 +2590,11 @@ fn refresh_geo() {
 }
 
 /// ディスプレイ構成の変更通知(メイン RunLoop 上で呼ばれる)。変更完了時だけ作り直す
-unsafe extern "C" fn display_reconfigured(_display: u32, flags: u32, _user: *mut core::ffi::c_void) {
+unsafe extern "C" fn display_reconfigured(
+    _display: u32,
+    flags: u32,
+    _user: *mut core::ffi::c_void,
+) {
     const BEGIN: u32 = 1; // kCGDisplayBeginConfigurationFlag
     if flags & BEGIN == 0 {
         refresh_geo();
@@ -1455,7 +2629,10 @@ fn enter_win_mode_cursor_lock() {
     if IME_SYNC.load(Ordering::Relaxed) {
         if let Some(on) = current_ime_state() {
             send_msg(&Msg::Ime { kana: on });
-            eprintln!("[ime] Mac の状態を Windows へ同期: {}", if on { "かな(ON)" } else { "英数(OFF)" });
+            eprintln!(
+                "[ime] Mac の状態を Windows へ同期: {}",
+                if on { "かな(ON)" } else { "英数(OFF)" }
+            );
         }
     }
     std::thread::spawn(|| {
@@ -1497,14 +2674,19 @@ fn enter_win_mode_cursor_lock() {
         // 固定すると、その先にサブモニターがある環境で隠れカーソルが別画面へ飛ぶ)
         let dir = side_dir();
         let g = geo();
-        let lock_x2 = live_cursor().map(|p| p.x).unwrap_or((g.min_x + g.max_x) / 2.0);
+        let lock_x2 = live_cursor()
+            .map(|p| p.x)
+            .unwrap_or((g.min_x + g.max_x) / 2.0);
         let (lock_x, lock_y) = match dir {
             1 => (g.min_x + 2.0, lock_y),
             2 => (lock_x2, g.min_y + 2.0),
             3 => (lock_x2, g.max_y - 2.0),
             _ => (g.max_x - 2.0, lock_y),
         };
-        CGWarpMouseCursorPosition(CGPoint { x: lock_x, y: lock_y });
+        CGWarpMouseCursorPosition(CGPoint {
+            x: lock_x,
+            y: lock_y,
+        });
         // タップが握った位置を CUR_POS にも反映(積算の起点を正しくする)
         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (lock_x, lock_y);
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = Some((lock_x, lock_y));
@@ -1533,7 +2715,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         // 注意: ここでライブ位置を同期すると「復帰ワープ前」の境界位置
         // (2309)を掴んでしまい、ガード明けに即再突入する原因になる。
         // CUR_POS はこの後のワープ先で上書きするため、ここでは同期しない
-        
+
         *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) = None;
         CGAssociateMouseAndMouseCursorPosition(true);
         set_cursor_in_background();
@@ -1546,13 +2728,13 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
             }
         }
         CGSetLocalEventsSuppressionInterval(0.0); // Deskflow setZeroSuppressionInterval
-        // 復帰位置: ダブルタップ切替が有効な間は出た境界のすぐ内側(60px)へ戻す。
-        // 1回の到達では切替しなくなったため境界近くでも再突入せず、境界を
-        // 跨いで戻ってくる連続的な体験になる。
-        // 1回切替(TSUNAGU_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
-        // 誤再突入を防ぐ
-        // SIDE(Windows の位置)に応じた復帰座標: 出てきた境界のすぐ内側へ。
-        // ny は Windows 側カーソルの「境界に沿った比率」(side 0/1=縦、2/3=横)
+                                                  // 復帰位置: ダブルタップ切替が有効な間は出た境界のすぐ内側(60px)へ戻す。
+                                                  // 1回の到達では切替しなくなったため境界近くでも再突入せず、境界を
+                                                  // 跨いで戻ってくる連続的な体験になる。
+                                                  // 1回切替(TSUNAGU_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
+                                                  // 誤再突入を防ぐ
+                                                  // SIDE(Windows の位置)に応じた復帰座標: 出てきた境界のすぐ内側へ。
+                                                  // ny は Windows 側カーソルの「境界に沿った比率」(side 0/1=縦、2/3=横)
         let g = geo();
         let dir = side_dir();
         let taps = EDGE_TAPS.load(Ordering::Relaxed);
@@ -1578,6 +2760,15 @@ fn send_msg(msg: &Msg) {
     }
 }
 
+/// 送信の成否を返す版(未接続時に操作を通知したい UI から使う)
+pub fn send_msg_reported(msg: &Msg) -> bool {
+    DIAG_SEND_COUNT.fetch_add(1, Ordering::Relaxed);
+    match TX.get() {
+        Some(tx) => tx.send(encode(msg)).is_ok(),
+        None => false,
+    }
+}
+
 /// ホットキー/メニューバーGUI からの手動トグル(F13 とメニューの共通経路)。
 /// 切替状態遷移はここを含む既存6経路のまま(一元化はモジュール分割 Phase5 で実施)
 fn do_toggle(reason: &str) {
@@ -1597,7 +2788,11 @@ fn do_toggle(reason: &str) {
         let ny = {
             let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
             let (_ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-            if wh > 0.0 { (wc.1 / wh).clamp(0.0, 1.0) } else { 0.5 }
+            if wh > 0.0 {
+                (wc.1 / wh).clamp(0.0, 1.0)
+            } else {
+                0.5
+            }
         };
         leave_win_mode_cursor_unlock(Some(ny));
     }
@@ -1660,10 +2855,7 @@ unsafe extern "C" fn tap_callback(
         // 本体キーボードの音量(F10-12)とメディア(F7-F9)キーは fn フラグ付きで届く。
         // Windows 側の音量・メディア操作として転送し、Mac 側の操作は握る。
         // fn 無しは F キーとしての使用のため素通り(誤転送防止)
-        if event_type == EVT_KEY_DOWN
-            && win_mode
-            && CGEventGetFlags(event) & FLAG_FN != 0
-        {
+        if event_type == EVT_KEY_DOWN && win_mode && CGEventGetFlags(event) & FLAG_FN != 0 {
             let op = match kc {
                 72 => Some(0u8), // F12 音量 up
                 73 => Some(1),   // F11 音量 down
@@ -1706,18 +2898,48 @@ unsafe extern "C" fn tap_callback(
         }
     }
 
-    if matches!(event_type, EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED) {
+    if matches!(
+        event_type,
+        EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED
+    ) {
         DIAG_MOVE_COUNT.fetch_add(1, Ordering::Relaxed);
         LAST_EVENT_MS.store(now_ms(), Ordering::Relaxed);
     }
     if matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP | EVT_FLAGS_CHANGED) {
         DIAG_KEY_COUNT.fetch_add(1, Ordering::Relaxed);
     }
+    // 自己投稿のUPは元アプリだけに届け、物理的な押下や転送先の状態を変えない。
+    if event_type == EVT_LEFT_UP
+        && CGEventGetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA) == SYNTH_UP_MAGIC
+    {
+        return event;
+    }
     // マウスボタンの押下状態はモードに関係なく追跡する(ドラッグ中切替の
     // 持ち込み判定に使う。Mac モードの素通し経路でも更新が必要)
     match event_type {
-        EVT_LEFT_DOWN => BTN_DOWN[0].store(true, Ordering::Relaxed),
-        EVT_LEFT_UP => BTN_DOWN[0].store(false, Ordering::Relaxed),
+        EVT_LEFT_DOWN => {
+            // FinderへDownを渡す前に基準値だけ取得する。URLの読み出しは別スレッド。
+            // 押下後のポーリングで基準を作ると、既に始まったドラッグを見逃す。
+            let baseline = if !win_mode && connected {
+                with_pool(|| {
+                    let pb = drag_pasteboard();
+                    (!pb.is_null())
+                        .then(|| msg0_isize(pb, sel_registerName(c"changeCount".as_ptr())))
+                })
+            } else {
+                None
+            };
+            FILE_DRAG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .begin(baseline);
+            BTN_DOWN[0].store(true, Ordering::Relaxed);
+        }
+        EVT_LEFT_DRAGGED => FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).moved(),
+        EVT_LEFT_UP => {
+            FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).end();
+            BTN_DOWN[0].store(false, Ordering::Relaxed);
+        }
         EVT_RIGHT_DOWN => BTN_DOWN[1].store(true, Ordering::Relaxed),
         EVT_RIGHT_UP => BTN_DOWN[1].store(false, Ordering::Relaxed),
         EVT_OTHER_DOWN => BTN_DOWN[2].store(true, Ordering::Relaxed),
@@ -1731,7 +2953,11 @@ unsafe extern "C" fn tap_callback(
         // CGEventCreate(NULL) のライブカーソル位置で判定する(境界の応答性の鍵)
         // ファイル掴み中(ドラッグペーストボードにファイル+左ボタン押下)は設定に
         // 依らず常に「掴んだまま境界越え」を許可する(掴んでいる意図が明確なため)
-        let drag_ok = DRAG_SWITCH.load(Ordering::Relaxed) || DRAG_FILE.load(Ordering::Relaxed);
+        let file_drag_ready = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).ready();
+        // 受信ドラッグ進行中は掴み検出を無効化する: 受信ドラッグ自身が
+        // ドラッグ用ペーストボードを変えるため、押下と無関係に偽の掴みになる
+        let file_drag_ready = file_drag_ready && !incoming_drag::blocking();
+        let drag_ok = DRAG_SWITCH.load(Ordering::Relaxed) || file_drag_ready;
         if (matches!(event_type, EVT_MOUSE_MOVED)
             || (drag_ok
                 && matches!(event_type, EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED)))
@@ -1789,6 +3015,22 @@ unsafe extern "C" fn tap_callback(
                     EDGE_STAY_SINCE_MS.store(0, Ordering::Relaxed);
                 }
                 if gap(px, py) <= edge {
+                    // 受信ドラッグ(NSDraggingSession)進行中: 物理ボタンは押されたまま
+                    // Mac 側のドロップを続けるため、ここでは Windows へ自動切替しない。
+                    // 切替すると入力転送がセッションからマウス入力を奪い、ended も
+                    // ドロップも来なくなる(実測)。掴んだまま境界に触れた場合は
+                    // ボタンを離して終わらせるのが意図された復帰操作
+                    if incoming_drag::blocking() {
+                        // 操作を宙吊りにした理由が利用者に分かるよう、
+                        // 初回だけ案内を出す(連投しない)
+                        static DRAG_GUIDE_MS: AtomicU64 = AtomicU64::new(0);
+                        let now = now_ms();
+                        if now.saturating_sub(DRAG_GUIDE_MS.swap(now, Ordering::Relaxed)) >= 120_000
+                        {
+                            notify("tsunagu", "ファイルを掴んだままです。Mac のドロップ先でボタンを離すとそこへ置けます(境界では切り替わりません)");
+                        }
+                        return event;
+                    }
                     // switchCorners(+cornerSize): 四隅 N px 内では切替しない(誤爆防止)
                     let corner = CORNER_PX.load(Ordering::Relaxed) as f64;
                     if corner > 0.0
@@ -1800,16 +3042,28 @@ unsafe extern "C" fn tap_callback(
                     // 二段階判定: 積算値が閾値を超えても、実カーソル(ライブ位置)が
                     // 境界付近でなければ発火しない。ドリフトが残っていても
                     // MacBook 中央などでの誤発火を構造的に防ぐ
-                    let Some(loc) = live_cursor() else { return event };
+                    let Some(loc) = live_cursor() else {
+                        return event;
+                    };
                     if gap(loc.x, loc.y) > edge + 40.0 {
                         // 積算ドリフト検出: 実位置で CUR_POS を補正して通過
                         *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
                         return event;
                     }
+                    // Crossing Intelligence(ビジョン§24): 境界への速度が十分大きければ
+                    // 「意図的な越え」とみなして滞在待ち(switchDelay)とダブルタップを
+                    // スキップする。ゆっくり端に触れた場合だけ従来どおりの誤爆防止が働く。
+                    // 計装(下のログ)で集めた分布をもとに閾値は 1200px/s とする。
+                    // `TSUNAGU_FAST_EDGE=0` で無効化
+                    let speed = {
+                        let r = *RECENT_PX.lock().unwrap_or_else(|e| e.into_inner());
+                        px_per_sec(r.0, now_ms().saturating_sub(r.1))
+                    };
+                    let fast = FAST_EDGE.load(Ordering::Relaxed) && speed >= 1200.0;
                     // switchDelay: 端に N ms 滞ってから切替(0=無効)。
                     // 滞在判定は「端に到達し続けている」間のみ継続する
                     let delay = SWITCH_DELAY_MS.load(Ordering::Relaxed);
-                    if delay > 0 {
+                    if delay > 0 && !fast {
                         let now = now_ms();
                         let since = EDGE_STAY_SINCE_MS.load(Ordering::Relaxed);
                         if since == 0 {
@@ -1820,7 +3074,7 @@ unsafe extern "C" fn tap_callback(
                             return event; // まだ規定時間に達していない
                         }
                         EDGE_STAY_SINCE_MS.store(0, Ordering::Relaxed);
-                    } else if !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
+                    } else if delay == 0 && !fast && !EDGE_AT_EDGE.swap(true, Ordering::Relaxed) {
                         // switchDoubleTap: 閾値を「下から跨いだ瞬間」だけをヒットと数え、
                         // 判定窓(DOUBLE_TAP_MS)以内の 2回目のヒットでのみ切替する。
                         // カーソルが境界に張り付いたまま出す delta は継続扱いで数えない
@@ -1852,11 +3106,13 @@ unsafe extern "C" fn tap_callback(
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                     // 到達時の速度を添える(§24 用の計装。速い=意図的な越え、
                     // 遅い=停止しようとして端に触れた、の分布を実機で見る)
-                    let v = {
-                        let r = *RECENT_PX.lock().unwrap_or_else(|e| e.into_inner());
-                        px_per_sec(r.0, now_ms().saturating_sub(r.1))
-                    };
-                    eprintln!("[mode] WINDOWS (edge) at ({:.0},{:.0}) v={v:.0}px/s", loc.x, loc.y);
+                    // fast 経路は滞在/ダブルタップをスキップしたことが分かるよう明記する
+                    eprintln!(
+                        "[mode] WINDOWS (edge{}) at ({:.0},{:.0}) v={speed:.0}px/s",
+                        if fast { ", fast" } else { "" },
+                        loc.x,
+                        loc.y
+                    );
 
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
                     // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
@@ -1864,7 +3120,7 @@ unsafe extern "C" fn tap_callback(
                     // 掴みドラッグ中は EVT_MOUSE_MOVED 由来の切替でも持ち込む
                     // (押下直後の軽い移動は MOVED として届くことがある=実測。
                     // 持ち込み漏れは Win 側のフォールバックを誘発する)
-                    if event_type != EVT_MOUSE_MOVED || DRAG_FILE.load(Ordering::Relaxed) {
+                    if event_type != EVT_MOUSE_MOVED || file_drag_ready {
                         if drag_ok {
                             for b in 0u8..=2 {
                                 if BTN_DOWN[b as usize].load(Ordering::Relaxed) {
@@ -1873,7 +3129,10 @@ unsafe extern "C" fn tap_callback(
                             }
                         } else {
                             for b in 0u8..=2 {
-                                send_msg(&Msg::MouseButton { btn: b, down: false });
+                                send_msg(&Msg::MouseButton {
+                                    btn: b,
+                                    down: false,
+                                });
                             }
                         }
                     }
@@ -1884,27 +3143,22 @@ unsafe extern "C" fn tap_callback(
                     // kCGEventSourceUserData にマジックを刻み、tap 側で識別して
                     // 「Mac へ素通し・Windows へは転送しない」処理をする(転送すると
                     // 押したままのユーザー意図に反して Win 側が離した扱いになる)
-                    if DRAG_FILE.swap(false, Ordering::Relaxed) {
-                        let files = std::mem::take(&mut *DRAG_FILES.lock().unwrap_or_else(|e| e.into_inner()));
+                    let dragged_files = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(files) = dragged_files {
                         if !files.is_empty() {
                             // ⌘C ポーリング経由の再送を指紋で抜く(通常は載らないが保険)
                             let key = mac_files_key(&files);
                             *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
                             eprintln!("[file] 掴みドラッグ切替: {} 件を転送します", files.len());
+                            history_push_files(&files, "Mac");
                             send_files_to_win(files, true);
                         }
                         std::thread::spawn(|| {
                             std::thread::sleep(Duration::from_millis(60));
                             unsafe {
                                 let pos = live_cursor().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
-                                let e = CGEventCreateMouseEvent(
-                                    std::ptr::null_mut(),
-                                    3, // kCGEventLeftMouseUp
-                                    pos,
-                                    0, // kCGMouseButtonLeft
-                                );
+                                let e = make_drag_end_event(pos);
                                 if !e.is_null() {
-                                    CGEventSetIntegerValueField(e as CGEventRef, 41, SYNTH_UP_MAGIC);
                                     CGEventPost(0 /* kCGHIDEventTap */, e);
                                     CFRelease(e as *mut core::ffi::c_void);
                                 }
@@ -1936,6 +3190,109 @@ unsafe extern "C" fn tap_callback(
                 }
             }
         }
+        // Search My Desk(ビジョン§14): Mac 操作中の ⌥⌘S でデスク横断検索を
+        // 開く(アプリ・履歴・URL)。押下エッジで発火し down/up を握る
+        //(Continue Here と同じ。up 単体が前面アプリへ漏れないようにする)。
+        // ※境界判定の if はマウス系イベントしか通さないため、その内側に置くと
+        // KEY_DOWN が絶対に届かず発火しない(実測: 検索窓が開かなかった)
+        if DESK_SEARCH.load(Ordering::Relaxed) && matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP) {
+            let fl = CGEventGetFlags(event);
+            if fl & FLAG_OPT != 0
+                && fl & FLAG_CMD != 0
+                && fl & FLAG_CTRL == 0
+                && fl & FLAG_SHIFT == 0
+            {
+                let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE) as u16;
+                if kc == 1
+                /* S */
+                {
+                    static SEARCH_S_DOWN: AtomicBool = AtomicBool::new(false);
+                    let down = event_type == EVT_KEY_DOWN;
+                    if down && !SEARCH_S_DOWN.swap(true, Ordering::Relaxed) {
+                        eprintln!("[search] ⌥⌘S 検出: 検索窓の表示を依頼します");
+                        dispatch_show_search();
+                    }
+                    if !down {
+                        SEARCH_S_DOWN.store(false, Ordering::Relaxed);
+                    }
+                    return std::ptr::null_mut();
+                }
+            }
+        }
+        // 検索窓が開いている間は文字キーを握って field へ直接積む(IME 経由だと
+        // 日本語モードでは確定・変換に消費されて検索できない=実測)。
+        // ⌘/⌥/⌃/Fn 付きはシステムショートカットのため素通しする
+        if DESK_SEARCH.load(Ordering::Relaxed)
+            && matches!(event_type, EVT_KEY_DOWN | EVT_KEY_UP)
+            && gui::search_open()
+        {
+            let fl = CGEventGetFlags(event);
+            let kc = CGEventGetIntegerValueField(event, FIELD_KEYCODE) as u16;
+            let down = event_type == EVT_KEY_DOWN;
+            // ⌥Enter: 先頭候補を Windows へ投げる(ビジョン§13 Throw)。
+            // 装飾キーなし判定の外で先に処理する(でないると ⌥Enter が
+            // システムショートカットとして素通ししてしまう)
+            if kc == 36 && fl & FLAG_OPT != 0 && fl & (FLAG_CMD | FLAG_CTRL | FLAG_FN) == 0 {
+                if down && !SEARCH_ENTER_DOWN.swap(true, Ordering::Relaxed) {
+                    SEARCH_ENTER_OPT.store(true, Ordering::Relaxed);
+                    eprintln!("[search] ⌥Enter: 先頭候補を Windows へ投げます");
+                    gui::dispatch_search_enter();
+                }
+                if !down {
+                    SEARCH_ENTER_DOWN.store(false, Ordering::Relaxed);
+                }
+                return std::ptr::null_mut();
+            }
+            if fl & (FLAG_CMD | FLAG_OPT | FLAG_CTRL | FLAG_FN) == 0 {
+                match kc {
+                    // Enter: 先頭候補を実行(押下エッジ。up は握る)
+                    36 => {
+                        if down && !SEARCH_ENTER_DOWN.swap(true, Ordering::Relaxed) {
+                            gui::dispatch_search_enter();
+                        }
+                        if !down {
+                            SEARCH_ENTER_DOWN.store(false, Ordering::Relaxed);
+                        }
+                        return std::ptr::null_mut();
+                    }
+                    // Backspace: 末尾 1 文字削除
+                    51 => {
+                        if down {
+                            gui::dispatch_search_backspace();
+                        }
+                        return std::ptr::null_mut();
+                    }
+                    // ↑↓: 候補の選択を動かす(Enter は選択位置を実行)。
+                    // 以前は矢印を握らず Enter が常に先頭候補だったため、
+                    // 先頭のアプリを誤起動する事故が起きた(実績)
+                    125 | 126 => {
+                        if down {
+                            gui::dispatch_search_arrow(kc == 125);
+                        }
+                        return std::ptr::null_mut();
+                    }
+                    // Esc: 検索窓を閉じる(トグル表示で閉じる)
+                    53 => {
+                        if down && !SEARCH_ESC_DOWN.swap(true, Ordering::Relaxed) {
+                            dispatch_show_search();
+                        }
+                        if !down {
+                            SEARCH_ESC_DOWN.store(false, Ordering::Relaxed);
+                        }
+                        return std::ptr::null_mut();
+                    }
+                    _ => {
+                        if let Some(ch) = keychar(kc, fl & FLAG_SHIFT != 0) {
+                            if down {
+                                gui::dispatch_search_text(ch);
+                            }
+                            // keyUp も握る(IME・前面アプリへ漏れないように)
+                            return std::ptr::null_mut();
+                        }
+                    }
+                }
+            }
+        }
         return event; // 素通し
     }
 
@@ -1958,7 +3315,10 @@ unsafe extern "C" fn tap_callback(
                 // 未対応タイプ(聴写キー等がここに来る機種あり)は記録して次の
                 // 対応表追加に備える。毎回 1 行だけで洪水にはならない
                 _ => {
-                    eprintln!("[media] 未対応 nx={nx}({})", if down { "down" } else { "up" });
+                    eprintln!(
+                        "[media] 未対応 nx={nx}({})",
+                        if down { "down" } else { "up" }
+                    );
                     0
                 }
             };
@@ -1973,7 +3333,10 @@ unsafe extern "C" fn tap_callback(
                     tr: false,
                     rcmd: false,
                 });
-                eprintln!("[media] nx={nx} -> kc={kc}({})", if down { "down" } else { "up" });
+                eprintln!(
+                    "[media] nx={nx} -> kc={kc}({})",
+                    if down { "down" } else { "up" }
+                );
             }
         }
         return std::ptr::null_mut();
@@ -2011,16 +3374,33 @@ unsafe extern "C" fn tap_callback(
             // 実機のキーコード特定用: 「右⌘が効かない」報告の切り分け。
             // ここに出ない=そのキーは 54 ではない(外付けの配列差・キーリマップ等)
             if event_type == EVT_FLAGS_CHANGED && (kc == 54 || kc == 55) {
-                eprintln!("[rcmd] kc={} -> {}(rcmd={})", kc, if cmd || rcmd { "押下" } else { "解放" }, rcmd);
+                eprintln!(
+                    "[rcmd] kc={} -> {}(rcmd={})",
+                    kc,
+                    if cmd || rcmd { "押下" } else { "解放" },
+                    rcmd
+                );
             }
             if down && (kc == 104 || kc == 102) {
-                eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
+                eprintln!(
+                    "[ime] kc={kc} ({}) 転送",
+                    if kc == 104 { "かな" } else { "英数" }
+                );
             }
             // Caps Lock は Mac では押すたびに flagsChanged が 1 回だけ来る(押下/解放の
             // 区別がない)。Windows はキーの押し離しでトグルするため 1 回を down+up に展開する
             if event_type == EVT_FLAGS_CHANGED && kc == 57 {
                 for d in [true, false] {
-                    send_msg(&Msg::Key { kc, down: d, ctrl, opt, cmd, shift, tr: false, rcmd });
+                    send_msg(&Msg::Key {
+                        kc,
+                        down: d,
+                        ctrl,
+                        opt,
+                        cmd,
+                        shift,
+                        tr: false,
+                        rcmd,
+                    });
                 }
                 return std::ptr::null_mut();
             }
@@ -2059,19 +3439,38 @@ unsafe extern "C" fn tap_callback(
                 let swap = crate::CMD_ALT.load(Ordering::Relaxed);
                 let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool, r: bool| {
                     let (c2, o2, m2) = if swap { (c, m, o) } else { (c, o, m) };
-                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c2, opt: o2, cmd: m2, shift: sh, tr: true, rcmd: r });
+                    send_msg(&Msg::Key {
+                        kc: kc2,
+                        down: d,
+                        ctrl: c2,
+                        opt: o2,
+                        cmd: m2,
+                        shift: sh,
+                        tr: true,
+                        rcmd: r,
+                    });
                 };
                 // fn+F11(Mac のデスクトップ表示)= Win+D(FN フラグは表の外)
                 if kc == 103 && flags & FLAG_FN != 0 {
                     send(2, down, true, false, false, false, rcmd); // D + ctrl フラグ(Win キー)
                     return std::ptr::null_mut();
                 }
-                if let Some((kc2, c, o, m, s)) = mac_shortcut_translation(kc, ctrl, opt, cmd, shift) {
+                if let Some((kc2, c, o, m, s)) = mac_shortcut_translation(kc, ctrl, opt, cmd, shift)
+                {
                     send(kc2, down, c, o, m, s, rcmd);
                     return std::ptr::null_mut(); // 元キーは送らない
                 }
             }
-            send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift, tr: false, rcmd });
+            send_msg(&Msg::Key {
+                kc,
+                down,
+                ctrl,
+                opt,
+                cmd,
+                shift,
+                tr: false,
+                rcmd,
+            });
         }
         EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED => {
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
@@ -2082,11 +3481,14 @@ unsafe extern "C" fn tap_callback(
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
                     let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-                    let (mw, mh) = { let g = geo(); (g.main_w, g.main_h) };
+                    let (mw, mh) = {
+                        let g = geo();
+                        (g.main_w, g.main_h)
+                    };
                     let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
-                    // 重要: WIN_CUR のガードをこのブロック内で必ず解放してから
-                    // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
-                    // するため、保持したまま呼ぶと自己デッドロックでタップが固まる)
+                                                       // 重要: WIN_CUR のガードをこのブロック内で必ず解放してから
+                                                       // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
+                                                       // するため、保持したまま呼ぶと自己デッドロックでタップが固まる)
                     let (nx, ny, at_left) = {
                         let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
                         wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
@@ -2103,7 +3505,9 @@ unsafe extern "C" fn tap_callback(
                         (
                             wc.0 / ww,
                             wc.1 / wh,
-                            !HOTKEY_ONLY.load(Ordering::Relaxed) && event_type == EVT_MOUSE_MOVED && at_edge,
+                            !HOTKEY_ONLY.load(Ordering::Relaxed)
+                                && event_type == EVT_MOUSE_MOVED
+                                && at_edge,
                         )
                     };
                     // 毎イベント送信(量子化スキップは低速時にステップ感が出るため廃止)
@@ -2121,22 +3525,16 @@ unsafe extern "C" fn tap_callback(
                     }
                 } else {
                     // 相対移動モード(従来互換)
-                    send_msg(&Msg::MouseMove { dx: dx * sc, dy: dy * sc });
+                    send_msg(&Msg::MouseMove {
+                        dx: dx * sc,
+                        dy: dy * sc,
+                    });
                 }
             }
             // カーソル固定の巻き戻しは 200ms 監視スレッドに集約した
             // (タップ内で毎イベント CGEventCreate すると負荷でカクつくため)
         }
         EVT_LEFT_DOWN | EVT_LEFT_UP => {
-            // 自分が投稿した合成 LeftMouseUp(掴み切替直後の Mac 側ドラッグ完結用)。
-            // Mac へ素通しし Win へは転送しない(ユーザーはまだ押している)
-            if event_type == EVT_LEFT_UP
-                && CGEventGetIntegerValueField(event, 41 /* kCGEventSourceUserData */)
-                    == SYNTH_UP_MAGIC
-            {
-                BTN_DOWN[0].store(false, Ordering::Relaxed);
-                return event;
-            }
             let d = event_type == EVT_LEFT_DOWN;
             BTN_DOWN[0].store(d, Ordering::Relaxed);
             send_msg(&Msg::MouseButton { btn: 0, down: d });
@@ -2182,7 +3580,11 @@ unsafe extern "C" fn tap_callback(
                     let btn = if acc.0 > 0.0 { 3u8 } else { 4 }; // 3=戻る, 4=進む
                     send_msg(&Msg::MouseButton { btn, down: true });
                     send_msg(&Msg::MouseButton { btn, down: false });
-                    eprintln!("[swipe] {} 送信(total={:.0})", if btn == 3 { "戻る" } else { "進む" }, acc.0);
+                    eprintln!(
+                        "[swipe] {} 送信(total={:.0})",
+                        if btn == 3 { "戻る" } else { "進む" },
+                        acc.0
+                    );
                     *acc = (0.0, now, now); // 発火済みマーク(ジェスチャ完結まで保持)
                 }
                 // 横優勢ジェスチャはここで完結(縦の揺れも無視し二重発火を防ぐ)
@@ -2195,13 +3597,25 @@ unsafe extern "C" fn tap_callback(
                 // 除数を大きくすると遅くなる(設定ウィンドウのスライダーで可変)。端数は持ち越し
                 // 互換モードは 1 ノッチ(120)単位に量子化(旧来のホイール相当)。
                 // 既定は 0.05 ノッチ(=6 wheel units)の高解像度
-                let q: f64 = if SCROLL_COMPAT.load(Ordering::Relaxed) { 1.0 } else { 0.05 };
+                let q: f64 = if SCROLL_COMPAT.load(Ordering::Relaxed) {
+                    1.0
+                } else {
+                    0.05
+                };
                 let div = scroll_div();
                 // 方向: 既定は Mac の操作感に合わせる(自然スクロール設定を起動時に
                 // 取得)。SCROLL_FLIP=true は「Windows 標準」への手動上書き。
                 // 実測: 自然スクロール環境で Mac と同じ向きになるのは -1 側
-                let aligned = if NATURAL_SCROLL.load(Ordering::Relaxed) { -1.0 } else { 1.0 };
-                let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) { -aligned } else { aligned };
+                let aligned = if NATURAL_SCROLL.load(Ordering::Relaxed) {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let sgn = if SCROLL_FLIP.load(Ordering::Relaxed) {
+                    -aligned
+                } else {
+                    aligned
+                };
                 let mut acc = SCROLL_ACC.lock().unwrap_or_else(|e| e.into_inner());
                 acc.0 += sgn * dx / div;
                 acc.1 += sgn * dy / div;
@@ -2225,14 +3639,36 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-105439-1683612";
+const BUILD_ID: &str = "build-20260927-201932-68d4857";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--probe-search") {
+        // Search My Desk の実機検証。AppKit を使うため対話セッション(GUI)で実行する
+        let ok = if gui::start() {
+            gui::probe_search()
+        } else {
+            eprintln!("[probe-search] AppKit を初期化できません(対話セッションで実行してください)");
+            false
+        };
+        eprintln!("[probe-search] {}", if ok { "OK" } else { "FAILED" });
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     #[cfg(debug_assertions)]
-    if args.iter().any(|a| a == "--probe-setup") { gui::setup::probe_invitation(); return; }
-    if args.iter().any(|a| a == "--preview-setup") { let _=gui::setup::first_run(true); return; }
+    if args.iter().any(|a| a == "--probe-incoming-drag") {
+        incoming_drag::probe();
+        return;
+    }
+    #[cfg(debug_assertions)]
+    if args.iter().any(|a| a == "--probe-setup") {
+        gui::setup::probe_invitation();
+        return;
+    }
+    if args.iter().any(|a| a == "--preview-setup") {
+        let _ = gui::setup::first_run(true);
+        return;
+    }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
         if gui::start() {
@@ -2251,25 +3687,47 @@ fn main() {
         .unwrap_or(PORT);
     // 既存のenvを優先。新規利用者だけOS保護の接続キーと初回導入を使用する。
     let no_gui = args.iter().any(|a| a == "--no-gui")
-        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v|v=="1");
+        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v| v == "1");
     let mut registered_now = false;
     // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
     // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
-    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32) { t } else if envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
+    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32) {
+        t
+    } else if envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
         eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
         std::process::exit(1);
     } else {
         match tsunagu_common::credentials::load() {
-            Ok(Some(t))=>t,
-            Ok(None) if !no_gui=>match gui::setup::first_run(false){Some(t)=>{registered_now=true;t},None=>return},
-            Ok(None)=>{eprintln!("[setup] 接続キー未設定。GUIで初回登録を完了してください。");return;},
-            Err(_)=>{if !no_gui{gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
+            Ok(Some(t)) => t,
+            Ok(None) if !no_gui => match gui::setup::first_run(false) {
+                Some(t) => {
+                    registered_now = true;
+                    t
+                }
+                None => return,
+            },
+            Ok(None) => {
+                eprintln!("[setup] 接続キー未設定。GUIで初回登録を完了してください。");
+                return;
+            }
+            Err(_) => {
+                if !no_gui {
+                    gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");
+                }
+                eprintln!("[setup] credential store unavailable");
+                return;
+            }
         }
     };
 
-    if !no_gui && !gui::setup::ensure_permission() { return; }
+    if !no_gui && !gui::setup::ensure_permission() {
+        return;
+    }
     refresh_geo();
-    let (screen_w, screen_h) = { let g = geo(); (g.main_w, g.main_h) };
+    let (screen_w, screen_h) = {
+        let g = geo();
+        (g.main_w, g.main_h)
+    };
     unsafe { CGDisplayRegisterReconfigurationCallback(display_reconfigured, std::ptr::null_mut()) };
     unsafe {
         if let Some(loc) = live_cursor() {
@@ -2315,7 +3773,11 @@ fn main() {
     NATURAL_SCROLL.store(detect_natural_scroll(), Ordering::Relaxed);
     eprintln!(
         "[info] macOS scroll: {} / tsunagu 方向: {}",
-        if NATURAL_SCROLL.load(Ordering::Relaxed) { "自然スクロール" } else { "標準(非自然)" },
+        if NATURAL_SCROLL.load(Ordering::Relaxed) {
+            "自然スクロール"
+        } else {
+            "標準(非自然)"
+        },
         if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
             "Windows 標準(手動上書き)"
         } else {
@@ -2350,6 +3812,16 @@ fn main() {
     }
     if envutil::get("TSUNAGU_DRAG_SWITCH").as_deref() == Some("1") {
         DRAG_SWITCH.store(true, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_FAST_EDGE").as_deref() == Some("0") {
+        FAST_EDGE.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_DESK_SEARCH").as_deref() == Some("0") {
+        DESK_SEARCH.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_APP_HANDOFF").as_deref() == Some("1") {
+        APP_HANDOFF.store(true, Ordering::Relaxed);
+        eprintln!("[handoff] 越境 App Handoff を有効化しました(TSUNAGU_APP_HANDOFF=1)");
     }
     if envutil::get("TSUNAGU_MAC_KEYS").as_deref() == Some("0") {
         MAC_KEYS.store(false, Ordering::Relaxed);
@@ -2389,6 +3861,14 @@ fn main() {
         hotkey_kc(),
         EDGE_TAPS.load(Ordering::Relaxed)
     );
+    // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
+    let _ = std::fs::create_dir_all(
+        std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join("Downloads/Tsunagu"))
+            .unwrap_or_default(),
+    );
+    history_load();
+    eprintln!("[info] 操作ガイド: カーソルを画面端へ動かすと Windows へ移ります。メニューバーにクリップボード履歴があります");
 
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
     let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -2460,7 +3940,11 @@ fn main() {
                             }
                         }
                     }
-                    let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+                    let mut guard = STREAM_SLOT
+                        .get()
+                        .unwrap()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     if let Some(s) = guard.as_mut() {
                         // encode() が行末 \n を持つため writeln! だと二重改行で
                         // ワイヤが \n\n になる(受信側の空行パースが倍増する)。write_all で送る
@@ -2482,9 +3966,16 @@ fn main() {
                     drop_stream("pong が 10 秒途絶");
                     continue;
                 }
-                let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = STREAM_SLOT
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(s) = guard.as_mut() {
-                    if s.write_all(encode(&Msg::Ping { ts: now_ms() }).as_bytes()).and_then(|_| s.flush()).is_err() {
+                    if s.write_all(encode(&Msg::Ping { ts: now_ms() }).as_bytes())
+                        .and_then(|_| s.flush())
+                        .is_err()
+                    {
                         if let Some(s) = guard.take() {
                             s.shutdown();
                         }
@@ -2519,13 +4010,20 @@ fn main() {
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(30));
         let peer = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(peer) = peer.filter(|p| CONNECTED.load(Ordering::Relaxed) && tsunagu_common::net::is_tailscale(*p)) else {
+        let Some(peer) = peer
+            .filter(|p| CONNECTED.load(Ordering::Relaxed) && tsunagu_common::net::is_tailscale(*p))
+        else {
             continue;
         };
-        let Some(now) = tailscale_path(peer) else { continue };
+        let Some(now) = tailscale_path(peer) else {
+            continue;
+        };
         let before = TS_PATH.swap(now, Ordering::Relaxed);
         if before != now {
-            eprintln!("[net] Tailscale 経路: {}", if now == 1 { "直結" } else { "中継(DERP)" });
+            eprintln!(
+                "[net] Tailscale 経路: {}",
+                if now == 1 { "直結" } else { "中継(DERP)" }
+            );
             if now == 2 {
                 notify("tsunagu", "Windows との通信が中継経由になりました(遅延が増えます)。同じネットワークか有線直結を推奨します");
             }
@@ -2559,7 +4057,10 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .cloned()
             .or_else(|| envutil::get("TSUNAGU_HOST"));
-        eprintln!("[info] client mode: connecting to {}", host.as_deref().unwrap_or("LAN から自動検出"));
+        eprintln!(
+            "[info] client mode: connecting to {}",
+            host.as_deref().unwrap_or("LAN から自動検出")
+        );
         std::thread::spawn(move || {
             bulk::connect_loop(
                 bulk_ep,
@@ -2576,12 +4077,22 @@ fn main() {
         // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
         let tk = token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed) {
+            if let Err(e) = tsunagu_common::discover::respond(
+                "0.0.0.0",
+                port + tsunagu_common::discover::PORT_OFFSET,
+                &tk,
+                tsunagu_common::net::is_allowed,
+            ) {
                 eprintln!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
             }
         });
         std::thread::spawn(move || {
-            bulk::serve(bulk_ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed)
+            bulk::serve(
+                bulk_ep,
+                &bind,
+                port + bulk::PORT_OFFSET,
+                tsunagu_common::net::is_allowed,
+            )
         });
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
     }
@@ -2620,7 +4131,11 @@ fn main() {
                 );
                 unsafe {
                     let ev = CGEventCreate(std::ptr::null_mut());
-                    let p = if ev.is_null() { CGPoint { x: 0.0, y: 0.0 } } else { CGEventGetLocation(ev) };
+                    let p = if ev.is_null() {
+                        CGPoint { x: 0.0, y: 0.0 }
+                    } else {
+                        CGEventGetLocation(ev)
+                    };
                     let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
                     eprintln!(
                         "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} self_heal={heal} cursor=({:.0},{:.0}) moving={}",
@@ -2635,49 +4150,35 @@ fn main() {
     // 起動時点のクリップボードは送らない(以後の変化だけを切替時に同期する)
     LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
 
-    // ファイル掴み検出(Mac→Windows の掴みドラッグ越境): ドラッグ用ペーストボードに
-    // ファイル参照が載っており左ボタン押下中 = Finder 等でファイルを掴んでいる。
-    // 「押下開始時点からの changeCount 変化」を条件にする(ドラッグ開始で初めて
-    // ファイルが載るため)。押下前に載っていた残骸(キャンセル済みドラッグ等は
-    // クリアされないことがある=実測)での誤検出を構造的に防ぐ
-    std::thread::spawn(|| {
-        // None=非押下。Some(cnt)=押下中の基準値(押下開始時点の changeCount)
-        let mut baseline: Option<isize> = None;
-        loop {
-            std::thread::sleep(Duration::from_millis(120));
-            if !BTN_DOWN[0].load(Ordering::Relaxed) {
-                if DRAG_FILE.swap(false, Ordering::Relaxed) {
-                    eprintln!("[file] 掴み終了(ボタンを離した)");
-                }
-                baseline = None;
-                continue;
+    // 基準値はMouseDownで取得済み。重いURL読み出しはタップの外で行う。
+    // 取得中に離す・押し直す・越境する場合は、世代の異なる結果を捨てる。
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_millis(16));
+        let probe = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).probe();
+        let Some(probe) = probe else { continue };
+        with_pool(|| unsafe {
+            let pb = drag_pasteboard();
+            if pb.is_null() {
+                return;
             }
-            if DRAG_FILE.load(Ordering::Relaxed) {
-                continue; // 掴み確立済み(切替は tap 側が担う)
+            let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
+            if cnt == probe.baseline {
+                return;
             }
-            with_pool(|| unsafe {
-                let pb = drag_pasteboard();
-                if pb.is_null() {
+            if let Some(files) = pb_files(pb) {
+                if msg0_isize(pb, sel_registerName(c"changeCount".as_ptr())) != cnt {
                     return;
                 }
-                let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
-                match baseline {
-                    None => {
-                        // 押下開始直後: 現在値を基準に取る(残骸では検出しない)
-                        baseline = Some(cnt);
-                    }
-                    Some(b) if cnt != b => {
-                        baseline = Some(cnt);
-                        if let Some(files) = pb_files(pb) {
-                            DRAG_FILES.lock().unwrap_or_else(|e| e.into_inner()).clone_from(&files);
-                            DRAG_FILE.store(true, Ordering::Relaxed);
-                            eprintln!("[file] ファイル掴み検出: {} 件", files.len());
-                        }
-                    }
-                    _ => {}
+                let n = files.len();
+                if FILE_DRAG
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .complete(probe, cnt, files)
+                {
+                    eprintln!("[file] ファイル掴み検出: {n} 件");
                 }
-            });
-        }
+            }
+        });
     });
 
     // WIN モード中のカーソル固定監視(改善ループ4):
@@ -2722,7 +4223,10 @@ fn main() {
                 let now = now_ms();
                 let last_ev = LAST_EVENT_MS.load(Ordering::Relaxed);
                 let last_abs = LAST_ABS_MS.load(Ordering::Relaxed);
-                if last_ev > 0 && now.saturating_sub(last_ev) < 2_000 && now.saturating_sub(last_abs) > 5_000 {
+                if last_ev > 0
+                    && now.saturating_sub(last_ev) < 2_000
+                    && now.saturating_sub(last_abs) > 5_000
+                {
                     WIN_MODE.store(false, Ordering::Relaxed);
                     eprintln!("[watchdog] WIN中に転送停止を検知。強制復帰します");
                     leave_win_mode_cursor_unlock(None);
@@ -2732,7 +4236,9 @@ fn main() {
             if !WIN_MODE.load(Ordering::Relaxed) {
                 continue;
             }
-            let Some((lx, ly)) = *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) else { continue };
+            let Some((lx, ly)) = *LOCK_POS.lock().unwrap_or_else(|e| e.into_inner()) else {
+                continue;
+            };
             unsafe {
                 let Some(loc) = live_cursor() else { continue };
                 if (loc.x - lx).abs() > 1.0 || (loc.y - ly).abs() > 1.0 {
@@ -2784,7 +4290,9 @@ fn main() {
         CFRunLoopAddSource(rl, src, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
     }
-    eprintln!("[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13・メニューでトグル");
+    eprintln!(
+        "[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13・メニューでトグル"
+    );
     // メニューバー GUI(既定ON。--no-gui / TSUNAGU_NO_GUI=1 で CUI のみ)。
     // AppKit が使えない環境(ssh 由来のセッション等)では start() が失敗し、
     // 従来どおり CFRunLoop で継続する(タップはメインRunLoop共通モードのため共存可)
@@ -2830,6 +4338,21 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
             Ok(_) => {
                 if let Some(msg) = decode(&line) {
                     match msg {
+                        Msg::DragOffer {
+                            id,
+                            count,
+                            total,
+                            position,
+                        } => incoming_drag::offer(id, count, total, position),
+                        Msg::DragCommit { id } => incoming_drag::commit(id),
+                        Msg::DragCancel { id } => incoming_drag::cancel(id),
+                        Msg::AppsReply { apps } => {
+                            // Search My Desk の横断化: Windows 側のアプリ候補を受け取り、
+                            // 検索窓が開いていれば絞り込みをやり直す(AppKit はメインスレッド)
+                            *WIN_APPS.lock().unwrap_or_else(|e| e.into_inner()) = apps.clone();
+                            eprintln!("[search] Windows アプリ {} 件を受信", apps.len());
+                            dispatch_search_refresh();
+                        }
                         Msg::Return { ny } => {
                             if HOTKEY_ONLY.load(Ordering::Relaxed) {
                                 // hotkey モードでは Windows 側の左端到達を無視し、
@@ -2849,7 +4372,19 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
                             if !CLIP_SHARE.load(Ordering::Relaxed) {
                                 continue;
                             }
-                            if text.len() <= CLIP_MAX_BYTES {
+                            if text.len() > CLIP_MAX_BYTES {
+                                // 巨大コピーの連投で通知が洪水にならないよう 60 秒に間引く
+                                static BIG_CLIP_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
+                                let now = now_ms();
+                                if now
+                                    .saturating_sub(BIG_CLIP_NOTIFY_MS.swap(now, Ordering::Relaxed))
+                                    >= 60_000
+                                {
+                                    notify("tsunagu", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_BYTES / (1024 * 1024)));
+                                }
+                                continue;
+                            }
+                            {
                                 // Windows の CRLF は Mac 向けに LF へ正規化
                                 let text = if text.contains("\r\n") {
                                     text.replace("\r\n", "\n")
@@ -2860,6 +4395,7 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
                                     Some(text.clone());
                                 with_pool(|| unsafe { mac_set_clipboard(&text) });
                                 LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
+                                history_push(&text, "Windows");
                                 eprintln!("[clip] win->mac {} bytes", text.len());
                             }
                         }
@@ -2875,7 +4411,14 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
                         Msg::Ping { ts } => send_msg(&Msg::Pong { ts }),
                         Msg::Rel { on } => {
                             if GAME_REL.swap(on, Ordering::Relaxed) != on {
-                                eprintln!("[game] ゲームモード -> {}", if on { "ON(相対移動)" } else { "OFF(絶対位置)" });
+                                eprintln!(
+                                    "[game] ゲームモード -> {}",
+                                    if on {
+                                        "ON(相対移動)"
+                                    } else {
+                                        "OFF(絶対位置)"
+                                    }
+                                );
                             }
                         }
                         Msg::Screen { w, h } if w > 0 && h > 0 => {
@@ -2899,8 +4442,13 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>) {
 
 /// セッション終了の共通後処理(スロット解除・切断通知・WIN 中なら正規 leave)
 fn on_disconnect() {
+    incoming_drag::reset();
     {
-        let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = STREAM_SLOT
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
     CONNECTED.store(false, Ordering::Relaxed);
@@ -2914,7 +4462,7 @@ fn on_disconnect() {
         leave_win_mode_cursor_unlock(None);
     }
     eprintln!("[conn] lost. waiting for reconnect...");
-    notify("tsunagu", "切断しました(自動再接続中)");
+    notify("tsunagu", "切断しました(自動で再接続します)");
 }
 
 /// 待受モード(既定): Windows からの接続を受け入れる
@@ -2933,6 +4481,8 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
     };
     eprintln!("[info] server mode. listening on {bind_ip}:{port}");
     let mut accept_errs: u32 = 0;
+    // 認証に失敗し続ける接続の連打を鈍らせる(正規の接続が成功すれば即回復)
+    let mut throttle = secure::FailThrottle::new();
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(x) => {
@@ -2963,6 +4513,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
         };
@@ -2973,55 +4524,85 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         match (&mut reader).take(MAX_LINE + 1).read_line(&mut line) {
             Ok(0) | Err(_) => {
                 eprintln!("[conn] closed before hello");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             Ok(_) if line.len() as u64 > MAX_LINE => {
                 eprintln!("[conn] hello too large. dropped");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             Ok(_) => {}
         }
         let ok = match decode(&line) {
-            Some(Msg::Hello { ver, w, h, .. }) if compatible(ver) => {
+            Some(Msg::Hello {
+                ver, w, h, name, ..
+            }) if compatible(ver) => {
                 // 相手画面サイズを受信(速度一致の自動スケール算出に使用)
                 if w > 0 && h > 0 {
                     *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (w as f64, h as f64);
                     eprintln!("[info] win screen {w}x{h}");
                 }
+                // 表示名は制御文字・Bidi オーバーライドを除去してから載せる
+                *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
+                    let n = safe_peer_name(name.trim());
+                    if n.is_empty() {
+                        "Windows".into()
+                    } else {
+                        n
+                    }
+                };
                 true
             }
             _ => false,
         };
         if !ok {
             eprintln!("[conn] invalid hello");
+            std::thread::sleep(throttle.fail());
             continue;
         }
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
         {
-            let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = STREAM_SLOT
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *guard = Some(w);
         }
         *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         // hello_ok 送信は送信スレッド経由で確実に
-        send_msg(&Msg::HelloOk { name: "macbook".into(), w: screen_w as i32, h: screen_h as i32 });
+        send_msg(&Msg::HelloOk {
+            name: hostname_label(),
+            w: screen_w as i32,
+            h: screen_h as i32,
+            ver: VERSION,
+        });
         // 現在の ⌘キー設定を同期(切断中に切り替えていた場合の整合)
         send_cfg();
         CONNECTED.store(true, Ordering::Relaxed);
         LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
+        throttle.success();
         eprintln!("[conn] established");
-        notify("tsunagu", "Windows に接続しました");
+        let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
+        notify(
+            "tsunagu",
+            &format!(
+                "{} と接続しました",
+                if peer.is_empty() {
+                    "Windows".into()
+                } else {
+                    peer
+                }
+            ),
+        );
         session_receive_loop(&mut reader);
         on_disconnect();
     }
 }
 
 /// 接続モードの 1 セッション分(ハンドシェイク+本体)。Result はリトライ理由
-fn client_attempt(
-    s: TcpStream,
-    token: &str,
-    screen_w: f64,
-    screen_h: f64,
-) -> Result<(), String> {
+fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Result<(), String> {
     use std::io::{BufRead, Read, Write};
     s.set_read_timeout(Some(Duration::from_secs(12))).ok();
     eprintln!("[conn] connected");
@@ -3032,7 +4613,7 @@ fn client_attempt(
     // hello(自画面サイズを相手へ伝える。相手は hello_ok で自画面を返す)
     let hello = encode(&Msg::Hello {
         ver: VERSION,
-        name: "macbook".into(),
+        name: hostname_label(),
         token: String::new(),
         w: screen_w as i32,
         h: screen_h as i32,
@@ -3051,15 +4632,29 @@ fn client_attempt(
         return Err("hello_ok too large".into());
     }
     match decode(&line) {
-        Some(Msg::HelloOk { w: mw, h: mh, .. }) if mw > 0 && mh > 0 => {
+        Some(Msg::HelloOk {
+            w: mw, h: mh, name, ..
+        }) if mw > 0 && mh > 0 => {
             *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (mw as f64, mh as f64);
+            *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
+                let n = safe_peer_name(name.trim());
+                if n.is_empty() {
+                    "Windows".into()
+                } else {
+                    n
+                }
+            };
             eprintln!("[info] win screen {mw}x{mh}");
         }
         _ => return Err("invalid hello_ok".into()),
     }
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     {
-        let mut guard = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = STREAM_SLOT
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         *guard = Some(hw);
     }
     CONNECTED.store(true, Ordering::Relaxed);
@@ -3067,7 +4662,18 @@ fn client_attempt(
     // 現在の ⌘キー設定を同期(クライアントモードの確立時)
     send_cfg();
     eprintln!("[conn] established");
-    notify("tsunagu", "Windows に接続しました");
+    let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
+    notify(
+        "tsunagu",
+        &format!(
+            "{} と接続しました",
+            if peer.is_empty() {
+                "Windows".into()
+            } else {
+                peer
+            }
+        ),
+    );
     session_receive_loop(&mut reader);
     on_disconnect();
     Ok(())
@@ -3103,6 +4709,32 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
 }
 
 #[cfg(test)]
+mod drag_end_tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn CGEventGetType(event: CGEventRef) -> u32;
+    }
+
+    #[test]
+    fn handoff_creates_a_tagged_left_release() {
+        unsafe {
+            // 作成だけを検証する。実際のポインタやボタン状態は操作しない。
+            let event = make_drag_end_event(CGPoint { x: 100.0, y: 100.0 });
+            assert!(!event.is_null());
+            let event_type = CGEventGetType(event);
+            let tag = CGEventGetIntegerValueField(event, FIELD_EVENT_SOURCE_USER_DATA);
+            CFRelease(event);
+            assert_eq!(
+                event_type, EVT_LEFT_UP,
+                "元の左ドラッグを終えるイベントであること"
+            );
+            assert_eq!(tag, SYNTH_UP_MAGIC, "物理ボタンの解放と区別できること");
+        }
+    }
+}
+
+#[cfg(test)]
 mod shortcut_tests {
     use super::mac_shortcut_translation as tr;
 
@@ -3110,40 +4742,103 @@ mod shortcut_tests {
     #[test]
     fn shortcut_table_matches_spec() {
         // ⌘← = Home(Shift 透過: ⌘⇧← は Shift+Home)
-        assert_eq!(tr(123, false, false, true, false), Some((115, false, false, false, false)));
-        assert_eq!(tr(123, false, false, true, true), Some((115, false, false, false, true)));
+        assert_eq!(
+            tr(123, false, false, true, false),
+            Some((115, false, false, false, false))
+        );
+        assert_eq!(
+            tr(123, false, false, true, true),
+            Some((115, false, false, false, true))
+        );
         // ⌘→ = End、⌘↑ = Ctrl+Home、⌘↓ = Ctrl+End
-        assert_eq!(tr(124, false, false, true, false), Some((119, false, false, false, false)));
-        assert_eq!(tr(126, false, false, true, false), Some((115, false, false, true, false)));
-        assert_eq!(tr(125, false, false, true, false), Some((119, false, false, true, false)));
+        assert_eq!(
+            tr(124, false, false, true, false),
+            Some((119, false, false, false, false))
+        );
+        assert_eq!(
+            tr(126, false, false, true, false),
+            Some((115, false, false, true, false))
+        );
+        assert_eq!(
+            tr(125, false, false, true, false),
+            Some((119, false, false, true, false))
+        );
         // ⌘M / ⌘H = Win+Down(最小化)
-        assert_eq!(tr(43, false, false, true, false), Some((125, true, false, false, false)));
-        assert_eq!(tr(4, false, false, true, false), Some((125, true, false, false, false)));
+        assert_eq!(
+            tr(43, false, false, true, false),
+            Some((125, true, false, false, false))
+        );
+        assert_eq!(
+            tr(4, false, false, true, false),
+            Some((125, true, false, false, false))
+        );
         // ⌘] = Ctrl+Tab / ⌘[ = Ctrl+Shift+Tab(⌘⇧[ も前タブ)
-        assert_eq!(tr(30, false, false, true, false), Some((48, false, false, true, false)));
-        assert_eq!(tr(33, false, false, true, false), Some((48, false, false, true, true)));
-        assert_eq!(tr(33, false, false, true, true), Some((48, false, false, true, true)));
+        assert_eq!(
+            tr(30, false, false, true, false),
+            Some((48, false, false, true, false))
+        );
+        assert_eq!(
+            tr(33, false, false, true, false),
+            Some((48, false, false, true, true))
+        );
+        assert_eq!(
+            tr(33, false, false, true, true),
+            Some((48, false, false, true, true))
+        );
         // ⌘⇧4 / ⌘⇧3 = Win+Shift+S。⇧無しの ⌘4 は素の F4 相当へ翻訳しない
-        assert_eq!(tr(21, false, false, true, true), Some((1, true, false, false, true)));
-        assert_eq!(tr(18, false, false, true, true), Some((1, true, false, false, true)));
+        assert_eq!(
+            tr(21, false, false, true, true),
+            Some((1, true, false, false, true))
+        );
+        assert_eq!(
+            tr(18, false, false, true, true),
+            Some((1, true, false, false, true))
+        );
         assert_eq!(tr(21, false, false, true, false), None);
         // ⌘⇧5 = Win+Alt+R
-        assert_eq!(tr(23, false, false, true, true), Some((15, false, true, false, false)));
+        assert_eq!(
+            tr(23, false, false, true, true),
+            Some((15, false, true, false, false))
+        );
         // ⌘Q = Alt+F4
-        assert_eq!(tr(12, false, false, true, false), Some((118, false, true, false, false)));
+        assert_eq!(
+            tr(12, false, false, true, false),
+            Some((118, false, true, false, false))
+        );
         // ⌘G = F3 / ⌘⇧G = Shift+F3
-        assert_eq!(tr(32, false, false, true, false), Some((99, false, false, false, false)));
-        assert_eq!(tr(32, false, false, true, true), Some((99, false, false, false, true)));
+        assert_eq!(
+            tr(32, false, false, true, false),
+            Some((99, false, false, false, false))
+        );
+        assert_eq!(
+            tr(32, false, false, true, true),
+            Some((99, false, false, false, true))
+        );
         // ⌘. = Esc
-        assert_eq!(tr(47, false, false, true, false), Some((53, false, false, false, false)));
+        assert_eq!(
+            tr(47, false, false, true, false),
+            Some((53, false, false, false, false))
+        );
         // ⌘Space = Win+Space
-        assert_eq!(tr(49, false, false, true, false), Some((49, true, false, false, false)));
+        assert_eq!(
+            tr(49, false, false, true, false),
+            Some((49, true, false, false, false))
+        );
         // ⌘⌥Esc = Ctrl+Shift+Esc
-        assert_eq!(tr(53, false, true, true, false), Some((53, false, false, true, true)));
+        assert_eq!(
+            tr(53, false, true, true, false),
+            Some((53, false, false, true, true))
+        );
         // ⌘Ctrl+Q = Win+L(⌘Q より優先)
-        assert_eq!(tr(12, true, false, true, false), Some((37, true, false, false, false)));
+        assert_eq!(
+            tr(12, true, false, true, false),
+            Some((37, true, false, false, false))
+        );
         // ⌥← = Ctrl+←(単語移動)
-        assert_eq!(tr(123, false, true, false, false), Some((123, false, false, true, false)));
+        assert_eq!(
+            tr(123, false, true, false, false),
+            Some((123, false, false, true, false))
+        );
         // 翻訳対象外: 素の A、⌘A(そのまま渡る)、⌥A
         assert_eq!(tr(0, false, false, false, false), None);
         assert_eq!(tr(0, false, false, true, false), None);
@@ -3164,7 +4859,12 @@ mod geo_tests {
             max_x: 4616.0,
             min_y: -200.0,
             max_y: 1329.0,
-            exit: [(-200.0, 1240.0), (0.0, 1080.0), (-1920.0, 0.0), (0.0, 2056.0)],
+            exit: [
+                (-200.0, 1240.0),
+                (0.0, 1080.0),
+                (-1920.0, 0.0),
+                (0.0, 2056.0),
+            ],
         }
     }
 
@@ -3201,18 +4901,30 @@ mod win_cur_tests {
     #[test]
     fn rescale_keeps_ratio_on_shrink_and_grow() {
         // 2560x1440 → 1920x1080: 画面内の同じ比率位置へ写す(張り付かせない)
-        assert_eq!(rs((2000.0, 1000.0), (2560.0, 1440.0), (1920.0, 1080.0)), (1500.0, 750.0));
+        assert_eq!(
+            rs((2000.0, 1000.0), (2560.0, 1440.0), (1920.0, 1080.0)),
+            (1500.0, 750.0)
+        );
         // 拡大時も比率維持(位置が飛ばない)
-        assert_eq!(rs((960.0, 540.0), (1920.0, 1080.0), (2560.0, 1440.0)), (1280.0, 720.0));
+        assert_eq!(
+            rs((960.0, 540.0), (1920.0, 1080.0), (2560.0, 1440.0)),
+            (1280.0, 720.0)
+        );
         // 同一サイズなら不変
-        assert_eq!(rs((123.0, 456.0), (1920.0, 1080.0), (1920.0, 1080.0)), (123.0, 456.0));
+        assert_eq!(
+            rs((123.0, 456.0), (1920.0, 1080.0), (1920.0, 1080.0)),
+            (123.0, 456.0)
+        );
     }
 
     #[test]
     fn rescale_ignores_invalid_sizes() {
         // 初期値(0x0)や不正値はそのまま(0 除算・暴発写像の防止)
         assert_eq!(rs((10.0, 20.0), (0.0, 0.0), (1920.0, 1080.0)), (10.0, 20.0));
-        assert_eq!(rs((10.0, 20.0), (1920.0, 1080.0), (0.0, 1080.0)), (10.0, 20.0));
+        assert_eq!(
+            rs((10.0, 20.0), (1920.0, 1080.0), (0.0, 1080.0)),
+            (10.0, 20.0)
+        );
     }
 
     #[test]
@@ -3234,8 +4946,14 @@ mod ime_tests {
         // ひらがな/カタカナ/半角カナ/全角英数は ON
         assert_eq!(st("com.apple.inputmethod.Japanese.Hiragana"), Some(true));
         assert_eq!(st("com.apple.inputmethod.Japanese.Katakana"), Some(true));
-        assert_eq!(st("com.apple.inputmethod.Japanese.HalfWidthKana"), Some(true));
-        assert_eq!(st("com.apple.inputmethod.Japanese.FullWidthRoman"), Some(true));
+        assert_eq!(
+            st("com.apple.inputmethod.Japanese.HalfWidthKana"),
+            Some(true)
+        );
+        assert_eq!(
+            st("com.apple.inputmethod.Japanese.FullWidthRoman"),
+            Some(true)
+        );
         // 日本語入力の英数モードは OFF
         assert_eq!(st("com.apple.inputmethod.Japanese.Roman"), Some(false));
         // サードパーティ IME は入力モードを反映しない ID を返すことがあるため
@@ -3245,5 +4963,95 @@ mod ime_tests {
         // 日本語入力以外・レイアウト指定も None=同期しない(勝手に閉じない)
         assert_eq!(st("com.apple.keylayout.ABC"), None);
         assert_eq!(st("com.apple.keylayout.US"), None);
+    }
+}
+
+#[cfg(test)]
+mod dib_tests {
+    use super::dib_to_bmp;
+
+    /// biSize=40 の BITMAPINFOHEADER を組み立てる。comp は biCompression
+    fn info_header(w: i32, h: i32, bpp: u16, comp: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 40];
+        b[0..4].copy_from_slice(&40u32.to_le_bytes());
+        b[4..8].copy_from_slice(&w.to_le_bytes());
+        b[8..12].copy_from_slice(&h.to_le_bytes());
+        b[12..14].copy_from_slice(&1u16.to_le_bytes());
+        b[14..16].copy_from_slice(&bpp.to_le_bytes());
+        b[16..20].copy_from_slice(&comp.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn bitfields_masks_after_info_header_are_skipped() {
+        // Windows のクリップボードは biSize=40 + BI_BITFIELDS で、ヘッダ直後に
+        // 12 バイトのカラーマスクを付ける。offbits はマスクの後でなければ
+        // 画像全体が 3px ずれる(実機で緑が赤に化けた実績)
+        let mut dib = info_header(8, 8, 32, 3);
+        dib.extend_from_slice(&[0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0]); // RGB マスク
+        dib.extend_from_slice(&[0xAA; 8 * 8 * 4]);
+        let bmp = dib_to_bmp(&dib);
+        let off = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        assert_eq!(off, 14 + 40 + 12, "ピクセル開始はマスクの直後");
+        assert_eq!(bmp[off], 0xAA, "マスク列をピクセルとして読まない");
+    }
+
+    #[test]
+    fn plain_header_and_v5_header_offsets_are_unchanged() {
+        let dib = [info_header(4, 4, 32, 0), vec![0x11; 4 * 4 * 4]].concat();
+        let bmp = dib_to_bmp(&dib);
+        let off = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        assert_eq!(off, 14 + 40, "BI_RGB はマスクなし");
+
+        // biSize>=52(V4/V5)はマスクがヘッダサイズに含まれるため加算しない
+        let mut v5 = info_header(4, 4, 32, 3);
+        v5[0..4].copy_from_slice(&124u32.to_le_bytes());
+        v5.resize(124, 0);
+        v5.extend_from_slice(&[0x22; 4 * 4 * 4]);
+        let bmp = dib_to_bmp(&v5);
+        let off = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        assert_eq!(off, 14 + 124, "V5 ヘッダは二重に足さない");
+    }
+}
+
+#[cfg(test)]
+mod handoff_tests {
+    use super::app_handoff_match;
+
+    fn apps() -> Vec<(String, String)> {
+        vec![
+            ("Visual Studio Code".to_string(), "C:/code.exe".to_string()),
+            ("Windows Terminal".to_string(), "C:/wt.exe".to_string()),
+            ("Blender".to_string(), "C:/blender.exe".to_string()),
+        ]
+    }
+
+    #[test]
+    fn matches_exact_name_case_insensitively() {
+        let a = apps();
+        let hit = app_handoff_match("Visual Studio CODE", &a).unwrap();
+        assert_eq!(hit.1, "C:/code.exe", "大小違いの完全一致にヒット");
+        assert!(
+            app_handoff_match("  Blender  ", &a).is_some(),
+            "前後空白は無視"
+        );
+    }
+
+    #[test]
+    fn matches_by_containment_with_a_long_enough_name() {
+        let a = apps();
+        // Mac の「Terminal」は Windows の「Windows Terminal」の部分文字列
+        let hit = app_handoff_match("Terminal", &a).unwrap();
+        assert_eq!(hit.1, "C:/wt.exe");
+        // 4 文字未満の部分一致は誤爆のもとなので拾わない
+        assert!(
+            app_handoff_match("Ble", &a).is_none(),
+            "4 文字未満の contains は不可"
+        );
+        assert!(
+            app_handoff_match("Safari", &a).is_none(),
+            "存在しないアプリは不一致"
+        );
+        assert!(app_handoff_match("", &a).is_none(), "空の名前は不一致");
     }
 }

@@ -1,5 +1,8 @@
-pub mod pairing;
 pub mod credentials;
+pub mod desksearch;
+pub mod drag;
+pub mod history;
+pub mod pairing;
 pub mod smartguard;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
@@ -47,7 +50,9 @@ pub mod envutil {
                 }
             }
             for p in paths {
-                let Ok(s) = std::fs::read_to_string(&p) else { continue };
+                let Ok(s) = std::fs::read_to_string(&p) else {
+                    continue;
+                };
                 for line in s.lines() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
@@ -104,7 +109,8 @@ pub mod proto {
     /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入。
     /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除。
     /// 11: 全経路を Noise で暗号化(認証はハンドシェイクで行い hello のトークンは空)
-    pub const VERSION: u32 = 11;
+    /// 12: Windows→Macの操作ID付きファイルドラッグ。
+    pub const VERSION: u32 = 12;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
@@ -113,6 +119,18 @@ pub mod proto {
     /// 相手の版を受け入れてよいか
     pub fn compatible(peer: u32) -> bool {
         peer >= MIN_VERSION
+    }
+
+    /// 通信で受け取った表示名を UI・ログへ載せられる形にする: 制御文字と
+    /// 文字の並びを偽装する Bidi オーバーライドを除去し、長さを切る。
+    /// 登録(pairing)の safe_name と同一規則を hello の name にも適用する
+    pub fn safe_peer_name(name: &str) -> String {
+        name.chars()
+            .filter(|c| {
+                !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+            })
+            .take(48)
+            .collect()
     }
 
     #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -132,7 +150,30 @@ pub mod proto {
             h: i32,
         },
         #[serde(rename = "hello_ok")]
-        HelloOk { name: String, w: i32, h: i32 },
+        HelloOk {
+            name: String,
+            w: i32,
+            h: i32,
+            #[serde(default)]
+            ver: u32,
+        },
+        #[serde(rename = "drag_offer")]
+        DragOffer {
+            id: u64,
+            count: usize,
+            total: u64,
+            position: f64,
+        },
+        #[serde(rename = "drag_accept")]
+        DragAccept { id: u64 },
+        #[serde(rename = "drag_ready")]
+        DragReady { id: u64 },
+        #[serde(rename = "drag_commit")]
+        DragCommit { id: u64 },
+        #[serde(rename = "drag_cancel")]
+        DragCancel { id: u64 },
+        #[serde(rename = "drag_done")]
+        DragDone { id: u64, copied: bool },
         /// 画面構成の変化(Windows→Mac)。解像度変更・モニター抜き差しで送る
         #[serde(rename = "screen")]
         Screen { w: i32, h: i32 },
@@ -227,6 +268,18 @@ pub mod proto {
         /// スキーム・長さの検査は urlx::transferable で両側で行う
         #[serde(rename = "open_url")]
         OpenUrl { url: String },
+        /// Search My Desk の横断化(ビジョン§14): 相手 PC のアプリ一覧を要求する。
+        /// 旧側は未知行として無視する拡張(版 12 のまま)
+        #[serde(rename = "apps_query")]
+        AppsQuery,
+        /// アプリ一覧の応答((表示名, 起動パス)。起動は RunApp で、受け側が
+        /// この列挙結果と突き合わせてから行う)
+        #[serde(rename = "apps_reply")]
+        AppsReply { apps: Vec<(String, String)> },
+        /// 相手 PC でアプリを起動する。受け側は直前に列挙したパスと
+        /// 完全一致するものだけ実行する(任意パスの実行を防ぐ)
+        #[serde(rename = "run_app")]
+        RunApp { path: String },
         #[serde(rename = "bye")]
         Bye,
     }
@@ -279,7 +332,7 @@ pub mod files {
     use std::path::{Path, PathBuf};
 
     /// 1 ファイルの受信上限(送信側の合計上限と同じ)
-    pub const MAX_FILE: u64 = 200 * 1024 * 1024;
+    pub const MAX_FILE: u64 = 10 * 1024 * 1024 * 1024;
 
     /// 相手から届いたファイル名を、どちらの OS でも安全な単一の名前へ変換する。
     /// パス区切り・予約文字・制御文字は '_'、先頭末尾の '.' と空白は除去、
@@ -293,7 +346,9 @@ pub mod files {
                 c => c,
             })
             .collect();
-        s = s.trim_matches(|c: char| c == '.' || c.is_whitespace()).to_string();
+        s = s
+            .trim_matches(|c: char| c == '.' || c.is_whitespace())
+            .to_string();
         if s.chars().count() > 200 {
             s = s.chars().take(200).collect();
         }
@@ -350,7 +405,9 @@ pub mod files {
                 .unwrap_or(0);
             // 形式: フラグ;時刻(16進);取得元アプリ;UUID(省略可)
             let value = format!("0081;{secs:x};Tsunagu;");
-            let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return };
+            let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+                return;
+            };
             unsafe {
                 setxattr(
                     p.as_ptr(),
@@ -371,11 +428,25 @@ pub mod files {
         std::fs::create_dir_all(dir).ok()?;
         let base = sanitize(name);
         let p = Path::new(&base);
-        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "file".into());
-        let ext = p.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        let ext = p
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
         for i in 0..1000u32 {
-            let cand = if i == 0 { dir.join(&base) } else { dir.join(format!("{stem} ({i}){ext}")) };
-            if let Ok(f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&cand) {
+            let cand = if i == 0 {
+                dir.join(&base)
+            } else {
+                dir.join(format!("{stem} ({i}){ext}"))
+            };
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&cand)
+            {
                 mark_untrusted(&cand);
                 return Some((f, cand));
             }
@@ -442,7 +513,10 @@ pub mod secure {
                 // 復号出力は暗号文長−タグ分に収まるため cipher 長だけで足りる。
                 // MAX_MSG(64KB)のゼロフィルは毎レコードの無駄なメモリ書き込みになる
                 self.plain.resize(self.cipher.len(), 0);
-                let n = self.st.read_message(self.nonce, &self.cipher, &mut self.plain).map_err(invalid)?;
+                let n = self
+                    .st
+                    .read_message(self.nonce, &self.cipher, &mut self.plain)
+                    .map_err(invalid)?;
                 self.nonce += 1;
                 self.plain.truncate(n);
                 self.pos = 0;
@@ -466,7 +540,10 @@ pub mod secure {
     impl Writer {
         fn emit(&mut self, n: usize) -> io::Result<()> {
             self.cipher.resize(n + TAG, 0);
-            let len = self.st.write_message(self.nonce, &self.buf[..n], &mut self.cipher).map_err(invalid)?;
+            let len = self
+                .st
+                .write_message(self.nonce, &self.buf[..n], &mut self.cipher)
+                .map_err(invalid)?;
             self.nonce += 1;
             write_rec(&mut self.s, &self.cipher[..len])?;
             self.buf.drain(..n);
@@ -505,8 +582,21 @@ pub mod secure {
         let st = Arc::new(hs.into_stateless_transport_mode().map_err(invalid)?);
         let w = s.try_clone()?;
         Ok((
-            Reader { s, st: st.clone(), nonce: 0, cipher: Vec::new(), plain: Vec::new(), pos: 0 },
-            Writer { s: w, st, nonce: 0, buf: Vec::new(), cipher: Vec::new() },
+            Reader {
+                s,
+                st: st.clone(),
+                nonce: 0,
+                cipher: Vec::new(),
+                plain: Vec::new(),
+                pos: 0,
+            },
+            Writer {
+                s: w,
+                st,
+                nonce: 0,
+                buf: Vec::new(),
+                cipher: Vec::new(),
+            },
         ))
     }
 
@@ -528,8 +618,12 @@ pub mod secure {
         write_rec(&mut s, &buf[..n])?;
         let mut rec = Vec::new();
         read_rec(&mut s, &mut rec)?;
-        hs.read_message(&rec, &mut buf)
-            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "handshake failed (token mismatch?)"))?;
+        hs.read_message(&rec, &mut buf).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "handshake failed (token mismatch?)",
+            )
+        })?;
         split(s, hs)
     }
 
@@ -540,11 +634,41 @@ pub mod secure {
         let mut buf = vec![0u8; MAX_MSG];
         let mut rec = Vec::new();
         read_rec(&mut s, &mut rec)?;
-        hs.read_message(&rec, &mut buf)
-            .map_err(|_| io::Error::new(io::ErrorKind::PermissionDenied, "handshake failed (token mismatch?)"))?;
+        hs.read_message(&rec, &mut buf).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "handshake failed (token mismatch?)",
+            )
+        })?;
         let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
         write_rec(&mut s, &buf[..n])?;
         split(s, hs)
+    }
+
+    /// 待受ループの連続失敗スロットル。認証に失敗し続ける接続が高頻度で
+    /// 来た時だけ受け付けを鈍らせ、正規の接続が成功すれば直ちに回復する
+    /// (登録ポートの MAX_ATTEMPTS=3 と違い、確立済みの運用を締め出さない)
+    pub struct FailThrottle {
+        fails: u32,
+    }
+    impl FailThrottle {
+        pub const fn new() -> Self {
+            Self { fails: 0 }
+        }
+        /// 失敗を 1 つ数え、5 回目以降は失敗 1 回あたり 250ms ずつ
+        /// (上限 5 秒)伸びる待ち時間を返す。呼び出し側で sleep する
+        pub fn fail(&mut self) -> std::time::Duration {
+            self.fails += 1;
+            if self.fails < 5 {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(250 * (self.fails - 4).min(20) as u64)
+            }
+        }
+        /// 成功で待ち時間を解除する
+        pub fn success(&mut self) {
+            self.fails = 0;
+        }
     }
 }
 
@@ -561,7 +685,9 @@ pub mod net {
             return true;
         }
         match ip {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback() || is_tailscale(ip),
+            IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_link_local() || v4.is_loopback() || is_tailscale(ip)
+            }
             IpAddr::V6(v6) => {
                 v6.is_loopback()
                     || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA
@@ -599,12 +725,20 @@ pub mod discover {
         let mut h = blake2::Blake2s256::new();
         h.update(b"tsunagu-room-v1\0");
         h.update(token.as_bytes());
-        h.finalize()[..8].iter().map(|b| format!("{b:02x}")).collect()
+        h.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 
     /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える。
     /// 戻り値は bind 失敗のみ(待受に入ったら戻らない)。呼び出し側でログに出す
-    pub fn respond(bind: &str, port: u16, token: &str, allow: fn(IpAddr) -> bool) -> std::io::Result<()> {
+    pub fn respond(
+        bind: &str,
+        port: u16,
+        token: &str,
+        allow: fn(IpAddr) -> bool,
+    ) -> std::io::Result<()> {
         let sock = UdpSocket::bind((bind, port))?;
         let ask = format!("TSUNAGU?{}", room_id(token));
         let ans = format!("TSUNAGU!{}", room_id(token));
@@ -620,7 +754,9 @@ pub mod discover {
     /// 問い合わせ側(早期終了版)。最初の応答が届いた時点で返る。
     /// 再接続のたびに呼ばれるため、LAN 内の実質レイテンシは応答 1 往復分で済む
     pub fn seek_first(target: SocketAddr, token: &str, wait: Duration) -> Option<IpAddr> {
-        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else { return None };
+        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else {
+            return None;
+        };
         let _ = sock.set_broadcast(true);
         let ask = format!("TSUNAGU?{}", room_id(token));
         let ans = format!("TSUNAGU!{}", room_id(token));
@@ -628,7 +764,10 @@ pub mod discover {
         let until = Instant::now() + wait;
         let mut buf = [0u8; 128];
         // 不正な応答を受け取るたびにタイムアウトが延びないよう、残り時間を都度計算し直す
-        while let Some(left) = until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) {
+        while let Some(left) = until
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+        {
             let _ = sock.set_read_timeout(Some(left));
             match sock.recv_from(&mut buf) {
                 Ok((n, from)) if &buf[..n] == ans.as_bytes() => return Some(from.ip()),
@@ -642,7 +781,11 @@ pub mod discover {
     /// LAN 全体へ問い合わせ、最初に応答した相手を 1 つ返す。
     /// LAN 内なら応答は数 ms、誰もいなくても 600ms で諦める(再接続 1 回あたりの上乗せがこれ以下)
     pub fn seek_first_lan(port: u16, token: &str) -> Option<IpAddr> {
-        seek_first(SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)), token, Duration::from_millis(600))
+        seek_first(
+            SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)),
+            token,
+            Duration::from_millis(600),
+        )
     }
 }
 
@@ -659,20 +802,31 @@ pub mod connect {
             .map(str::trim)
             .filter(|h| !h.is_empty())
             .flat_map(|h| {
-                let with_port = if h.contains(':') && !h.starts_with('[') && h.matches(':').count() == 1 {
-                    h.to_string()
-                } else {
-                    format!("{h}:{port}")
-                };
-                with_port.to_socket_addrs().ok().and_then(|mut it| it.next())
+                let with_port =
+                    if h.contains(':') && !h.starts_with('[') && h.matches(':').count() == 1 {
+                        h.to_string()
+                    } else {
+                        format!("{h}:{port}")
+                    };
+                with_port
+                    .to_socket_addrs()
+                    .ok()
+                    .and_then(|mut it| it.next())
             })
             .collect()
     }
 
     /// 発見結果と手動指定を併合する(発見を先頭・IP+ポート単位で重複排除)。
     /// LAN 直と Tailscale を両方候補へ並べるため、first_reachable が自然に最速経路を採用する
-    pub(crate) fn merge_candidates(found: Vec<std::net::IpAddr>, hosts: Option<&str>, port: u16) -> Vec<SocketAddr> {
-        let mut addrs: Vec<SocketAddr> = found.into_iter().map(|ip| SocketAddr::new(ip, port)).collect();
+    pub(crate) fn merge_candidates(
+        found: Vec<std::net::IpAddr>,
+        hosts: Option<&str>,
+        port: u16,
+    ) -> Vec<SocketAddr> {
+        let mut addrs: Vec<SocketAddr> = found
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
         if let Some(h) = hosts {
             for a in parse_hosts(h, port) {
                 if !addrs.contains(&a) {
@@ -686,17 +840,24 @@ pub mod connect {
     /// 接続候補: LAN 自動発見の結果を先頭に、指定(TSUNAGU_HOST)を併せて返す。
     /// 同じ LAN にいれば発見=LAN 直が最速で、いなければ指定(Tailscale 等)へフォールバックする
     pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
-        let found = crate::discover::seek_first_lan(port, token).into_iter().collect::<Vec<_>>();
+        let found = crate::discover::seek_first_lan(port, token)
+            .into_iter()
+            .collect::<Vec<_>>();
         let mut candidates = merge_candidates(found, hosts, port);
         if hosts.is_none() {
             if let Some(peer) = crate::credentials::load_peer() {
-                if !candidates.contains(&peer) { candidates.push(peer); }
+                if !candidates.contains(&peer) {
+                    candidates.push(peer);
+                }
             }
         }
         candidates
     }
 
-    pub fn first_reachable(addrs: &[SocketAddr], timeout: Duration) -> Option<(TcpStream, SocketAddr)> {
+    pub fn first_reachable(
+        addrs: &[SocketAddr],
+        timeout: Duration,
+    ) -> Option<(TcpStream, SocketAddr)> {
         let (tx, rx) = std::sync::mpsc::channel();
         for a in addrs.iter().copied() {
             let tx = tx.clone();
@@ -731,7 +892,11 @@ pub mod bulk {
     /// ファイル・画像データを分割する単位
     pub const CHUNK: usize = 256 * 1024;
     /// 1 回の一括送信の合計上限
-    pub const MAX_TOTAL: u64 = 200 * 1024 * 1024;
+    pub const MAX_TOTAL: u64 = crate::files::MAX_FILE;
+    /// UI の表示も実際の制限値から作る(バイト数は 2 進単位)
+    pub fn file_limit_label() -> String {
+        format!("{}GiB", MAX_TOTAL / (1024 * 1024 * 1024))
+    }
     /// クリップボード画像の上限(生 DIB)
     pub const MAX_IMAGE: usize = 64 * 1024 * 1024;
 
@@ -744,6 +909,7 @@ pub mod bulk {
     pub const DROP_END: u8 = 6;
     pub const IMAGE_BEGIN: u8 = 7;
     pub const IMAGE_END: u8 = 8;
+    pub const DROP_ID_BEGIN: u8 = 9;
 
     pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
         let mut head = [0u8; 5];
@@ -759,7 +925,10 @@ pub mod bulk {
         r.read_exact(&mut head)?;
         let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
         if len > MAX_FRAME {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         buf.resize(len, 0);
         r.read_exact(buf)?;
@@ -769,8 +938,13 @@ pub mod bulk {
     pub fn total_size(paths: &[PathBuf]) -> u64 {
         paths
             .iter()
-            .filter_map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len()))
-            .sum()
+            .filter_map(|p| {
+                std::fs::metadata(p)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+            })
+            .fold(0, u64::saturating_add)
     }
 
     /// ファイル群を送る。drop=true は「掴んだまま境界越え」(受信側は OLE ドラッグで渡す)。
@@ -781,55 +955,120 @@ pub mod bulk {
         drop: bool,
         mut on_progress: impl FnMut(u64, u64),
     ) -> std::io::Result<usize> {
-        let declared: u64 = paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok().filter(|m| m.is_file()).map(|m| m.len()))
-            .sum();
-        let n = send_files_inner(w, paths, drop, &mut |sent| on_progress(sent, declared))?;
+        let declared = total_size(paths);
+        let n = send_files_inner(w, paths, drop, None, &mut |sent| {
+            on_progress(sent, declared);
+            Ok(())
+        })?;
         Ok(n)
     }
 
     /// ファイル群を送る(進捗不要版)
     pub fn send_files(w: &mut impl Write, paths: &[PathBuf], drop: bool) -> std::io::Result<usize> {
-        send_files_inner(w, paths, drop, &mut |_| {})
+        send_files_inner(w, paths, drop, None, &mut |_| Ok(()))
+    }
+
+    pub fn send_drag_files(
+        w: &mut impl Write,
+        paths: &[PathBuf],
+        id: u64,
+        cancelled: impl Fn() -> bool,
+    ) -> std::io::Result<usize> {
+        if id == 0
+            || paths.is_empty()
+            || paths.len() > crate::drag::MAX_FILES
+            || paths.iter().any(|p| !p.is_file())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsupported drag files",
+            ));
+        }
+        send_files_inner(w, paths, true, Some(id), &mut |_| {
+            if cancelled() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "drag cancelled",
+                ))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn send_files_inner(
         w: &mut impl Write,
         paths: &[PathBuf],
         drop: bool,
-        on_progress: &mut dyn FnMut(u64),
+        drag_id: Option<u64>,
+        on_progress: &mut dyn FnMut(u64) -> std::io::Result<()>,
     ) -> std::io::Result<usize> {
-        if drop {
+        if total_size(paths) > MAX_TOTAL {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file batch exceeds size limit",
+            ));
+        }
+        if drag_id.is_some() {
+            on_progress(0)?;
+        }
+        if let Some(id) = drag_id {
+            write_frame(w, DROP_ID_BEGIN, &id.to_le_bytes())?;
+        } else if drop {
             write_frame(w, DROP_BEGIN, &[])?;
         }
         let mut buf = vec![0u8; CHUNK];
         let mut sent = 0;
+        let mut sent_bytes = 0u64;
         for p in paths {
-            let Ok(meta) = std::fs::metadata(p) else { continue };
-            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+            if drag_id.is_some() {
+                on_progress(sent_bytes)?;
+            }
+            let meta = match std::fs::metadata(p) {
+                Ok(meta) => meta,
+                Err(error) if drag_id.is_some() => return Err(error),
+                Err(_) => continue,
+            };
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
             if !meta.is_file() {
+                if drag_id.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "drag source is not a file",
+                    ));
+                }
                 continue;
             }
-            // 受信側の上限(files::MAX_FILE)を超えるファイルは送らない
-            //(受信側で必ず破棄されるため、転送時間と進捗表示が無駄になる)
-            if meta.len() > crate::files::MAX_FILE {
-                continue;
+            let mut f = match std::fs::File::open(p) {
+                Ok(file) => file,
+                Err(error) if drag_id.is_some() => return Err(error),
+                Err(_) => continue,
+            };
+            let size = f.metadata()?.len();
+            // 事前検査の後にファイルが増大していても、受信上限を超える宣言を送らない。
+            if size > crate::files::MAX_FILE || size > MAX_TOTAL - sent_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "file batch exceeds size limit",
+                ));
             }
-            let Ok(mut f) = std::fs::File::open(p) else { continue };
-            let head = serde_json::json!({ "name": name, "size": meta.len() }).to_string();
+            let head = serde_json::json!({ "name": name, "size": size }).to_string();
             write_frame(w, FILE_BEGIN, head.as_bytes())?;
-            let mut remain = meta.len();
-            let mut sent_this = 0u64;
+            let mut remain = size;
             while remain > 0 {
                 let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
                 if n == 0 {
-                    break;
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "file shortened during transfer",
+                    ));
                 }
                 write_frame(w, DATA, &buf[..n])?;
                 remain -= n as u64;
-                sent_this += n as u64;
-                on_progress(sent_this);
+                sent_bytes += n as u64;
+                on_progress(sent_bytes)?;
             }
             write_frame(w, FILE_END, &[])?;
             sent += 1;
@@ -856,7 +1095,11 @@ pub mod bulk {
     #[derive(Debug)]
     pub enum Event {
         /// 一括送信が完了した(drop=true は掴みドラッグ)
-        Files { paths: Vec<PathBuf>, drop: bool },
+        Files {
+            paths: Vec<PathBuf>,
+            drop: bool,
+            drag_id: Option<u64>,
+        },
         Image(Vec<u8>),
     }
 
@@ -872,8 +1115,9 @@ pub mod bulk {
         sink: Sink,
         paths: Vec<PathBuf>,
         drop: bool,
-        /// 接続(=Receiver の寿命)あたりの累積書き込みバイト。送信側の MAX_TOTAL
-        /// と同じ上限を検査側にも置く(正トークンの悪意ピアによるディスク消費攻撃対策)
+        drag_id: Option<u64>,
+        /// 一括転送内の累積書き込みバイト。正常な BATCH_END でリセットする。
+        /// 接続の寿命で累積すると、正当な連続転送も過去の転送量で拒否されてしまう。
         written: u64,
         limit: u64,
         /// 上限超過後はバッチを問わず受け付けない(FILE_BEGIN の連打で上限を
@@ -888,6 +1132,7 @@ pub mod bulk {
                 sink: Sink::None,
                 paths: Vec::new(),
                 drop: false,
+                drag_id: None,
                 written: 0,
                 limit: MAX_TOTAL,
                 tainted: false,
@@ -902,24 +1147,43 @@ pub mod bulk {
 
         /// 書き込み途中のファイルを破棄する(Drop から呼ぶ。完了済みは残す)
         fn discard_open_file(&mut self) {
-            self.sink = Sink::None;
-            if let Some(p) = self.paths.pop() {
-                let _ = std::fs::remove_file(p);
+            if let Sink::File { f, .. } = std::mem::replace(&mut self.sink, Sink::None) {
+                drop(f); // Windows でも削除できるよう、ハンドルを先に閉じる
+                if let Some(p) = self.paths.pop() {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
 
         pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
             match kind {
+                DROP_ID_BEGIN => {
+                    let id = u64::from_le_bytes(body.try_into().ok()?);
+                    if id == 0
+                        || !self.paths.is_empty()
+                        || !matches!(self.sink, Sink::None)
+                        || self.drag_id.is_some()
+                    {
+                        self.tainted = true;
+                        return None;
+                    }
+                    self.drop = true;
+                    self.drag_id = Some(id);
+                }
                 DROP_BEGIN => self.drop = true,
                 FILE_BEGIN => {
+                    self.discard_open_file();
                     if self.tainted {
                         return None;
                     }
-                    self.sink = Sink::None;
                     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
                     let name = v["name"].as_str().unwrap_or("file");
                     let size = v["size"].as_u64().unwrap_or(0);
-                    if size > crate::files::MAX_FILE {
+                    // 書いてから超過分を消す方式では、一時的に上限を超えてしまう。
+                    if size > crate::files::MAX_FILE
+                        || size > self.limit.saturating_sub(self.written)
+                    {
+                        self.tainted = true;
                         return None;
                     }
                     let (f, path) = crate::files::create_unique(&self.dir, name)?;
@@ -929,16 +1193,14 @@ pub mod bulk {
                 DATA => match &mut self.sink {
                     Sink::File { f, remain } => {
                         // 宣言サイズを超える・書けないデータは、そのファイルごと破棄する
-                        if body.len() as u64 > *remain || f.write_all(body).is_err() {
+                        if body.len() as u64 > self.limit.saturating_sub(self.written) {
+                            self.tainted = true;
+                            self.discard_open_file();
+                        } else if body.len() as u64 > *remain || f.write_all(body).is_err() {
                             self.discard_open_file();
                         } else {
                             *remain -= body.len() as u64;
                             self.written += body.len() as u64;
-                            // 接続あたりの合計上限(送信側と同じ 200MB)を検査側にも置く
-                            if self.written > self.limit {
-                                self.tainted = true;
-                                self.discard_open_file();
-                            }
                         }
                     }
                     Sink::Image { data, remain } => {
@@ -961,22 +1223,38 @@ pub mod bulk {
                     self.sink = Sink::None;
                 }
                 BATCH_END => {
-                    self.sink = Sink::None;
+                    // FILE_END が無いファイルは完了として公開しない。
+                    self.discard_open_file();
+                    if !self.tainted {
+                        self.written = 0;
+                    }
                     let paths = std::mem::take(&mut self.paths);
                     let drop = std::mem::replace(&mut self.drop, false);
-                    if !paths.is_empty() {
-                        return Some(Event::Files { paths, drop });
+                    let drag_id = self.drag_id.take();
+                    // 受信失敗で0件でも、操作IDを返して準備待ちを取り消せるようにする。
+                    if !paths.is_empty() || drag_id.is_some() {
+                        return Some(Event::Files {
+                            paths,
+                            drop,
+                            drag_id,
+                        });
                     }
                 }
                 IMAGE_BEGIN => {
+                    self.discard_open_file();
                     let n = u64::from_le_bytes(body.try_into().ok()?) as usize;
                     if n == 0 || n > MAX_IMAGE {
                         return None;
                     }
-                    self.sink = Sink::Image { data: Vec::with_capacity(n), remain: n };
+                    self.sink = Sink::Image {
+                        data: Vec::with_capacity(n),
+                        remain: n,
+                    };
                 }
                 IMAGE_END => {
-                    if let Sink::Image { data, remain: 0 } = std::mem::replace(&mut self.sink, Sink::None) {
+                    if let Sink::Image { data, remain: 0 } =
+                        std::mem::replace(&mut self.sink, Sink::None)
+                    {
                         return Some(Event::Image(data));
                     }
                 }
@@ -992,6 +1270,11 @@ pub mod bulk {
         fn drop(&mut self) {
             if !matches!(self.sink, Sink::None) {
                 self.discard_open_file();
+            }
+            if self.drag_id.is_some() {
+                for p in self.paths.drain(..) {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
     }
@@ -1013,7 +1296,10 @@ pub mod bulk {
 
     impl Link {
         pub const fn new() -> Self {
-            Self { w: std::sync::Mutex::new(None), gen: std::sync::atomic::AtomicU64::new(0) }
+            Self {
+                w: std::sync::Mutex::new(None),
+                gen: std::sync::atomic::AtomicU64::new(0),
+            }
         }
         fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, crate::secure::Writer)>> {
             self.w.lock().unwrap_or_else(|e| e.into_inner())
@@ -1051,7 +1337,10 @@ pub mod bulk {
         ) -> std::io::Result<T> {
             let mut g = self.slot();
             let Some((_, s)) = g.as_mut() else {
-                return Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "bulk link down"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "bulk link down",
+                ));
             };
             let r = f(s);
             if r.is_err() {
@@ -1088,35 +1377,49 @@ pub mod bulk {
     }
 
     /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす
-    pub fn serve(ep: &'static Endpoint, bind: &str, port: u16, allow: fn(std::net::IpAddr) -> bool) {
+    pub fn serve(
+        ep: &'static Endpoint,
+        bind: &str,
+        port: u16,
+        allow: fn(std::net::IpAddr) -> bool,
+    ) {
         let listener = match std::net::TcpListener::bind((bind, port)) {
             Ok(l) => l,
             Err(e) => {
-                (ep.log)(&format!("[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可)"));
+                (ep.log)(&format!(
+                    "[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可)"
+                ));
                 return;
             }
         };
         (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
+        let mut throttle = crate::secure::FailThrottle::new();
         for s in listener.incoming() {
             let Ok(s) = s else { continue };
             let Ok(peer) = s.peer_addr() else { continue };
             if !allow(peer.ip()) {
                 (ep.log)(&format!("[bulk] rejected: {peer}"));
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             let Ok(ctl) = s.try_clone() else { continue };
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
             let (r, w) = match crate::secure::accept(s, &ep.token, LABEL) {
                 Ok(x) => x,
                 Err(e) => {
                     (ep.log)(&format!("[bulk] handshake 失敗 ({peer}): {e}"));
+                    std::thread::sleep(throttle.fail());
                     continue;
                 }
             };
             // 接続側は 10 秒毎にキープアライブを送る。3 回分届かなければ死んだ経路
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(35))).ok();
-            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(35)))
+                .ok();
+            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20)))
+                .ok();
             let gen = ep.link.set(w);
+            throttle.success();
             (ep.log)(&format!("[bulk] established ({peer})"));
             spawn_reader(ep, r, gen);
         }
@@ -1139,16 +1442,21 @@ pub mod bulk {
             if ep.link.is_up() {
                 if last_keepalive.elapsed() >= std::time::Duration::from_secs(10) {
                     last_keepalive = std::time::Instant::now();
-                    let _ = ep.link.send(|w| write_frame(w, KEEPALIVE, &[]).and_then(|_| w.flush()));
+                    let _ = ep
+                        .link
+                        .send(|w| write_frame(w, KEEPALIVE, &[]).and_then(|_| w.flush()));
                 }
                 continue;
             }
             let Some(addr) = addr() else { continue };
-            let Ok(s) = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3)) else {
+            let Ok(s) =
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
+            else {
                 continue;
             };
             let Ok(ctl) = s.try_clone() else { continue };
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .ok();
             let (r, w) = match crate::secure::connect(s, &ep.token, LABEL) {
                 Ok(x) => x,
                 Err(e) => {
@@ -1157,7 +1465,8 @@ pub mod bulk {
                 }
             };
             ctl.set_read_timeout(None).ok();
-            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20))).ok();
+            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20)))
+                .ok();
             let gen = ep.link.set(w);
             (ep.log)(&format!("[bulk] established (→{addr})"));
             spawn_reader(ep, r, gen);
@@ -1170,32 +1479,32 @@ pub mod keymap {
     pub fn mac_kc_to_win_vk(kc: u16) -> Option<u16> {
         let vk = match kc {
             // アルファベット(Mac keycode はレイアウト依存しない物理キー)
-            0 => 0x41,   // A
-            11 => 0x42,  // B
-            8 => 0x43,   // C
-            2 => 0x44,   // D
-            14 => 0x45,  // E
-            3 => 0x46,   // F
-            5 => 0x47,   // G
-            4 => 0x48,   // H
-            34 => 0x49,  // I
-            38 => 0x4A,  // J
-            40 => 0x4B,  // K
-            37 => 0x4C,  // L
-            46 => 0x4D,  // M
-            45 => 0x4E,  // N
-            31 => 0x4F,  // O
-            35 => 0x50,  // P
-            12 => 0x51,  // Q
-            15 => 0x52,  // R
-            1 => 0x53,   // S
-            17 => 0x54,  // T
-            32 => 0x55,  // U
-            9 => 0x56,   // V
-            13 => 0x57,  // W
-            7 => 0x58,   // X
-            16 => 0x59,  // Y
-            6 => 0x5A,   // Z
+            0 => 0x41,  // A
+            11 => 0x42, // B
+            8 => 0x43,  // C
+            2 => 0x44,  // D
+            14 => 0x45, // E
+            3 => 0x46,  // F
+            5 => 0x47,  // G
+            4 => 0x48,  // H
+            34 => 0x49, // I
+            38 => 0x4A, // J
+            40 => 0x4B, // K
+            37 => 0x4C, // L
+            46 => 0x4D, // M
+            45 => 0x4E, // N
+            31 => 0x4F, // O
+            35 => 0x50, // P
+            12 => 0x51, // Q
+            15 => 0x52, // R
+            1 => 0x53,  // S
+            17 => 0x54, // T
+            32 => 0x55, // U
+            9 => 0x56,  // V
+            13 => 0x57, // W
+            7 => 0x58,  // X
+            16 => 0x59, // Y
+            6 => 0x5A,  // Z
             // 数字row
             18 => 0x31, // 1
             19 => 0x32,
@@ -1221,11 +1530,11 @@ pub mod keymap {
             27 => 0xBD, // -(US)/ー(JIS 長音)→ Win -[OEM_MINUS]
             94 => 0xBD, // _(Mac JIS)→ Win -
             // 制御・編集
-            36 => 0x0D, // Return
-            48 => 0x09, // Tab
-            49 => 0x20, // Space
-            51 => 0x08, // Delete(Backspace)
-            53 => 0x1B, // Escape
+            36 => 0x0D,  // Return
+            48 => 0x09,  // Tab
+            49 => 0x20,  // Space
+            51 => 0x08,  // Delete(Backspace)
+            53 => 0x1B,  // Escape
             117 => 0x2E, // Forward Delete
             115 => 0x24, // Home
             119 => 0x23, // End
@@ -1258,15 +1567,15 @@ pub mod keymap {
             88 => 0x66,
             89 => 0x67,
             91 => 0x68,
-            92 => 0x69, // Num9
-            65 => 0x6E, // Num .
-            67 => 0x6A, // Num *
-            69 => 0x6B, // Num +
-            78 => 0x6D, // Num -
-            75 => 0x6F, // Num /
-            71 => 0x0C, // Clear
-            76 => 0x0D, // テンキー Enter(Win 側で拡張キーフラグを付けて区別する)
-            57 => 0x14, // Caps Lock(Mac 側は押下ごとに down+up の組で送る)
+            92 => 0x69,  // Num9
+            65 => 0x6E,  // Num .
+            67 => 0x6A,  // Num *
+            69 => 0x6B,  // Num +
+            78 => 0x6D,  // Num -
+            75 => 0x6F,  // Num /
+            71 => 0x0C,  // Clear
+            76 => 0x0D,  // テンキー Enter(Win 側で拡張キーフラグを付けて区別する)
+            57 => 0x14,  // Caps Lock(Mac 側は押下ごとに down+up の組で送る)
             114 => 0x2D, // Help(Mac の Ins 位置)→ Insert
             // かな(104)/英数(102)はここを通らない: win 側の受信ループが先に
             // 傍受して ime_set_open(IME 開閉)へ変換する
@@ -1289,14 +1598,52 @@ pub mod charmap {
     /// 送信テスト用: Mac keycode → 表示文字(英数字・記号のみ)
     pub fn mac_kc_to_char(kc: u16) -> Option<char> {
         let c = match kc {
-            0 => 'A', 11 => 'B', 8 => 'C', 2 => 'D', 14 => 'E', 3 => 'F', 5 => 'G',
-            4 => 'H', 34 => 'I', 38 => 'J', 40 => 'K', 37 => 'L', 46 => 'M', 45 => 'N',
-            31 => 'O', 35 => 'P', 12 => 'Q', 15 => 'R', 1 => 'S', 17 => 'T', 32 => 'U',
-            9 => 'V', 13 => 'W', 7 => 'X', 16 => 'Y', 6 => 'Z',
-            18 => '1', 19 => '2', 20 => '3', 21 => '4', 23 => '5', 22 => '6',
-            26 => '7', 28 => '8', 25 => '9', 29 => '0',
-            39 => ';', 41 => '\'', 43 => ',', 47 => '.', 44 => '/', 33 => '[', 30 => ']',
-            49 => ' ', 36 => '\n', 48 => '\t',
+            0 => 'A',
+            11 => 'B',
+            8 => 'C',
+            2 => 'D',
+            14 => 'E',
+            3 => 'F',
+            5 => 'G',
+            4 => 'H',
+            34 => 'I',
+            38 => 'J',
+            40 => 'K',
+            37 => 'L',
+            46 => 'M',
+            45 => 'N',
+            31 => 'O',
+            35 => 'P',
+            12 => 'Q',
+            15 => 'R',
+            1 => 'S',
+            17 => 'T',
+            32 => 'U',
+            9 => 'V',
+            13 => 'W',
+            7 => 'X',
+            16 => 'Y',
+            6 => 'Z',
+            18 => '1',
+            19 => '2',
+            20 => '3',
+            21 => '4',
+            23 => '5',
+            22 => '6',
+            26 => '7',
+            28 => '8',
+            25 => '9',
+            29 => '0',
+            39 => ';',
+            41 => '\'',
+            43 => ',',
+            47 => '.',
+            44 => '/',
+            33 => '[',
+            30 => ']',
+            49 => ' ',
+            36 => '\n',
+            48 => '\t',
             _ => return None,
         };
         Some(c)
@@ -1307,6 +1654,19 @@ pub mod charmap {
 mod tests {
     use super::keymap::mac_kc_to_win_vk;
     use super::proto::*;
+
+    #[test]
+    fn peer_names_drop_control_and_bidi_overrides() {
+        // 制御文字と Bidi オーバーライド(見た目の文字順を偽装する不可視文字)は
+        // 通知・ログへ載せない。hello と登録(pairing)で同じ規則を使う
+        assert_eq!(safe_peer_name("PC\u{202e}gpj.exe"), "PCgpj.exe");
+        assert_eq!(safe_peer_name("A\u{2066}B\u{2069}C"), "ABC");
+        assert_eq!(safe_peer_name("Mac\nPro"), "MacPro");
+        // 呼び出し側は trim 済みの名前を渡す(空白のみの名前は既定名へ落ちる)
+        assert_eq!(safe_peer_name("  \u{7}\t".trim()), "");
+        // 長さは 48 文字で切る
+        assert_eq!(safe_peer_name(&"x".repeat(60)).chars().count(), 48);
+    }
 
     #[test]
     fn keymap_covers_full_keyboard_and_numpad_enter() {
@@ -1367,7 +1727,11 @@ mod tests {
         assert_eq!(k1, k2, "同じ選択は同じ指紋");
         std::fs::write(&base.join("a.txt"), b"hello world").unwrap();
         assert_ne!(k1, key(&[a.clone()]), "内容が変われば指紋も変わる");
-        assert_eq!(key(&[a.clone(), a.clone()]).split('|').next(), key(&[a.clone(), a.clone()]).split('|').next(), "順序込みで一貫");
+        assert_eq!(
+            key(&[a.clone(), a.clone()]).split('|').next(),
+            key(&[a.clone(), a.clone()]).split('|').next(),
+            "順序込みで一貫"
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1380,8 +1744,16 @@ mod tests {
         assert!(b.to_string_lossy().ends_with("x (1).txt"));
         #[cfg(target_os = "macos")]
         {
-            let out = std::process::Command::new("xattr").arg("-p").arg("com.apple.quarantine").arg(&a).output().unwrap();
-            assert!(String::from_utf8_lossy(&out.stdout).contains(";Tsunagu;"), "quarantine 属性が付いていない");
+            let out = std::process::Command::new("xattr")
+                .arg("-p")
+                .arg("com.apple.quarantine")
+                .arg(&a)
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains(";Tsunagu;"),
+                "quarantine 属性が付いていない"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -1412,7 +1784,7 @@ mod tests {
         }
         assert_eq!(events.len(), 2);
         match &events[0] {
-            Event::Files { paths, drop } => {
+            Event::Files { paths, drop, .. } => {
                 assert!(*drop);
                 assert_eq!(std::fs::read(&paths[0]).unwrap(), big);
                 assert_eq!(std::fs::read(&paths[1]).unwrap(), b"hello");
@@ -1443,10 +1815,10 @@ mod tests {
     }
 
     #[test]
-    fn bulk_sender_skips_files_over_the_limit() {
+    fn bulk_sender_rejects_files_over_the_limit_before_writing() {
         use super::bulk::*;
-        // 上限を超えるファイルは送信段階で飛ばす(受信側で破棄されるだけの
-        // 無駄転送をしない)。超過ファイルはスパース(実データなし)で作る
+        // 一部だけ届いて成功に見えないよう、超過は送信開始前に拒否する。
+        // 超過ファイルはスパース(実データなし)で作る
         let base = std::env::temp_dir().join(format!("tsunagu-bulk-cap-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("ok.txt"), b"ok").unwrap();
@@ -1456,19 +1828,57 @@ mod tests {
 
         let mut wire = Vec::new();
         let paths = vec![base.join("huge.bin"), base.join("ok.txt")];
-        assert_eq!(send_files(&mut wire, &paths, false).unwrap(), 1);
-
-        let mut rx = Receiver::new(&base.join("dst"));
-        let mut r = std::io::Cursor::new(&wire);
-        let mut buf = Vec::new();
-        let mut events = Vec::new();
-        while let Ok(k) = read_frame(&mut r, &mut buf) {
-            if let Some(e) = rx.feed(k, &buf) {
-                events.push(e);
-            }
-        }
-        assert_eq!(events.len(), 1, "超過ファイルは送られず 1 件だけ届く");
+        assert_eq!(
+            send_files(&mut wire, &paths, true).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(wire.is_empty(), "上限超過時には DROP_BEGIN も送らない");
+        // それぞれは上限内でも、合計が上限を超える選択は拒否する。
+        let huge = std::fs::OpenOptions::new()
+            .write(true)
+            .open(base.join("huge.bin"))
+            .unwrap();
+        huge.set_len(MAX_TOTAL / 2 + 1).unwrap();
+        drop(huge);
+        let paths = vec![base.join("huge.bin"), base.join("huge.bin")];
+        assert!(
+            send_files_with_progress(&mut wire, &paths, false, |_, _| panic!(
+                "送信前に拒否すべき"
+            ))
+            .is_err()
+        );
+        assert!(wire.is_empty());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bulk_sender_reports_files_shortened_during_transfer() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-shortened-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("source.bin");
+        std::fs::write(&src, vec![5u8; CHUNK * 2]).unwrap();
+        let mut wire = Vec::new();
+        let err = send_files_with_progress(&mut wire, &[src.clone()], false, |_, _| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&src)
+                .unwrap()
+                .set_len(CHUNK as u64)
+                .unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        let dst = base.join("received");
+        let mut rx = Receiver::new(&dst);
+        let mut reader = std::io::Cursor::new(wire);
+        let mut buf = Vec::new();
+        while let Ok(kind) = read_frame(&mut reader, &mut buf) {
+            assert!(rx.feed(kind, &buf).is_none(), "未完了の転送を成功にしない");
+        }
+        drop(rx);
+        assert!(!dst.join("source.bin").exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// seek_first: 応答があれば即座に返り、無ければタイムアウトで None を返す。
@@ -1492,9 +1902,17 @@ mod tests {
             responder.send_to(ans.as_bytes(), from).unwrap();
         });
         let t0 = Instant::now();
-        let found = seek_first(SocketAddr::from(([127, 0, 0, 1], port)), token, Duration::from_secs(3));
+        let found = seek_first(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            token,
+            Duration::from_secs(3),
+        );
         assert!(found.is_some(), "応答があるのに None");
-        assert!(t0.elapsed() < Duration::from_secs(2), "応答があるなら長く待たない: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "応答があるなら長く待たない: {:?}",
+            t0.elapsed()
+        );
         answerer.join().unwrap();
 
         // 応答が無ければ wait 経過で None。quiet は保持したまま(閉じたポートへ送ると
@@ -1503,11 +1921,19 @@ mod tests {
         let quiet_port = quiet.local_addr().unwrap().port();
         let t0 = Instant::now();
         assert_eq!(
-            seek_first(SocketAddr::from(([127, 0, 0, 1], quiet_port)), token, Duration::from_millis(300)),
+            seek_first(
+                SocketAddr::from(([127, 0, 0, 1], quiet_port)),
+                token,
+                Duration::from_millis(300)
+            ),
             None,
             "応答が無いのに Some"
         );
-        assert!(t0.elapsed() >= Duration::from_millis(250), "タイムアウト前に返った: {:?}", t0.elapsed());
+        assert!(
+            t0.elapsed() >= Duration::from_millis(250),
+            "タイムアウト前に返った: {:?}",
+            t0.elapsed()
+        );
         drop(quiet);
     }
 
@@ -1532,7 +1958,10 @@ mod tests {
         rx.set_limit_for_test(1_000);
         // 600B × 2 ファイルで 1,200B > 上限 1,000B
         for i in 0..2 {
-            rx.feed(FILE_BEGIN, format!("{{\"name\":\"c{i}.bin\",\"size\":600}}").as_bytes());
+            rx.feed(
+                FILE_BEGIN,
+                format!("{{\"name\":\"c{i}.bin\",\"size\":600}}").as_bytes(),
+            );
             rx.feed(DATA, &[0u8; 600]);
             rx.feed(FILE_END, &[]);
         }
@@ -1545,21 +1974,79 @@ mod tests {
         }
         assert!(base.join("c0.bin").exists(), "上限内の 1 本目は保持");
         assert!(!base.join("c1.bin").exists(), "2 本目(超過分)は破棄");
-        // 1 本目は上限内で完了済みでも、tainted 後の新しいバッチは拒否
-        let mut rx2 = Receiver::new(&base);
-        rx2.set_limit_for_test(1_000);
-        rx2.feed(FILE_BEGIN, br#"{"name":"x.bin","size":600}"#);
-        rx2.feed(DATA, &[0u8; 600]);
-        rx2.feed(FILE_END, &[]);
-        assert!(rx2.feed(BATCH_END, &[]).is_some());
-        rx2.feed(FILE_BEGIN, br#"{"name":"y.bin","size":600}"#);
-        rx2.feed(DATA, &[0u8; 600]);
-        rx2.feed(FILE_END, &[]);
-        rx2.feed(FILE_BEGIN, br#"{"name":"z.bin","size":1}"#);
-        rx2.feed(DATA, b"z");
-        rx2.feed(FILE_END, &[]);
-        assert!(rx2.feed(BATCH_END, &[]).is_none(), "累積上限後の後続バッチも拒否");
+        // 不正な上限超過の後は、BATCH_END を送っても拒否を解除しない。
+        rx.feed(FILE_BEGIN, br#"{"name":"z.bin","size":1}"#);
+        rx.feed(DATA, b"z");
+        rx.feed(FILE_END, &[]);
+        assert!(
+            rx.feed(BATCH_END, &[]).is_none(),
+            "不正な接続の後続バッチも拒否"
+        );
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn bulk_receiver_limit_applies_to_each_completed_batch() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-batches-{}", std::process::id()));
+        let mut rx = Receiver::new(&base);
+        rx.set_limit_for_test(1_000);
+        for i in 0..3 {
+            rx.feed(
+                FILE_BEGIN,
+                format!("{{\"name\":\"{i}.bin\",\"size\":1000}}").as_bytes(),
+            );
+            rx.feed(DATA, &[7u8; 1_000]);
+            rx.feed(FILE_END, &[]);
+            match rx.feed(BATCH_END, &[]) {
+                Some(Event::Files { paths, .. }) => {
+                    assert_eq!(paths.len(), 1);
+                    assert_eq!(std::fs::read(&paths[0]).unwrap(), vec![7u8; 1_000]);
+                }
+                e => panic!("正当な連続転送 {i} が失われた: {e:?}"),
+            }
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn bulk_receiver_checks_declared_capacity_and_cleans_unfinished_files() {
+        use super::bulk::*;
+        let base = std::env::temp_dir().join(format!("tsunagu-declared-{}", std::process::id()));
+        let mut rx = Receiver::new(&base);
+        // 4GiB を超えるヘッダも扱える。実データなしで新上限の境界を確認する。
+        let size = 10u64 * 1024 * 1024 * 1024;
+        rx.feed(
+            FILE_BEGIN,
+            format!("{{\"name\":\"large.bin\",\"size\":{size}}}").as_bytes(),
+        );
+        assert!(base.join("large.bin").exists());
+        rx.feed(DATA, b"partial");
+        assert!(
+            rx.feed(BATCH_END, &[]).is_none(),
+            "未完了のファイルを公開しない"
+        );
+        assert!(!base.join("large.bin").exists());
+        rx.feed(
+            FILE_BEGIN,
+            format!("{{\"name\":\"too-large.bin\",\"size\":{}}}", size + 1).as_bytes(),
+        );
+        assert!(
+            !base.join("too-large.bin").exists(),
+            "上限超過は作成前に拒否する"
+        );
+
+        let mut rx = Receiver::new(&base);
+        rx.set_limit_for_test(10);
+        rx.feed(FILE_BEGIN, br#"{"name":"first.bin","size":8}"#);
+        rx.feed(DATA, b"12345678");
+        rx.feed(FILE_END, &[]);
+        rx.feed(FILE_BEGIN, br#"{"name":"overflow.bin","size":3}"#);
+        assert!(
+            !base.join("overflow.bin").exists(),
+            "合計上限も作成前に拒否する"
+        );
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// 切断(Drop)時に書き込み途中のファイルを破棄し、完了済みは残す
@@ -1591,12 +2078,19 @@ mod tests {
         // 1.5 チャンク分のファイル(複数チャンクをまたぐ)
         let data: Vec<u8> = (0..(CHUNK + CHUNK / 2)).map(|i| (i % 97) as u8).collect();
         std::fs::write(src.join("p.bin"), &data).unwrap();
+        std::fs::write(src.join("q.bin"), b"second file").unwrap();
         let mut wire = Vec::new();
         let mut log: Vec<(u64, u64)> = Vec::new();
-        send_files_with_progress(&mut wire, &[src.join("p.bin")], false, |s, t| log.push((s, t))).unwrap();
+        send_files_with_progress(
+            &mut wire,
+            &[src.join("p.bin"), src.join("q.bin")],
+            false,
+            |s, t| log.push((s, t)),
+        )
+        .unwrap();
         let (last_s, last_t) = *log.last().unwrap();
-        assert_eq!(last_t, data.len() as u64, "宣言合計=ファイルサイズ");
-        assert_eq!(last_s, data.len() as u64, "最終送信済み=合計");
+        assert_eq!(last_t, data.len() as u64 + 11, "宣言合計=全ファイルサイズ");
+        assert_eq!(last_s, last_t, "最終送信済み=合計");
         let mut prev = 0;
         for (s, _) in &log {
             assert!(*s >= prev, "進捗は単調非減少: {log:?}");
@@ -1614,7 +2108,11 @@ mod tests {
         let found: Vec<IpAddr> = vec!["192.168.0.1".parse().unwrap()];
         let merged = merge_candidates(found, Some("100.100.10.9,192.168.0.1"), 24900);
         assert_eq!(merged.len(), 2, "発見と指定の同じ IP は 1 つに: {merged:?}");
-        assert_eq!(merged[0].to_string(), "192.168.0.1:24900", "発見結果が先頭");
+        assert_eq!(
+            merged[0].to_string(),
+            "192.168.0.1:24900",
+            "発見結果が先頭"
+        );
         assert_eq!(merged[1].to_string(), "100.100.10.9:24900");
 
         // 指定なし → 発見のみ
@@ -1673,15 +2171,21 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let src = base.join("payload.bin");
         std::fs::write(&src, b"over-the-wire").unwrap();
-        CLIENT_LINK.send(|w| send_files(w, &[src.clone()], false)).unwrap();
+        CLIENT_LINK
+            .send(|w| send_files(w, &[src.clone()], false))
+            .unwrap();
         while GOT.lock().unwrap().is_empty() && t0.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        assert_eq!(GOT.lock().unwrap().first().map(|v| v.as_slice()), Some(&b"over-the-wire"[..]));
+        assert_eq!(
+            GOT.lock().unwrap().first().map(|v| v.as_slice()),
+            Some(&b"over-the-wire"[..])
+        );
 
         // 誤トークンは拒否される
         let bad = std::net::TcpStream::connect(addr).unwrap();
-        bad.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        bad.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         assert!(crate::secure::connect(bad, "wrong", b"tsunagu-bulk").is_err());
         let _ = std::fs::remove_dir_all(base);
     }
@@ -1696,7 +2200,10 @@ mod tests {
             let t = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             t.local_addr().unwrap()
         };
-        let addrs = parse_hosts(&format!("127.0.0.1:{}, 127.0.0.1:{}", dead.port(), good.port()), 1);
+        let addrs = parse_hosts(
+            &format!("127.0.0.1:{}, 127.0.0.1:{}", dead.port(), good.port()),
+            1,
+        );
         assert_eq!(addrs.len(), 2);
         let (_, picked) = first_reachable(&addrs, std::time::Duration::from_secs(2)).unwrap();
         assert_eq!(picked, good);
@@ -1723,13 +2230,19 @@ mod tests {
             let (s2, _) = l.accept().unwrap();
             assert!(accept(s2, "tok", b"test").is_err());
         });
-        let (mut r, mut w) = connect(std::net::TcpStream::connect(addr).unwrap(), "tok", b"test").unwrap();
+        let (mut r, mut w) =
+            connect(std::net::TcpStream::connect(addr).unwrap(), "tok", b"test").unwrap();
         w.write_all(&big).unwrap(); // 64KB を超えて複数レコードに分かれる
         w.flush().unwrap();
         let mut p = [0u8; 4];
         r.read_exact(&mut p).unwrap();
         assert_eq!(&p, b"pong");
-        assert!(connect(std::net::TcpStream::connect(addr).unwrap(), "wrong", b"test").is_err());
+        assert!(connect(
+            std::net::TcpStream::connect(addr).unwrap(),
+            "wrong",
+            b"test"
+        )
+        .is_err());
         srv.join().unwrap();
     }
 
@@ -1744,8 +2257,14 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let found = seek_first(target, "room-token", std::time::Duration::from_millis(500));
-        assert_eq!(found, Some("127.0.0.1".parse::<std::net::IpAddr>().unwrap()));
-        assert_eq!(seek_first(target, "other-token", std::time::Duration::from_millis(300)), None);
+        assert_eq!(
+            found,
+            Some("127.0.0.1".parse::<std::net::IpAddr>().unwrap())
+        );
+        assert_eq!(
+            seek_first(target, "other-token", std::time::Duration::from_millis(300)),
+            None
+        );
         assert_ne!(room_id("a"), room_id("b"));
         assert!(!room_id("secret").contains("secret"));
     }
@@ -1776,6 +2295,34 @@ mod tests {
     fn unknown_message_is_ignored_not_fatal() {
         assert!(decode("{\"t\":\"future_feature\",\"x\":1}").is_none());
         assert!(matches!(decode(&encode(&Msg::Leave)), Some(Msg::Leave)));
-        assert!(matches!(decode("{\"t\":\"return\"}"), Some(Msg::Return { .. })));
+        assert!(matches!(
+            decode("{\"t\":\"return\"}"),
+            Some(Msg::Return { .. })
+        ));
+    }
+
+    #[test]
+    fn search_desk_messages_round_trip_for_cross_pc_apps() {
+        assert!(matches!(
+            decode(&encode(&Msg::AppsQuery)),
+            Some(Msg::AppsQuery)
+        ));
+        let reply = Msg::AppsReply {
+            apps: vec![("メモ帳".into(), r"C:\Windows\notepad.exe".into())],
+        };
+        match decode(&encode(&reply)) {
+            Some(Msg::AppsReply { apps }) => {
+                assert_eq!(apps.len(), 1);
+                assert_eq!(apps[0].0, "メモ帳");
+                assert_eq!(apps[0].1, r"C:\Windows\notepad.exe");
+            }
+            other => panic!("AppsReply が復元できない: {other:?}"),
+        }
+        match decode(&encode(&Msg::RunApp {
+            path: r"C:\x\y.lnk".into(),
+        })) {
+            Some(Msg::RunApp { path }) => assert_eq!(path, r"C:\x\y.lnk"),
+            other => panic!("RunApp が復元できない: {other:?}"),
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "tsunagu-win"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2021"
 
 [dependencies]
@@ -20,4 +20,3 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_DataExchange",
     "Win32_System_Memory",
 ] }
-

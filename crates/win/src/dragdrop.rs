@@ -9,8 +9,19 @@
 //! メソッド順序どおり。並びを間違えると即クラッシュするので変更時は注意)。
 
 use std::ffi::c_void;
+pub mod edge;
+mod host;
+pub use host::{relay_cancel, relay_move, relay_up};
+#[cfg(test)]
+mod live_tests;
+/// 進行中の OLE ドラッグを回しているスレッドのID(0=なし)。共有入力の
+/// 中継先を「進行中のドラッグ」に限定するために保持する
+pub static DRAG_THREAD: AtomicU32 = AtomicU32::new(0);
+#[cfg(test)]
+static TEST_DRAG_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use windows_sys::Win32::System::Com::DVASPECT_CONTENT;
 use windows_sys::Win32::System::Ole::{DoDragDrop, OleInitialize, OleUninitialize};
 
 pub type HRESULT = i32;
@@ -60,7 +71,7 @@ const IID_IENUMFORMATETC: Guid = Guid {
     data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
 };
 const IID_IDROPSOURCE: Guid = Guid {
-    data1: 0x0000_0221,
+    data1: 0x0000_0121,
     data2: 0x0000,
     data3: 0x0000,
     data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
@@ -111,7 +122,8 @@ struct IDataObjectVtbl {
     add_ref: AddRefFn,
     release: ReleaseFn,
     get_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> HRESULT,
-    get_data_here: unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> HRESULT,
+    get_data_here:
+        unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut StgMedium) -> HRESULT,
     query_get_data: unsafe extern "system" fn(*mut c_void, *const FormatEtc) -> HRESULT,
     get_canonical_format_etc:
         unsafe extern "system" fn(*mut c_void, *const FormatEtc, *mut FormatEtc) -> HRESULT,
@@ -198,7 +210,9 @@ unsafe extern "system" fn ds_qi(
     *out = std::ptr::null_mut();
     if guid_eq(&*iid, &IID_IUNKNOWN) || guid_eq(&*iid, &IID_IDATAOBJECT) {
         *out = this;
-        DataSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed);
+        DataSource::from_raw(this)
+            .refs
+            .fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
     // COM 規約: QI の不支援は E_NOINTERFACE(E_NOTIMPL ではない)
@@ -206,7 +220,10 @@ unsafe extern "system" fn ds_qi(
 }
 
 unsafe extern "system" fn ds_add_ref(this: *mut c_void) -> u32 {
-    DataSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+    DataSource::from_raw(this)
+        .refs
+        .fetch_add(1, Ordering::Relaxed)
+        + 1
 }
 
 unsafe extern "system" fn ds_release(this: *mut c_void) -> u32 {
@@ -248,10 +265,7 @@ unsafe extern "system" fn ds_get_data_here(
     E_NOTIMPL
 }
 
-unsafe extern "system" fn ds_query_get_data(
-    _this: *mut c_void,
-    pfe: *const FormatEtc,
-) -> HRESULT {
+unsafe extern "system" fn ds_query_get_data(_this: *mut c_void, pfe: *const FormatEtc) -> HRESULT {
     if pfe.is_null() {
         return E_FAIL;
     }
@@ -317,10 +331,7 @@ unsafe extern "system" fn ds_d_unadvise(_this: *mut c_void, _conn: u32) -> HRESU
     OLE_E_ADVISENOTSUPPORTED
 }
 
-unsafe extern "system" fn ds_enum_d_advise(
-    _this: *mut c_void,
-    _out: *mut *mut c_void,
-) -> HRESULT {
+unsafe extern "system" fn ds_enum_d_advise(_this: *mut c_void, _out: *mut *mut c_void) -> HRESULT {
     OLE_E_ADVISENOTSUPPORTED
 }
 
@@ -387,7 +398,7 @@ unsafe extern "system" fn ef_next(
         *rgelt.add(n as usize) = FormatEtc {
             cf_format: CF_HDROP,
             ptd: std::ptr::null_mut(),
-            dw_aspect: 4, // DVASPECT_CONTENT
+            dw_aspect: DVASPECT_CONTENT,
             lindex: -1,
             tymed: TYMED_HGLOBAL,
         };
@@ -442,14 +453,19 @@ unsafe extern "system" fn src_qi(
     *out = std::ptr::null_mut();
     if guid_eq(&*iid, &IID_IUNKNOWN) || guid_eq(&*iid, &IID_IDROPSOURCE) {
         *out = this;
-        DropSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed);
+        DropSource::from_raw(this)
+            .refs
+            .fetch_add(1, Ordering::Relaxed);
         return S_OK;
     }
     E_NOINTERFACE
 }
 
 unsafe extern "system" fn src_add_ref(this: *mut c_void) -> u32 {
-    DropSource::from_raw(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+    DropSource::from_raw(this)
+        .refs
+        .fetch_add(1, Ordering::Relaxed)
+        + 1
 }
 
 unsafe extern "system" fn src_release(this: *mut c_void) -> u32 {
@@ -466,11 +482,11 @@ unsafe extern "system" fn src_release(this: *mut c_void) -> u32 {
 unsafe extern "system" fn src_query_continue(
     _this: *mut c_void,
     f_escape_pressed: i32,
-    key_state: u32,
+    _key_state: u32,
 ) -> HRESULT {
-    if f_escape_pressed != 0 {
+    if f_escape_pressed != 0 || host::cancelled() {
         DRAGDROP_S_CANCEL
-    } else if key_state & MK_LBUTTON == 0 {
+    } else if !crate::BTN_W[0].load(Ordering::Relaxed) {
         DRAGDROP_S_DROP
     } else {
         S_OK
@@ -478,6 +494,8 @@ unsafe extern "system" fn src_query_continue(
 }
 
 unsafe extern "system" fn src_give_feedback(_this: *mut c_void, _effect: u32) -> HRESULT {
+    #[cfg(test)]
+    TEST_DRAG_READY.store(true, Ordering::Relaxed);
     DRAGDROP_S_USEDEFAULTCURSORS
 }
 
@@ -493,17 +511,30 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 
 /// 受信済みファイル群で OLE ドラッグを開始する(別スレッド。呼び出し元の
 /// 受信ループは DoDragDrop のモーダルループの影響を受けない)。
-/// ドロップ先が受けられなかった場合はクリップボード掲載へフォールバックし
-/// Ctrl+V の従来体験で救済する
+/// 入力を捕捉できるウィンドウを同じSTAに用意する。背景のSTAから
+/// DoDragDropだけを呼ぶと、他アプリ上のMouseUpを受け取れず終了しない。
 pub fn start(paths: Vec<String>) {
     std::thread::spawn(move || unsafe {
         // ドラッグ&ドロップは STA 必須(既に初期化済みなら S_FALSE が返る=成功扱い)
         let hr_init = OleInitialize(std::ptr::null());
         if hr_init != S_OK && hr_init != S_FALSE {
-            println!("[drag] OleInitialize 失敗(0x{hr_init:08x}) → クリップボードへフォールバック");
+            println!("[drag] OleInitialize 失敗(0x{hr_init:08x})");
             fallback(&paths);
             return;
         }
+        if host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed) {
+            OleUninitialize();
+            return;
+        }
+        let Some(host) = host::Host::create() else {
+            fallback(&paths);
+            OleUninitialize();
+            return;
+        };
+        DRAG_THREAD.store(
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            Ordering::Relaxed,
+        );
         let ds = Box::into_raw(Box::new(DataSource {
             vtbl: &DATA_VTBL,
             paths: paths.clone(),
@@ -513,24 +544,294 @@ pub fn start(paths: Vec<String>) {
             vtbl: &SRC_VTBL,
             refs: AtomicU32::new(1),
         })) as *mut c_void;
-        println!("[drag] DoDragDrop 開始({} 件、ボタンを離した位置へドロップ)", paths.len());
+        println!(
+            "[drag] DoDragDrop 開始({} 件、ボタンを離した位置へドロップ)",
+            paths.len()
+        );
         let mut effect: u32 = DROPEFFECT_NONE;
         let hr = DoDragDrop(ds, src, DROPEFFECT_COPY, &mut effect);
+        DRAG_THREAD.store(0, Ordering::Relaxed);
         ds_release(ds); // 我々の保持分(DoDragDrop 内部の参照は既に解放済み)
         src_release(src);
+        drop(host);
         if effect == DROPEFFECT_COPY {
             println!("[drag] ドロップ完了(コピー。元は Downloads\\Tsunagu に残ります)");
+        } else if hr == DRAGDROP_S_CANCEL {
+            println!("[drag] ドロップを取り消しました");
         } else {
-            println!("[drag] ドロップ不成立(hr=0x{hr:08x}) → クリップボードへフォールバック");
+            println!("[drag] ドロップ不成立(hr=0x{hr:08x})");
             fallback(&paths);
         }
         OleUninitialize();
     });
 }
 
-fn fallback(paths: &[String]) {
-    if crate::clipboard_write_files(paths) {
-        println!("[drag] フォールバック: クリップボードへ載せました(Ctrl+V で貼り付け可)");
-        crate::tray::notify("tsunagu", "ドロップ先が受けられませんでした。Ctrl+V で貼り付けられます");
+fn fallback(_paths: &[String]) {
+    println!("[drag] 受信ファイルは Downloads\\Tsunagu に保持しています");
+    #[cfg(not(test))]
+    crate::tray::notify("Tsunagu", "ドロップを開始・完了できませんでした。受信ファイルはDownloads\\Tsunaguに保存されています。掴んだまま境界を越えて、相手の画面上で離すとその場に置けます");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Com::DVASPECT_CONTENT;
+
+    #[link(name = "uuid", kind = "static")]
+    unsafe extern "system" {
+        #[link_name = "IID_IDropSource"]
+        static SDK_IDROP_SOURCE: Guid;
+        #[link_name = "IID_IShellItem"]
+        static SDK_ISHELL_ITEM: Guid;
+        #[link_name = "IID_IDropTarget"]
+        static SDK_IDROP_TARGET: Guid;
+        #[link_name = "BHID_SFUIObject"]
+        static SDK_SHELL_UI_OBJECT: Guid;
+    }
+
+    #[test]
+    fn shell_can_enumerate_file_contents() {
+        unsafe {
+            let mut enumerator = std::ptr::null_mut();
+            assert_eq!(
+                ds_enum_format_etc(std::ptr::null_mut(), DATADIR_GET, &mut enumerator),
+                S_OK
+            );
+            let mut format: FormatEtc = std::mem::zeroed();
+            let mut fetched = 0;
+            let result = ef_next(enumerator, 1, &mut format, &mut fetched);
+            ef_release(enumerator);
+            assert_eq!(result, S_OK);
+            assert_eq!(fetched, 1);
+            assert_eq!(format.cf_format, CF_HDROP);
+            assert_eq!(
+                format.dw_aspect, DVASPECT_CONTENT,
+                "Shellへファイル本体を提供する"
+            );
+            assert_eq!(format.lindex, -1);
+            assert_eq!(ds_query_get_data(std::ptr::null_mut(), &format), S_OK);
+        }
+    }
+
+    #[test]
+    fn ole_can_query_the_standard_drop_source_interface() {
+        unsafe {
+            let source = Box::into_raw(Box::new(DropSource {
+                vtbl: &SRC_VTBL,
+                refs: AtomicU32::new(1),
+            })) as *mut c_void;
+            let mut queried = std::ptr::null_mut();
+            let result = src_qi(source, &SDK_IDROP_SOURCE, &mut queried);
+            if !queried.is_null() {
+                src_release(queried);
+            }
+            src_release(source);
+            assert_eq!(result, S_OK, "OLEの標準インターフェース要求を拒否しない");
+            assert_eq!(queried, source);
+        }
+    }
+
+    #[test]
+    fn shell_can_read_the_received_unicode_file_paths() {
+        use windows_sys::Win32::Foundation::GlobalFree;
+        use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        let paths = vec![
+            String::from(r"C:\Tsunagu test\資料.txt"),
+            String::from(r"C:\Tsunagu test\second.txt"),
+        ];
+        unsafe {
+            let source = Box::into_raw(Box::new(DataSource {
+                vtbl: &DATA_VTBL,
+                paths: paths.clone(),
+                refs: AtomicU32::new(1),
+            })) as *mut c_void;
+            let format = FormatEtc {
+                cf_format: CF_HDROP,
+                ptd: std::ptr::null_mut(),
+                dw_aspect: DVASPECT_CONTENT,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL,
+            };
+            let mut medium: StgMedium = std::mem::zeroed();
+            let result = ds_get_data(source, &format, &mut medium);
+            ds_release(source);
+            assert_eq!(result, S_OK);
+            let raw = GlobalLock(medium.h_global) as *const u32;
+            assert!(!raw.is_null());
+            let offset = *raw as usize;
+            let wide = *raw.add(4);
+            let expected: Vec<u16> = paths
+                .iter()
+                .flat_map(|p| p.encode_utf16().chain([0]))
+                .chain([0])
+                .collect();
+            let actual = std::slice::from_raw_parts(
+                (raw as *const u8).add(offset) as *const u16,
+                expected.len(),
+            )
+            .to_vec();
+            GlobalUnlock(medium.h_global);
+            GlobalFree(medium.h_global);
+            assert_eq!(medium.tymed, TYMED_HGLOBAL);
+            assert!(medium.p_unk_for_release.is_null());
+            assert_eq!(wide, 1);
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn windows_shell_accepts_and_copies_the_data_object() {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn SHCreateItemFromParsingName(
+                name: *const u16,
+                context: *mut c_void,
+                iid: *const Guid,
+                out: *mut *mut c_void,
+            ) -> HRESULT;
+        }
+        #[repr(C)]
+        struct UnknownVtbl {
+            qi: QiFn,
+            add_ref: AddRefFn,
+            release: ReleaseFn,
+        }
+        #[repr(C)]
+        struct ShellItemVtbl {
+            unknown: UnknownVtbl,
+            bind: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                *const Guid,
+                *const Guid,
+                *mut *mut c_void,
+            ) -> HRESULT,
+        }
+        #[repr(C)]
+        struct DropTargetVtbl {
+            unknown: UnknownVtbl,
+            enter: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                windows_sys::Win32::Foundation::POINTL,
+                *mut u32,
+            ) -> HRESULT,
+            over: unsafe extern "system" fn(
+                *mut c_void,
+                u32,
+                windows_sys::Win32::Foundation::POINTL,
+                *mut u32,
+            ) -> HRESULT,
+            leave: unsafe extern "system" fn(*mut c_void) -> HRESULT,
+            drop: unsafe extern "system" fn(
+                *mut c_void,
+                *mut c_void,
+                u32,
+                windows_sys::Win32::Foundation::POINTL,
+                *mut u32,
+            ) -> HRESULT,
+        }
+        struct ComPtr(*mut c_void);
+        impl Drop for ComPtr {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe {
+                        let vtbl = *(self.0 as *const *const UnknownVtbl);
+                        ((*vtbl).release)(self.0);
+                    }
+                }
+            }
+        }
+        struct Ole;
+        impl Drop for Ole {
+            fn drop(&mut self) {
+                unsafe {
+                    OleUninitialize();
+                }
+            }
+        }
+        struct Temp(std::path::PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        unsafe {
+            assert!(OleInitialize(std::ptr::null()) >= 0);
+            let _ole = Ole;
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let temp = Temp(
+                std::env::temp_dir()
+                    .join(format!("tsunagu-shell-drop-{}-{stamp}", std::process::id())),
+            );
+            let dest = temp.0.join("destination");
+            std::fs::create_dir_all(&dest).unwrap();
+            let source_path = temp.0.join("越境テスト.txt");
+            let contents = b"Tsunagu native Shell drop test\n";
+            std::fs::write(&source_path, contents).unwrap();
+            let dest_w: Vec<u16> = dest
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let mut item = ComPtr(std::ptr::null_mut());
+            assert_eq!(
+                SHCreateItemFromParsingName(
+                    dest_w.as_ptr(),
+                    std::ptr::null_mut(),
+                    &SDK_ISHELL_ITEM,
+                    &mut item.0
+                ),
+                S_OK
+            );
+            let shell = *(item.0 as *const *const ShellItemVtbl);
+            let mut target = ComPtr(std::ptr::null_mut());
+            assert_eq!(
+                ((*shell).bind)(
+                    item.0,
+                    std::ptr::null_mut(),
+                    &SDK_SHELL_UI_OBJECT,
+                    &SDK_IDROP_TARGET,
+                    &mut target.0
+                ),
+                S_OK
+            );
+            let data = ComPtr(Box::into_raw(Box::new(DataSource {
+                vtbl: &DATA_VTBL,
+                paths: vec![source_path.to_string_lossy().into_owned()],
+                refs: AtomicU32::new(1),
+            })) as *mut c_void);
+            let drop_target = *(target.0 as *const *const DropTargetVtbl);
+            let point = windows_sys::Win32::Foundation::POINTL { x: 0, y: 0 };
+            let mut effect = DROPEFFECT_COPY;
+            assert_eq!(
+                ((*drop_target).enter)(target.0, data.0, MK_LBUTTON, point, &mut effect),
+                S_OK
+            );
+            assert_eq!(
+                effect, DROPEFFECT_COPY,
+                "実際のShellフォルダがコピーを受け入れる"
+            );
+            assert_eq!(
+                ((*drop_target).drop)(target.0, data.0, 0, point, &mut effect),
+                S_OK
+            );
+            assert_eq!(effect, DROPEFFECT_COPY);
+            assert_eq!(
+                std::fs::read(dest.join("越境テスト.txt")).unwrap(),
+                contents
+            );
+            assert_eq!(
+                std::fs::read(source_path).unwrap(),
+                contents,
+                "原本を保持する"
+            );
+        }
     }
 }

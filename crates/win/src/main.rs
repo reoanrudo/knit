@@ -9,23 +9,22 @@ mod audio;
 mod dragdrop;
 mod tray;
 
-use tsunagu_common::{bulk, secure};
 use tsunagu_common::keymap::mac_kc_to_win_vk;
+use tsunagu_common::{bulk, secure};
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-use tsunagu_common::proto::{compatible, decode, encode, Msg, PORT, VERSION};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tsunagu_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
 
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_CONTROL, VK_MENU,
-    VK_SHIFT, VK_LWIN,
+    SendInput, INPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetForegroundWindow, GetSystemMetrics, SendMessageW, SetCursorPos, SM_CXSCREEN,
@@ -38,7 +37,11 @@ const MOUSEEVENTF_MOVE: u32 = 0x0001;
 // ---------- Win32 直宣言(desktop 接続) ----------
 #[link(name = "user32")]
 unsafe extern "system" {
-    fn OpenInputDesktop(dwFlags: u32, fInherit: bool, dwDesiredAccess: u32) -> *mut core::ffi::c_void;
+    fn OpenInputDesktop(
+        dwFlags: u32,
+        fInherit: bool,
+        dwDesiredAccess: u32,
+    ) -> *mut core::ffi::c_void;
     fn SetThreadDesktop(hdesktop: *mut core::ffi::c_void) -> i32;
     fn CloseDesktop(hdesktop: *mut core::ffi::c_void) -> i32;
     // クリップボード
@@ -126,9 +129,23 @@ fn ime_set_open_impl(open: bool, allow_toggle_fallback: bool) {
                 println!("[ime] WM_IME_CONTROL open={open} -> sent");
                 return;
             }
-            println!("[ime] default IME wnd=null -> {}", if allow_toggle_fallback { "fallback" } else { "skip" });
+            println!(
+                "[ime] default IME wnd=null -> {}",
+                if allow_toggle_fallback {
+                    "fallback"
+                } else {
+                    "skip"
+                }
+            );
         } else {
-            println!("[ime] no foreground window -> {}", if allow_toggle_fallback { "fallback" } else { "skip" });
+            println!(
+                "[ime] no foreground window -> {}",
+                if allow_toggle_fallback {
+                    "fallback"
+                } else {
+                    "skip"
+                }
+            );
         }
         if !allow_toggle_fallback {
             return;
@@ -177,7 +194,9 @@ pub(crate) const MAIN_SHUTDOWN: &str = "\u{0}MAIN-SHUTDOWN";
 /// ログへ出してよい形へ整える(ピアが自由に送れる文字列の制御文字を置換。
 /// ターミナルエスケープによる表示偽装=ログインジェクション防止)
 fn log_safe(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+    s.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// 「Mac へ戻る」用の Return 行(高さは画面中央相当)
@@ -205,12 +224,232 @@ static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
 /// 最後に Mac と同期したクリップボードのシーケンス番号
 static LAST_SYNC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+// ---------- クリップボード履歴(Universal Clipboard History) ----------
+/// 送信・受信したテキストの履歴。トレイメニューから選んで復元できる。
+/// 機密判定(smartguard)と秘匿指定は送信側で弾くため、履歴へは届かない
+pub static HISTORY: std::sync::Mutex<tsunagu_common::history::History> =
+    std::sync::Mutex::new(tsunagu_common::history::History::new(50));
+/// 接続・切断通知の間引き(断続的な切替で連打しない。種別が変われば都度出す)
+static CONN_NOTIFY: std::sync::Mutex<Option<(bool, Instant)>> = std::sync::Mutex::new(None);
+
+/// 履歴の保存先(音声設定と同じユーザープロファイル。配布先の書込み権限に依存しない)
+pub fn history_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|root| std::path::PathBuf::from(root).join("Tsunagu/history.json"))
+}
+
+pub fn history_save() {
+    let Some(path) = history_path() else { return };
+    if let Ok(h) = HISTORY.lock() {
+        h.save_to(&path);
+    }
+}
+
+pub fn history_load() {
+    let Some(path) = history_path() else { return };
+    if let Ok(mut h) = HISTORY.lock() {
+        h.load_from(&path);
+    }
+}
+
+fn history_push(text: &str, device: &str) {
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_text(text, device, ts).is_some() {
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// ファイル群を履歴へ載せる(ビジョン§10 の File 分類)。送信・受信の
+/// すべてのファイル移動で呼ぶ
+fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_files(paths, device, ts).is_some() {
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// 画像履歴の本体を置くディレクトリ(履歴 JSON と同じ %LOCALAPPDATA%\Tsunagi\images)
+fn image_store_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|root| std::path::PathBuf::from(root).join("Tsunagu/images"))
+}
+
+/// images/ に残す実体の上限。履歴 cap(50)より少し余裕を持たせた件数
+const IMAGE_KEEP: usize = 60;
+
+/// 画像を履歴へ載せる(ビジョン§10 の Image 分類)。本体は CF_DIB の生バイトを
+/// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ残す
+fn history_push_image(dib: &[u8], device: &str) {
+    let Some(dir) = image_store_dir() else { return };
+    let name =
+        tsunagu_common::history::image_file_name(tsunagu_common::history::fnv1a64(dib), "dib");
+    let _ = std::fs::create_dir_all(&dir);
+    tsunagu_common::history::restrict_dir(&dir);
+    let path = dir.join(&name);
+    if !path.exists() {
+        if tsunagu_common::history::write_private(&path, dib).is_err() {
+            println!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
+            return;
+        }
+        tsunagu_common::history::prune_image_store(&dir, IMAGE_KEEP);
+    }
+    let ts = tsunagu_common::history::now_epoch_ms();
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.push_image(&name, dib.len(), device, ts).is_some() {
+            drop(h);
+            history_save();
+        }
+    }
+}
+
+/// 履歴の全消去(トレイメニュー)。保存ファイルも消して次回起動に残さない
+pub fn history_clear() {
+    if let Ok(mut h) = HISTORY.lock() {
+        h.clear();
+    }
+    if let Some(path) = history_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    println!("[clip] 履歴を消しました");
+}
+
+/// バイト数を通知・表示用に整形する(2048→"2 KB"、3_500_000→"3.3 MB")
+pub fn human_bytes(n: u64) -> String {
+    if n >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", n as f64 / (1024 * 1024 * 1024) as f64)
+    } else if n >= 1024 * 1024 {
+        format!("{:.1} MB", n as f64 / (1024 * 1024) as f64)
+    } else if n >= 1024 {
+        format!("{} KB", (n + 1023) / 1024)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// 接続・切断の通知(種別が同じものは 60 秒に 1 回に間引く)。
+/// 初回や状態が変わったときは必ず出る
+fn conn_notify(connected: bool, text: &str) {
+    let now = Instant::now();
+    let due = {
+        let mut g = CONN_NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = match *g {
+            Some((same_kind, at)) => {
+                same_kind != connected || now.duration_since(at) >= Duration::from_secs(60)
+            }
+            None => true,
+        };
+        if ok {
+            *g = Some((connected, now));
+        }
+        ok
+    };
+    if due {
+        tray::notify("Tsunagu", text);
+    }
+}
+
+/// トレイメニューからの履歴復元。クリップボードへ書き戻し、再送の
+/// エコー防止のため同期基準を進める。画像の履歴は images/ から CF_DIB の
+/// 本体を、ファイル参照の履歴(絶対パスの改行区切り)は CF_HDROP として
+/// 載せ直す(Explorer の Ctrl+C 相当)
+pub fn history_restore_by_id(id: u64) {
+    let Some(entry) = HISTORY.lock().ok().and_then(|h| h.get(id).cloned()) else {
+        return;
+    };
+    // 画像の履歴(ビジョン§10): images/ から CF_DIB の本体を読み戻す
+    if entry.kind == tsunagu_common::history::Kind::Image {
+        let Some((name, _)) = tsunagu_common::history::parse_image_entry(&entry.text) else {
+            return;
+        };
+        let dib = image_store_dir().and_then(|d| std::fs::read(d.join(&name)).ok());
+        let Some(dib) = dib else {
+            tray::notify(
+                "Tsunagu",
+                "履歴の画像が見つからないため復元できませんでした(削除済み)",
+            );
+            return;
+        };
+        if clipboard_write_dib(&dib) {
+            LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+            history_push_image(&dib, "Windows");
+            println!(
+                "[clip] 履歴({})から画像を Windows のクリップボードへ復元({}KB)",
+                entry.device,
+                dib.len() / 1024
+            );
+        } else {
+            tray::notify(
+                "Tsunagu",
+                "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
+            );
+        }
+        return;
+    }
+    if entry.kind == tsunagu_common::history::Kind::File
+        || tsunagu_common::history::looks_like_file_paths(&entry.text)
+    {
+        let paths: Vec<String> = entry
+            .text
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && std::path::Path::new(l).exists())
+            .collect();
+        if paths.is_empty() {
+            tray::notify(
+                "Tsunagu",
+                "履歴のファイルが見つからないため復元できませんでした(移動・削除済み)",
+            );
+            return;
+        }
+        if clipboard_write_files(&paths) {
+            LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+            let pb: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+            history_push_files(&pb, "Windows");
+            println!(
+                "[clip] 履歴({})からファイル {} 件を復元",
+                entry.device,
+                paths.len()
+            );
+        } else {
+            tray::notify(
+                "Tsunagu",
+                "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
+            );
+        }
+        return;
+    }
+    if clipboard_write_text(&entry.text) {
+        LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+        history_push(&entry.text, "Windows");
+        println!(
+            "[clip] 履歴({})を Windows のクリップボードへ復元({} bytes)",
+            entry.device,
+            entry.text.len()
+        );
+    } else {
+        tray::notify(
+            "Tsunagu",
+            "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
+        );
+    }
+}
+
 /// smartguard の通知間引き(誤検知の連打防止。60 秒に 1 回)
 static SMART_SECRET_NOTIFY: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 fn smart_secret_notify() {
     let due = {
-        let mut g = SMART_SECRET_NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
-        let ok = g.map(|t| t.elapsed() >= Duration::from_secs(60)).unwrap_or(true);
+        let mut g = SMART_SECRET_NOTIFY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ok = g
+            .map(|t| t.elapsed() >= Duration::from_secs(60))
+            .unwrap_or(true);
         if ok {
             *g = Some(Instant::now());
         }
@@ -219,7 +458,7 @@ fn smart_secret_notify() {
     if due {
         tray::notify(
             "tsunagu",
-            "クリップボードに機密の可能性があるため Mac へは送りませんでした(TSUNAGU_SMART_SECRET=0 で無効化)",
+            "クリップボードに機密の可能性があるため Mac へは送りませんでした(履歴にも載りません。TSUNAGU_SMART_SECRET=0 で無効化)",
         );
     }
 }
@@ -234,16 +473,20 @@ fn clipboard_seq() -> u32 {
 fn clipboard_is_excluded() -> bool {
     static FMTS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
     let fmts = FMTS.get_or_init(|| {
-        ["ExcludeClipboardContentFromMonitorProcessing", "Clipboard Viewer Ignore"]
-            .iter()
-            .filter_map(|n| {
-                let w: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
-                let fmt = unsafe { RegisterClipboardFormatW(w.as_ptr()) };
-                (fmt != 0).then_some(fmt)
-            })
-            .collect()
+        [
+            "ExcludeClipboardContentFromMonitorProcessing",
+            "Clipboard Viewer Ignore",
+        ]
+        .iter()
+        .filter_map(|n| {
+            let w: Vec<u16> = n.encode_utf16().chain(std::iter::once(0)).collect();
+            let fmt = unsafe { RegisterClipboardFormatW(w.as_ptr()) };
+            (fmt != 0).then_some(fmt)
+        })
+        .collect()
     });
-    fmts.iter().any(|&f| unsafe { IsClipboardFormatAvailable(f) } != 0)
+    fmts.iter()
+        .any(|&f| unsafe { IsClipboardFormatAvailable(f) } != 0)
 }
 
 /// Mac へ制御が戻る時に Windows のクリップボードを渡す(Deskflow と同じ「画面を
@@ -258,7 +501,9 @@ fn sync_clipboard_to_mac() {
     if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq {
         return;
     }
-    let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return };
+    let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+        return;
+    };
     std::thread::spawn(move || {
         if clipboard_is_excluded() {
             println!("[clip] 秘匿指定のコピー(パスワード等)のため送りません");
@@ -278,6 +523,7 @@ fn sync_clipboard_to_mac() {
                     return;
                 }
                 println!("[clip] win->mac {} bytes", text.len());
+                history_push(&text, "Windows");
                 let _ = tx.send(encode(&Msg::Clip { text }));
             }
             return;
@@ -285,7 +531,10 @@ fn sync_clipboard_to_mac() {
         if let Some(dib) = clipboard_read_dib() {
             if dib.len() <= bulk::MAX_IMAGE {
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
-                    Ok(()) => println!("[clip] win->mac image {}KB", dib.len() / 1024),
+                    Ok(()) => {
+                        println!("[clip] win->mac image {}KB", dib.len() / 1024);
+                        history_push_image(&dib, "Windows");
+                    }
                     Err(e) => println!("[clip] win->mac image 送信失敗: {e}"),
                 }
             }
@@ -524,35 +773,53 @@ fn send_files_to_mac(paths: &[String]) {
     let total = bulk::total_size(&paths);
     // 空ファイルのみの選択(total=0)は正当な送信のため、件数 0 だけを拒否する
     if paths.is_empty() || total > bulk::MAX_TOTAL {
-        println!("[file] win->mac skip(件数 {} / 合計 {total} bytes)", paths.len());
+        println!(
+            "[file] win->mac skip(件数 {} / 合計 {total} bytes)",
+            paths.len()
+        );
+        tray::notify(
+            "tsunagu",
+            &format!(
+                "ファイルを送信できません(合計 {}MiB。1回の上限 {})",
+                total / 1024 / 1024,
+                bulk::file_limit_label()
+            ),
+        );
         return;
     }
     // 進捗は 10% 刻みでログへ(巨大転送中に固まって見えるのを防ぐ)。
     // クロージャは send で消費されるため、再試行側にも同じ形を書く
     macro_rules! send_with_progress {
-        () => { BULK_LINK.send(|w| {
-            let mut last_step = 0u64;
-            bulk::send_files_with_progress(w, &paths, false, |sent, total| {
-                if total > 0 {
-                    let step = sent * 10 / total.max(1);
-                    if step > last_step {
-                        last_step = step;
-                        println!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+        () => {
+            BULK_LINK.send(|w| {
+                let mut last_step = 0u64;
+                bulk::send_files_with_progress(w, &paths, false, |sent, total| {
+                    if total > 0 {
+                        let step = sent * 10 / total.max(1);
+                        if step > last_step {
+                            last_step = step;
+                            println!("[file] 転送 {}%({}/{})", step * 10, sent, total);
+                        }
                     }
-                }
+                })
             })
-        }) };
+        };
     }
     // 未接続(NotConnected)は本線再接続直後の bulk 張り直しの窓で起きるため、
     // 少し待って 1 回だけやり直す(呼び出し元はすべてバックグラウンドスレッド)
     let mut r = send_with_progress!();
-    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected) {
+    if r.as_ref()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+    {
         println!("[file] bulk 経路の再接続を待って再試行します");
         std::thread::sleep(Duration::from_millis(2500));
         r = send_with_progress!();
     }
     match r {
-        Ok(n) => println!("[file] win->mac {n} 件送信完了"),
+        Ok(n) => {
+            println!("[file] win->mac {n} 件送信完了");
+            history_push_files(&paths, "Windows");
+        }
         Err(e) => println!("[file] win->mac 送信失敗: {e}"),
     }
 }
@@ -565,7 +832,11 @@ fn clipboard_write_dib(dib: &[u8]) -> bool {
         }
         EmptyClipboard();
         let h = GlobalAlloc(GMEM_MOVEABLE, dib.len());
-        let p = if h.is_null() { std::ptr::null_mut() } else { GlobalLock(h) as *mut u8 };
+        let p = if h.is_null() {
+            std::ptr::null_mut()
+        } else {
+            GlobalLock(h) as *mut u8
+        };
         if p.is_null() {
             if !h.is_null() {
                 GlobalFree(h);
@@ -592,8 +863,11 @@ static BULK: std::sync::OnceLock<bulk::Endpoint> = std::sync::OnceLock::new();
 /// 大容量経路の受信完了(Mac からのファイル・画像)
 fn win_on_bulk(e: bulk::Event) {
     match e {
-        bulk::Event::Files { paths, drop } => {
-            let files: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        bulk::Event::Files { paths, drop, .. } => {
+            let files: Vec<String> = paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
             let n = files.len();
             FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
             // 自分が渡す CF_HDROP を Mac へ送り返さない
@@ -608,8 +882,20 @@ fn win_on_bulk(e: bulk::Event) {
             }
             if clipboard_write_files(&files) {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+                history_push_files(&paths, "Mac");
                 println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                tray::notify("tsunagu", &format!("ファイルを受信: {n} 件(Ctrl+V で貼り付け可)"));
+                let dir = std::env::var_os("USERPROFILE")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join("Downloads")
+                    .join("Tsunagu");
+                tray::notify(
+                    "Tsunagu",
+                    &format!(
+                        "ファイルを受信: {n} 件(Ctrl+V で貼り付け可)。実体は {}",
+                        dir.display()
+                    ),
+                );
             }
         }
         bulk::Event::Image(dib) => {
@@ -619,8 +905,13 @@ fn win_on_bulk(e: bulk::Event) {
             let ok = clipboard_write_dib(&dib);
             if ok {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
+                history_push_image(&dib, "Mac");
             }
-            println!("[clip] mac->win image {}KB {}", dib.len() / 1024, if ok { "ok" } else { "FAILED" });
+            println!(
+                "[clip] mac->win image {}KB {}",
+                dib.len() / 1024,
+                if ok { "ok" } else { "FAILED" }
+            );
         }
     }
 }
@@ -636,7 +927,10 @@ struct InputBuf {
 }
 
 fn send_input_buf(buf: InputBuf) -> bool {
-    assert_eq!(std::mem::size_of::<InputBuf>(), std::mem::size_of::<INPUT>());
+    assert_eq!(
+        std::mem::size_of::<InputBuf>(),
+        std::mem::size_of::<INPUT>()
+    );
     unsafe {
         SendInput(
             1,
@@ -649,7 +943,10 @@ fn send_input_buf(buf: InputBuf) -> bool {
 /// 拡張キー(E0 プレフィクス付き scan)の VK。scan code を併記して注入するため、
 /// この区別を付けないと矢印キー等がテンキーの 4/6/8/2 と同じ scan で届く
 fn is_extended_vk(vk: u16) -> bool {
-    matches!(vk, 0x21..=0x28 | 0x2D | 0x2E | 0x6F | 0x5B | 0x5C | 0xA3 | 0xA5)
+    matches!(
+        vk,
+        0x21..=0x28 | 0x2D | 0x2E | 0x6F | 0x5B | 0x5C | 0xA3 | 0xA5
+    )
 }
 
 fn inject_key(vk: u16, up: bool) -> bool {
@@ -662,7 +959,9 @@ fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
     extern "system" {
         fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
     }
-    let scan = unsafe { MapVirtualKeyW(vk as u32, 0 /*MAPVK_VK_TO_VSC*/) } as u32;
+    let scan = unsafe {
+        MapVirtualKeyW(vk as u32, 0 /*MAPVK_VK_TO_VSC*/)
+    } as u32;
     // KEYBDINPUT の共用体先頭 u32 は「低16bit=wVk / 高16bit=wScan」
     let vk_scan = ((scan & 0xFFFF) << 16) | (vk as u32 & 0xFFFF);
     send_input_buf(InputBuf {
@@ -670,7 +969,12 @@ fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
         _pad: 0,
         body: [
             vk_scan,
-            (if up { KEYEVENTF_KEYUP } else { 0 }) | if extended { 0x0001 /*EXTENDEDKEY*/ } else { 0 },
+            (if up { KEYEVENTF_KEYUP } else { 0 })
+                | if extended {
+                    0x0001 /*EXTENDEDKEY*/
+                } else {
+                    0
+                },
             0,
             0,
             0,
@@ -682,6 +986,89 @@ fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
 
 /// 既定ブラウザで URL を開く(Continue Here)。ShellExecuteW の "open" 動詞は
 /// 拡張子/スキームの関連付けに従うため、ブラウザ選びは OS の既定に任せる
+/// Search My Desk の横断化(ビジョン§14): Windows 側のアプリ候補。
+/// AppsReply を返したときの列挙を保持し、RunApp はこのパスと完全一致だけ許す
+pub static WIN_APPS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// スタートメニューのショートカット(.lnk)を(表示名, パス)で列挙する。
+/// アンインストーラー等は除外し、上限 200 件(名前順・重複名は除去)
+pub fn list_win_apps() -> Vec<(String, String)> {
+    let mut roots = Vec::new();
+    if let Some(pd) = std::env::var_os("ProgramData") {
+        roots.push(std::path::PathBuf::from(pd).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    if let Some(ad) = std::env::var_os("APPDATA") {
+        roots.push(std::path::PathBuf::from(ad).join(r"Microsoft\Windows\Start Menu\Programs"));
+    }
+    let mut out = Vec::new();
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .map(|x| x.eq_ignore_ascii_case("lnk"))
+                    .unwrap_or(false)
+                {
+                    let name = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !name.is_empty() && !name.to_lowercase().contains("uninstall") {
+                        out.push((name, p.to_string_lossy().into_owned()));
+                    }
+                }
+                if out.len() >= 200 {
+                    break;
+                }
+            }
+            if out.len() >= 200 {
+                break;
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+    out
+}
+
+/// パス(.lnk/.exe 等)をシェルの既定動作で起動する
+pub fn launch_path(path: &str) -> bool {
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut core::ffi::c_void,
+            verb: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    let file: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let verb: Vec<u16> = "open\0".encode_utf16().collect();
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        ) > 32
+    }
+}
+
 fn open_default_browser(url: &str) -> bool {
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -696,7 +1083,16 @@ fn open_default_browser(url: &str) -> bool {
     }
     let verb: Vec<u16> = "open\0".encode_utf16().collect();
     let file: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
-    unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), std::ptr::null(), 1) > 32 }
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        ) > 32
+    }
 }
 
 fn inject_mouse_move_rel(dx: i32, dy: i32) -> bool {
@@ -718,7 +1114,14 @@ fn inject_mouse_move_abs(x: i32, y: i32) -> bool {
     send_input_buf(InputBuf {
         itype: INPUT_MOUSE,
         _pad: 0,
-        body: [x as u32, y as u32, 0, MOUSEEVENTF_MOVE | ABSOLUTE | VIRTUALDESK, 0, 0],
+        body: [
+            x as u32,
+            y as u32,
+            0,
+            MOUSEEVENTF_MOVE | ABSOLUTE | VIRTUALDESK,
+            0,
+            0,
+        ],
         extra: 0,
     })
 }
@@ -757,6 +1160,43 @@ fn inject_xbutton(idx: u8, down: bool) -> bool {
         body: [0, 0, (idx + 1) as u32, if down { XDOWN } else { XUP }, 0, 0],
         extra: 0,
     })
+}
+
+/// Mac 由来の共有マウス移動を注入し、進行中の OLE ドラッグ(掴み越境)へも中継する。
+/// SendInput の共有入力は OLE のモーダルループに届かないため、こちらで拾わせる
+pub(crate) fn remote_mouse_move_rel(dx: i32, dy: i32) -> bool {
+    let ok = inject_mouse_move_rel(dx, dy);
+    dragdrop::relay_move();
+    ok
+}
+
+/// Mac 由来の共有マウス移動(絶対位置)を注入し、進行中の OLE ドラッグへも中継する
+pub(crate) fn remote_mouse_move_abs(x: i32, y: i32) -> bool {
+    let ok = inject_mouse_move_abs(x, y);
+    dragdrop::relay_move();
+    ok
+}
+
+/// Mac 由来の共有マウスボタンを注入する。左ボタンの解放は進行中の OLE ドラッグ
+/// (掴み越境)へ中継してドロップさせる
+pub(crate) fn remote_mouse_button(btn: u8, down: bool) {
+    if down {
+        dragdrop::edge::CONTROLLED.store(true, Ordering::Relaxed);
+    }
+    if btn >= 3 {
+        // XButton1/2(トラックパッドの戻る/進むスワイプ)。押下状態を追跡して
+        // 離脱時の up 注入に含める(スワイプ中の切断で押しっぱなし残留を防ぐ)
+        if (btn as usize) < 5 {
+            XBTN_W[btn as usize - 3].store(down, Ordering::Relaxed);
+        }
+        inject_xbutton(btn - 3, down);
+    } else {
+        BTN_W[btn as usize].store(down, Ordering::Relaxed);
+        inject_mouse_btn(btn, down);
+        if btn == 0 && !down {
+            dragdrop::relay_up();
+        }
+    }
 }
 
 fn inject_scroll(dx: f64, dy: f64) -> bool {
@@ -800,7 +1240,12 @@ unsafe extern "system" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
-    fn QueryFullProcessImageNameW(h: *mut core::ffi::c_void, flags: u32, buf: *mut u16, size: *mut u32) -> i32;
+    fn QueryFullProcessImageNameW(
+        h: *mut core::ffi::c_void,
+        flags: u32,
+        buf: *mut u16,
+        size: *mut u32,
+    ) -> i32;
 }
 #[repr(C)]
 #[derive(Default, Clone, Copy, PartialEq)]
@@ -830,7 +1275,10 @@ fn ctrl_apps() -> &'static Vec<String> {
              alacritty.exe,wezterm-gui.exe,putty.exe,kitty.exe,tabby.exe,hyper.exe"
                 .into()
         });
-        list.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()).collect()
+        list.split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
     })
 }
 
@@ -866,7 +1314,11 @@ fn terminal_profile() -> bool {
         let exe = foreground_exe(hwnd);
         let on = exe.as_ref().is_some_and(|e| ctrl_apps().contains(e));
         if on != c.1 {
-            println!("[keys] 前面 {:?}: Control → {}", exe.as_deref().unwrap_or("?"), if on { "Ctrl" } else { "Win" });
+            println!(
+                "[keys] 前面 {:?}: Control → {}",
+                exe.as_deref().unwrap_or("?"),
+                if on { "Ctrl" } else { "Win" }
+            );
         }
         *c = (hwnd as usize, on);
     }
@@ -881,12 +1333,24 @@ fn game_like() -> bool {
         let (vx, vy, vw, vh) = vscreen();
         let mut clip = RectL::default();
         let clipped = GetClipCursor(&mut clip) != 0
-            && clip != RectL { l: vx, t: vy, r: vx + vw, b: vy + vh }
+            && clip
+                != RectL {
+                    l: vx,
+                    t: vy,
+                    r: vx + vw,
+                    b: vy + vh,
+                }
             && (clip.r - clip.l) < vw;
         if clipped {
             return true;
         }
-        let mut ci = CursorInfo { size: std::mem::size_of::<CursorInfo>() as u32, flags: 0, cursor: std::ptr::null_mut(), x: 0, y: 0 };
+        let mut ci = CursorInfo {
+            size: std::mem::size_of::<CursorInfo>() as u32,
+            flags: 0,
+            cursor: std::ptr::null_mut(),
+            x: 0,
+            y: 0,
+        };
         let hidden = GetCursorInfo(&mut ci) != 0 && ci.flags & 1 /*CURSOR_SHOWING*/ == 0;
         if !hidden {
             return false;
@@ -916,7 +1380,14 @@ struct ModState {
 }
 impl ModState {
     fn new() -> Self {
-        Self { ctrl: false, alt: false, win: false, shift: false, rcmd: false, pressed: Vec::new() }
+        Self {
+            ctrl: false,
+            alt: false,
+            win: false,
+            shift: false,
+            rcmd: false,
+            pressed: Vec::new(),
+        }
     }
     /// 通常キーの注入(押下状態を追跡する)
     fn key(&mut self, vk: u16, down: bool, extended: bool) -> bool {
@@ -955,7 +1426,11 @@ impl ModState {
             (VK_CONTROL, VK_MENU)
         };
         // ターミナル系アプリでは Mac の Control を Windows の Ctrl として送る
-        let ctrl_vk = if ctrl && terminal_profile() { VK_CONTROL } else { VK_LWIN };
+        let ctrl_vk = if ctrl && terminal_profile() {
+            VK_CONTROL
+        } else {
+            VK_LWIN
+        };
         let want = [
             (cmd_vk, cmd),
             (opt_vk, opt),
@@ -1025,7 +1500,9 @@ fn acquire_single_instance() -> bool {
         let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if windows_sys::Win32::Foundation::GetLastError() == 183 {
             // ERROR_ALREADY_EXISTS = 既に起動している(自動復帰タスクからの起動等)
-            if !h.is_null() { windows_sys::Win32::Foundation::CloseHandle(h); }
+            if !h.is_null() {
+                windows_sys::Win32::Foundation::CloseHandle(h);
+            }
             return false;
         }
         !h.is_null() // ミューテックスはプロセス終了まで保持(明示解放しない)
@@ -1107,11 +1584,24 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
     const SM_CXVIRTUALSCREEN: i32 = 78;
     const SM_CYVIRTUALSCREEN: i32 = 79;
     let v = unsafe {
-        let (w, h) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let (w, h) = (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        );
         if w > 0 && h > 0 {
-            (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), w, h)
+            (
+                GetSystemMetrics(SM_XVIRTUALSCREEN),
+                GetSystemMetrics(SM_YVIRTUALSCREEN),
+                w,
+                h,
+            )
         } else {
-            (0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN))
+            (
+                0,
+                0,
+                GetSystemMetrics(SM_CXSCREEN),
+                GetSystemMetrics(SM_CYSCREEN),
+            )
         }
     };
     *VSCREEN.lock().unwrap_or_else(|e| e.into_inner()) = v;
@@ -1120,12 +1610,15 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-023848-1e87106";
+const BUILD_ID: &str = "win-20260927-201527-68d4857";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
     if JUST_REGISTERED.swap(false, Ordering::Relaxed) {
-        tray::notify("接続を確認しました", "登録したMacへ、次回から自動で接続します。");
+        tray::notify(
+            "接続を確認しました",
+            "登録したMacへ、次回から自動で接続します。",
+        );
     }
 }
 fn main() {
@@ -1138,19 +1631,70 @@ fn main() {
         }
         return;
     }
-    if std::env::args().any(|a| a == "--preview-setup") { let _=tray::setup::first_run(true); return; }
-    if std::env::args().any(|a| a == "--preview-ui") { tray::preview(); return; }
+    if std::env::args().any(|a| a == "--preview-setup") {
+        let _ = tray::setup::first_run(true);
+        return;
+    }
+    if std::env::args().any(|a| a == "--preview-ui") {
+        tray::preview();
+        return;
+    }
+    if let Some(pos) = std::env::args().position(|a| a == "--probe-history-image") {
+        // トレイと同じ経路での履歴復元を実機検証する(画像を含む)。
+        // 対話セッションで実行しないとクリップボードへ書けないため
+        // schtasks 経由を想定。id 無しなら最近の履歴を一覧して終わる
+        let id: u64 = std::env::args()
+            .nth(pos + 1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        history_load();
+        if id == 0 {
+            println!("[probe] 使い方: --probe-history-image <id>");
+            if let Ok(h) = HISTORY.lock() {
+                for e in h.recent(5) {
+                    println!(
+                        "[probe] id={} kind={:?} device={} {}",
+                        e.id,
+                        e.kind,
+                        e.device,
+                        e.text.split('\t').next().unwrap_or("")
+                    );
+                }
+            }
+            return;
+        }
+        history_restore_by_id(id);
+        println!("[probe] 履歴 id={id} の復元を試みました(結果は直前の [clip] 行)");
+        return;
+    }
     ensure_stdout();
     // コンソール付き起動なら DETACHED な自分へ置き換わって終了(常駐性の根保証)
     detach_if_console();
-    let retry_setup=std::env::args().any(|a|a=="--retry-setup");
-    let mut acquired=acquire_single_instance();
+    let retry_setup = std::env::args().any(|a| a == "--retry-setup");
+    let mut acquired = acquire_single_instance();
     if !acquired && retry_setup {
-        for _ in 0..20 {std::thread::sleep(Duration::from_millis(100));acquired=acquire_single_instance();if acquired{break;}}
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(100));
+            acquired = acquire_single_instance();
+            if acquired {
+                break;
+            }
+        }
     }
-    if !acquired {return;}
+    if !acquired {
+        return;
+    }
 
     println!("[info] tsunagu-win {BUILD_ID}");
+    // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
+    let recv_dir = std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Downloads")
+        .join("Tsunagu");
+    let _ = std::fs::create_dir_all(&recv_dir);
+    history_load();
+    println!("[info] 操作ガイド: Mac から来るカーソルはそのまま操作できます。トレイ右クリックにクリップボード履歴があります");
     let args: Vec<String> = std::env::args().collect();
     // 対話デスクトップへ接続(SSH 起動では失敗する。schtasks/スタートアップ起動を使う)
     unsafe {
@@ -1168,17 +1712,31 @@ fn main() {
 
     // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
     // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
-    let token = if let Some(t)=tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32){t}else if tsunagu_common::envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
+    let token = if let Some(t) =
+        tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32)
+    {
+        t
+    } else if tsunagu_common::envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
         eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
         exit(1);
-    }else{
+    } else {
         match tsunagu_common::credentials::load() {
-            Ok(Some(t))=>t,
-            Ok(None) if args.iter().any(|a|a=="--background")=>return,
-            Ok(None)=>match tray::setup::first_run(false) {
-                Some(t)=>{JUST_REGISTERED.store(true, Ordering::Relaxed);t},None=>return,
+            Ok(Some(t)) => t,
+            Ok(None) if args.iter().any(|a| a == "--background") => return,
+            Ok(None) => match tray::setup::first_run(false) {
+                Some(t) => {
+                    JUST_REGISTERED.store(true, Ordering::Relaxed);
+                    t
+                }
+                None => return,
             },
-            Err(_)=>{if !args.iter().any(|a|a=="--background"){tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");}eprintln!("[setup] credential store unavailable");return;},
+            Err(_) => {
+                if !args.iter().any(|a| a == "--background") {
+                    tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");
+                }
+                eprintln!("[setup] credential store unavailable");
+                return;
+            }
         }
     };
     let port: u16 = args
@@ -1205,7 +1763,9 @@ fn main() {
     // 接続先の既定値(開発者の環境の固定 IP)は持たない。未指定なら LAN で自動発見する
     let host_label = host.clone().unwrap_or_else(|| "LAN から自動検出".into());
     println!("[info] connecting to {host_label}");
-    *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = host_label;
+    *crate::tray::HOST_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = host_label;
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
     // TSUNAGU_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
@@ -1220,16 +1780,22 @@ fn main() {
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
+    dragdrop::edge::start();
 
     // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
     // (サーバモードは TSUNAGU_AUDIO_HOST で明示指定した時のみ)
     if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
         // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
-        match (tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"), role_server) {
+        match (
+            tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"),
+            role_server,
+        ) {
             // 音声は本線ポートからの差分 +1(24900→24901)
             (Some(h), _) => audio::start(Some(h), token.clone(), port + 1),
             (None, false) => audio::start(None, token.clone(), port + 1),
-            (None, true) => println!("[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"),
+            (None, true) => println!(
+                "[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"
+            ),
         }
     }
 
@@ -1247,12 +1813,25 @@ fn main() {
 
     if role_server {
         println!("[info] server mode. screen {w}x{h}");
-        let bind = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind =
+            tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let ep = bulk_ep;
-        std::thread::spawn(move || bulk::serve(ep, &bind, port + bulk::PORT_OFFSET, tsunagu_common::net::is_allowed));
+        std::thread::spawn(move || {
+            bulk::serve(
+                ep,
+                &bind,
+                port + bulk::PORT_OFFSET,
+                tsunagu_common::net::is_allowed,
+            )
+        });
         let tk = token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = tsunagu_common::discover::respond("0.0.0.0", port + tsunagu_common::discover::PORT_OFFSET, &tk, tsunagu_common::net::is_allowed) {
+            if let Err(e) = tsunagu_common::discover::respond(
+                "0.0.0.0",
+                port + tsunagu_common::discover::PORT_OFFSET,
+                &tk,
+                tsunagu_common::net::is_allowed,
+            ) {
                 println!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
             }
         });
@@ -1274,6 +1853,8 @@ fn main() {
 /// 接続モード(既定): 相手(Mac)へ接続し続ける。切断は指数バックオフで再接続
 /// 本線がいま繋がっている Mac のアドレス(大容量経路・音声はここへ追従する)
 static PEER: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
+/// 接続相手の名前(hello で受け取る)。通知・ログへ出す
+pub static PEER_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
     *PEER.lock().unwrap_or_else(|e| e.into_inner())
@@ -1298,7 +1879,9 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
             Some((s, a)) => {
                 println!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
-                *crate::tray::HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
+                *crate::tray::HOST_NOW
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = a.ip().to_string();
                 // 起動一発目は LAN 発見が間に合わず Tailscale へ落ちることがある
                 //(発見は 600ms で諦めるため)。Tailscale 接続の間は 30 秒毎に LAN を
                 // 探し直し、見つかれば本線を張り直して次の再接続で LAN 直へ昇格する
@@ -1316,7 +1899,8 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
                         }
                         if let Some(ip) = tsunagu_common::discover::seek_first_lan(port, &tk) {
                             println!("[conn] LAN 直の相手を発見({ip})。経路昇格のため張り直します");
-                            if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                            if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+                            {
                                 let _ = tx.send(MAIN_SHUTDOWN.to_string());
                             }
                             return;
@@ -1342,7 +1926,8 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
 /// hello のトークン検証後に hello_ok(自画面 w/h 付き)を返す
 fn server_loop(token: &str, port: u16, w: i32, h: i32) {
     use std::io::Read;
-    let bind_ip = tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_ip =
+        tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -1351,6 +1936,8 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         }
     };
     println!("[info] listening on {bind_ip}:{port}");
+    // 認証に失敗し続ける接続の連打を鈍らせる(正規の接続が成功すれば即回復)
+    let mut throttle = secure::FailThrottle::new();
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(x) => x,
@@ -1364,6 +1951,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         // 接続元の制限(LAN・有線直結・Tailscale のみ)。認証は暗号化ハンドシェイクで行う
         if !tsunagu_common::net::is_allowed(peer.ip()) {
             println!("[conn] rejected: {peer} は許可範囲外です(TSUNAGU_ALLOW_ANY=1 で許可)");
+            std::thread::sleep(throttle.fail());
             continue;
         }
         stream.set_nodelay(true).ok();
@@ -1373,6 +1961,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             Ok(x) => x,
             Err(e) => {
                 println!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
         };
@@ -1382,49 +1971,81 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         match (&mut pre).take(8 * 1024 * 1024 + 1).read_line(&mut line) {
             Ok(0) | Err(_) => {
                 println!("[conn] closed before hello");
+                std::thread::sleep(throttle.fail());
                 continue;
             }
             Ok(_) => {}
         }
         if line.len() > 8 * 1024 * 1024 {
             println!("[conn] hello too large. dropped");
+            std::thread::sleep(throttle.fail());
             continue;
         }
         let ok = match decode(&line) {
             Some(Msg::Hello { ver, name, .. }) if compatible(ver) => {
-                println!("[hello] from {name}");
+                dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
+                // 表示名は制御文字・Bidi オーバーライドを除去してから載せる
+                *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
+                    let n = safe_peer_name(name.trim());
+                    if n.is_empty() {
+                        "Mac".into()
+                    } else {
+                        n
+                    }
+                };
+                println!("[hello] from {}", log_safe(&name));
                 true
             }
             _ => false,
         };
         if !ok {
             println!("[conn] invalid hello");
+            std::thread::sleep(throttle.fail());
             continue;
         }
         // hello_ok(相手=Mac が画面サイズを得られるよう自画面 w/h を含める)
         if wr
-            .write_all(encode(&Msg::HelloOk { name: "desktop".into(), w, h }).as_bytes())
+            .write_all(
+                encode(&Msg::HelloOk {
+                    name: "desktop".into(),
+                    w,
+                    h,
+                    ver: VERSION,
+                })
+                .as_bytes(),
+            )
             .and_then(|_| wr.flush())
             .is_err()
         {
+            std::thread::sleep(throttle.fail());
             continue;
         }
         *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(peer.ip());
         CONNECTED.store(true, Ordering::Relaxed);
+        throttle.success();
         registration_authenticated(token);
         println!("[conn] established");
-        tray::notify("tsunagu", "接続しました");
+        conn_notify(
+            true,
+            &format!(
+                "{} と接続しました",
+                PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default()
+            ),
+        );
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
         if let Err(e) = session(pre, wr) {
             println!("[disc] {e}");
         }
         CONNECTED.store(false, Ordering::Relaxed);
+        // 切断で進行中の掴み越境ドラッグを残さない(以降はタイマー保険も引き継ぐ)
+        dragdrop::relay_cancel();
+        dragdrop::edge::reset();
         RTT_MS.store(0, Ordering::Relaxed);
         *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
         BULK_LINK.clear();
         audio::speaker_disconnect();
         println!("[conn] lost. waiting for reconnect...");
-        tray::notify("tsunagu", "切断しました(待機中)");
+        conn_notify(false, "切断しました(自動で再接続します)");
     }
 }
 
@@ -1436,42 +2057,86 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     // 再接続ループへ戻れるように)。本体の受信タイムアウトは session で設定し直す
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let (r, mut writer) = secure::connect(stream, token, b"tsunagu-main").map_err(|e| {
-        std::io::Error::new(e.kind(), format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"))
+        std::io::Error::new(
+            e.kind(),
+            format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"),
+        )
     })?;
-    let hello = encode(&Msg::Hello { ver: VERSION, name: "desktop".into(), token: String::new(), w, h });
-    writer.write_all(hello.as_bytes()).and_then(|_| writer.flush())?;
+    let hello = encode(&Msg::Hello {
+        ver: VERSION,
+        name: "desktop".into(),
+        token: String::new(),
+        w,
+        h,
+    });
+    writer
+        .write_all(hello.as_bytes())
+        .and_then(|_| writer.flush())?;
     // hello_ok と後続(Cfg 等)を同じ受信器で読む。旧実装は hello_ok 用と本体用で
     // BufReader を別々に作り、直後に届いた Cfg を前者のバッファに取り残して失っていた
     let mut pre = BufReader::new(r);
     let mut line = String::new();
     pre.read_line(&mut line)?;
     match decode(line.trim()) {
-        Some(Msg::HelloOk { name, w: mw, h: mh }) => {
+        Some(Msg::HelloOk {
+            name,
+            w: mw,
+            h: mh,
+            ver,
+        }) => {
+            dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
+            *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
+                let n = safe_peer_name(name.trim());
+                if n.is_empty() {
+                    "Mac".into()
+                } else {
+                    n
+                }
+            };
             println!("[hello] ok from {} (mac screen {mw}x{mh})", log_safe(&name));
         }
-        _ => return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid hello_ok")),
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid hello_ok",
+            ))
+        }
     }
     CONNECTED.store(true, Ordering::Relaxed);
-        registration_authenticated(token);
-    tray::notify("tsunagu", "接続しました");
+    registration_authenticated(token);
+    conn_notify(
+        true,
+        &format!(
+            "{} と接続しました",
+            PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default()
+        ),
+    );
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(pre, writer);
     CONNECTED.store(false, Ordering::Relaxed);
+    // 切断で進行中の掴み越境ドラッグを残さない(以降はタイマー保険も引き継ぐ)
+    dragdrop::relay_cancel();
+    dragdrop::edge::reset();
     // 旧セッションの RTT が再接続直後に「前の接続の値」として表示されるのを防ぐ
     RTT_MS.store(0, Ordering::Relaxed);
     // 旧セッションの送信チャネルを外す(切断中にトレイ等が旧ソケットへ書き込むのを防ぐ)
     *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
     BULK_LINK.clear();
     audio::speaker_disconnect();
-    tray::notify("tsunagu", "切断しました(自動再接続中)");
+    conn_notify(false, "切断しました(自動で再接続します)");
     r
 }
 
 /// 認証済みストリームの本体処理(接続/待受 両モード共通)
-fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) -> std::io::Result<()> {
+fn session(
+    mut reader: BufReader<secure::Reader>,
+    mut writer: secure::Writer,
+) -> std::io::Result<()> {
     // 読み出しタイムアウト: Mac は 3 秒毎に ping を送るため 9 秒(3 回分)無音は経路断。
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
-    reader.get_ref().set_read_timeout(Some(Duration::from_secs(9)));
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(9)));
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
@@ -1484,7 +2149,11 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 writer.shutdown();
                 break;
             }
-            if writer.write_all(line.as_bytes()).and_then(|_| writer.flush()).is_err() {
+            if writer
+                .write_all(line.as_bytes())
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
                 writer.shutdown();
                 break;
             }
@@ -1535,7 +2204,14 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 };
                 if now != on {
                     on = now;
-                    println!("[game] ゲームモード -> {}", if on { "ON(相対移動)" } else { "OFF(絶対位置)" });
+                    println!(
+                        "[game] ゲームモード -> {}",
+                        if on {
+                            "ON(相対移動)"
+                        } else {
+                            "OFF(絶対位置)"
+                        }
+                    );
                     if tx.send(encode(&Msg::Rel { on })).is_err() {
                         break;
                     }
@@ -1557,7 +2233,10 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 if now != last {
                     println!("[screen] 仮想デスクトップ {:?} -> {:?}", last, now);
                     last = now;
-                    if tx.send(encode(&Msg::Screen { w: now.2, h: now.3 })).is_err() {
+                    if tx
+                        .send(encode(&Msg::Screen { w: now.2, h: now.3 }))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1590,19 +2269,39 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             None => continue,
         };
         match msg {
-            Msg::HelloOk { name, w: mw, h: mh } => {
-                println!("[hello] (重複) ok from {} (mac screen {mw}x{mh})", log_safe(&name));
+            Msg::DragAccept { id } => dragdrop::edge::accept(id),
+            Msg::DragReady { id } => dragdrop::edge::ready(id),
+            Msg::DragCancel { id } | Msg::DragDone { id, .. } => dragdrop::edge::cancel(id),
+            Msg::HelloOk {
+                name,
+                w: mw,
+                h: mh,
+                ver,
+            } => {
+                dragdrop::edge::PEER_VERSION.store(ver, Ordering::Relaxed);
+                println!(
+                    "[hello] (重複) ok from {} (mac screen {mw}x{mh})",
+                    log_safe(&name)
+                );
             }
             Msg::Ping { ts } => {
                 let _ = wtx.send(encode(&Msg::Pong { ts }));
             }
-            Msg::Cfg { cmd_alt, spk_mute, side, clip } => {
+            Msg::Cfg {
+                cmd_alt,
+                spk_mute,
+                side,
+                clip,
+            } => {
                 CMD_ALT.store(cmd_alt, Ordering::Relaxed);
                 CLIP_SHARE_W.store(clip, Ordering::Relaxed);
                 SIDE_W.store(side.min(7), Ordering::Relaxed);
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
                 if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
-                    println!("[cfg] 接続中スピーカーミュート -> {}", if spk_mute { "ON" } else { "OFF" });
+                    println!(
+                        "[cfg] 接続中スピーカーミュート -> {}",
+                        if spk_mute { "ON" } else { "OFF" }
+                    );
                     audio::speaker_set_mode(spk_mute, true);
                 }
             }
@@ -1647,7 +2346,16 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             Msg::Stat { rtt } => {
                 RTT_MS.store(rtt, Ordering::Relaxed);
             }
-            Msg::Key { kc, down, ctrl, opt, cmd, shift, tr, rcmd } => {
+            Msg::Key {
+                kc,
+                down,
+                ctrl,
+                opt,
+                cmd,
+                shift,
+                tr,
+                rcmd,
+            } => {
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
                     let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
@@ -1700,6 +2408,17 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                     ALT_TAB_ACTIVE.store(false, Ordering::Relaxed);
                     println!("[alttab] confirmed");
                 }
+                if kc == 49 && cmd && !opt && !ctrl && !tr {
+                    // ⌘Space(Spotlight) → Windows キー: スタート/検索が開く。
+                    // ⌘分の Ctrl を先に離さないと「Ctrl+Space(入力メソッド切替)」に
+                    // なってしまうため、Space 面では Ctrl を上げてからタップする
+                    if down {
+                        mods.apply(false, opt, false, shift, rcmd);
+                        inject_key(0x5B /*VK_LWIN*/, false);
+                        inject_key(0x5B, true);
+                    }
+                    continue; // up も握る(離下の瞬間に Ctrl+Space が成立するのを防ぐ)
+                }
                 if kc == 48 && cmd && !opt && !ctrl && !tr {
                     if down {
                         // cmd 分の Ctrl 押下を抑制してから Alt+Tab を合成
@@ -1737,7 +2456,7 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 if ix != 0.0 || iy != 0.0 {
                     accum.0 -= ix;
                     accum.1 -= iy;
-                    inject_mouse_move_rel(ix as i32, iy as i32);
+                    remote_mouse_move_rel(ix as i32, iy as i32);
                     // 実際にカーソルが動いたときだけ左端到達を判定する
                     maybe_notify_return(&wtx, &mut last_return_notify, &mut mods);
                 }
@@ -1745,24 +2464,14 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             Msg::MouseAbs { nx, ny } => {
                 let x = (nx.clamp(0.0, 1.0) * 65535.0).round() as i32;
                 let y = (ny.clamp(0.0, 1.0) * 65535.0).round() as i32;
-                inject_mouse_move_abs(x, y);
+                remote_mouse_move_abs(x, y);
                 if DEBUG_KEYS.load(Ordering::Relaxed) {
                     println!("[abs] -> ({x},{y})");
                 }
                 maybe_notify_return(&wtx, &mut last_return_notify, &mut mods);
             }
             Msg::MouseButton { btn, down } => {
-                if btn >= 3 {
-                    // XButton1/2(トラックパッドの戻る/進むスワイプ)。押下状態を追跡して
-                    // 離脱時の up 注入に含める(スワイプ中の切断で押しっぱなし残留を防ぐ)
-                    if (btn as usize) < 5 {
-                        XBTN_W[btn as usize - 3].store(down, Ordering::Relaxed);
-                    }
-                    inject_xbutton(btn - 3, down);
-                } else {
-                    BTN_W[btn as usize].store(down, Ordering::Relaxed);
-                    inject_mouse_btn(btn, down);
-                }
+                remote_mouse_button(btn, down);
             }
             Msg::Scroll { dx, dy } => {
                 inject_scroll(dx, dy);
@@ -1773,12 +2482,17 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 unsafe { LockWorkStation() };
             }
             Msg::Leave => {
+                dragdrop::edge::CONTROLLED.store(false, Ordering::Relaxed);
                 // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で
                 // コピーされた内容があれば Mac へ渡す
+                dragdrop::relay_cancel();
                 mods.release_everything();
-                sync_clipboard_to_mac();
+                if !dragdrop::edge::committed() {
+                    sync_clipboard_to_mac();
+                }
             }
             Msg::Warp { nx, ny } => {
+                dragdrop::edge::CONTROLLED.store(true, Ordering::Relaxed);
                 let (vx, vy, vw, vh) = vscreen();
                 let x = vx + (nx.clamp(0.0, 1.0) * vw as f64) as i32;
                 let y = vy + (ny.clamp(0.0, 1.0) * vh as f64) as i32;
@@ -1787,9 +2501,36 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             }
             Msg::Clip { text } => {
                 if text.len() > CLIP_MAX_CHARS {
+                    // 巨大コピーの連投で通知が洪水にならないよう 60 秒に間引く
+                    static BIG_CLIP_NOTIFY: std::sync::Mutex<Option<Instant>> =
+                        std::sync::Mutex::new(None);
+                    let now = Instant::now();
+                    let due = BIG_CLIP_NOTIFY
+                        .lock()
+                        .map(|mut g| {
+                            let ok = g
+                                .map(|t| now.duration_since(t) >= Duration::from_secs(60))
+                                .unwrap_or(true);
+                            if ok {
+                                *g = Some(now);
+                            }
+                            ok
+                        })
+                        .unwrap_or(false);
+                    if due {
+                        tray::notify("Tsunagu", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_CHARS / (1024 * 1024)));
+                    }
                     continue;
                 }
+                // Mac の LF を Windows の CRLF へ正規化(メモ帳等で貼り付けた時の
+                // 行送りの乱れを防ぐ。既に CRLF が混ざる場合は壊さない)
+                let text = if text.contains('\r') {
+                    text
+                } else {
+                    text.replace('\n', "\r\n")
+                };
                 *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
+                history_push(&text, "Mac");
                 // 書き込みは、クリップボードマネージャ等の他プロセスが掴んでいる間は
                 // 開けない。掴みが数秒続く実測があるため、ここで待つと受信ループ
                 //(マウス・キー)まで止まるため、別スレッドで徐々に間隔を広げて
@@ -1819,7 +2560,10 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 // 方向指定で設定する。IME ウィンドウが取れない窓ではスキップ
                 //(トグルフォールバックは反転し続けるため手動キー専用)
                 ime_set_open_impl(kana, false);
-                println!("[ime] mac の状態へ同期: {}", if kana { "かな(ON)" } else { "英数(OFF)" });
+                println!(
+                    "[ime] mac の状態へ同期: {}",
+                    if kana { "かな(ON)" } else { "英数(OFF)" }
+                );
             }
             Msg::OpenUrl { url } => {
                 // Continue Here: Mac の前面ブラウザの URL を既定ブラウザで開く。
@@ -1834,6 +2578,41 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                     println!("[url] 受け取り拒否(転送できない形式の URL)");
                 }
             }
+            Msg::AppsQuery => {
+                // Search My Desk の横断化: 列挙(数百件の read_dir)で受信ループを
+                // 塞がないため、応答は別スレッドで行う
+                std::thread::spawn(|| {
+                    let apps = list_win_apps();
+                    *WIN_APPS.lock().unwrap_or_else(|e| e.into_inner()) = apps.clone();
+                    if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                        let _ = tx.send(encode(&Msg::AppsReply { apps }));
+                        println!("[search] Windows アプリ一覧を返しました");
+                    }
+                });
+            }
+            Msg::AppsReply { apps } => {
+                // Mac 側では使わない(Mac が問い合わせる側)。将来の双方向化に備えて受け捨てる
+                println!("[search] AppsReply {} 件(未使用)", apps.len());
+            }
+            Msg::RunApp { path } => {
+                // 相手 PC からの起動指示は「直前に列挙したパスと完全一致」だけ許す
+                //(任意パスの実行を防ぐ。入力転送と同じ暗号化経路だが口は狭く保つ)
+                let known = {
+                    let apps = WIN_APPS.lock().unwrap_or_else(|e| e.into_inner());
+                    apps.iter().any(|(_, p)| p == &path)
+                };
+                if !known {
+                    println!(
+                        "[search] 拒否: 列挙されていないパスの起動要求({})",
+                        log_safe(&path)
+                    );
+                } else if launch_path(&path) {
+                    println!("[search] Windows アプリを起動: {}", log_safe(&path));
+                    tray::notify("Tsunagu", &format!("Mac から起動: {}", log_safe(&path)));
+                } else {
+                    println!("[search] 起動失敗: {}", log_safe(&path));
+                }
+            }
             Msg::Bye => {
                 running_w.store(false, Ordering::Relaxed);
                 break;
@@ -1841,13 +2620,12 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             _ => {}
         }
     }
+    dragdrop::edge::reset();
     mods.release_everything();
     running_w.store(false, Ordering::Relaxed);
     Ok(())
 }
 
-/// ファイル受信の開始: Downloads\Tsunagu へ新規作成し書き込みハンドルを返す。
-/// サイズ上限 200MB。ファイル名はパス区切り・Windows 禁止文字・先頭 '.' を無害化
 /// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
 /// (連打防止 0.7 秒クールダウン)。境界に沿った比率も送り、Mac 側の復帰位置に
 /// 反映させる(境界の連続性)。side 0/1=縦比率、2/3=横比率を ny へ載せる
@@ -1872,17 +2650,25 @@ fn maybe_notify_return(
     let side = SIDE_W.load(Ordering::Relaxed);
     let hit = match side {
         1 | 6 | 7 => px >= w - 1, // Mac は左(左上/左下含む)→ Win の右端で戻る
-        2 => py >= h - 1,          // Mac は上にある → Win の下端で戻る
-        3 => py <= 1,              // Mac は下にある → Win の上端で戻る
-        _ => px <= 1,              // 既定: Mac は右(右上/右下含む)→ 左端で戻る
+        2 => py >= h - 1,         // Mac は上にある → Win の下端で戻る
+        3 => py <= 1,             // Mac は下にある → Win の上端で戻る
+        _ => px <= 1,             // 既定: Mac は右(右上/右下含む)→ 左端で戻る
     };
     if hit && last.elapsed() >= Duration::from_millis(700) {
         let ny = match side {
             2 | 3 => {
-                if w > 0 { (px as f64 / w as f64).clamp(0.0, 1.0) } else { 0.5 }
+                if w > 0 {
+                    (px as f64 / w as f64).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
             }
             _ => {
-                if h > 0 { (py as f64 / h as f64).clamp(0.0, 1.0) } else { 0.5 }
+                if h > 0 {
+                    (py as f64 / h as f64).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
             }
         };
         let _ = wtx.send(encode(&Msg::Return { ny }));

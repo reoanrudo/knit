@@ -73,22 +73,28 @@ pub(super) fn save() {
 
 fn write_to(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
     use std::io::Write;
-    std::fs::create_dir_all(
-        path.parent()
-            .ok_or_else(|| std::io::Error::other("保存先がありません"))?,
-    )?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("保存先がありません"))?;
+    std::fs::create_dir_all(parent)?;
+    tsunagu_common::history::restrict_dir(parent);
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
     f.sync_all()?;
+    drop(f);
+    // 履歴と同じく所有者のみ(600)で保存する(umask 既定の 644 に任せない)
+    tsunagu_common::history::restrict(&tmp);
     std::fs::rename(tmp, path)
 }
 
 pub(super) fn restore() {
     let Some(path) = path() else { return };
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
+    // 旧版が 644 で作ったファイルを読めたら 600 へ是正する
+    tsunagu_common::history::restrict(&path);
     let v: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {

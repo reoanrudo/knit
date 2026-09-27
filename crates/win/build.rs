@@ -1,6 +1,8 @@
 // exe へアプリアイコンを埋め込む(windres がある場合のみ。失敗時は静かに省略)
 fn main() {
-    let Ok(target) = std::env::var("TARGET") else { return };
+    let Ok(target) = std::env::var("TARGET") else {
+        return;
+    };
     if !target.contains("windows") {
         return;
     }
