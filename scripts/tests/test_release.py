@@ -18,7 +18,7 @@ class ReleaseArchiveTests(unittest.TestCase):
         manifest = dict(schema_version=1, version='0.1.0', platform=platform, binary_sha256=hashlib.sha256(b'binary').hexdigest())
         with zipfile.ZipFile(path, 'w') as z:
             z.writestr(f'{root}/{binary}', b'changed' if corrupt else b'binary')
-            files = ['Tsunagu.app/Contents/Info.plist', 'Tsunagu.app/Contents/Resources/AppIcon.icns'] if platform == 'macos-arm64' else ['app.ico', 'install.bat', 'uninstall.bat', 'run_tsunagu.bat', 'run_tsunagu.vbs', 'README-win.txt']
+            files = ['Tsunagu.app/Contents/Info.plist', 'Tsunagu.app/Contents/Resources/AppIcon.icns', 'README-Mac.txt'] if platform == 'macos-arm64' else ['app.ico', 'install.bat', 'uninstall.bat', 'run_tsunagu.bat', 'run_tsunagu.vbs', 'README-win.txt']
             for f in files:
                 z.writestr(f'{root}/{f}', b'fixture')
             prefix = ''

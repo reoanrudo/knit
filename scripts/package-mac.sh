@@ -16,6 +16,8 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/tsunagu-mac "$APP/Contents/MacOS/Tsunagu"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
+cp mac-dist/README-Mac.txt "$PACKAGE/README-Mac.txt"
+cp LICENSE "$PACKAGE/LICENSE.txt"
 lipo "$APP/Contents/MacOS/Tsunagu" -verify_arch arm64
 python3 - "$APP" "$VER" <<'PY'
 import pathlib, plistlib, sys
@@ -23,9 +25,31 @@ app = pathlib.Path(sys.argv[1]); version = sys.argv[2]
 with (app / 'Contents/Info.plist').open('wb') as f:
     plistlib.dump(dict(CFBundleName='Tsunagu', CFBundleDisplayName='Tsunagu', CFBundleIdentifier='local.tsunagu', CFBundleExecutable='Tsunagu', CFBundlePackageType='APPL', CFBundleShortVersionString=version, CFBundleVersion=version, CFBundleIconFile='AppIcon', LSUIElement=True, NSHighResolutionCapable=True, NSSupportsAutomaticTermination=False, NSSupportsSuddenTermination=False), f)
 PY
-# アドホック署名の失敗も配布失敗として扱う。公証済み製品の署名とは異なる。
-codesign --force --sign - "$APP"
+# 署名: 開発者証明書(TSUNAGU_SIGN_IDENTITY)があれば Developer ID 署名
+# (hardened runtime)。無ければ従来どおりアドホック署名。
+# 公証(TSUNAGU_NOTARY_PROFILE: 事前に xcrun notarytool store-credentials で
+# 登録したプロファイル)は Developer ID 署名時にだけ提出し、承認でステープルする。
+# 証明書が無い環境では両方スキップされ、このスクリプトは変わらず動く。
+SIGN_IDENTITY="${TSUNAGU_SIGN_IDENTITY:-}"
+NOTARY_PROFILE="${TSUNAGU_NOTARY_PROFILE:-}"
+if [ -n "$SIGN_IDENTITY" ]; then
+    echo "[package-mac] Developer ID 署名(hardened runtime)..."
+    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+else
+    codesign --force --sign - "$APP"
+fi
 codesign --verify --deep --strict "$APP"
+if [ -n "$SIGN_IDENTITY" ] && [ -n "$NOTARY_PROFILE" ]; then
+    echo "[package-mac] 公証を提出します(承認まで数分かかります)..."
+    ditto -c -k --keepParent "$APP" "$STAGE/notary-submit.zip"
+    if ! xcrun notarytool submit "$STAGE/notary-submit.zip" --keychain-profile "$NOTARY_PROFILE" --wait; then
+        echo '[package-mac] 公証が承認されませんでした。配布を中止します' >&2
+        exit 1
+    fi
+    xcrun notarytool staple "$APP"
+    xcrun stapler validate "$APP"
+    codesign --verify --deep --strict "$APP"
+fi
 # 署名後のハッシュを記録する。マニフェストは.appの外へ置き、署名対象を変更しない。
 python3 - "$APP" "$VER" <<'PY'
 import datetime, hashlib, json, pathlib, subprocess, sys

@@ -479,3 +479,9 @@ M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap
 | ループ | 内容 |
 |---|---|
 | 567 | 配布前の総合チェック: zip 完全性・check-release 再合格・トークン不混入を3経路で再照合(全差分・展開全ファイル・両 exe の strings)・スクリプト可搬性(install/uninstall/run は %USERPROFILE% と %~dp0 基準で固定パス無し)・バージョン整合(exe/plist/manifest とも 0.24.0)・Gatekeeper 実証(ad-hoc 署名=rejected→右クリック開くが必要、既知の制限)。発見した3件を修正: ①Win zip へ AppleDouble(._xxx)が混入(ditto が拡張属性を格納)→package-win.sh に --norsrc を追加し再生成(16→10ファイル) ②README-win.txt のライセンス表記を「同梱の LICENSE.txt」へ(リポジトリはプライベートのため) ③distribution.md のメニューバー表記が旧「SD·Mac」のまま→現状(アイコン+未接続表示)へ更新。修正コミット後に両 zip を再生成し manifest の source_commit=HEAD・working_tree_modified=false を確認(ソース完全一致のトレーサブルなビルド)。リポジトリは dist/zip を管理外、win-dist/tsunagu-win.exe は tracked(プライベートのため実害なし・公開時に要検討) |
+
+## 第24セッション(2026-09-27・568): 配布留意点の解消
+
+| ループ | 内容 |
+|---|---|
+| 568 | 配布チェックの留意点3件を解消: ①署名…package-mac.sh に Developer ID 署名(hardened runtime)と公証(notarytool 提出→承認→ステープル)の分岐を実装(TSUNAGU_SIGN_IDENTITY/TSUNAGU_NOTARY_PROFILE 環境変数で有効化。未設定時は従来の ad-hoc 動作=今回検証)。初見ユーザー向け mac-dist/README-Mac.txt(右クリック→開く手順・権限・登録)を Mac zip へ同梱し check-release.py の必須リストへ追加(テストも追随)。Windows の SmartScreen は証明書購入が必要なため手順書(distribution.md)に明記 ②win-dist/tsunagu-win.exe を git rm --cached で管理から除外(working tree には残す。*.exe ignore が以後有効=公開時にバイナリが露出しない) ③dist/ 直下を最新 0.24.0 のみへ整理し旧版(0.11〜0.23・redesign 計44ファイル)を dist/archive/ へ退避。ついでに distribution.md §2 の権限記載の矛盾(「CGEventTap 権限不要」と「許可が必要」が併存)を「初回にアクセシビリティ許可が必要(画面録画・入力監視は不要)」へ統一 |
