@@ -305,3 +305,57 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
 - BUILD_ID スタンプの整備(現状デプロイ副産物として未コミット運用)
 - 振る舞いを変えない保守性改善に限定する(機能追加は別セッションで)
 ```
+
+---
+
+## 機能 12: IME 引継ぎ(IME Follow Cursor)
+
+```text
+今回の対象機能: Windows へ入る瞬間の IME 状態同期(Msg::Ime)
+
+実装箇所:
+- crates/mac/src/main.rs: ime_mode_state(判定の純関数・テストあり)、
+  current_ime_state(TIS の InputModeID 取得)、enter_win_mode_cursor_lock 内の送信、
+  IME_SYNC(TSUNAGU_IME_SYNC=0 で無効)
+- crates/win/src/main.rs: Msg::Ime 受信→ime_set_open_impl(kana, false)
+  (WM_IME_CONTROL/IMC_SETOPENSTATUS。トグルフォールバックはしない)
+- crates/common/src/lib.rs: Msg::Ime(版 11 のまま。旧側は未知行として無視)
+
+現在の状態:
+- Mac が Apple 純正の日本語入力(かな系=ON/Roman=OFF)の間だけ同期。
+  英字レイアウト・サードパーティ IME は None=送らない(勝手に変えない)
+- 手動のかな/英数キー(kc=104/102)は従来どおり受信ループで IME 開閉へ変換
+  (IME ウィンドウが取れない窓では VK_KANJI のトグルへフォールバック)
+
+品質向上の観点(例):
+- 切替直後のフォアグラウンド確定前に ime_wnd が取れないタイミングの実測
+- IMC_GETOPENSTATUS で現状を読める窓では「既に目標状態なら送らない」最適化
+- Leave 時の逆方向(Win→Mac。TISSelectInputSource)は未実装(usage.md の既知の制限)
+- 実機ログ: win 側「[ime] mac の状態へ同期」「WM_IME_CONTROL open=.. -> sent」
+```
+
+## 機能 13: Continue Here(⌥⌘T のブラウザ引継ぎ)
+
+```text
+今回の対象機能: Mac の前面ブラウザの URL を Windows の既定ブラウザで開く
+
+実装箇所:
+- crates/mac/src/main.rs: frontmost_browser_url(System Events で前面アプリ特定+
+  try で防御した AppleScript)、continue_here(本体・60 秒デッドマン通知)、
+  tap 内の ⌥⌘T 傍受(押下エッジ+1.5 秒デッドタイム+up も握る)
+- crates/win/src/main.rs: Msg::OpenUrl 受信→open_default_browser(ShellExecuteW)
+- crates/common/src/lib.rs: Msg::OpenUrl と urlx::transferable
+  (http/https・2048 文字・制御文字/空白拒否。送受信両側で検査)
+
+現在の状態:
+- 読み取り対象は「実際に前面にある」Safari/Chrome/Edge/Brave の前面タブのみ
+  (裏で常駐のブラウザは読まない=固定順探査の事故を 477 で修正済み)
+- 初回は Mac 側に TCC(自動化)の許可ダイアログが出る。失敗時は通知 1 回
+
+品質向上の観点(例):
+- 逆方向(Windows の前面ブラウザ→Mac で開く)は未実装。Windows 側は
+  UI Automation でアドレスバーを読む必要がある(ブラウザごとの UIA 名に注意)
+- タブの選択状態(アクティブウィンドウが PWA/DevTools)の実測パターン収集
+- スクロール位置・選択テキストの引き継ぎ(ビジョン§11 の拡張)
+- 実機ログ: mac 側「[url] Continue Here: 送信しました」
+```
