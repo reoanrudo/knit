@@ -2016,23 +2016,6 @@ unsafe extern "C" fn tap_callback(
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
             }
-            // F5(新しい MacBook のマイク/聴写キー)→ Windows の音声入力(Win+H)。
-            // ctrl フラグが Win キー(VK_LWIN)に割り当てられる既定マップを利用する。
-            // up も同じフラグで送り、次の通常キーイベントで Win が解放される
-            if kc == 96 {
-                send_msg(&Msg::Key {
-                    kc: 4, // H
-                    down,
-                    ctrl: true,
-                    opt: false,
-                    cmd: false,
-                    shift: false,
-                    tr: true,
-                    rcmd,
-                });
-                eprintln!("[voice] F5 -> Win+H({})", if down { "down" } else { "up" });
-                return std::ptr::null_mut();
-            }
             // Caps Lock は Mac では押すたびに flagsChanged が 1 回だけ来る(押下/解放の
             // 区別がない)。Windows はキーの押し離しでトグルするため 1 回を down+up に展開する
             if event_type == EVT_FLAGS_CHANGED && kc == 57 {
