@@ -485,3 +485,9 @@ M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap
 | ループ | 内容 |
 |---|---|
 | 568 | 配布チェックの留意点3件を解消: ①署名…package-mac.sh に Developer ID 署名(hardened runtime)と公証(notarytool 提出→承認→ステープル)の分岐を実装(TSUNAGU_SIGN_IDENTITY/TSUNAGU_NOTARY_PROFILE 環境変数で有効化。未設定時は従来の ad-hoc 動作=今回検証)。初見ユーザー向け mac-dist/README-Mac.txt(右クリック→開く手順・権限・登録)を Mac zip へ同梱し check-release.py の必須リストへ追加(テストも追随)。Windows の SmartScreen は証明書購入が必要なため手順書(distribution.md)に明記 ②win-dist/tsunagu-win.exe を git rm --cached で管理から除外(working tree には残す。*.exe ignore が以後有効=公開時にバイナリが露出しない) ③dist/ 直下を最新 0.24.0 のみへ整理し旧版(0.11〜0.23・redesign 計44ファイル)を dist/archive/ へ退避。ついでに distribution.md §2 の権限記載の矛盾(「CGEventTap 権限不要」と「許可が必要」が併存)を「初回にアクセシビリティ許可が必要(画面録画・入力監視は不要)」へ統一 |
+
+## 第25セッション(2026-09-27・569): 配布 zip のクリーン導入試験(実機)
+
+| ループ | 内容 |
+|---|---|
+| 569 | v0.24.0 の Mac zip を実機で消去→クリーン→導入試験。消去=開発プロセス停止・~/.config/tsunagu・ログ・/tmp/tsunagu-cmd・.app(未配置を確認)・キーチェーン(未登録を確認)。シナリオ1(.env 無し): install-mac.sh で配置→起動→初回登録ダイアログ待ちで生存することを確認(トークン無し fatal にならない)。シナリオ2(.app 内 Resources/.env＋旧キー名 SEAMLESS_DESK_TOKEN): 起動→Windows から本線・音声・bulk の3経路が自動再接続→CGEventTap 権限も .app で有効(tap active)→メニューバー常駐→IME 同期まで確認。**発見①**: install-mac.sh が TSUNAGU_BIND を Tailscale IP へ限定するため AP 隔離環境で LAN 直の受け口が無く、Windows の「経路昇格」が成功せず発見→切断→再接続の無限ループ(Tailscale 接続を数秒で切る)→BIND を 0.0.0.0 既定へ修正(限定は TSUNAGU_BIND 明示指定に)したら LAN 直(192.168.0.2)で安定接続。**発見②**: 署名済み .app の Contents/Resources へ後から .env を置くと codesign 検証が壊れる(sealed resource。MacOS/ 内と同じ)→ad-hoc 再署名(codesign --force --sign -)で検証 OK を確認。配布形態の正しい案内として「トークンは ~/.config/tsunagu/env が最も簡単」を distribution.md へ追記。試験後は LaunchAgent 解除・.app 削除・env 復元・開発運用(target/release 直接起動)へ復元し再接続を確認(この間の履歴・設定はクリーン試験で消去=空スタート。バックアップから復元できるのは env のみ) |

@@ -34,8 +34,9 @@ pub mod envutil {
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(d) = exe.parent() {
                     paths.push(d.join(".env"));
-                    // .app バンドル配布用: Contents/Resources/.env
-                    // (MacOS/ 内に置くと codesign の署名対象になって失敗するため)
+                    // .app バンドル配布用: Contents/Resources/.env。
+                    // 注意: どちらの場所も署名済み .app へ後から足すとコード署名の
+                    // 検証が壊れる(sealed resource)。.app 内へ置く場合は再署名が必要
                     if let Some(res) = d.parent().map(|p| p.join("Resources/.env")) {
                         paths.push(res);
                     }

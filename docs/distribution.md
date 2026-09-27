@@ -76,6 +76,11 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 
 - 生成: `./scripts/gen-token.sh`(~/.config/tsunagu/env に 256bit ランダム値)
 - 参照順序(両バイナリ共通): 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env
+- **Mac の .app で .env を使う場合の注意**: 署名済み .app へ後から .env を
+  Contents/Resources/ へ置くとコード署名の検証が壊れます(sealed resource)。
+  トークンは ~/.config/tsunagu/env へ置くのが最も簡単です。
+  .app 内へ同梱したい場合は配置後に `codesign --force --sign - Tsunagu.app`
+  で再署名すると検証が通ります(ad-hoc 署名のためローカルで再署名可)
 - Mac と Windows で**同じ値**である必要がある(不一致は `[conn] invalid hello` で接続拒否)
 - トークンを変更する場合: 両側の .env を更新して両側を再起動(片方だけ更新すると切断が続く)
 
@@ -89,7 +94,7 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 |---|---|---|
 | Mac | TSUNAGU_ROLE 未設定 | `.env` に `TSUNAGU_ROLE=client` と `TSUNAGU_HOST=<Windows側Tailscale IP>` |
 | Windows | TSUNAGU_ROLE 未設定 | `.env` に `TSUNAGU_ROLE=server` |
-| 追加作業 | なし(下記参考: Mac の受信は Tailscale IF へ限定推奨) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="tsunagu-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
+| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="tsunagu-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
 
 設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/tsunagu/env)。
 変更後は**両側の再起動**が必要(片方だけ変えると切断が続く)。

@@ -27,9 +27,11 @@ BIN="$HOME/Applications/Tsunagu.app/Contents/MacOS/Tsunagu"
 chmod +x "$BIN"
 
 # ログは開発と同じ /tmp/tsunagu-mac.log へ(verify.sh 互換)。
-# TSUNAGU_BIND は Tailscale IF に限定(失敗時は 0.0.0.0 で起動しピア判定で防御)
-BIND_IP=$(tailscale ip -4 2>/dev/null | head -1)
-[ -z "$BIND_IP" ] && BIND_IP="0.0.0.0"
+# 待受は全インターフェース(0.0.0.0)。Tailscale IP へ限定すると AP 隔離の環境で
+# LAN 直の受け口が無くなり、Windows の「経路昇格」が成功せず再接続の無限ループに
+# なる(実機で発生)。防御は接続元制限(net::is_allowed)と暗号化ハンドシェイクが担う。
+# Tailscale IF へ限定したい場合は環境変数 TSUNAGU_BIND を指定してから実行すること
+BIND_IP="${TSUNAGU_BIND:-0.0.0.0}"
 PLIST="$HOME/Library/LaunchAgents/local.tsunagu.plist"
 cat > "$PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
