@@ -60,8 +60,11 @@ if grep -q "streaming started" /tmp/tsunagu-mac.log 2>/dev/null; then
 else
   warn_msg "音声経路の開始ログなし(TSUNAGU_AUDIO=0 か未接続)"
 fi
-if grep -q "handshake 失敗\|ハンドシェイク失敗" /tmp/tsunagu-mac.log 2>/dev/null; then
-  warn_msg "暗号化ハンドシェイク失敗のログあり(トークン不一致や旧版の接続を確認)"
+# トークン不一致の実签名(failed to fill whole buffer)だけを検知する。
+# 「Connection reset」等は経路の張替わり(再起動・昇格)で普通に起きるため
+# 対象外(ログ全体から拾うと過渡期の失敗が永遠に残り続けた)
+if tail -400 /tmp/tsunagu-mac.log 2>/dev/null | grep -q "failed to fill whole buffer"; then
+  warn_msg "暗号化ハンドシェイク失敗(トークン不一致や旧版の接続を確認)"
 fi
 
 echo "[verify] Windows プロセス:"
