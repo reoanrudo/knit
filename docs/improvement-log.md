@@ -491,3 +491,9 @@ M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap
 | ループ | 内容 |
 |---|---|
 | 569 | v0.24.0 の Mac zip を実機で消去→クリーン→導入試験。消去=開発プロセス停止・~/.config/tsunagu・ログ・/tmp/tsunagu-cmd・.app(未配置を確認)・キーチェーン(未登録を確認)。シナリオ1(.env 無し): install-mac.sh で配置→起動→初回登録ダイアログ待ちで生存することを確認(トークン無し fatal にならない)。シナリオ2(.app 内 Resources/.env＋旧キー名 SEAMLESS_DESK_TOKEN): 起動→Windows から本線・音声・bulk の3経路が自動再接続→CGEventTap 権限も .app で有効(tap active)→メニューバー常駐→IME 同期まで確認。**発見①**: install-mac.sh が TSUNAGU_BIND を Tailscale IP へ限定するため AP 隔離環境で LAN 直の受け口が無く、Windows の「経路昇格」が成功せず発見→切断→再接続の無限ループ(Tailscale 接続を数秒で切る)→BIND を 0.0.0.0 既定へ修正(限定は TSUNAGU_BIND 明示指定に)したら LAN 直(192.168.0.2)で安定接続。**発見②**: 署名済み .app の Contents/Resources へ後から .env を置くと codesign 検証が壊れる(sealed resource。MacOS/ 内と同じ)→ad-hoc 再署名(codesign --force --sign -)で検証 OK を確認。配布形態の正しい案内として「トークンは ~/.config/tsunagu/env が最も簡単」を distribution.md へ追記。試験後は LaunchAgent 解除・.app 削除・env 復元・開発運用(target/release 直接起動)へ復元し再接続を確認(この間の履歴・設定はクリーン試験で消去=空スタート。バックアップから復元できるのは env のみ) |
+
+## 第26セッション(2026-09-27・570): Windows 側のクリーン導入試験(実機)
+
+| ループ | 内容 |
+|---|---|
+| 570 | v0.24.0 の Windows zip を実機で消去→クリーン→導入試験。消去=tsunagu 系タスク 11件・プロセス・C:\Users\<user>\tsunagu(検証遺物の clip_* 系スクリプト含む)・%LOCALAPPDATA%\Tsunagu(履歴・設定)・Downloads\Tsunagu(受信・検証遺物)。導入=配布 zip を scp→Expand-Archive→配置→.env(トークン+TSUNAGU_HOST)を Mac から合成転送→install.bat 実行。**発見**: install.bat の schtasks /SC ONLOGON(ログオン時自動起動)は非昇格では作成できず、ssh からは UAC 昇格できないため同タスクのみ未作成(README の「管理者として実行」が必要な理由を実証)。ONCE/MINUTE タスク(tsunagu_run・tsunagu_watch)は手動作成して起動。**結果**: トレイ常駐→LAN 直(192.168.0.1)で Mac へ接続→本線・音声・bulk 確立→15秒間の切断ゼロ・exe の SHA-256 が manifest と一致。Mac 側クリーン試験(569)と合わせ、両 OS の配布 zip がクリーン環境で機能することを実証。Windows 側のデータ(履歴・設定)もクリーンスタート |
