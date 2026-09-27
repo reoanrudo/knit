@@ -24,10 +24,12 @@ jobs:
             dist/Tsunagu-*.zip.sha256
   windows:
     # Windows 用も macos runner から x86_64-pc-windows-gnu へクロスビルドする
-    # (ローカル開発と同一手法。rust のセルフコンテインドな MinGW リンカで完結する)
+    # (ローカル開発と同一手法)。ring(snow の依存)の C 部分に mingw の
+    # コンパイラが必要なため brew で入れる
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - run: brew install mingw-w64
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-gnu
