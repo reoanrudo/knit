@@ -150,13 +150,22 @@ if [ "$WIN_OK" -eq 1 ]; then
   IMELOG=$($SSH "type C:\\Users\\<user>\\tsunagu\\tsunagu-win.log" 2>/dev/null); RC=$?
   if [ "$RC" -eq 255 ]; then
     warn_msg "IMEは未検証(実機でかな/英数キーを押した実績なし)(tsunagu-win.log 取得不能)"
+  elif printf '%s' "$IMELOG" | grep -q 'mac の状態へ同期'; then
+    echo "  OK  IME 引継ぎ(IME Follow Cursor)の動作実績を検出"; pass=$((pass+1))
   elif printf '%s' "$IMELOG" | grep -q '\[ime\]'; then
-    echo "  OK  [ime] 行を検出"; pass=$((pass+1))
+    echo "  OK  [ime] 行を検出(手動かな/英数の実績。引継ぎは切替で未検証)"; pass=$((pass+1))
   else
-    warn_msg "IMEは未検証(実機でかな/英数キーを押した実績なし)"
+    warn_msg "IMEは未検証(実機でかな/英数キーを押す/Windows へ切替する実績なし)"
   fi
 else
   warn_msg "IMEは未検証(実機でかな/英数キーを押した実績なし)"
+fi
+
+echo "[verify] Continue Here(⌥⌘T)ログ:"
+if grep -q 'Continue Here: 送信しました' /tmp/tsunagu-mac.log 2>/dev/null; then
+  echo "  OK  Continue Here の送信実績を検出"; pass=$((pass+1))
+else
+  warn_msg "Continue Here は未検証(Windows 画面中に ⌥⌘T を押した実績なし)"
 fi
 
 echo "[verify] Win→Mac ファイル送信:"
