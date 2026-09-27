@@ -810,59 +810,51 @@ fn current_ime_state() -> Option<bool> {
     }
 }
 
-/// 起動中ブラウザの前面タブの URL(Continue Here 用)。実際に前面にあるアプリを
-/// System Events で特定してから、そのブラウザの前面タブだけを読む(起動順で
-/// 固定探査すると、裏で起動したままのブラウザの古いページを誤って渡す)。
-/// 未起動・対象外のアプリ・タブ無しは None。Firefox は URL の AppleScript
-/// 対応が無いため対象外
-fn frontmost_browser_url() -> Option<String> {
-    // try で囲む: DevTools や PWA の特殊ウィンドウなど active tab が無い前面
-    // ウィンドウでエラーになっても、以降の処理が止まらないようにする
-    let script = r#"
-tell application "System Events" to set frontApp to name of first application process whose frontmost is true
-set src to ""
-if frontApp is "Safari" then
-  tell application "Safari"
-    try
-      if (count of documents) > 0 then set src to URL of front document
-    end try
-  end tell
-else if frontApp is "Google Chrome" then
-  tell application "Google Chrome"
-    try
-      if (count of windows) > 0 then set src to URL of active tab of front window
-    end try
-  end tell
-else if frontApp is "Microsoft Edge" then
-  tell application "Microsoft Edge"
-    try
-      if (count of windows) > 0 then set src to URL of active tab of front window
-    end try
-  end tell
-else if frontApp is "Brave Browser" then
-  tell application "Brave Browser"
-    try
-      if (count of windows) > 0 then set src to URL of active tab of front window
-    end try
-  end tell
-end if
-return src
-"#;
+/// osascript を 1 本実行し、成功時は stdout を返す。失敗は stderr を
+/// ログへ出して(制御文字置換済み)None
+fn osascript_output(script: &str) -> Option<String> {
     let out = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
         .output()
         .ok()?;
-    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if url.is_empty() && !out.stderr.is_empty() {
-        // TCC の自動化拒否(-1743)等の切り分けに使う。制御文字は置換して出す
-        let err: String = String::from_utf8_lossy(&out.stderr)
-            .chars()
-            .map(|c| if c.is_control() { '?' } else { c })
-            .collect();
-        eprintln!("[url] osascript: {}", err.trim());
+    if out.status.success() {
+        return Some(String::from_utf8_lossy(&out.stdout).into_owned());
     }
-    (!url.is_empty()).then_some(url)
+    let err: String = String::from_utf8_lossy(&out.stderr)
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    eprintln!("[url] osascript: {}", err.trim());
+    None
+}
+
+/// 前面ブラウザの前面タブの URL(Continue Here 用)。
+/// 2 段階で実行する: ①System Events で前面アプリ名を取得、②そのアプリ専用の
+/// 取得スクリプトだけ実行。1 スクリプトに全ブラウザの tell を並べると、
+/// インストールされていないアプリ(Edge 等)の用語解決で構文エラー(-2741)に
+/// なる実績があるため、静的な複合は組まない
+/// Firefox は URL の AppleScript 対応が無いため対象外
+fn frontmost_browser_url() -> Option<String> {
+    let front = osascript_output(
+        r#"tell application "System Events" to get name of first application process whose frontmost is true"#,
+    )?;
+    let get_url = match front.trim() {
+        "Safari" => r#"tell application "Safari" to get URL of front document"#,
+        "Google Chrome" => {
+            r#"tell application "Google Chrome" to get URL of active tab of front window"#
+        }
+        "Microsoft Edge" => {
+            r#"tell application "Microsoft Edge" to get URL of active tab of front window"#
+        }
+        "Brave Browser" => {
+            r#"tell application "Brave Browser" to get URL of active tab of front window"#
+        }
+        _ => return None,
+    };
+    let url = osascript_output(get_url)?;
+    let url = url.trim();
+    (!url.is_empty()).then(|| url.to_string())
 }
 
 /// Continue Here の本体(⌥⌘T の押下エッジで別スレッドから呼ぶ)。
