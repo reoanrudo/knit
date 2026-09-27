@@ -2,6 +2,23 @@
 
 **2台のPCを、1つのキーボードで。**
 
+> **Status: early stage (v0.25.0).** Core features work day-to-day on the
+> developer's machines, but this has not yet gone through the release
+> quality bar (first-time-user trials, long-run stability, high-DPI,
+> signed/verified installers). Binaries are unsigned — see
+> [the distribution guide](docs/distribution.md) for first-launch steps.
+> Feedback and issue reports are very welcome.
+
+**English summary** — Tsunagu is an open-source input-sharing tool that lets
+you drive a Windows PC from your MacBook's keyboard and trackpad. Move the
+cursor to a screen edge to hop between machines; clipboard (text/images/
+files), file drag-over-border, clipboard history, and Windows audio
+follow automatically. All traffic is encrypted with the Noise protocol
+(mutual authentication via a shared secret that never crosses the wire);
+only LAN, direct-link, or Tailscale peers are accepted. Multiple Windows
+machines can be connected at once and switched from the menu-bar, and each
+machine's monitor layout is exchanged automatically. Rust, MIT license.
+
 MacBook のキーボード/トラックパッドで Windows デスクトップを操作する入力共有ツール。
 カーソルを画面の端へ動かすだけで相手の画面へ移り、Windows の音声まで Mac に集約される。
 キーボード/マウス/クリップボード/ファイル/音声を「つなぐ」ことから命名(Deskflow 等の
@@ -9,11 +26,12 @@ MacBook のキーボード/トラックパッドで Windows デスクトップ�
 
 主な機能: 画面端での切替・Mac 流ショートカットの翻訳・クリップボード(テキスト/画像/ファイル、
 画面を移る時に同期)・クリップボード履歴(両 PC のコピーから選んで復元)・ファイルを掴んだまま
-境界越え・Windows の音を Mac で再生・ターミナル/ゲーム向けの自動切替・画面ロック連動・
-全通信の暗号化。変更点は CHANGELOG を参照
+境界越え・Windows の音を Mac で再生・複数台の同時接続と切替・モニター構成の自動交換・
+ターミナル/ゲーム向けの自動切替・画面ロック連動・全通信の暗号化。変更点は CHANGELOG を参照
 
 設計: [docs/design.md](docs/design.md) / 配布手順: [docs/distribution.md](docs/distribution.md) /
-変更履歴: [CHANGELOG.md](CHANGELOG.md) / ライセンス: [LICENSE](LICENSE)(MIT)
+変更履歴: [CHANGELOG.md](CHANGELOG.md) / セキュリティ: [SECURITY.md](SECURITY.md) /
+ライセンス: [LICENSE](LICENSE)(MIT)
 
 ## 構成
 
