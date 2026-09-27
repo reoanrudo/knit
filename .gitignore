@@ -8,3 +8,4 @@ win-dist/.env
 output/
 .omc/
 .zcode/
+__pycache__/
