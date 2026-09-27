@@ -1955,7 +1955,12 @@ unsafe extern "C" fn tap_callback(
                 2 => 120, // 輝度を上げる → F2
                 22 => 96, // キーボード照明を下げる → F5
                 21 => 97, // キーボード照明を上げる → F6
-                _ => 0,
+                // 未対応タイプ(聴写キー等がここに来る機種あり)は記録して次の
+                // 対応表追加に備える。毎回 1 行だけで洪水にはならない
+                _ => {
+                    eprintln!("[media] 未対応 nx={nx}({})", if down { "down" } else { "up" });
+                    0
+                }
             };
             if kc != 0 {
                 send_msg(&Msg::Key {
@@ -2010,6 +2015,23 @@ unsafe extern "C" fn tap_callback(
             }
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
+            }
+            // F5(新しい MacBook のマイク/聴写キー)→ Windows の音声入力(Win+H)。
+            // ctrl フラグが Win キー(VK_LWIN)に割り当てられる既定マップを利用する。
+            // up も同じフラグで送り、次の通常キーイベントで Win が解放される
+            if kc == 96 {
+                send_msg(&Msg::Key {
+                    kc: 4, // H
+                    down,
+                    ctrl: true,
+                    opt: false,
+                    cmd: false,
+                    shift: false,
+                    tr: true,
+                    rcmd,
+                });
+                eprintln!("[voice] F5 -> Win+H({})", if down { "down" } else { "up" });
+                return std::ptr::null_mut();
             }
             // Caps Lock は Mac では押すたびに flagsChanged が 1 回だけ来る(押下/解放の
             // 区別がない)。Windows はキーの押し離しでトグルするため 1 回を down+up に展開する
