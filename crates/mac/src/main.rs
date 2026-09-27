@@ -1949,7 +1949,7 @@ unsafe extern "C" fn tap_callback(
     if event_type == EVT_SYSTEM_DEFINED {
         if let Some((_, data1)) = ns_media_event(event) {
             let nx = (data1 >> 16) & 0xFFFF;
-            let down = ((data1 >> 8) & 0xFF) >> 4 == 0xA;
+            let down = ((data1 >> 8) & 0xFF) == 0x0A; // 0x0A=押下 / 0x0B=解放
             let kc: u16 = match nx {
                 3 => 122, // 輝度を下げる → F1
                 2 => 120, // 輝度を上げる → F2
