@@ -511,7 +511,7 @@ pub fn show_prefs() {
         extern "C" {
             fn NSSetUncaughtExceptionHandler(h: Option<unsafe extern "C" fn(ID)>);
         }
-        unsafe { NSSetUncaughtExceptionHandler(Some(uncaught_exc_handler)) };
+        NSSetUncaughtExceptionHandler(Some(uncaught_exc_handler));
         eprintln!("[prefs] activated");
         let existing = PREFS_WIN.load(Ordering::Relaxed) as ID;
         if existing.is_null() {

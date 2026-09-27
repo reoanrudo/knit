@@ -48,7 +48,6 @@ const CLR_HEAD: u32 = 0x222638; // 見出し・状態行(黒)
 const CLR_TEXT: u32 = 0x424A5E; // 本文
 const CLR_SUB: u32 = 0x626B7D; // 補足
 const CLR_ACCENT: u32 = 0x515FD1; // 標準アクセント(Windows 11 青)
-const CLR_DANGER: u32 = 0xC2504B; // 終了ボタン(赤系)
 /// 0xRRGGBB → COLORREF(0x00BBGGRR)
 fn rgb(c: u32) -> u32 {
     ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
@@ -90,7 +89,6 @@ unsafe extern "system" {
         rect: *mut Rect,
         flags: u32,
     ) -> i32;
-    fn SetWindowPos(hwnd: HWND, after: HWND, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -118,9 +116,9 @@ struct DrawItemStruct {
     item_data: usize,
 }
 
-/// DWM: タイトルバーをダークへ(Windows 10 1809+/11 対応。失敗時は無地のまま)
-#[link(name = "dwmapi")]
+// DWM のダークタイトルバー(DwmSetWindowAttribute)は現状未使用(無地のまま)
 unsafe extern "system" {
+    #[allow(dead_code)]
     fn DwmSetWindowAttribute(
         hwnd: HWND,
         attr: u32,
@@ -196,7 +194,6 @@ static LABEL_SPK: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FILES: AtomicUsize = AtomicUsize::new(0);
 static LABEL_MACCFG: AtomicUsize = AtomicUsize::new(0);
 static LABEL_FOOTER: AtomicUsize = AtomicUsize::new(0);
-static LABEL_LOGO: AtomicUsize = AtomicUsize::new(0);
 /// プロセス起動時刻(稼働時間表示用)
 static START_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
@@ -802,20 +799,20 @@ unsafe fn open_menu(hwnd: HWND) {
     w.push(0);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    let mut open_w = wide("設定を開く…");
+    let open_w = wide("設定を開く…");
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
-    let mut audio_w = wide(&audio_line());
+    let audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
-    let mut bm = wide("Mac へ戻る");
+    let bm = wide("Mac へ戻る");
     AppendMenuW(menu, MF_STRING, MENU_BACKMAC as usize, bm.as_ptr());
-    let mut fo = wide("受信フォルダを開く");
+    let fo = wide("受信フォルダを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
-    let mut log_w = wide("ログを開く");
+    let log_w = wide("ログを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
-    let mut rs = wide("再起動");
+    let rs = wide("再起動");
     AppendMenuW(menu, MF_STRING, MENU_RESTART as usize, rs.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    let mut quit = wide("終了");
+    let quit = wide("終了");
     AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, quit.as_ptr());
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
