@@ -2003,6 +2003,11 @@ unsafe extern "C" fn tap_callback(
             }
             let rcmd = RCMD_CTRL.load(Ordering::Relaxed) && R_RIGHT_CMD.load(Ordering::Relaxed);
             let cmd = if rcmd { false } else { cmd };
+            // 実機のキーコード特定用: 「右⌘が効かない」報告の切り分け。
+            // ここに出ない=そのキーは 54 ではない(外付けの配列差・キーリマップ等)
+            if event_type == EVT_FLAGS_CHANGED && (kc == 54 || kc == 55) {
+                eprintln!("[rcmd] kc={} -> {}(rcmd={})", kc, if cmd || rcmd { "押下" } else { "解放" }, rcmd);
+            }
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
             }
