@@ -1,5 +1,6 @@
 pub mod pairing;
 pub mod credentials;
+pub mod smartguard;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
     //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env。

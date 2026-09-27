@@ -5,6 +5,11 @@
 ## [Unreleased]
 
 ### 追加
+- smartguard(実験的): 同じ PC でローカル判定モデルランタイム ollaya が動いている環境で、
+  クリップボードのテキスト送信前に機密らしさ(パスワード/API キー等)をローカル判定し、
+  高確度(3 択分類の P≥0.8。実測で機密 0.96〜0.99/通常 0.03〜0.18 と分離)なら送信を止める
+  追加ガード。手書き HTTP で依存追加なし、ollaya 無しでは挙動不変、両方向のテキストが対象
+  (`TSUNAGU_SMART_SECRET=0` で無効化。通知は 60 秒に 1 回に間引き)
 - Continue Here(ブラウザの引継ぎ): Windows 画面操作中に ⌥⌘T で Mac の前面ブラウザ
   (Safari/Chrome/Edge/Brave)の現在ページを Windows の既定ブラウザで開く。
   osascript 取得はタップを塞がない別スレッド。URL は http/HTTPS・上限 2048 文字を

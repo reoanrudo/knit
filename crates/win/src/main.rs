@@ -205,6 +205,25 @@ static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
 /// 最後に Mac と同期したクリップボードのシーケンス番号
 static LAST_SYNC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// smartguard の通知間引き(誤検知の連打防止。60 秒に 1 回)
+static SMART_SECRET_NOTIFY: Mutex<Option<Instant>> = Mutex::new(None);
+fn smart_secret_notify() {
+    let due = {
+        let mut g = SMART_SECRET_NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = g.map(|t| t.elapsed() >= Duration::from_secs(60)).unwrap_or(true);
+        if ok {
+            *g = Some(Instant::now());
+        }
+        ok
+    };
+    if due {
+        tray::notify(
+            "tsunagu",
+            "クリップボードに機密の可能性があるため Mac へは送りませんでした(TSUNAGU_SMART_SECRET=0 で無効化)",
+        );
+    }
+}
+
 fn clipboard_seq() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
@@ -251,6 +270,13 @@ fn sync_clipboard_to_mac() {
                 .map(|g| g.as_deref() == Some(text.as_str()))
                 .unwrap_or(false);
             if !text.is_empty() && text.len() <= CLIP_MAX_CHARS && !echo {
+                // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
+                // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結
+                if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
+                    println!("[clip] smartguard: 機密の可能性が高いため Mac へ送りません");
+                    smart_secret_notify();
+                    return;
+                }
                 println!("[clip] win->mac {} bytes", text.len());
                 let _ = tx.send(encode(&Msg::Clip { text }));
             }

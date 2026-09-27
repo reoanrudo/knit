@@ -221,9 +221,30 @@ fn sync_clipboard_to_win() {
         if LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(text.as_str()) {
             return;
         }
+        // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
+        // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結し
+        // 入力経路(タップ)は塞がない
+        if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
+            eprintln!("[clip] smartguard: 機密の可能性が高いため Windows へ送りません");
+            smart_secret_notify("Windows へは送りませんでした");
+            return;
+        }
         eprintln!("[clip] mac->win {} bytes", text.len());
         send_msg(&Msg::Clip { text });
     }));
+}
+
+/// smartguard の通知間引き(誤検知の連打防止。60 秒に 1 回)
+static SMART_SECRET_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
+fn smart_secret_notify(detail: &str) {
+    let now = now_ms();
+    if now.saturating_sub(SMART_SECRET_NOTIFY_MS.swap(now, Ordering::Relaxed)) < 60_000 {
+        return;
+    }
+    notify(
+        "tsunagu",
+        &format!("クリップボードに機密の可能性があるため {detail}(TSUNAGU_SMART_SECRET=0 で無効化)"),
+    );
 }
 
 /// 最後に Windows から受信して書き込んだテキスト(エコーバック送信防止)
