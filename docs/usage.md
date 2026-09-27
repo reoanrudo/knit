@@ -26,6 +26,8 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 
 - Mac の修飾キーは自動変換: Cmd→Ctrl、Option→Alt、Control→Win、Shift→Shift
   (Win 側では「Mac と同じ修飾の組合せ」になるよう差分で押し替え、復帰時に全解放)
+- **右⌘キーは Windows の右 Ctrl として動きます**(既定)。`TSUNAGU_RCMD_CTRL=0` で無効
+  (右⌘をホットキーに設定している場合はホットキーが優先される)
 - **かなキー**(Mac keycode 104)→ Windows 側の IME を ON(ひらがな入力)
 - **英数キー**(Mac keycode 102)→ Windows 側の IME を OFF(英字入力)
 - **切替時に Mac の IME 状態を引き継ぐ**(IME Follow Cursor): Windows へ画面を
@@ -156,6 +158,9 @@ Windows 画面を操作している間、Mac 本体キーボードの音量キ�
 | F7 / F8 / F9(メディア) | 前の曲へ / 再生・一時停止 / 次の曲へ |
 
 fn を押さない F7〜F12 は従来どおり F キーとして渡ります。
+F1〜F6 は macOS が輝度・キーボード照明のメディアイベントとして配るため、Windows では
+対応する F1/F2・F5/F6 キーとして届け直します(実験的。輝度そのものは Windows 側の
+画面を変えられないため)。F3/F4 は OS が直接処理するためイベントが届かないことがあります
 
 ## 実機での確認手順(IME 引継ぎ・Continue Here)
 

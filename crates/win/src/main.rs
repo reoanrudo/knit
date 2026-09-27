@@ -206,7 +206,7 @@ static CLIP_SHARE_W: AtomicBool = AtomicBool::new(true);
 static LAST_SYNC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// smartguard の通知間引き(誤検知の連打防止。60 秒に 1 回)
-static SMART_SECRET_NOTIFY: Mutex<Option<Instant>> = Mutex::new(None);
+static SMART_SECRET_NOTIFY: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
 fn smart_secret_notify() {
     let due = {
         let mut g = SMART_SECRET_NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
@@ -900,11 +900,15 @@ fn game_like() -> bool {
 }
 
 // ---------- 修飾キー状態管理(Mac mods → Win VK) ----------
+/// 右 Ctrl(拡張キー)。Mac の右⌘(rcmd フラグ)の割当先
+const VK_RCONTROL: u16 = 0xA3;
+
 struct ModState {
     ctrl: bool,
     alt: bool,
     win: bool,
     shift: bool,
+    rcmd: bool,
     /// 注入して押下中のキー((vk, 拡張))。離脱・切断時に全部 up を注入する
     /// (修飾だけ解放していた旧実装では、切替の瞬間に押していた矢印キー等が
     /// Windows 側で押下扱いのまま残った)
@@ -912,7 +916,7 @@ struct ModState {
 }
 impl ModState {
     fn new() -> Self {
-        Self { ctrl: false, alt: false, win: false, shift: false, pressed: Vec::new() }
+        Self { ctrl: false, alt: false, win: false, shift: false, rcmd: false, pressed: Vec::new() }
     }
     /// 通常キーの注入(押下状態を追跡する)
     fn key(&mut self, vk: u16, down: bool, extended: bool) -> bool {
@@ -943,7 +947,7 @@ impl ModState {
             inject_key(VK_MENU, true);
         }
     }
-    fn apply(&mut self, ctrl: bool, opt: bool, cmd: bool, shift: bool) {
+    fn apply(&mut self, ctrl: bool, opt: bool, cmd: bool, shift: bool, rcmd: bool) {
         // Mac: cmd→Win Ctrl(既定)/ Alt(Cfg で切替可), option→もう一方, ctrl→Winキー, shift→Shift
         let (cmd_vk, opt_vk) = if CMD_ALT.load(Ordering::Relaxed) {
             (VK_MENU, VK_CONTROL)
@@ -952,12 +956,20 @@ impl ModState {
         };
         // ターミナル系アプリでは Mac の Control を Windows の Ctrl として送る
         let ctrl_vk = if ctrl && terminal_profile() { VK_CONTROL } else { VK_LWIN };
-        let want = [(cmd_vk, cmd), (opt_vk, opt), (ctrl_vk, ctrl), (VK_SHIFT, shift)];
+        let want = [
+            (cmd_vk, cmd),
+            (opt_vk, opt),
+            (ctrl_vk, ctrl),
+            (VK_SHIFT, shift),
+            // 右⌘は常に右 Ctrl(VK_RCONTROL・拡張)。CMD_ALT の影響も受けない
+            (VK_RCONTROL, rcmd),
+        ];
         let mut state = [
             (VK_CONTROL, &mut self.ctrl),
             (VK_MENU, &mut self.alt),
             (VK_LWIN, &mut self.win),
             (VK_SHIFT, &mut self.shift),
+            (VK_RCONTROL, &mut self.rcmd),
         ];
         for (vk, cur) in &mut state {
             // 複数の Mac 修飾が同じ VK に対応し得るため、いずれかが押されていれば押下
@@ -969,7 +981,7 @@ impl ModState {
         }
     }
     fn release_all(&mut self) {
-        self.apply(false, false, false, false);
+        self.apply(false, false, false, false, false);
     }
 }
 
@@ -1635,7 +1647,7 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
             Msg::Stat { rtt } => {
                 RTT_MS.store(rtt, Ordering::Relaxed);
             }
-            Msg::Key { kc, down, ctrl, opt, cmd, shift, tr } => {
+            Msg::Key { kc, down, ctrl, opt, cmd, shift, tr, rcmd } => {
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
                     let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
@@ -1676,7 +1688,7 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                 if kc == 48 && cmd && !opt && !ctrl && !tr {
                     if down {
                         // cmd 分の Ctrl 押下を抑制してから Alt+Tab を合成
-                        mods.apply(false, opt, false, shift);
+                        mods.apply(false, opt, false, shift, false);
                         inject_key(VK_MENU, false);
                         inject_key(0x09, false);
                         ALT_TAB_ACTIVE.store(true, Ordering::Relaxed);
@@ -1688,7 +1700,7 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                     }
                     continue;
                 }
-                mods.apply(ctrl, opt, cmd, shift);
+                mods.apply(ctrl, opt, cmd, shift, rcmd);
                 if let Some(vk) = mac_kc_to_win_vk(kc) {
                     // テンキー Enter(76)は通常 Enter と同じ VK で拡張フラグだけが違う
                     let ext = kc == 76 || is_extended_vk(vk);

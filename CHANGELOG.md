@@ -9,7 +9,14 @@
   クリップボードのテキスト送信前に機密らしさ(パスワード/API キー等)をローカル判定し、
   高確度(3 択分類の P≥0.8。実測で機密 0.96〜0.99/通常 0.03〜0.18 と分離)なら送信を止める
   追加ガード。手書き HTTP で依存追加なし、ollaya 無しでは挙動不変、両方向のテキストが対象
-  (`TSUNAGU_SMART_SECRET=0` で無効化。通知は 60 秒に 1 回に間引き)
+    (`TSUNAGU_SMART_SECRET=0` で無効化。通知は 60 秒に 1 回に間引き)
+- F1〜F6 の F 行キーを Windows でも使えるように: macOS が輝度・キーボード照明を
+  NSSystemDefined(メディアイベント)で配るため key 経路に乗らず、Windows モードで
+  握り潰されていた(NSEvent 経由で data1 を復号し、対応する F1/F2・F5/F6 として転送)。
+  音量・再生(F7〜F12)は従来の key 経路のまま
+- 右⌘キーを Windows の右 Ctrl に(Key メッセージに rcmd フラグを追加。serde default のため
+  版 11 のまま)。押下中は cmd を分離して送るため「右⌘+C = 右 Ctrl+C」。
+  `TSUNAGU_RCMD_CTRL=0` で無効
 - Continue Here(ブラウザの引継ぎ): Windows 画面操作中に ⌥⌘T で Mac の前面ブラウザ
   (Safari/Chrome/Edge/Brave)の現在ページを Windows の既定ブラウザで開く。
   osascript 取得はタップを塞がない別スレッド。URL は http/HTTPS・上限 2048 文字を

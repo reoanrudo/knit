@@ -155,6 +155,10 @@ pub mod proto {
             /// 「生の Mac 入力」前提の特殊処理を適用しない
             #[serde(default)]
             tr: bool,
+            /// 右⌘を右 Ctrl として扱う(Mac 側で cmd から分離して載せる)。
+            /// 旧側は未知フィールドを無視するため版 11 のまま
+            #[serde(default)]
+            rcmd: bool,
         },
         #[serde(rename = "mouse_move")]
         MouseMove { dx: f64, dy: f64 },

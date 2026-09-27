@@ -53,6 +53,9 @@ const EVT_RIGHT_DRAGGED: u32 = 7;
 const EVT_KEY_DOWN: u32 = 10;
 const EVT_KEY_UP: u32 = 11;
 const EVT_FLAGS_CHANGED: u32 = 12;
+/// NSSystemDefined(F 行のメディアキー・輝度等)。key イベントとして届かない
+/// ため、Windows モードではここから翻訳する(実績: F5 が届かなかった)
+const EVT_SYSTEM_DEFINED: u32 = 14;
 const EVT_SCROLL_WHEEL: u32 = 22;
 const EVT_OTHER_DOWN: u32 = 25;
 const EVT_OTHER_UP: u32 = 26;
@@ -771,6 +774,13 @@ pub(crate) fn mac_shortcut_translation(
 static GAME_REL: AtomicBool = AtomicBool::new(false);
 /// 画面ロックの連動(TSUNAGU_LOCK_SYNC=0 で無効)
 static LOCK_SYNC: AtomicBool = AtomicBool::new(true);
+/// 右⌘ → Windows の右 Ctrl(TSUNAGU_RCMD_CTRL=0 で無効)。
+/// 右⌘をホットキー(TSUNAGU_HOTKEY_KC=54 等)に設定している場合は
+/// 先の分岐で握られるため適用されない(競合しない)
+static RCMD_CTRL: AtomicBool = AtomicBool::new(true);
+/// 右⌘(kc 54)の押下状態。押下中は cmd フラグを rcmd へ置き換えて送る
+///(フラグだけだと左右を区別できないため、kc 単位でここで分離する)
+static R_RIGHT_CMD: AtomicBool = AtomicBool::new(false);
 /// IME 状態同期: Windows へ入る時に Mac のかな/英数を相手の IME 開閉へ反映
 ///(TSUNAGU_IME_SYNC=0 で無効)
 static IME_SYNC: AtomicBool = AtomicBool::new(true);
@@ -1594,6 +1604,36 @@ fn do_toggle(reason: &str) {
 }
 
 // ---------- イベントタップコールバック ----------
+/// NSSystemDefined(Type 14)の内容を読む。CGEvent API に data1/subtype の
+/// 取得フィールドが無いため、NSEvent(eventWithCGEvent:) 経由で読む。
+/// F 行のメディアキーのときだけ呼ばれるため頻度は低い。subtype 8 以外は None
+unsafe fn ns_media_event(event: CGEventRef) -> Option<(i64, i64)> {
+    unsafe extern "C" {
+        fn objc_retain(id: ID) -> ID;
+        fn objc_release(id: ID);
+    }
+    let cls = objc_getClass(c"NSEvent".as_ptr());
+    if cls.is_null() {
+        return None;
+    }
+    let mk: unsafe extern "C" fn(ID, SEL, ID) -> ID =
+        std::mem::transmute(objc_msgSend as *const () as usize);
+    let get: unsafe extern "C" fn(ID, SEL) -> i64 =
+        std::mem::transmute(objc_msgSend as *const () as usize);
+    let e = mk(cls, sel_registerName(c"eventWithCGEvent:".as_ptr()), event);
+    if e.is_null() {
+        return None;
+    }
+    objc_retain(e);
+    let sub = get(e, sel_registerName(c"subtype".as_ptr()));
+    let data1 = get(e, sel_registerName(c"data1".as_ptr()));
+    objc_release(e);
+    if sub != 8 {
+        return None; // 8 = NX_SUBTYPE_AUX_CONTROL_BUTTONS(メディアキー)
+    }
+    Some((sub, data1))
+}
+
 unsafe extern "C" fn tap_callback(
     _proxy: *mut core::ffi::c_void,
     event_type: u32,
@@ -1901,6 +1941,38 @@ unsafe extern "C" fn tap_callback(
 
     // Windows モード: 全イベントを握って転送
     let flags = CGEventGetFlags(event);
+    // F 行のメディア(NSSystemDefined, subtype 8)の翻訳: 輝度(F1/F2)とキーボード
+    // 照明(F5/F6)は macOS が key イベントではなく system-defined で配るため、
+    // key 経路だけだと Windows で反応しない(実績: F5 等が効かなかった)。
+    // 対応する F キーとして届け直す。音量・再生(F7〜F12)は key 経路
+    //(kc 72-74/100/101/103)で処理済みのためここでは転送しない(二重送信の防止)
+    if event_type == EVT_SYSTEM_DEFINED {
+        if let Some((_, data1)) = ns_media_event(event) {
+            let nx = (data1 >> 16) & 0xFFFF;
+            let down = ((data1 >> 8) & 0xFF) >> 4 == 0xA;
+            let kc: u16 = match nx {
+                3 => 122, // 輝度を下げる → F1
+                2 => 120, // 輝度を上げる → F2
+                22 => 96, // キーボード照明を下げる → F5
+                21 => 97, // キーボード照明を上げる → F6
+                _ => 0,
+            };
+            if kc != 0 {
+                send_msg(&Msg::Key {
+                    kc,
+                    down,
+                    ctrl: false,
+                    opt: false,
+                    cmd: false,
+                    shift: false,
+                    tr: false,
+                    rcmd: false,
+                });
+                eprintln!("[media] nx={nx} -> kc={kc}({})", if down { "down" } else { "up" });
+            }
+        }
+        return std::ptr::null_mut();
+    }
     let (ctrl, opt, cmd, shift) = (
         flags & FLAG_CTRL != 0,
         flags & FLAG_OPT != 0,
@@ -1923,6 +1995,14 @@ unsafe extern "C" fn tap_callback(
             } else {
                 event_type == EVT_KEY_DOWN
             };
+            // 右⌘(kc 54)の押下状態を追跡し、押下中は cmd を rcmd(右 Ctrl)へ
+            // 置き換えて送る。左⌘(55)は従来どおり cmd のまま。combos でも
+            // 「右⌘+C = 右 Ctrl+C」になる(rcmd 押下中は cmd を落とす)
+            if event_type == EVT_FLAGS_CHANGED && kc == 54 {
+                R_RIGHT_CMD.store(cmd, Ordering::Relaxed);
+            }
+            let rcmd = RCMD_CTRL.load(Ordering::Relaxed) && R_RIGHT_CMD.load(Ordering::Relaxed);
+            let cmd = if rcmd { false } else { cmd };
             if down && (kc == 104 || kc == 102) {
                 eprintln!("[ime] kc={kc} ({}) 転送", if kc == 104 { "かな" } else { "英数" });
             }
@@ -1930,7 +2010,7 @@ unsafe extern "C" fn tap_callback(
             // 区別がない)。Windows はキーの押し離しでトグルするため 1 回を down+up に展開する
             if event_type == EVT_FLAGS_CHANGED && kc == 57 {
                 for d in [true, false] {
-                    send_msg(&Msg::Key { kc, down: d, ctrl, opt, cmd, shift, tr: false });
+                    send_msg(&Msg::Key { kc, down: d, ctrl, opt, cmd, shift, tr: false, rcmd });
                 }
                 return std::ptr::null_mut();
             }
@@ -1967,21 +2047,21 @@ unsafe extern "C" fn tap_callback(
                 // 翻訳先の修飾は「既定マップ(cmd→Ctrl / opt→Alt)」で解釈させる。
                 // CMD_ALT=true でも翻訳の意味が変わらないよう、cmd/opt を差し替える
                 let swap = crate::CMD_ALT.load(Ordering::Relaxed);
-                let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool| {
+                let send = |kc2: u16, d: bool, c: bool, o: bool, m: bool, sh: bool, r: bool| {
                     let (c2, o2, m2) = if swap { (c, m, o) } else { (c, o, m) };
-                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c2, opt: o2, cmd: m2, shift: sh, tr: true });
+                    send_msg(&Msg::Key { kc: kc2, down: d, ctrl: c2, opt: o2, cmd: m2, shift: sh, tr: true, rcmd: r });
                 };
                 // fn+F11(Mac のデスクトップ表示)= Win+D(FN フラグは表の外)
                 if kc == 103 && flags & FLAG_FN != 0 {
-                    send(2, down, true, false, false, false); // D + ctrl フラグ(Win キー)
+                    send(2, down, true, false, false, false, rcmd); // D + ctrl フラグ(Win キー)
                     return std::ptr::null_mut();
                 }
                 if let Some((kc2, c, o, m, s)) = mac_shortcut_translation(kc, ctrl, opt, cmd, shift) {
-                    send(kc2, down, c, o, m, s);
+                    send(kc2, down, c, o, m, s, rcmd);
                     return std::ptr::null_mut(); // 元キーは送らない
                 }
             }
-            send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift, tr: false });
+            send_msg(&Msg::Key { kc, down, ctrl, opt, cmd, shift, tr: false, rcmd });
         }
         EVT_MOUSE_MOVED | EVT_LEFT_DRAGGED | EVT_RIGHT_DRAGGED | EVT_OTHER_DRAGGED => {
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
@@ -2275,6 +2355,9 @@ fn main() {
     }
     if envutil::get("TSUNAGU_CONTINUE_HERE").as_deref() == Some("0") {
         CONTINUE_HERE.store(false, Ordering::Relaxed);
+    }
+    if envutil::get("TSUNAGU_RCMD_CTRL").as_deref() == Some("0") {
+        RCMD_CTRL.store(false, Ordering::Relaxed);
     }
     if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);
