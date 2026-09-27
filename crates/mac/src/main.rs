@@ -2746,6 +2746,9 @@ fn main() {
         | (1 << EVT_KEY_DOWN)
         | (1 << EVT_KEY_UP)
         | (1 << EVT_FLAGS_CHANGED)
+        // F 行のメディア(輝度・照明)は NSSystemDefined で届くため、
+        // マスクに入れないとタップ自体が受け取らない(F5 不反応の実績)
+        | (1 << EVT_SYSTEM_DEFINED)
         | (1 << EVT_SCROLL_WHEEL)
         | (1 << EVT_OTHER_DOWN)
         | (1 << EVT_OTHER_UP);
