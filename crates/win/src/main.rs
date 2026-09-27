@@ -1652,6 +1652,21 @@ fn session(mut reader: BufReader<secure::Reader>, mut writer: secure::Writer) ->
                     let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
                 }
+                // 右⌘(kc 54)の到着と注入後の実状態を記録(「効かない」報告の切り分け)。
+                // state が -32768(押下)なら注入は成功、0 なら競合や失敗
+                if kc == 54 {
+                    mods.apply(ctrl, opt, cmd, shift, rcmd);
+                    let st = unsafe {
+                        extern "system" {
+                            fn GetAsyncKeyState(v_key: i32) -> i16;
+                        }
+                        GetAsyncKeyState(0xA3)
+                    };
+                    println!("[rcmd] arrived kc=54 down={down} rcmd={rcmd} -> win rctrl={st}");
+                    if !down {
+                        continue;
+                    }
+                }
                 // Mac JIS の 英数(102)/かな(104)キーは Windows 側 IME の開閉に変換する
                 // (HIToolbox 実測: kVK_JIS_Eisu=102, kVK_JIS_Kana=104)
                 if down {
