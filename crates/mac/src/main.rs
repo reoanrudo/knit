@@ -854,6 +854,14 @@ return src
         .output()
         .ok()?;
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() && !out.stderr.is_empty() {
+        // TCC の自動化拒否(-1743)等の切り分けに使う。制御文字は置換して出す
+        let err: String = String::from_utf8_lossy(&out.stderr)
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
+        eprintln!("[url] osascript: {}", err.trim());
+    }
     (!url.is_empty()).then_some(url)
 }
 
@@ -2114,7 +2122,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-023559-3c3468f";
+const BUILD_ID: &str = "build-20260927-105439-1683612";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
