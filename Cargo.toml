@@ -6,7 +6,7 @@ members = ["crates/common", "crates/mac", "crates/win"]
 [workspace.package]
 version = "0.25.0"
 edition = "2021"
-description = "Mac⇄Windows 入力共有ツール(tsunagu): CGEventTap→TCP→SendInput"
+description = "Mac⇄Windows 入力共有ツール(knit): CGEventTap→TCP→SendInput"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

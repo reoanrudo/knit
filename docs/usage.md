@@ -1,4 +1,4 @@
-# tsunagu 操作ガイド
+# knit 操作ガイド
 
 Mac のキーボード/トラックパッドで Windows デスクトップを操作するツール。
 Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し続ける逆転構成)。
@@ -13,7 +13,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 
 切替まわりの細部の挙動:
 
-- 右端判定は Mac 画面右端から `TSUNAGU_EDGE_PX`(既定 2px)の内側。
+- 右端判定は Mac 画面右端から `KNIT_EDGE_PX`(既定 2px)の内側。
   Windows 側の復帰判定は左端(x ≤ 1)で、実際にカーソルが動いたときだけ判定する
 - 切替時にドラッグしていた場合は Windows 側へ左ボタンを離すイベントを送り、
   誤ドラッグを持ち込まない
@@ -26,14 +26,14 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
 
 - Mac の修飾キーは自動変換: Cmd→Ctrl、Option→Alt、Control→Win、Shift→Shift
   (Win 側では「Mac と同じ修飾の組合せ」になるよう差分で押し替え、復帰時に全解放)
-- **右⌘キーは Windows の右 Ctrl として動きます**(既定)。`TSUNAGU_RCMD_CTRL=0` で無効
+- **右⌘キーは Windows の右 Ctrl として動きます**(既定)。`KNIT_RCMD_CTRL=0` で無効
   (右⌘をホットキーに設定している場合はホットキーが優先される)
 - **かなキー**(Mac keycode 104)→ Windows 側の IME を ON(ひらがな入力)
 - **英数キー**(Mac keycode 102)→ Windows 側の IME を OFF(英字入力)
 - **切替時に Mac の IME 状態を引き継ぐ**(IME Follow Cursor): Windows へ画面を
   移る瞬間、Mac がかな入力中なら Windows の IME を ON、英数モードなら OFF へ
   合わせる。日本語入力以外(英字レイアウト)の間は Windows 側を変えない
-  (`TSUNAGU_IME_SYNC=0` で無効化)
+  (`KNIT_IME_SYNC=0` で無効化)
   - フォアグラウンドウィンドウのデフォルト IME ウィンドウへ
     `WM_IME_CONTROL`(IMC_SETOPENSTATUS)を送る(方向指定が確実な定番手法)
   - IME ウィンドウが取れないアプリ(コンソール等)では、手動のかな/英数キーは
@@ -52,7 +52,7 @@ Mac=サーバ(TCP 24900 で待ち受け)、Windows=クライアント(接続し�
   積算して自前のカーソル位置を追跡し、16 イベントに 1 回だけ実カーソル位置へ同期
   する(毎イベントの位置取得は負荷が高くカクつくため)。切替の瞬間だけ実位置を
   取って正確な高さを Windows 側へ引き継ぐ
-- 移動倍率は `TSUNAGU_MOUSE_SCALE` で調整(既定 1.0)
+- 移動倍率は `KNIT_MOUSE_SCALE` で調整(既定 1.0)
 
 ## 有線直結(遅延・揺らぎの低減)
 
@@ -67,15 +67,15 @@ WiFi の瞬間的な揺らぎがカーソルのカクつきの原因になる場
 | **Thunderbolt ブリッジ** | Thunderbolt 対応 PC と Thunderbolt ケーブルで直結 | 高速。Windows 側の Thunderbolt Networking 対応が必要 |
 | USB リンクケーブル | ブリッジチップ入りの転送用ケーブル | Mac 対応品がほぼ無い |
 
-いずれも IP リンクが張れれば Tsunagu はそのまま動きます(TCP のみのため)。
-直結 IP は Windows 側 `.env` の `TSUNAGU_HOST` に **カンマ区切りで並べて** 指定できます
-(例: `TSUNAGU_HOST=169.254.10.2,100.100.10.9`)。起動のたびに全候補へ同時に接続を試み、
+いずれも IP リンクが張れれば Knit はそのまま動きます(TCP のみのため)。
+直結 IP は Windows 側 `.env` の `KNIT_HOST` に **カンマ区切りで並べて** 指定できます
+(例: `KNIT_HOST=169.254.10.2,100.100.10.9`)。起動のたびに全候補へ同時に接続を試み、
 最初に繋がった経路(=遅延の小さい経路)を使うため、直結を抜いても Tailscale へ自動で戻ります。
 Mac の IP は `ifconfig` で確認(Thunderbolt ブリッジは bridge0、USB-LAN は en*)。
-接続先は **LAN 自動発見(UDP 24903)と `TSUNAGU_HOST` の併用**です。接続のたびにまず同じ
-LAN の Mac を探し(最初の応答 or 600ms)、見つかった LAN IP を先頭に `TSUNAGU_HOST` の
+接続先は **LAN 自動発見(UDP 24903)と `KNIT_HOST` の併用**です。接続のたびにまず同じ
+LAN の Mac を探し(最初の応答 or 600ms)、見つかった LAN IP を先頭に `KNIT_HOST` の
 候補を並べて同時接続レースへかけます。つまり **同じ LAN では Tailscale の状態に
-関係なく常時 LAN 直**、LAN 外(AP 隔離・外出先)では `TSUNAGU_HOST` の Tailscale IP へ
+関係なく常時 LAN 直**、LAN 外(AP 隔離・外出先)では `KNIT_HOST` の Tailscale IP へ
 自動フォールバックします。
 
 ## Mac 流ショートカットの自動翻訳(Windows 画面操作中)
@@ -121,7 +121,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   256KiBずつ読み書きするため、ファイル全体をメモリに載せない。受信先には転送量に応じた空き容量が必要。
 - パスワードマネージャ等が「共有しない」印を付けたコピーは送らない
   (Mac: nspasteboard の Concealed/Transient、Windows: ExcludeClipboardContentFromMonitorProcessing)
-- 受信ファイルは各 PC の Downloads/Tsunagu に保存し、同名は「名前 (1).拡張子」で回避する。
+- 受信ファイルは各 PC の Downloads/Knit に保存し、同名は「名前 (1).拡張子」で回避する。
   外部から来たファイルとして Mac は quarantine、Windows は Zone.Identifier を付ける
   (開く時に OS の確認が出る)
 - Win→Mac は CRLF を LF へ正規化して書き込む。相手から受信した内容は送り返さない
@@ -129,7 +129,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
 - (実験的)同じ PC で ollaya が動いている場合、テキストの送信前にローカルの判定モデルで
   機密らしさ(パスワード・API キー等)を検査し、確度が高いときだけ送信を止めます(smartguard)。
   判定は完全にローカルで、テキストが外へ出ることはありません。ollaya が無ければ従来どおり。
-  誤検知時は `TSUNAGU_SMART_SECRET=0` で無効化。対象はテキストのみ(画像・ファイルは従来どおり)
+  誤検知時は `KNIT_SMART_SECRET=0` で無効化。対象はテキストのみ(画像・ファイルは従来どおり)
 - Mac→Win は LF を CRLF へ正規化して書き込む(メモ帳等で貼り付けた時の行送りの乱れを防ぐ)
 
 ## クリップボード履歴(Universal Clipboard History)
@@ -140,10 +140,10 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   から選ぶと、その PC のクリップボードへ復元できます(貼り付け操作で使えます)
 - 項目は「3分前・Mac・本文の先頭…」の形式。ファイルは「ファイル・名前 ほかN件」、
   画像は「画像・NKB」と種別が分かるように出ます。どちらの PC で発生したコピーか一目で分かります
-- 履歴は起動しても保持されます(Windows: %LOCALAPPDATA%\Tsunagu\history.json、
-  Mac: ~/.config/tsunagu/history.json)。「履歴を消す」で全消去できます
-- 画像の本体は各 PC のデータ領域(Windows: %LOCALAPPDATA%\Tsunagu\images、
-  Mac: ~/.config/tsunagu/images)に内容ハッシュ名で保存され、新しい 60 件へ
+- 履歴は起動しても保持されます(Windows: %LOCALAPPDATA%\Knit\history.json、
+  Mac: ~/.config/knit/history.json)。「履歴を消す」で全消去できます
+- 画像の本体は各 PC のデータ領域(Windows: %LOCALAPPDATA%\Knit\images、
+  Mac: ~/.config/knit/images)に内容ハッシュ名で保存され、新しい 60 件へ
   自動的に刈り込まれます(履歴から選ぶと画像が戻ります)
 - 機密判定(smartguard)で止めたテキストや「共有しない」印のコピーは履歴に載りません
 - 1MB を超えるテキストは同期も履歴も対象外です(通知でお知らせします)
@@ -154,7 +154,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   窓は**カーソルがある画面の中央**へ出ます。もう一度 **⌥⌘S か Esc で閉じます**。
   **両 PC のアプリ・デスクのファイル/フォルダ・コマンド・クリップボード履歴・URL** を
   1 つの窓から扱えます(ビジョン§14 の実装)。
-- 検索窓が開いている間のキー入力は tsunagu が直接受け取ります(IME に影響されず、
+- 検索窓が開いている間のキー入力は knit が直接受け取ります(IME に影響されず、
   日本語入力モードでもローマ字でそのまま検索できます。Spotlight と同じ挙動)。
   入力するたびに候補が絞られます。**↑↓ で候補を選び**(選択行に ► が付きます)、
   **アプリは Enter かクリックで起動**、
@@ -176,13 +176,13 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   Windows はスタートメニューのショートカット(最大 200 件)
 - Windows 側は「列挙したパスと完全一致する起動指示だけ」を実行します
   (任意パスの実行は受けません)
-- 実機検証: 対話セッションで `tsunagu-mac --probe-search` を実行すると
+- 実機検証: 対話セッションで `knit-mac --probe-search` を実行すると
   「窓/入力/8 ボタン OK」と出ます
-- `TSUNAGU_DESK_SEARCH=0` で無効化
+- `KNIT_DESK_SEARCH=0` で無効化
 
 ## 越境 App Handoff(実験的)
 
-- `TSUNAGU_APP_HANDOFF=1` を設定すると、**Windows へ切り替えた瞬間**に Mac の
+- `KNIT_APP_HANDOFF=1` を設定すると、**Windows へ切り替えた瞬間**に Mac の
   最前面アプリと同じアプリを Windows でも起動します(«作業を別 PC へ投げた» 体感の
   第一歩。ビジョン§12)。例: Mac の「Terminal」→ Windows の「Windows Terminal」
 - 照合はアプリ一覧(検索窓で使う列挙)に対する完全一致→部分一致(Mac 名 4 文字以上)。
@@ -195,7 +195,7 @@ Mac の指癖がそのまま Windows で通るように、以下を翻訳しま�
   滞在待ち(switchDelay)やダブルタップをスキップして即座に切替します。
   ゆっくり端に触れた場合だけ従来どおりの誤爆防止が働きます
 - どちらで切替したかはログに記録されます(`[mode] WINDOWS (edge, fast)`)。
-  `TSUNAGU_FAST_EDGE=0` で無効化
+  `KNIT_FAST_EDGE=0` で無効化
 
 ## Windowsのファイルを掴んでMacへ渡す
 
@@ -226,8 +226,8 @@ Windows 画面を操作している時に **⌥⌘T** を押すと、Mac の前�
   出ます。Windows 画面を操作している間は気づきにくいため、失敗時は Mac に
   通知を出します
 - ⌥⌘T は専用ショートカットとして Mac・Windows のどちらにも転送されません
-  (Ctrl+Alt+T 系のショートカットと衝突する場合は `TSUNAGU_CONTINUE_HERE=0`)
-- `TSUNAGU_CONTINUE_HERE=0` で無効化
+  (Ctrl+Alt+T 系のショートカットと衝突する場合は `KNIT_CONTINUE_HERE=0`)
+- `KNIT_CONTINUE_HERE=0` で無効化
 
 ## 音量・メディアキー(Windows 画面操作中)
 
@@ -271,7 +271,7 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
   自動発見 UDP 24903。ファイル転送は本線と別経路のため、転送中もマウスが止まらない
 - **全経路を暗号化**(Noise プロトコル。トークンから導いた鍵で相互認証し、トークン自体は
   回線に流れない)。接続を受け入れるのは LAN・有線直結・Tailscale のアドレスのみ
-  (`TSUNAGU_ALLOW_ANY=1` で全許可)
+  (`KNIT_ALLOW_ANY=1` で全許可)
 - 生存確認は双方向: Mac・Windows とも 3 秒毎に ping し、9〜10 秒応答が無ければ張り直す
 - Windows の解像度変更・モニター抜き差しを検知すると Mac へ通知し、
   カーソル速度の換算と Windows 画面内の仮想カーソル位置を自動で追従させる
@@ -280,15 +280,15 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
 - Windows モード中に切断・Mac の画面ロックが起きたら即 Mac モードへ復帰(入力の閉じ込め防止)
 - 画面を離れる時は、Windows 側で押下中の全キー・ボタンを解放する(押しっぱなしを残さない)
 
-## 調整用環境変数(tsunagu-mac 起動時)
+## 調整用環境変数(knit-mac 起動時)
 
 | 変数 | 既定 | 説明 |
 |------|------|------|
-| `TSUNAGU_SCROLL_DIV` | 60 | スクロール速度の除数(初期値)。大きくすると遅い。実行中は設定ウィンドウのスライダーで可変 |
-| `TSUNAGU_SCROLL_FLIP` | (未設定) | スクロール方向。未設定=macOS の設定(自然スクロール ON/OFF)に自動追従。`1` で Windows 標準へ固定 |
-| `TSUNAGU_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
-| `TSUNAGU_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
-| `TSUNAGU_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
+| `KNIT_SCROLL_DIV` | 60 | スクロール速度の除数(初期値)。大きくすると遅い。実行中は設定ウィンドウのスライダーで可変 |
+| `KNIT_SCROLL_FLIP` | (未設定) | スクロール方向。未設定=macOS の設定(自然スクロール ON/OFF)に自動追従。`1` で Windows 標準へ固定 |
+| `KNIT_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
+| `KNIT_MOUSE_SCALE` | 1.0 | マウス移動の倍率。0.7 で遅く、1.5 で速く |
+| `KNIT_SWITCH_MODE` | edge | 切替方式。`edge`=画面右端とF13の両方(既定)/`hotkey`=F13のみで切替し、切替後は境界を超えても戻らないロック状態(F13で戻すまで固定) |
 
 ## ホットキーロックモード(オプション)
 
@@ -298,32 +298,32 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
 (Windows 側で左端に行っても戻りません)。`--edge` で従来モードに戻ります。
 
 - 既定のホットキーは **F13**(Mac keycode 105)。MacBook 内蔵キーボードに F13 が
-  無い場合は `TSUNAGU_HOTKEY_KC` で変更できます(例: 右 Cmd=54、F6=97)
-  - 起動例: `TSUNAGU_HOTKEY_KC=54 ./scripts/restart-mac.sh --diag --hotkey`
+  無い場合は `KNIT_HOTKEY_KC` で変更できます(例: 右 Cmd=54、F6=97)
+  - 起動例: `KNIT_HOTKEY_KC=54 ./scripts/restart-mac.sh --diag --hotkey`
 - 起動ログに `switch_mode=hotkey(ロック) hotkey_kc=105` の形式で反映状況が出ます
 
 ## 調整用環境変数(つづき)
 
 | 変数 | 既定 | 説明 |
 |------|------|------|
-| `TSUNAGU_SIDE` | right | Windows 画面の位置。right/left/up/down + upright/lowright(右下)/upleft/lowleft。設定窓の配置エディタ(ドラッグ)が同じ結果を視覚的に作れる |
-| `TSUNAGU_SWITCH_DELAY` | 0 | 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時) |
-| `TSUNAGU_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |
-| `TSUNAGU_CORNER_PX` | 0 | 四隅 N px 内では切替しない(switchCorners/cornerSize) |
-| `TSUNAGU_SWIPE_NAV` | 1 | 2本指横スワイプをブラウザの戻る/進むへ翻訳(XButton)。0 で従来の横ホイール |
-| `TSUNAGU_SCROLL_COMPAT` | 0 | スクロール互換モード(1 で 1ノッチ=120単位送信。一部の古いアプリでスクロールが効かない時) |
-| `TSUNAGU_CLIP` | 1 | クリップボード共有(clipboardSharing)。0 で無効 |
-| `TSUNAGU_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(`TSUNAGU_DOUBLE_TAP_MS` 既定 700ms 以内)だけ切替(誤爆防止)。1=従来の1回切替 |
-| `TSUNAGU_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
-| `TSUNAGU_TOKEN` | (必須) | 両側共通の秘密。暗号化の鍵の元になる。未設定だと起動しない |
-| `TSUNAGU_BIND` | 0.0.0.0 | Mac 側の待受アドレス。既定は全インターフェース(LAN 直を受け入れる) |
-| `TSUNAGU_HOST` | (未設定) | Windows 側の接続先(フォールバック候補)。LAN 自動発見とは併用で、見つかった LAN IP が優先される |
-| `TSUNAGU_ALLOW_ANY` | 0 | 1 で LAN・直結・Tailscale 以外のアドレスからの接続も受け入れる |
-| `TSUNAGU_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
-| `TSUNAGU_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
-| `TSUNAGU_LOCK_SYNC` | 1 | Mac の画面ロックで Windows もロックする。0 で無効 |
-| `TSUNAGU_IME_SYNC` | 1 | Windows へ入る時の IME 状態引継ぎ(かな=ON/英数=OFF)。0 で無効 |
-| `TSUNAGU_CONTINUE_HERE` | 1 | ⌥⌘T でのブラウザ引継ぎ(Continue Here)。0 で無効 |
+| `KNIT_SIDE` | right | Windows 画面の位置。right/left/up/down + upright/lowright(右下)/upleft/lowleft。設定窓の配置エディタ(ドラッグ)が同じ結果を視覚的に作れる |
+| `KNIT_SWITCH_DELAY` | 0 | 端に N ms 滞ってから切替(switchDelay。0=無効でダブルタップ/即時) |
+| `KNIT_DOUBLE_TAP_MS` | 700 | ダブルタップの判定窓 ms(switchDoubleTap) |
+| `KNIT_CORNER_PX` | 0 | 四隅 N px 内では切替しない(switchCorners/cornerSize) |
+| `KNIT_SWIPE_NAV` | 1 | 2本指横スワイプをブラウザの戻る/進むへ翻訳(XButton)。0 で従来の横ホイール |
+| `KNIT_SCROLL_COMPAT` | 0 | スクロール互換モード(1 で 1ノッチ=120単位送信。一部の古いアプリでスクロールが効かない時) |
+| `KNIT_CLIP` | 1 | クリップボード共有(clipboardSharing)。0 で無効 |
+| `KNIT_EDGE_TAPS` | 2 | 境界到達回数。既定2=境界に続けて2回当てた時(`KNIT_DOUBLE_TAP_MS` 既定 700ms 以内)だけ切替(誤爆防止)。1=従来の1回切替 |
+| `KNIT_EDGE_PX` | 2 | 右端切替の判定幅(右端からの距離 px)。0 以上 100 未満 |
+| `KNIT_TOKEN` | (必須) | 両側共通の秘密。暗号化の鍵の元になる。未設定だと起動しない |
+| `KNIT_BIND` | 0.0.0.0 | Mac 側の待受アドレス。既定は全インターフェース(LAN 直を受け入れる) |
+| `KNIT_HOST` | (未設定) | Windows 側の接続先(フォールバック候補)。LAN 自動発見とは併用で、見つかった LAN IP が優先される |
+| `KNIT_ALLOW_ANY` | 0 | 1 で LAN・直結・Tailscale 以外のアドレスからの接続も受け入れる |
+| `KNIT_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
+| `KNIT_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
+| `KNIT_LOCK_SYNC` | 1 | Mac の画面ロックで Windows もロックする。0 で無効 |
+| `KNIT_IME_SYNC` | 1 | Windows へ入る時の IME 状態引継ぎ(かな=ON/英数=OFF)。0 で無効 |
+| `KNIT_CONTINUE_HERE` | 1 | ⌥⌘T でのブラウザ引継ぎ(Continue Here)。0 で無効 |
 
 ## 機能別品質向上(開発者用)
 
@@ -336,7 +336,7 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
 変更→検証の 1 サイクルを回す手順:
 
 ```bash
-# Mac 側: ビルド鮮度保証付きで再起動(引数はそのまま tsunagu-mac へ)
+# Mac 側: ビルド鮮度保証付きで再起動(引数はそのまま knit-mac へ)
 # 起動直後に異常終了した場合はログ末尾とともに WARN を表示する
 ./scripts/restart-mac.sh --diag
 
@@ -348,8 +348,8 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
 ```
 
 - `restart-mac.sh` / `deploy-win.sh` は起動のたび BUILD_ID(日時+git短縮sha)を
-  埋め込み、`/tmp/tsunagu-mac.log`・`C:\Users\<user>\tsunagu\tsunagu-win.log` の
-  先頭行(`[info] tsunagu-mac ...` / `[info] tsunagu-win ...`)で配布物の鮮度を確認できる
+  埋め込み、`/tmp/knit-mac.log`・`C:\Users\<user>\knit\knit-win.log` の
+  先頭行(`[info] knit-mac ...` / `[info] knit-win ...`)で配布物の鮮度を確認できる
 - `--diag` は毎秒
   `mode/moves/keys/sent/scrolls/warp_fixed/switches/cursor/moving` をログ出力。
   境界問題の切り分けは `warp_fixed`(カーソル巻き戻し回数)と
@@ -360,14 +360,14 @@ F1〜F6 は macOS が輝度・キーボード照明のメディアイベント�
 - `verify.sh` は Windows へ ssh できない場合、該当項目を NG にせず WARN 扱いにして
   続行する(検証不能と失敗を区別)
 - `check-mouse.sh` は切替後に Mac 側カーソルが凍結(抑制)されているかを検証する
-- ログ: Mac=`/tmp/tsunagu-mac.log`、Windows=`C:\Users\<user>\tsunagu\tsunagu-win.log`
+- ログ: Mac=`/tmp/knit-mac.log`、Windows=`C:\Users\<user>\knit\knit-win.log`
   (ssh home で type)
 
 ## 開発者・ゲーム向けの自動切替
 
 - **ターミナルでの Control**: Windows の前面が Windows Terminal・cmd・PowerShell・WSL 等の間は、
   Mac の Control を Windows の Ctrl として送る(Ctrl+A/E/R/C がそのまま効く)。それ以外のアプリでは
-  従来どおり Win キー。対象は `TSUNAGU_CTRL_APPS` で変更できる
+  従来どおり Win キー。対象は `KNIT_CTRL_APPS` で変更できる
 - **ゲームモード**: Windows でカーソルが閉じ込められた(FPS 等)、または全画面でカーソルが
   1.5 秒以上隠れた間は相対移動で送る(視点回転が効く)。戻るにはホットキーを使う
 - **Secure Input の通知**: Mac でパスワード欄などの保護入力が有効だと、キーボードを Windows へ

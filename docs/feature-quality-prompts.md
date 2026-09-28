@@ -1,11 +1,11 @@
-# 機能別 品質向上プロンプト集(Tsunagu)
+# 機能別 品質向上プロンプト集(Knit)
 
 機能一つ一つの品質を上げるためのセッション用プロンプト集。
 「共通の土台」+ 対象機能のブロックを連結して、新しい ZCode セッションの先頭に貼る。
 
 ## 使い方
 
-1. ZCode を `tsunagu` ディレクトリで開き、新しいセッションを始める
+1. ZCode を `knit` ディレクトリで開き、新しいセッションを始める
 2. 「共通の土台」を貼る
 3. 手を入れたい機能のブロックを土台の直後に連結して貼る
 4. セッションは 1 機能ずつがおすすめ(棚上げが深くなり、コミットも追いやすい)
@@ -20,7 +20,7 @@
 ## 共通の土台(必ず貼る)
 
 ```text
-Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」セッションです。
+Knit(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」セッションです。
 リポジトリ: 
 
 最初に必ず docs/agent-guide.md を読んでください(構成・環境固有の罠 16 項目・
@@ -33,7 +33,7 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
 - 実機配備(scripts/restart-mac.sh / deploy-win.sh / verify.sh / dev.sh)は必ず私が
   実行する。あなたは実行しない。実機検証が必要になったら項目とコマンドを提示して待つ
 - 音が出るテストは事前に私の承認を得る(無断トーン事故の実績あり)
-- トークン(TSUNAGU_TOKEN 等)の値は画面に出さない。~/.config/tsunagu/env の旧名
+- トークン(KNIT_TOKEN 等)の値は画面に出さない。~/.config/knit/env の旧名
   キー(SEAMLESS_DESK_*)のフォールバックは消さない
 - 未追跡の output/・AGENTS.md・.omc/ には触らない
 - Deskflow(/tmp/deskflow、GPL-2.0)は設計参照のみ。コードは写さない
@@ -76,7 +76,7 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
   (30 秒毎・通知のみで自動回復なし)
 
 現在の状態:
-- Windows は TSUNAGU_HOST のカンマ区切り候補へ同時接続レース、最初に繋がった採用
+- Windows は KNIT_HOST のカンマ区切り候補へ同時接続レース、最初に繋がった採用
 - keepalive: 3 秒毎 ping、pong 10 秒途絶で切断扱い→再接続ループ
 - docs/superpowers/specs/2026-09-26-lan-direct-design.md(LAN 直優先)が承認待ち。
   接続先解決の仕様変更はこの設計と競合させない
@@ -194,7 +194,7 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
 
 実装箇所:
 - crates/common/src/lib.rs: bulk モジュール(バイナリフレーム化)
-- crates/mac/src/main.rs: mac_on_bulk(受信側。Downloads/Tsunagu へ保存)、
+- crates/mac/src/main.rs: mac_on_bulk(受信側。Downloads/Knit へ保存)、
   送信開始のトリガ
 - crates/win/src/main.rs: bulk::connect_loop(本線が選んだ Mac アドレスへ追従)
 
@@ -240,7 +240,7 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
 現在の状態:
 - トークンの BLAKE2s ハッシュで部屋 ID を生成し、UDP ブロードキャストで問い合わせ/応答
 - seek_lan は 255.255.255.255 宛に 1.5 秒待ち
-- resolve は TSUNAGU_HOST 指定時はホストリストのみ、未指定時は seek_lan のみ(排他)
+- resolve は KNIT_HOST 指定時はホストリストのみ、未指定時は seek_lan のみ(排他)
 - docs/superpowers/specs/2026-09-26-lan-direct-design.md(発見 ∪ 手動指定の併合設計)が
   承認待ち。接続先解決の仕様変更はこの設計と競合させない
 
@@ -316,7 +316,7 @@ Tsunagu(Mac⇄Windows 入力共有ツール、Rust)の「機能品質向上」�
 実装箇所:
 - crates/mac/src/main.rs: ime_mode_state(判定の純関数・テストあり)、
   current_ime_state(TIS の InputModeID 取得)、enter_win_mode_cursor_lock 内の送信、
-  IME_SYNC(TSUNAGU_IME_SYNC=0 で無効)
+  IME_SYNC(KNIT_IME_SYNC=0 で無効)
 - crates/win/src/main.rs: Msg::Ime 受信→ime_set_open_impl(kana, false)
   (WM_IME_CONTROL/IMC_SETOPENSTATUS。トグルフォールバックはしない)
 - crates/common/src/lib.rs: Msg::Ime(版 11 のまま。旧側は未知行として無視)

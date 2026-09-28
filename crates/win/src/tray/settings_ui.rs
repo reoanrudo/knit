@@ -38,7 +38,7 @@ pub(super) unsafe fn sync() {
         if crate::CONNECTED.load(Ordering::Relaxed) {
             "接続できています。MacからこのWindowsを操作できます。"
         } else {
-            "MacでTsunaguを開き、同じネットワークへの接続を確認。"
+            "MacでKnitを開き、同じネットワークへの接続を確認。"
         },
     );
     static LAST_SIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -70,7 +70,7 @@ pub(super) unsafe fn build() {
         return;
     }
     let hinst = TRAY_HINST.load(Ordering::Relaxed) as *mut core::ffi::c_void;
-    let class = wide("TsunaguSettings");
+    let class = wide("KnitSettings");
     let wc = WNDCLASSW {
         lpfnWndProc: Some(status_wndproc),
         hInstance: hinst,
@@ -94,7 +94,7 @@ pub(super) unsafe fn build() {
     let hwnd = CreateWindowExW(
         0x00010000, /*WS_EX_CONTROLPARENT*/
         class.as_ptr(),
-        wide("Tsunagu 設定").as_ptr(),
+        wide("Knit 設定").as_ptr(),
         style,
         windows_sys::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
         windows_sys::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
@@ -152,7 +152,7 @@ pub(super) unsafe fn build() {
     make(
         None,
         "STATIC",
-        "Tsunagu",
+        "Knit",
         0,
         68,
         32,

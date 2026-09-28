@@ -18,8 +18,8 @@ mod live_tests;
 /// 中継先を「進行中のドラッグ」に限定するために保持する
 pub static DRAG_THREAD: AtomicU32 = AtomicU32::new(0);
 /// Macから掴んだまま越えてきた操作。離した後に届いた転送を別の押下で開始しない
-static CARRIED: std::sync::Mutex<tsunagu_common::drag::Carried> =
-    std::sync::Mutex::new(tsunagu_common::drag::Carried::new());
+static CARRIED: std::sync::Mutex<knit_common::drag::Carried> =
+    std::sync::Mutex::new(knit_common::drag::Carried::new());
 
 pub fn expect(id: u64) {
     CARRIED
@@ -583,7 +583,7 @@ pub fn start(paths: Vec<String>) {
         src_release(src);
         drop(host);
         if effect == DROPEFFECT_COPY {
-            println!("[drag] ドロップ完了(コピー。元は Downloads\\Tsunagu に残ります)");
+            println!("[drag] ドロップ完了(コピー。元は Downloads\\Knit に残ります)");
         } else if hr == DRAGDROP_S_CANCEL {
             println!("[drag] ドロップを取り消しました");
         } else {
@@ -595,9 +595,9 @@ pub fn start(paths: Vec<String>) {
 }
 
 fn fallback(_paths: &[String]) {
-    println!("[drag] 受信ファイルは Downloads\\Tsunagu に保持しています");
+    println!("[drag] 受信ファイルは Downloads\\Knit に保持しています");
     #[cfg(not(test))]
-    crate::tray::notify("Tsunagu", "ドロップを開始・完了できませんでした。受信ファイルはDownloads\\Tsunaguに保存されています。掴んだまま境界を越えて、相手の画面上で離すとその場に置けます");
+    crate::tray::notify("Knit", "ドロップを開始・完了できませんでした。受信ファイルはDownloads\\Knitに保存されています。掴んだまま境界を越えて、相手の画面上で離すとその場に置けます");
 }
 
 #[cfg(test)]
@@ -679,8 +679,8 @@ mod tests {
         use windows_sys::Win32::Foundation::GlobalFree;
         use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
         let paths = vec![
-            String::from(r"C:\Tsunagu test\資料.txt"),
-            String::from(r"C:\Tsunagu test\second.txt"),
+            String::from(r"C:\Knit test\資料.txt"),
+            String::from(r"C:\Knit test\second.txt"),
         ];
         unsafe {
             let source = Box::into_raw(Box::new(DataSource {
@@ -810,12 +810,12 @@ mod tests {
                 .as_nanos();
             let temp = Temp(
                 std::env::temp_dir()
-                    .join(format!("tsunagu-shell-drop-{}-{stamp}", std::process::id())),
+                    .join(format!("knit-shell-drop-{}-{stamp}", std::process::id())),
             );
             let dest = temp.0.join("destination");
             std::fs::create_dir_all(&dest).unwrap();
             let source_path = temp.0.join("越境テスト.txt");
-            let contents = b"Tsunagu native Shell drop test\n";
+            let contents = b"Knit native Shell drop test\n";
             std::fs::write(&source_path, contents).unwrap();
             let dest_w: Vec<u16> = dest
                 .as_os_str()

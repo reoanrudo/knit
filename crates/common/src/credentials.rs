@@ -32,7 +32,7 @@ mod platform {
 /// 入力の前後空白だけを許す。短いPIN、行の混入、URLなどを鍵として受け入れない。
 pub fn parse_key(text: &str) -> io::Result<String> {
     let text = text.trim();
-    let text = text.strip_prefix("tsunagu1:").unwrap_or(text);
+    let text = text.strip_prefix("knit1:").unwrap_or(text);
     if text.len() != 64 || !text.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -42,7 +42,7 @@ pub fn parse_key(text: &str) -> io::Result<String> {
     Ok(text.to_ascii_lowercase())
 }
 pub fn display_key(token: &str) -> String {
-    format!("tsunagu1:{token}")
+    format!("knit1:{token}")
 }
 pub fn generate() -> io::Result<String> {
     let mut bytes = [0u8; 32];
@@ -73,8 +73,8 @@ mod tests {
             "123456".to_string(),
             "0".repeat(63),
             "g".repeat(64),
-            format!("{}\nTSUNAGU_HOST=other", token),
-            format!("tsunagu2:{token}"),
+            format!("{}\nKNIT_HOST=other", token),
+            format!("knit2:{token}"),
         ] {
             assert!(parse_key(&bad).is_err());
         }
@@ -83,13 +83,8 @@ mod tests {
 
 // Non-secret reconnect hint. Authentication always uses the protected token.
 fn peer_path() -> io::Result<std::path::PathBuf> {
-    #[cfg(target_os = "windows")]
-    let root =
-        std::env::var_os("LOCALAPPDATA").map(|p| std::path::PathBuf::from(p).join("Tsunagu"));
-    #[cfg(not(target_os = "windows"))]
-    let root = std::env::var_os("HOME")
-        .map(|p| std::path::PathBuf::from(p).join("Library/Application Support/Tsunagu"));
-    root.map(|p| p.join("paired-host.txt"))
+    crate::envutil::data_dir()
+        .map(|p| p.join("paired-host.txt"))
         .ok_or_else(|| io::Error::other("user directory unavailable"))
 }
 pub fn save_peer(peer: std::net::SocketAddr) -> io::Result<()> {

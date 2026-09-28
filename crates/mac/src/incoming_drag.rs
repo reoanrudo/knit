@@ -1,7 +1,7 @@
 //! Windowsで準備されたファイルを、Macの標準ドラッグとして引き継ぐ。
 use crate::*;
+use knit_common::drag::Incoming;
 use std::sync::atomic::AtomicUsize;
-use tsunagu_common::drag::Incoming;
 
 static INCOMING: Mutex<Incoming> = Mutex::new(Incoming::new());
 static COMMIT: Mutex<Option<u64>> = Mutex::new(None);
@@ -152,7 +152,7 @@ unsafe fn register_source() -> ID {
     }
     let class = objc_allocateClassPair(
         objc_getClass(c"NSObject".as_ptr()),
-        c"TsunaguIncomingFileDrag".as_ptr(),
+        c"KnitIncomingFileDrag".as_ptr(),
         0,
     );
     if class.is_null() {
@@ -410,13 +410,16 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
     if !begin(id, &paths, false) {
         cancel(id);
         send_msg(&Msg::DragCancel { id });
-        notify("Tsunagu","Macのドラッグを開始できませんでした。受信ファイルはDownloads/Tsunaguに保存されています");
+        notify(
+            "Knit",
+            "Macのドラッグを開始できませんでした。受信ファイルはDownloads/Knitに保存されています",
+        );
     }
 }
 
 #[cfg(debug_assertions)]
 pub fn probe() {
-    let path = std::env::temp_dir().join(format!("tsunagu-drag-appkit-{}.txt", std::process::id()));
+    let path = std::env::temp_dir().join(format!("knit-drag-appkit-{}.txt", std::process::id()));
     std::fs::write(&path, b"AppKit drag construction probe").unwrap();
     with_pool(|| unsafe {
         msg0(

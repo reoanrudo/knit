@@ -1,9 +1,9 @@
 //! ドラッグ調査用。OSの入力・クリップボードを操作せず共通転送層の挙動を観測する。
-//! cargo run --locked -q -p tsunagu-common --example drag_protocol_probe
+//! cargo run --locked -q -p knit-common --example drag_protocol_probe
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tsunagu_common::bulk;
+use knit_common::bulk;
 
 struct TempDir(PathBuf);
 impl Drop for TempDir {
@@ -14,7 +14,7 @@ impl Drop for TempDir {
 
 fn main() {
     let base = TempDir(std::env::temp_dir().join(format!(
-        "tsunagu-drag-probe-{}-{}",
+        "knit-drag-probe-{}-{}",
         std::process::id(),
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
     )));

@@ -13,12 +13,12 @@ spec.loader.exec_module(module)
 
 class ReleaseArchiveTests(unittest.TestCase):
     def write_zip(self, path, extra=None, corrupt=False, platform='windows-x64'):
-        root = 'Tsunagu-test' if platform == 'macos-arm64' else 'Tsunagu-win-test'
-        binary = 'Tsunagu.app/Contents/MacOS/Tsunagu' if platform == 'macos-arm64' else 'tsunagu-win.exe'
+        root = 'Knit-test' if platform == 'macos-arm64' else 'Knit-win-test'
+        binary = 'Knit.app/Contents/MacOS/Knit' if platform == 'macos-arm64' else 'knit-win.exe'
         manifest = dict(schema_version=1, version='0.1.0', platform=platform, binary_sha256=hashlib.sha256(b'binary').hexdigest())
         with zipfile.ZipFile(path, 'w') as z:
             z.writestr(f'{root}/{binary}', b'changed' if corrupt else b'binary')
-            files = ['Tsunagu.app/Contents/Info.plist', 'Tsunagu.app/Contents/Resources/AppIcon.icns', 'README-Mac.txt'] if platform == 'macos-arm64' else ['app.ico', 'install.bat', 'uninstall.bat', 'run_tsunagu.bat', 'run_tsunagu.vbs', 'README-win.txt']
+            files = ['Knit.app/Contents/Info.plist', 'Knit.app/Contents/Resources/AppIcon.icns', 'README-Mac.txt'] if platform == 'macos-arm64' else ['app.ico', 'install.bat', 'uninstall.bat', 'run_knit.bat', 'run_knit.vbs', 'README-win.txt']
             for f in files:
                 z.writestr(f'{root}/{f}', b'fixture')
             prefix = ''
@@ -36,7 +36,7 @@ class ReleaseArchiveTests(unittest.TestCase):
     def test_rejects_private_settings_and_keys_at_any_depth(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'release.zip'
-            for extra in ['Tsunagu-win-test/.env', 'Tsunagu-win-test/nested/.env.backup', 'Tsunagu-win-test/nested/preferences.json', 'Tsunagu-win-test/private.p12', 'Tsunagu-win-test/app.log', 'Tsunagu-win-test/connection.dpapi', 'Tsunagu-win-test/paired-host.txt']:
+            for extra in ['Knit-win-test/.env', 'Knit-win-test/nested/.env.backup', 'Knit-win-test/nested/preferences.json', 'Knit-win-test/private.p12', 'Knit-win-test/app.log', 'Knit-win-test/connection.dpapi', 'Knit-win-test/paired-host.txt']:
                 self.write_zip(p, extra=extra)
                 with self.assertRaises(ValueError):
                     module.check_release(p)
@@ -49,7 +49,7 @@ class ReleaseArchiveTests(unittest.TestCase):
     def test_rejects_traversal_and_duplicate_entries(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)/'release.zip'
-            for extra in ['../outside', '/absolute', 'Tsunagu-win-test/tsunagu-win.exe']:
+            for extra in ['../outside', '/absolute', 'Knit-win-test/knit-win.exe']:
                 self.write_zip(p,extra=extra)
                 with self.assertRaises(ValueError): module.check_release(p)
 

@@ -14,11 +14,11 @@
 ## 2. 環境の注意（必読）
 
 1. `cargo` は `source $HOME/.cargo/env` の後に使う。PATH の既定 cargo には Windows ターゲットが無い。clippy は未導入。
-2. Windows のビルド：`cargo test --locked -p tsunagu-win --target x86_64-pc-windows-gnu --no-run`。テスト実行はビルド出力の exe を `scp` で `home:C:/Users/owner/tsunagu/` へ送り、`ssh home` で実行後に削除する。exe 名のハッシュは依存で変わるので、出力の `Executable` 行から取る。
+2. Windows のビルド：`cargo test --locked -p knit-win --target x86_64-pc-windows-gnu --no-run`。テスト実行はビルド出力の exe を `scp` で `home:C:/Users/owner/knit/` へ送り、`ssh home` で実行後に削除する。exe 名のハッシュは依存で変わるので、出力の `Executable` 行から取る。
 3. 配備スクリプト `scripts/deploy-win.sh`・`scripts/restart-mac.sh` は gitignore 済みのローカル専用。`deploy-win.sh` の Windows パスは `<user>` のまま（公開前の掃除の名残）で、そのまま実行すると壊れる。`sed 's/<user>/owner/g' scripts/deploy-win.sh > scripts/.deploy-win-tmp.sh` で一時コピーを作って実行し、実行後に削除する。両スクリプトとも `BUILD_ID` 定数をソースへ書き込む。
 4. 配備は利用者が使用中のアプリを数秒止める。Windows 側から先に配備し、次に Mac を再起動する。配備後は両ログで `established` と `[bulk] established` を確認する。
 5. `scripts/verify.sh` は入力とクリップボードを変更するため、全体では実行しない。
-6. Windows の対話試験（`shared_mouse_release_completes_native_shell_drop` 等、`#[ignore]`）は対話セッションが必要。一時スケジュールタスクで実行し、**終了後に必ずタスクを削除**する。試験中は通常アプリを止め、失敗しても `tsunagu_run` と `tsunagu_watch` を復帰させる。
+6. Windows の対話試験（`shared_mouse_release_completes_native_shell_drop` 等、`#[ignore]`）は対話セッションが必要。一時スケジュールタスクで実行し、**終了後に必ずタスクを削除**する。試験中は通常アプリを止め、失敗しても `knit_run` と `knit_watch` を復帰させる。
 7. 同じリポジトリを別エージェントが編集することがある。大きな編集の前に対象ファイルの mtime と `git status` を確認し、衝突しそうなら worktree で作業する。
 8. プロトコルの版を変える変更は、Mac と Windows を同時に配備する。旧版とも接続を保つ（`MIN_VERSION` は 11）。
 9. 実機の GUI 操作（Computer Use での Finder 操作）は過去に長時間停止した。実操作の確認は利用者に依頼する。
@@ -46,9 +46,9 @@
 ### 4.1 段階0（実機確認の準備）
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)のドラッグ&ドロップを実機確認する準備をしてください。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)のドラッグ&ドロップを実機確認する準備をしてください。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。コードは変更しない。
-1. docs/plans/2026-09-28-drag-upgrade-design.md の段階0の表を、利用者が上から順に実行できる手順書にして output/2026-09-28-drag-e2e/checklist.md に置く。各手順に「確認するログの行(Mac /tmp/tsunagu-mac.log、Windows C:\Users\owner\tsunagu\tsunagu-win.log の [drag] 行)」を添える。
+1. docs/plans/2026-09-28-drag-upgrade-design.md の段階0の表を、利用者が上から順に実行できる手順書にして output/2026-09-28-drag-e2e/checklist.md に置く。各手順に「確認するログの行(Mac /tmp/knit-mac.log、Windows C:\Users\owner\knit\knit-win.log の [drag] 行)」を添える。
 2. 利用者が実行した後に両ログから [drag]・[file]・[mode] 行を抜き出し、手順ごとの合否を output/2026-09-28-drag-e2e/result.json に記録するスクリプト(読み取りのみ)を用意する。
 3. 手順書を利用者に示して止まる。実操作は利用者が行う。
 ```
@@ -56,7 +56,7 @@ docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 ### 4.2 レビュー指摘の修正
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)で、docs/reviews/2026-09-28-drag-review.md の重大度 HIGH 以上(CRITICAL・HIGH)の指摘を修正してください。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)で、docs/reviews/2026-09-28-drag-review.md の重大度 HIGH 以上(CRITICAL・HIGH)の指摘を修正してください。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。着手前に未コミット差分の扱いを利用者に確認する。
 - 指摘ごとに、まず失敗する単体テスト(共通クレートの純粋関数で書けるものはそこに)を書き、次に最小の修正を行う。
 - 「要実機確認」の指摘は、修正後の確認手順を output/2026-09-28-drag-e2e/checklist.md に追記する。
@@ -68,9 +68,9 @@ docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 ### 4.3 段階1（転送層の信頼性）
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)で docs/plans/2026-09-28-drag-upgrade-design.md の段階1(転送層の信頼性)を実装してください。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)で docs/plans/2026-09-28-drag-upgrade-design.md の段階1(転送層の信頼性)を実装してください。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」と設計書 §5 の互換方針を守ること。
-範囲: 一時保存(.tsunagu-part)→検証→rename、FILE_END へのハッシュ、CANCEL フレームと転送ID、受信側の進捗イベント、Mac の FILE_TX_BUSY を直列キューへ置換、hello への caps 追加(VERSION 14)。
+範囲: 一時保存(.knit-part)→検証→rename、FILE_END へのハッシュ、CANCEL フレームと転送ID、受信側の進捗イベント、Mac の FILE_TX_BUSY を直列キューへ置換、hello への caps 追加(VERSION 14)。
 - 依存クレートの追加(ハッシュ)は理由と代替案を示し、利用者の承認を得てから行う。
 - crates/common/src/lib.rs の bulk は巨大なので、変更前に該当範囲だけを読む。bulk モジュールの分割が必要なら、先に挙動を変えない分割コミットを作る。
 - 受け入れ: 中断・再起動・同名・送信中の元ファイル更新の結合テストを crates/common/tests/ に追加し、旧版(caps なし)の相手との互換テストも書く。
@@ -80,7 +80,7 @@ docs/plans/2026-09-28-drag-handoff.md の「環境の注意」と設計書 §5 �
 ### 4.4 段階2（状態管理の共通化）
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)で docs/plans/2026-09-28-drag-upgrade-design.md の段階2(ドラッグ状態管理の共通化)を実装してください。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)で docs/plans/2026-09-28-drag-upgrade-design.md の段階2(ドラッグ状態管理の共通化)を実装してください。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 - crates/common/src/drag.rs に Session 状態機械(入力イベント→命令列)を作り、全遷移を表形式の単体テストで固定してから、既存の drag::Incoming / drag::Carried / win edge の Pending / mac incoming_drag の ACTIVE・COMMIT を置き換える。
 - OS 依存部(COM/objc)は命令の実行だけにする。挙動を変える変更と置き換えのコミットを分ける。
@@ -91,7 +91,7 @@ docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 ### 4.5 段階3（PoC）
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)で docs/plans/2026-09-28-drag-upgrade-design.md の段階3「PoC で先に確かめること」1〜4を検証してください。製品コードは変更せず、crates/win/examples/ と crates/mac/examples/ に検証用プログラムを置く。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)で docs/plans/2026-09-28-drag-upgrade-design.md の段階3「PoC で先に確かめること」1〜4を検証してください。製品コードは変更せず、crates/win/examples/ と crates/mac/examples/ に検証用プログラムを置く。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。Windows の GUI 試験は一時スケジュールタスクで実行し、終了後に削除する。
 - Windows: CFSTR_FILEDESCRIPTORW + CFSTR_FILECONTENTS(IStream) + IDataObjectAsyncCapability を持つ IDataObject で、Explorer のフォルダへドロップさせ、IStream の読み出しを意図的に遅らせる・途中で失敗させる。DoDragDrop 終了後の読み出し継続、部分ファイルの残り方、COM の寿命を記録する。
 - Mac: NSFilePromiseProvider で Finder へドロップさせ、書き出しを遅らせる・失敗させる。
@@ -102,7 +102,7 @@ docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 ### 4.6 段階4（フォルダ・多数項目）
 
 ```text
-Tsunagu(/Users/taguchireo/ZCodeProject/tsunagu)で docs/plans/2026-09-28-drag-upgrade-design.md の段階4(フォルダ・多数項目)を実装してください。段階1の caps が入っていることが前提。日本語で対応。
+Knit(/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit)で docs/plans/2026-09-28-drag-upgrade-design.md の段階4(フォルダ・多数項目)を実装してください。段階1の caps が入っていることが前提。日本語で対応。
 docs/plans/2026-09-28-drag-handoff.md の「環境の注意」を守ること。
 - 目録(相対パス・種別・サイズ)と FILE_BEGIN の rel、受信側の構造再現(一意なトップフォルダ、空フォルダ)。
 - 名前規則(Windows 予約名、末尾の点・空白、禁止文字、大文字小文字衝突、260文字超)を crates/common の files モジュールで検出し、変換か拒否理由を返す。表形式の単体テストで固定する。

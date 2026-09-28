@@ -2,7 +2,7 @@
 
 ## 対応バージョン / Supported versions
 
-開発の先行段階のため、最新のタグ（[Releases](https://github.com/reoanrudo/tsunagu/releases)）
+開発の先行段階のため、最新のタグ（[Releases](https://github.com/reoanrudo/knit/releases)）
 のみを対象とします。
 
 ## 脆弱性の報告 / Reporting a vulnerability
@@ -10,7 +10,7 @@
 **公開の issue には報告しないでください。** 次のいずれかへお願いします:
 
 - **GitHub Security Advisories（推奨）**: このリポジトリの
-  [Security タブ → Report a vulnerability](https://github.com/reoanrudo/tsunagu/security/advisories/new)
+  [Security タブ → Report a vulnerability](https://github.com/reoanrudo/knit/security/advisories/new)
   から非公開で報告できます
 - またはメンテナへ直接ご連絡ください（GitHub 上のメンションでも構いません）
 
@@ -25,7 +25,7 @@
 - 全通信経路（入力 24900・音声 24901・ファイル 24902・登録 24904）を
   Noise プロトコル（`Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s`）で暗号化。
   共有トークンは回線に流れず、PSK の導出にのみ使用（前方秘匿あり）
-- 接続元は LAN・有線直結・Tailscale 範囲に限定（`TSUNAGU_ALLOW_ANY` で全域許可に変更可）
+- 接続元は LAN・有線直結・Tailscale 範囲に限定（`KNIT_ALLOW_ANY` で全域許可に変更可）
 - 初回登録は SPAKE2 + 6桁コード（5 分期限・3 回試行制限・単発使用）
 - 受信ファイルは無害化・隔離属性付与・上限付き。URL は http/https のみ、
   アプリ起動は列挙済み .lnk との完全一致のみ

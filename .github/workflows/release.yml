@@ -2,7 +2,7 @@
 # ビルドは CI 上で公開コードから行われるため、配布物の再現性の担保になる
 # (署名なし OSS の標準形。Mac は ad-hoc 署名、Windows は未署名)。
 # 将来コード署名を導入する場合は各 package スクリプトの環境変数
-# (TSUNAGU_SIGN_IDENTITY / TSUNAGU_NOTARY_PROFILE 等)を Secrets へ登録する。
+# (KNIT_SIGN_IDENTITY / KNIT_NOTARY_PROFILE 等)を Secrets へ登録する。
 name: release
 on:
   push:
@@ -20,8 +20,8 @@ jobs:
         with:
           name: dist-macos
           path: |
-            dist/Tsunagu-*.zip
-            dist/Tsunagu-*.zip.sha256
+            dist/Knit-*.zip
+            dist/Knit-*.zip.sha256
   windows:
     # Windows 用も macos runner から x86_64-pc-windows-gnu へクロスビルドする
     # (ローカル開発と同一手法)。ring(snow の依存)の C 部分に mingw の
@@ -38,8 +38,8 @@ jobs:
         with:
           name: dist-windows
           path: |
-            dist/Tsunagu-win-*.zip
-            dist/Tsunagu-win-*.zip.sha256
+            dist/Knit-win-*.zip
+            dist/Knit-win-*.zip.sha256
   publish:
     needs: [macos, windows]
     runs-on: ubuntu-latest

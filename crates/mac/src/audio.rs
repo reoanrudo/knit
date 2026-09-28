@@ -359,7 +359,7 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
 pub fn start(token: String, port: u16) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read, Write};
-        let bind_ip = crate::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind_ip = crate::envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
             Ok(l) => l,
             Err(e) => {
@@ -369,7 +369,7 @@ pub fn start(token: String, port: u16) {
         };
         eprintln!("[audio] listening on {bind_ip}:{port}");
         // 本線と同じ連続失敗スロットル(認証失敗の連打を鈍らせる)
-        let mut throttle = tsunagu_common::secure::FailThrottle::new();
+        let mut throttle = knit_common::secure::FailThrottle::new();
         loop {
             let (stream, peer) = match listener.accept() {
                 Ok(x) => x,
@@ -379,7 +379,7 @@ pub fn start(token: String, port: u16) {
                 }
             };
             // 本線と同じ接続元制限と暗号化(トークン不一致はハンドシェイクで弾かれる)
-            if !tsunagu_common::net::is_allowed(peer.ip()) {
+            if !knit_common::net::is_allowed(peer.ip()) {
                 eprintln!("[audio] rejected: {peer}");
                 std::thread::sleep(throttle.fail());
                 continue;
@@ -392,8 +392,7 @@ pub fn start(token: String, port: u16) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(12)))
                 .ok();
-            let (r, mut w) = match tsunagu_common::secure::accept(stream, &token, b"tsunagu-audio")
-            {
+            let (r, mut w) = match knit_common::secure::accept(stream, &token, b"knit-audio") {
                 Ok(x) => x,
                 Err(e) => {
                     eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");

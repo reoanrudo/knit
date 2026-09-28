@@ -17,8 +17,8 @@ pub const PORT: u16 = 24904;
 pub const LIFETIME: Duration = Duration::from_secs(300);
 const MAX_ATTEMPTS: usize = 3;
 const IO_TIMEOUT: Duration = Duration::from_secs(8);
-const ASK: &[u8] = b"TSUNAGU-PAIR-DISCOVER-1";
-const LABEL: &[u8] = b"tsunagu-enrollment-v1";
+const ASK: &[u8] = b"KNIT-PAIR-DISCOVER-1";
+const LABEL: &[u8] = b"knit-enrollment-v1";
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
@@ -140,7 +140,7 @@ impl Invitation {
         let (tx, events) = mpsc::channel();
         let name = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
-            .unwrap_or_else(|_| "Mac · Tsunagu".into());
+            .unwrap_or_else(|_| "Mac · Knit".into());
         let beacon = serde_json::to_vec(&Beacon {
             version: 1,
             name: safe_name(&name),
@@ -251,7 +251,7 @@ fn serve_one(
     wire.send(id.as_bytes())?;
     let (state, message) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.as_bytes()),
-        &Identity::new(b"tsunagu-windows-v1"),
+        &Identity::new(b"knit-windows-v1"),
         &Identity::new(id.as_bytes()),
     );
     let incoming = wire.receive()?;
@@ -306,7 +306,7 @@ pub fn enroll_cancellable(
     }
     let (state, message) = Spake2::<Ed25519Group>::start_a(
         &Password::new(code.as_bytes()),
-        &Identity::new(b"tsunagu-windows-v1"),
+        &Identity::new(b"knit-windows-v1"),
         &Identity::new(&id),
     );
     wire.send(&message)?;

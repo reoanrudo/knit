@@ -43,7 +43,7 @@ impl Drop for Owned {
 fn error(status: i32) -> io::Error {
     io::Error::other(format!("キーチェーンを利用できません（{status}）。"))
 }
-const SERVICE: &str = "local.tsunagu.connection";
+const SERVICE: &str = "local.knit.connection";
 unsafe fn query(service: &str) -> io::Result<Owned> {
     let service_name =
         std::ffi::CString::new(service).map_err(|_| io::Error::other("不正なサービス名"))?;
@@ -157,7 +157,7 @@ mod tests {
     #[ignore = "専用の一時キーチェーン項目を作成・削除する実機試験"]
     fn keychain_roundtrip_without_touching_registered_key() {
         let service = format!(
-            "local.tsunagu.test.{}.{}",
+            "local.knit.test.{}.{}",
             std::process::id(),
             super::super::generate().unwrap()
         );

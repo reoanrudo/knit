@@ -84,7 +84,7 @@ impl Host {
         if ACTIVE.swap(true, Ordering::Relaxed) {
             return None;
         }
-        let class: Vec<u16> = "TsunaguDragSource\0".encode_utf16().collect();
+        let class: Vec<u16> = "KnitDragSource\0".encode_utf16().collect();
         let wc = WNDCLASSW {
             lpfnWndProc: Some(proc),
             lpszClassName: class.as_ptr(),

@@ -365,7 +365,7 @@ pub(super) unsafe fn sync() {
         } else if crate::CONNECTED.load(Ordering::Relaxed) {
             "接続できています。画面の端からWindowsへ移動できます。"
         } else {
-            "WindowsでTsunaguを開き、同じネットワークへの接続を確認。"
+            "WindowsでKnitを開き、同じネットワークへの接続を確認。"
         };
         msg1_void_id(hint, sel(c"setStringValue:"), nsstring(text));
     }
@@ -394,7 +394,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
     if win.is_null() {
         return win;
     }
-    msg1_void_id(win, sel(c"setTitle:"), nsstring("Tsunagu 設定"));
+    msg1_void_id(win, sel(c"setTitle:"), nsstring("Knit 設定"));
     msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
     msg0_void(win, sel(c"center"));
     let cv = msg0(win, sel(c"contentView"));
@@ -436,7 +436,7 @@ pub(super) unsafe fn build(target: ID) -> ID {
     );
     msg1_void_id(iv, sel(c"setImage:"), icon);
     msg1_void_id(sidebar, sel(c"addSubview:"), iv);
-    label(sidebar, "Tsunagu", 59.0, 537.0, 110.0, 20.0, false);
+    label(sidebar, "Knit", 59.0, 537.0, 110.0, 20.0, false);
     label(
         sidebar,
         "2台を、ひとつの手元で。",

@@ -1,15 +1,15 @@
 //! ExplorerのOLEドラッグを接続辺で受け、準備が整ったMacへ引き継ぐ。
 use super::*;
+use knit_common::{
+    bulk,
+    proto::{encode, Msg},
+};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64},
     Mutex,
 };
 use std::time::{Duration, Instant};
-use tsunagu_common::{
-    bulk,
-    proto::{encode, Msg},
-};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINTL, WPARAM};
 use windows_sys::Win32::System::Ole::{RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -88,7 +88,7 @@ pub fn accept(id: u64) {
             println!("[drag] win->mac transfer {id} failed: {error}");
             if error.kind() != std::io::ErrorKind::Interrupted {
                 crate::tray::notify(
-                    "Tsunagu",
+                    "Knit",
                     "Macへファイルを渡せませんでした。接続を確認してもう一度掴んでください",
                 );
             }
@@ -129,7 +129,7 @@ unsafe fn data_files(data: *mut c_void) -> Option<Vec<PathBuf>> {
     let mut files = Vec::new();
     if medium.tymed == TYMED_HGLOBAL && !medium.h_global.is_null() {
         let n = crate::DragQueryFileW(medium.h_global, u32::MAX, std::ptr::null_mut(), 0);
-        if n > 0 && n <= tsunagu_common::drag::MAX_FILES as u32 {
+        if n > 0 && n <= knit_common::drag::MAX_FILES as u32 {
             for i in 0..n {
                 let len = crate::DragQueryFileW(medium.h_global, i, std::ptr::null_mut(), 0);
                 if len == 0 || len > 32767 {
@@ -232,7 +232,7 @@ unsafe extern "system" fn enter(
         .any(|p| !p.is_file() || std::fs::File::open(p).is_err())
         || bulk::total_size(&files) > bulk::MAX_TOTAL
     {
-        crate::tray::notify("Tsunagu", "通常のファイルを選んでください。フォルダ・読み取れない項目・転送上限を超える選択は渡せません");
+        crate::tray::notify("Knit", "通常のファイルを選んでください。フォルダ・読み取れない項目・転送上限を超える選択は渡せません");
         return S_OK;
     }
     let total = bulk::total_size(&files);
@@ -265,7 +265,7 @@ unsafe extern "system" fn enter(
     println!("[drag] win->mac offer {id}: {count} files, {total} bytes");
     if total > 8 * 1024 * 1024 {
         crate::tray::notify(
-            "Tsunagu",
+            "Knit",
             &format!(
                 "Macへ転送中です({})。境界で押したまま待つと、準備後にMacへ移ります",
                 crate::human_bytes(total)
@@ -400,7 +400,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         if finish && !crate::inject_mouse_btn(0, false) {
             cancel_current();
             crate::tray::notify(
-                "Tsunagu",
+                "Knit",
                 "Windowsのドラッグを引き継げませんでした。もう一度掴んでください",
             );
         }
@@ -459,7 +459,7 @@ unsafe fn create_window() -> HWND {
         fn GetModuleHandleW(name: *const u16) -> *mut c_void;
     }
     let instance = GetModuleHandleW(std::ptr::null());
-    let name: Vec<u16> = "TsunaguFileEdge\0".encode_utf16().collect();
+    let name: Vec<u16> = "KnitFileEdge\0".encode_utf16().collect();
     let class = WNDCLASSW {
         hInstance: instance,
         lpfnWndProc: Some(window_proc),

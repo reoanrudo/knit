@@ -228,7 +228,7 @@ fn rtt_line() -> String {
     }
     // 経路(LAN 直 / Tailscale)を併記: Mac のメニューバー表示との対称
     let route = match crate::peer_ip() {
-        Some(ip) if tsunagu_common::net::is_tailscale(ip) => "・Tailscale",
+        Some(ip) if knit_common::net::is_tailscale(ip) => "・Tailscale",
         Some(_) => "・LAN 直",
         None => "",
     };
@@ -239,7 +239,7 @@ fn rtt_line() -> String {
         format!("遅延: {ms}ms{route}")
     }
 }
-/// exe と同じフォルダの .env の TSUNAGU_HOST 行を書き換える(無ければ追記)
+/// exe と同じフォルダの .env の KNIT_HOST 行を書き換える(無ければ追記)
 fn save_host_to_env(host: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = exe
@@ -249,10 +249,10 @@ fn save_host_to_env(host: &str) -> std::io::Result<()> {
     let mut lines: Vec<String> = std::fs::read_to_string(&path)
         .unwrap_or_default()
         .lines()
-        .filter(|l| !l.trim_start().starts_with("TSUNAGU_HOST"))
+        .filter(|l| !l.trim_start().starts_with("KNIT_HOST"))
         .map(|l| l.to_string())
         .collect();
-    lines.push(format!("TSUNAGU_HOST={host}"));
+    lines.push(format!("KNIT_HOST={host}"));
     std::fs::write(&path, lines.join("\r\n") + "\r\n")
 }
 
@@ -288,7 +288,7 @@ fn footer_line() -> String {
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
         .join("Downloads")
-        .join("Tsunagu");
+        .join("Knit");
     format!(
         "接続先: {host} ・ 稼働 {h}時間{m:02}分\n受信フォルダ: {}",
         recv.display()
@@ -344,7 +344,7 @@ fn tray_status_text() -> String {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .map(|ip| {
-            if tsunagu_common::net::is_tailscale(ip) {
+            if knit_common::net::is_tailscale(ip) {
                 " · Tailscale"
             } else {
                 " · LAN 直"
@@ -360,7 +360,7 @@ fn tray_status_text() -> String {
     } else {
         String::new()
     };
-    format!("Tsunagu · {conn}{rtt_s}{route}{history_s}")
+    format!("Knit · {conn}{rtt_s}{route}{history_s}")
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -475,10 +475,10 @@ unsafe fn handle_command(id: u32) {
             update_tip();
         }
         MENU_OPENLOG => {
-            // ログは exe と同じフォルダ(run_tsunagu.bat が書き出す)
+            // ログは exe と同じフォルダ(run_knit.bat が書き出す)
             let path = std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("tsunagu-win.log")))
+                .and_then(|p| p.parent().map(|d| d.join("knit-win.log")))
                 .unwrap_or_default();
             let mut log: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
             log.push(0);
@@ -502,18 +502,18 @@ unsafe fn handle_command(id: u32) {
             } else {
                 println!("[tray] Mac へ戻る: 未接続のため何も起きません");
                 notify(
-                    "Tsunagu",
+                    "Knit",
                     "未接続のため戻れません(Mac側アプリが起動していれば自動で再接続します)",
                 );
             }
         }
         MENU_OPENFOLDER => {
-            // 受信フォルダ(DOWNLOADS\\Tsunagu)をエクスプローラーで開く
+            // 受信フォルダ(DOWNLOADS\\Knit)をエクスプローラーで開く
             let dir = std::env::var_os("USERPROFILE")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_default()
                 .join("Downloads")
-                .join("Tsunagu");
+                .join("Knit");
             let _ = std::fs::create_dir_all(&dir);
             let mut path: Vec<u16> = dir.to_string_lossy().encode_utf16().collect();
             path.push(0);
@@ -868,7 +868,7 @@ unsafe fn open_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
     // クリップボード履歴(送信・受信したテキストから選んで復元)
     {
-        let now = tsunagu_common::history::now_epoch_ms();
+        let now = knit_common::history::now_epoch_ms();
         let count = crate::HISTORY
             .lock()
             .map(|h| h.entries().len())
@@ -876,9 +876,9 @@ unsafe fn open_menu(hwnd: HWND) {
         let entries: Vec<(u64, String)> = crate::HISTORY
             .lock()
             .map(|h| {
-                h.recent(tsunagu_common::history::MENU_ITEMS)
+                h.recent(knit_common::history::MENU_ITEMS)
                     .into_iter()
-                    .map(|e| (e.id, tsunagu_common::history::label(e, now, 34)))
+                    .map(|e| (e.id, knit_common::history::label(e, now, 34)))
                     .collect()
             })
             .unwrap_or_default();
@@ -1004,7 +1004,7 @@ unsafe fn tray_loop() {
         eprintln!("[tray] RegisterClassW 失敗(トレイなしで継続)");
         return;
     }
-    let mut title: Vec<u16> = "tsunagu".encode_utf16().collect();
+    let mut title: Vec<u16> = "Knit".encode_utf16().collect();
     title.push(0);
     // 可視化しないメッセージウィンドウ(トレイのコールバック受け)
     let hwnd = CreateWindowExW(
@@ -1041,10 +1041,10 @@ unsafe fn tray_loop() {
     }
     SetTimer(hwnd, 1, 1000, None);
     eprintln!("[tray] タスクトレイに常駐しました");
-    // デバッグ/スクリーンショット検証用: TSUNAGU_STATUS_SHOW=1 で起動時に窓を開く
+    // デバッグ/スクリーンショット検証用: KNIT_STATUS_SHOW=1 で起動時に窓を開く
     if UI_PREVIEW.load(Ordering::Relaxed)
         || crate::JUST_REGISTERED.load(Ordering::Relaxed)
-        || tsunagu_common::envutil::get("TSUNAGU_STATUS_SHOW").as_deref() == Some("1")
+        || knit_common::envutil::get("KNIT_STATUS_SHOW").as_deref() == Some("1")
     {
         open_status_window();
     }

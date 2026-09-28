@@ -245,7 +245,7 @@ impl History {
 
 /// 履歴本文と画像実体を、所有者だけが読める権限で書き込む。
 /// ~/.config 下は既定 umask(022)だと他ユーザーに読める(644)ため、
-/// トークン設定(~/.config/tsunagu/env=600)と同じ土俵へ揃える。
+/// トークン設定(~/.config/knit/env=600)と同じ土俵へ揃える。
 /// Windows はプロファイル直下の既定 ACL に任せる(何もしない)
 pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, bytes)?;
@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn file_kind_survives_disk_round_trip() {
-        let dir = std::env::temp_dir().join(format!("tsunagu-history-file-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-history-file-{}", std::process::id()));
         let path = dir.join("history.json");
         let mut h = History::new(5);
         h.push_files(&[std::path::PathBuf::from("/tmp/a.txt")], "Mac", 1);
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_disk_and_drops_overflow() {
-        let dir = std::env::temp_dir().join(format!("tsunagu-history-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-history-test-{}", std::process::id()));
         let path = dir.join("history.json");
         let mut h = History::new(2);
         h.push_text("a", "Mac", 1);
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn tolerates_a_broken_file() {
-        let dir = std::env::temp_dir().join(format!("tsunagu-history-bad-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-history-bad-{}", std::process::id()));
         let path = dir.join("history.json");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "not json").unwrap();
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn image_kind_survives_disk_round_trip() {
-        let dir = std::env::temp_dir().join(format!("tsunagu-history-img-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-history-img-{}", std::process::id()));
         let path = dir.join("history.json");
         let mut h = History::new(5);
         let name = image_file_name(0xdeadbeef, "dib");
@@ -701,8 +701,7 @@ mod tests {
 
     #[test]
     fn prunes_image_store_keeping_newest() {
-        let dir =
-            std::env::temp_dir().join(format!("tsunagu-history-prune-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-history-prune-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // mtime の分解能に頼らないよう、書き込み順=新しい順になるよう少し空けて作る
@@ -736,7 +735,7 @@ mod tests {
     #[test]
     fn history_and_images_are_owner_only() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("tsunagu-hist-perm-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-hist-perm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut h = History::new(3);
         h.push_text("clipboard text", "Mac", 1);

@@ -1,6 +1,6 @@
 //! 初回導入は通常の通信・入力フックを起動する前に完了させる。
 use super::*;
-use tsunagu_common::credentials;
+use knit_common::credentials;
 
 unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) -> isize {
     let app = msg0(
@@ -83,14 +83,14 @@ pub fn first_run(preview: bool) -> Option<String> {
 }
 
 struct PairingUi {
-    invitation: tsunagu_common::pairing::Invitation,
+    invitation: knit_common::pairing::Invitation,
     until: std::time::Instant,
     message: String,
 }
 static PAIRING: std::sync::Mutex<Option<PairingUi>> = std::sync::Mutex::new(None);
 static PAIR_ALERT: AtomicUsize = AtomicUsize::new(0);
 unsafe extern "C" fn poll_pairing(_s: ID, _c: SEL, _timer: ID) {
-    use tsunagu_common::pairing::Event;
+    use knit_common::pairing::Event;
     let mut state = PAIRING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(ui) = state.as_mut() else {
         return;
@@ -124,12 +124,12 @@ unsafe extern "C" fn poll_pairing(_s: ID, _c: SEL, _timer: ID) {
         .until
         .saturating_duration_since(std::time::Instant::now())
         .as_secs();
-    let body = format!("WindowsでTsunaguを開き、このMacを選んでコードを入力してください。\n\n有効期限：{}分{:02}秒 • 登録できるのは1台です。\n{}", seconds / 60, seconds % 60, ui.message);
+    let body = format!("WindowsでKnitを開き、このMacを選んでコードを入力してください。\n\n有効期限：{}分{:02}秒 • 登録できるのは1台です。\n{}", seconds / 60, seconds % 60, ui.message);
     msg1_void_id(a, sel(c"setInformativeText:"), nsstring(&body));
     msg0_void(a, sel(c"layout"));
 }
 fn show_invitation(token: &str, preview: bool) {
-    use tsunagu_common::pairing::{Invitation, LIFETIME};
+    use knit_common::pairing::{Invitation, LIFETIME};
     if preview {
         unsafe {
             alert("Windowsとつなぐ", "Windowsで近くのMacを選び、この6桁を入力します。\n\nコードは5分間有効です。\nこれは画面確認用です。通信・保存は行いません。", &["閉じる"], Some("123 456"));
@@ -158,7 +158,7 @@ fn show_invitation(token: &str, preview: bool) {
         message: "この画面を閉じると登録の受付を終了します。".into(),
     });
     unsafe {
-        let class_name = c"TsunaguPairingTarget";
+        let class_name = c"KnitPairingTarget";
         let mut cls = objc_getClass(class_name.as_ptr());
         if cls.is_null() {
             cls =
@@ -205,7 +205,7 @@ pub(super) unsafe extern "C" fn show_registration(_s: ID, _c: SEL, _sender: ID) 
         let _ = first_run(true);
         return;
     }
-    let token = crate::envutil::get("TSUNAGU_TOKEN")
+    let token = crate::envutil::get("KNIT_TOKEN")
         .filter(|t| !t.is_empty())
         .or_else(|| credentials::load().ok().flatten());
     match token {
@@ -221,7 +221,7 @@ unsafe extern "C" {
 pub fn ensure_permission() -> bool {
     while !unsafe { AXIsProcessTrusted() } {
         let choice = unsafe {
-            alert("このMacから操作する準備","TsunaguでWindowsを操作するには、Macのアクセシビリティ権限が必要です。\n\nシステム設定でTsunaguを許可し、この画面に戻って確認してください。",&["システム設定を開く","許可したので確認","あとで"],None)
+            alert("このMacから操作する準備","KnitでWindowsを操作するには、Macのアクセシビリティ権限が必要です。\n\nシステム設定でKnitを許可し、この画面に戻って確認してください。",&["システム設定を開く","許可したので確認","あとで"],None)
         };
         if choice == 1002 {
             return false;

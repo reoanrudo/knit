@@ -3,26 +3,25 @@ use super::*;
 use serde_json::{json, Value};
 
 fn path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".config/tsunagu/preferences.json"))
+    knit_common::envutil::config_dir().map(|dir| dir.join("preferences.json"))
 }
 
 pub(super) fn has_overrides() -> bool {
     [
-        "TSUNAGU_SIDE",
-        "TSUNAGU_SWITCH_MODE",
-        "TSUNAGU_EDGE_TAPS",
-        "TSUNAGU_HOTKEY_KC",
-        "TSUNAGU_SWITCH_DELAY",
-        "TSUNAGU_DOUBLE_TAP_MS",
-        "TSUNAGU_SCROLL_DIV",
-        "TSUNAGU_MOUSE_SCALE",
-        "TSUNAGU_EDGE_PX",
-        "TSUNAGU_SCROLL_FLIP",
-        "TSUNAGU_SCROLL_COMPAT",
-        "TSUNAGU_CMD_ALT",
-        "TSUNAGU_MUTE_SPK",
-        "TSUNAGU_CLIP",
+        "KNIT_SIDE",
+        "KNIT_SWITCH_MODE",
+        "KNIT_EDGE_TAPS",
+        "KNIT_HOTKEY_KC",
+        "KNIT_SWITCH_DELAY",
+        "KNIT_DOUBLE_TAP_MS",
+        "KNIT_SCROLL_DIV",
+        "KNIT_MOUSE_SCALE",
+        "KNIT_EDGE_PX",
+        "KNIT_SCROLL_FLIP",
+        "KNIT_SCROLL_COMPAT",
+        "KNIT_CMD_ALT",
+        "KNIT_MUTE_SPK",
+        "KNIT_CLIP",
     ]
     .iter()
     .any(|key| crate::envutil::get(key).is_some())
@@ -77,14 +76,14 @@ fn write_to(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
         .parent()
         .ok_or_else(|| std::io::Error::other("保存先がありません"))?;
     std::fs::create_dir_all(parent)?;
-    tsunagu_common::history::restrict_dir(parent);
+    knit_common::history::restrict_dir(parent);
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(serde_json::to_string_pretty(value)?.as_bytes())?;
     f.sync_all()?;
     drop(f);
     // 履歴と同じく所有者のみ(600)で保存する(umask 既定の 644 に任せない)
-    tsunagu_common::history::restrict(&tmp);
+    knit_common::history::restrict(&tmp);
     std::fs::rename(tmp, path)
 }
 
@@ -94,7 +93,7 @@ pub(super) fn restore() {
         return;
     };
     // 旧版が 644 で作ったファイルを読めたら 600 へ是正する
-    tsunagu_common::history::restrict(&path);
+    knit_common::history::restrict(&path);
     let v: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -170,7 +169,7 @@ mod tests {
         assert_eq!(*crate::LAY_RANGE.lock().unwrap(), (0.2, 0.8));
         apply(&before);
         let dir = std::env::temp_dir().join(format!(
-            "tsunagu-prefs-test-{}-{}",
+            "knit-prefs-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

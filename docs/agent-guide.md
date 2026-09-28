@@ -1,4 +1,4 @@
-# Tsunagu エージェント作業ガイド(AI/自動化向け)
+# Knit エージェント作業ガイド(AI/自動化向け)
 
 このファイルは、AI エージェント(または自動化スクリプト)が本プロジェクトを安全に扱うための
 最重要事項を集約したもの。経緯は CHANGELOG.md と docs/improvement-log.md 参照。
@@ -10,8 +10,8 @@
 
 ## 構成と定数
 
-- **Mac = サーバ**(`tsunagu-mac`, TCP 24900 受信)/ **Win = クライアント**(`tsunagu-win`, 接続ループ)。
-  逆転構成は環境固有(本環境は Mac 発 TCP が不通なため)。`TSUNAGU_ROLE=server` で反転可
+- **Mac = サーバ**(`knit-mac`, TCP 24900 受信)/ **Win = クライアント**(`knit-win`, 接続ループ)。
+  逆転構成は環境固有(本環境は Mac 発 TCP が不通なため)。`KNIT_ROLE=server` で反転可
 - 経路: 本線 TCP 24900(JSON Lines の `Msg`)/ 音声 TCP 24901(s16 PCM)/
   ファイル・画像 TCP 24902(`common::bulk` のバイナリフレーム)/ LAN 自動発見 UDP 24903(`common::discover`)
 - **全 TCP 経路は `common::secure`(Noise NNpsk0)で包む**。平文で読み書きしない。
@@ -32,7 +32,7 @@
 ./scripts/verify.sh                 # 自動検証(15 項目。WARN は fail 扱いでない)
 ```
 
-ログ: Mac `/tmp/tsunagu-mac.log`、Win `ssh home "type C:\Users\<user>\tsunagu\tsunagu-win.log"`。
+ログ: Mac `/tmp/knit-mac.log`、Win `ssh home "type C:\Users\<user>\knit\knit-win.log"`。
 
 ## 環境固有の罠(実績バグ集 — 絶対に再発させない)
 
@@ -60,7 +60,7 @@
 10. Mac keycode の数字row: **18=1, 19=2, 20=3, 21=4, 23=5, 22=6, 26=7, 28=8, 25=9, 29=0**
     (21=4 と 23=5 を取り違えると ⌘⇧3/⌘⇧5 が効かない — 実績)
 11. **PCM 音声は 8 バイト(f32×2ch)境界**を厳守。境界外ドロップは恒久位相ずれ=破壊音
-12. トークン(TSUNAGU_TOKEN)は画面出力しない。`.env`/`dist/` は gitignore 済み
+12. トークン(KNIT_TOKEN)は画面出力しない。`.env`/`dist/` は gitignore 済み
 13. 音が出る E2E テストはユーザーの事前承認が必要(無断トーン事故の実績)
 14. **ドラッグ用ペーストボード(NSPasteboardNameDrag)はキャンセル後もクリアされず
     残ることがある**(実測)。掴み判定は「押下開始時点からの changeCount 変化」基準に
@@ -110,8 +110,8 @@
   新しい押下へ結びつけない。MacのAppKit呼び出しはGUIタイマーのメインスレッドで行う。
 
 - クリップボード履歴は `common/src/history.rs` に本体(蓄積・保存・ラベル)があり、
-  両側は push 時に保存、起動時に読むだけ。保存先は Win: %LOCALAPPDATA%\Tsunagu\history.json、
-  Mac: ~/.config/tsunagu/history.json。機密・秘匿指定は push 前に除外済みなので
+  両側は push 時に保存、起動時に読むだけ。保存先は Win: %LOCALAPPDATA%\Knit\history.json、
+  Mac: ~/.config/knit/history.json。機密・秘匿指定は push 前に除外済みなので
   history.rs には検査を足さない。Mac の履歴メニューは GUI_HISTORY_SEEN(初期 u64::MAX)で
   変化検知し、push が HISTORY_LAST_ID を上げた時だけ項目を作り直す。
 

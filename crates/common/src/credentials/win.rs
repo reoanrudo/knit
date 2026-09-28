@@ -41,8 +41,8 @@ unsafe extern "system" {
     fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
 }
 fn path() -> io::Result<PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|p| PathBuf::from(p).join("Tsunagu/connection.dpapi"))
+    crate::envutil::data_dir()
+        .map(|dir| dir.join("connection.dpapi"))
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -181,7 +181,7 @@ mod tests {
     fn protected_file_roundtrip_and_no_overwrite() {
         let token = super::super::generate().unwrap();
         let dir = std::env::temp_dir().join(format!(
-            "tsunagu-key-test-{}-{}",
+            "knit-key-test-{}-{}",
             std::process::id(),
             &token[..12]
         ));
