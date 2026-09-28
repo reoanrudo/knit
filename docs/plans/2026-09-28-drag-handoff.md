@@ -5,9 +5,9 @@
 
 ## 1. 現在の状態
 
-- ブランチ `main`。2026-09-28 のセッションで Mac→Windows の受け渡しID化と関連修正を行い、**未コミット**のまま両アプリへ配備した（Mac `build-20260928-123220-fb6ce7a`、Windows は同時刻の `win-…-fb6ce7a`）。
-- 未コミットの変更：`crates/common/src/drag.rs`、`crates/mac/src/{main.rs,file_drag.rs,gui.rs}`、`crates/win/src/{main.rs,dragdrop.rs,dragdrop/host.rs}`、`CHANGELOG.md`（[未リリース]）、`docs/drag-drop-investigation.md`、本書と設計書・レビュー。`BUILD_ID` 定数も配備スクリプトが書き換えている。
-- **着手前に、この差分をコミットするかを利用者に確認する。** 自分の変更と混ぜない。
+- ブランチ `main`。2026-09-28 のセッションで Mac→Windows の受け渡しID化と関連修正を行い、両アプリへ配備した（Mac `build-20260928-123220-fb6ce7a`、Windows は同時刻の `win-…-fb6ce7a`）。ソースと文書の変更はコミット `735069a` にまとまっている。
+- 変更範囲：`crates/common/src/drag.rs`、`crates/mac/src/{main.rs,file_drag.rs,gui.rs}`、`crates/win/src/{main.rs,dragdrop.rs,dragdrop/host.rs}`、`CHANGELOG.md`（[未リリース]）、`docs/drag-drop-investigation.md`、本書と設計書・レビュー。なお配備スクリプトが `BUILD_ID` 定数をソースへ書き込むため、配備後は `git status` が汚れる。
+- **作業は `735069a` 以降に積み、自分の変更と混ぜない。**
 - レビュー判定は変更要求（HIGH 5件）。L5（コメントの関数名）だけは本セッションで直した。
 - 検証済み：Mac・共通の通常テスト95件、Windows 実機の通常テスト8件。未確認：Finder⇄Explorer の実操作（設計書の段階0）。
 
