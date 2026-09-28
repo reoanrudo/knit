@@ -2,7 +2,7 @@
 
 このプロジェクトは Semantic Versioning に準拠します。
 
-## [未リリース]
+## [0.26.0] - 2026-09-28
 
 ### 変更(名称を Tsunagu から Knit へ)
 - アプリ名・クレート名(knit-common / knit-mac / knit-win)・実行ファイル名・
