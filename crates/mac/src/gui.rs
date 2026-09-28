@@ -651,7 +651,7 @@ unsafe fn run_search_hit(index: usize, throw: bool) {
                 // ファイル/フォルダ候補を Windows へ投げる(Throw)。送信経路は
                 // Finder の ⌘C 同期と同じ(FileBegin→FileEnd、Ctrl+V で貼り付け可)
                 eprintln!("[search] ファイルを Windows へ投げます: {text}");
-                crate::send_files_to_win(vec![std::path::PathBuf::from(&text)], false);
+                crate::send_files_to_win(vec![std::path::PathBuf::from(&text)]);
             } else {
                 // 既定アプリで開く(.app は NSWorkspace が起動、フォルダは Finder)
                 let url = crate::msg1_id(
@@ -1197,7 +1197,7 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
     if !paths.is_empty() {
         let pb: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
         eprintln!("[gui] ファイル送信: {} 件", pb.len());
-        crate::send_files_to_win(pb, false);
+        crate::send_files_to_win(pb);
     }
 }
 /// 設定ウィンドウを開く(初回のみ生成。以降は同一ウィンドウを前面化)。

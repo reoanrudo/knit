@@ -496,7 +496,7 @@ fn sync_clipboard_to_win() {
                             files.len()
                         );
                         history_push_files(&files, "Mac");
-                        send_files_to_win(files, false);
+                        send_files_to_win(files);
                     }
                 } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) < 1_000 {
                     // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る
@@ -922,9 +922,8 @@ fn mac_files_key(paths: &[std::path::PathBuf]) -> String {
 
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
-/// drop=true は「掴んだまま境界越え」: FileDropBegin で始め FileDropEnd で終わり、
-/// Windows 側はクリップボードではなく OLE ドラッグとして扱う
-pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
+/// 掴んだまま境界を越える場合は offer_drag_to_win を使う
+pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
         eprintln!("[file] 送信中のため要求を無視しました");
         return;
@@ -946,10 +945,9 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
             return;
         }
         eprintln!(
-            "[file] 送信開始: {} 件 / 合計 {}KB{}",
+            "[file] 送信開始: {} 件 / 合計 {}KB",
             paths.len(),
-            total / 1024,
-            if drop { "(掴みドラッグ)" } else { "" }
+            total / 1024
         );
         let t0 = std::time::Instant::now();
         // 進捗は 10% 刻みでログへ(巨大転送中に固まって見えるのを防ぐ)。
@@ -958,7 +956,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
             () => {
                 BULK_LINK.send(|w| {
                     let mut last_step = 0u64;
-                    bulk::send_files_with_progress(w, &paths, drop, |sent, total| {
+                    bulk::send_files_with_progress(w, &paths, false, |sent, total| {
                         if total > 0 {
                             let step = sent * 10 / total.max(1);
                             if step > last_step {
@@ -987,29 +985,107 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>, drop: bool) {
                     "[file] 送信完了({n} 件, {:.1}MB/s)",
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
-                if drop {
-                    notify(
-                        "tsunagu",
-                        &format!(
-                            "{n} 件({})を Windows へ掴んで渡しました",
-                            human_bytes(total)
-                        ),
-                    );
-                } else {
-                    notify(
-                        "tsunagu",
-                        &format!(
-                            "{n} 件({})を Windows へ送信しました(Ctrl+V で貼り付け)",
-                            human_bytes(total)
-                        ),
-                    );
-                }
+                notify(
+                    "tsunagu",
+                    &format!(
+                        "{n} 件({})を Windows へ送信しました(Ctrl+V で貼り付け)",
+                        human_bytes(total)
+                    ),
+                );
             }
             Err(e) => {
                 eprintln!("[file] 送信失敗: {e}");
                 notify(
                     "tsunagu",
                     "Windows へファイルを送れませんでした(ファイル転送経路が未接続)",
+                );
+            }
+        }
+        FILE_TX_BUSY.store(false, Ordering::Relaxed);
+    });
+}
+
+/// 掴んだまま境界を越えたファイルを Windows へ渡す準備。本線の予告(DragOffer)と
+/// ファイル転送に同じ受け渡しIDを付け、Windows は越えてきた押下が続いている間に
+/// 届いた場合だけ OLE ドラッグを始める(離した後の転送を別の操作に混ぜない)。
+/// 予告は押下より前に本線へ積む。受け付けなければ None を返し、呼び出し元は
+/// 境界を越えない。tap スレッドから呼ぶため、ファイル情報の読み出しは 1 回にする
+fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
+    let mut total = 0u64;
+    let supported = !paths.is_empty()
+        && paths.len() <= tsunagu_common::drag::MAX_FILES
+        && paths.iter().all(|p| match std::fs::metadata(p) {
+            Ok(meta) if meta.is_file() => {
+                total = total.saturating_add(meta.len());
+                true
+            }
+            _ => false,
+        })
+        && total <= bulk::MAX_TOTAL;
+    if !supported {
+        eprintln!("[drag] mac->win 対象外: {} 件", paths.len());
+        notify(
+            "tsunagu",
+            &format!(
+                "掴んだまま渡せるのは通常のファイル {} 件・合計 {} までです(フォルダは未対応)",
+                tsunagu_common::drag::MAX_FILES,
+                bulk::file_limit_label()
+            ),
+        );
+        return None;
+    }
+    if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
+        eprintln!("[drag] mac->win 送信中のため受け付けません");
+        notify(
+            "tsunagu",
+            "前のファイルを転送中です。完了後にもう一度掴んでください",
+        );
+        return None;
+    }
+    // Windows 側が自分で採番する受け渡しIDと重ならないよう最上位ビットを立てる
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let id = (1 << 63) | NEXT.fetch_add(1, Ordering::Relaxed);
+    send_msg(&Msg::DragOffer {
+        id,
+        count: paths.len(),
+        total,
+        position: 0.0,
+    });
+    eprintln!(
+        "[drag] mac->win offer {id}: {} 件 / 合計 {}KB",
+        paths.len(),
+        total / 1024
+    );
+    Some(id)
+}
+
+/// 予告済みの掴みドラッグのファイルを転送する。押下を本線へ積んだ後に呼ぶ
+/// (小さいファイルの完了が押下より先に Windows へ着くのを避ける)
+fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
+    std::thread::spawn(move || {
+        let t0 = std::time::Instant::now();
+        let send = || BULK_LINK.send(|w| bulk::send_drag_files(w, &paths, id, || false));
+        let mut r = send();
+        if r.as_ref()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotConnected)
+        {
+            eprintln!("[drag] bulk 経路の再接続を待って再試行します");
+            std::thread::sleep(Duration::from_millis(2500));
+            r = send();
+        }
+        match r {
+            Ok(n) => eprintln!(
+                "[drag] mac->win {id} 転送完了({n} 件, {:.1}MB/s)",
+                bulk::total_size(&paths) as f64
+                    / 1024.0
+                    / 1024.0
+                    / t0.elapsed().as_secs_f64().max(0.001)
+            ),
+            Err(e) => {
+                eprintln!("[drag] mac->win {id} 転送失敗: {e}");
+                notify(
+                    "tsunagu",
+                    "Windows へファイルを渡せませんでした。接続を確認してもう一度掴んでください",
                 );
             }
         }
@@ -3158,6 +3234,14 @@ unsafe extern "C" fn tap_callback(
                     // 切替すると入力転送がセッションからマウス入力を奪い、ended も
                     // ドロップも来なくなる(実測)。掴んだまま境界に触れた場合は
                     // ボタンを離して終わらせるのが意図された復帰操作
+                    // 渡せなかった掴みは、離すまで Mac 側のドラッグとして続ける
+                    if FILE_DRAG
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .refused()
+                    {
+                        return event;
+                    }
                     if incoming_drag::blocking() {
                         // 操作を宙吊りにした理由が利用者に分かるよう、
                         // 初回だけ案内を出す(連投しない)
@@ -3240,6 +3324,27 @@ unsafe extern "C" fn tap_callback(
                         }
                         EDGE_LAST_HIT_MS.store(0, Ordering::Relaxed);
                     }
+                    // 掴んだファイルは切替より先に受け付け、予告を押下より前に本線へ積む。
+                    // 渡せない掴みでは境界を越えず、Mac 側のドラッグをそのまま続けさせる
+                    // (越えると元のドラッグを画面端で終わらせることになる)
+                    let dragged_files = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    let mut handoff = None;
+                    if let Some(files) = dragged_files {
+                        eprintln!("[file] 掴みドラッグ切替: {} 件を転送します", files.len());
+                        let Some(id) = offer_drag_to_win(&files) else {
+                            // 離すまで越えさせず、境界の到達回数も数え直す
+                            FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).refuse();
+                            EDGE_AT_EDGE.store(false, Ordering::Relaxed);
+                            EDGE_LAST_HIT_MS.store(0, Ordering::Relaxed);
+                            EDGE_STAY_SINCE_MS.store(0, Ordering::Relaxed);
+                            return event;
+                        };
+                        // ⌘C ポーリング経由の再送を指紋で抜く(通常は載らないが保険)
+                        let key = mac_files_key(&files);
+                        *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
+                        history_push_files(&files, "Mac");
+                        handoff = Some((files, id));
+                    }
                     WIN_MODE.store(true, Ordering::Relaxed);
                     DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                     // 到達時の速度を添える(§24 用の計装。速い=意図的な越え、
@@ -3252,12 +3357,48 @@ unsafe extern "C" fn tap_callback(
                         loc.y
                     );
 
+                    // ファイル掴み切替: 掴んだファイルを Windows へ流し、Mac 側の
+                    // ドラッグは合成 LeftMouseUp で完結させる(Finder の宙吊り防止)。
+                    // UP は tap コールバック内で post できないため別スレッド投稿。
+                    // 投稿イベントは自分の HID タップを再通過する(定番の再帰問題)ため
+                    // kCGEventSourceUserData にマジックを刻み、tap 側で識別して
+                    // 「Mac へ素通し・Windows へは転送しない」処理をする(転送すると
+                    // 押したままのユーザー意図に反して Win 側が離した扱いになる)
+                    if handoff.is_some() {
+                        std::thread::spawn(|| {
+                            std::thread::sleep(Duration::from_millis(60));
+                            unsafe {
+                                let pos = live_cursor().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
+                                let e = make_drag_end_event(pos);
+                                if !e.is_null() {
+                                    CGEventPost(0 /* kCGHIDEventTap */, e);
+                                    CFRelease(e as *mut core::ffi::c_void);
+                                }
+                            }
+                        });
+                    }
+                    // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
+                    // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
+                    let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
+                    if nx < 0.0 || handoff.is_some() {
+                        // 初回とファイル掴み: 越えた境界の対応位置から入る(Windows 側の反対の辺)
+                        let r = g.along_ratio(dir, loc.x, loc.y);
+                        (nx, ny) = match dir {
+                            1 => (0.95, r),
+                            2 => (r, 0.95),
+                            3 => (r, 0.05),
+                            _ => (0.05, r),
+                        };
+                    }
+                    send_msg(&Msg::Warp { nx, ny });
+                    eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
                     // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
                     // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験。
                     // 掴みドラッグ中は EVT_MOUSE_MOVED 由来の切替でも持ち込む
                     // (押下直後の軽い移動は MOVED として届くことがある=実測。
-                    // 持ち込み漏れは Win 側のフォールバックを誘発する)
+                    // 持ち込み漏れは Win 側のフォールバックを誘発する)。
+                    // 押し直しはワープの後に送る(前回の Windows 位置にある物を押さない)
                     if event_type != EVT_MOUSE_MOVED || file_drag_ready {
                         if drag_ok {
                             for b in 0u8..=2 {
@@ -3274,50 +3415,9 @@ unsafe extern "C" fn tap_callback(
                             }
                         }
                     }
-                    // ファイル掴み切替: 掴んだファイルを Windows へ流し、Mac 側の
-                    // ドラッグは合成 LeftMouseUp で完結させる(Finder の宙吊り防止)。
-                    // UP は tap コールバック内で post できないため別スレッド投稿。
-                    // 投稿イベントは自分の HID タップを再通過する(定番の再帰問題)ため
-                    // kCGEventSourceUserData にマジックを刻み、tap 側で識別して
-                    // 「Mac へ素通し・Windows へは転送しない」処理をする(転送すると
-                    // 押したままのユーザー意図に反して Win 側が離した扱いになる)
-                    let dragged_files = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).take();
-                    if let Some(files) = dragged_files {
-                        if !files.is_empty() {
-                            // ⌘C ポーリング経由の再送を指紋で抜く(通常は載らないが保険)
-                            let key = mac_files_key(&files);
-                            *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = key;
-                            eprintln!("[file] 掴みドラッグ切替: {} 件を転送します", files.len());
-                            history_push_files(&files, "Mac");
-                            send_files_to_win(files, true);
-                        }
-                        std::thread::spawn(|| {
-                            std::thread::sleep(Duration::from_millis(60));
-                            unsafe {
-                                let pos = live_cursor().unwrap_or(CGPoint { x: 0.0, y: 0.0 });
-                                let e = make_drag_end_event(pos);
-                                if !e.is_null() {
-                                    CGEventPost(0 /* kCGHIDEventTap */, e);
-                                    CFRelease(e as *mut core::ffi::c_void);
-                                }
-                            }
-                        });
+                    if let Some((files, id)) = handoff {
+                        send_drag_files_to_win(files, id);
                     }
-                    // 前回 Windows に出た位置があればそこへ戻し、なければ境界の対応高さへ。
-                    // 高さは出口ディスプレイの y 範囲で正規化(反転なし: 画面上端同士が対応)
-                    let (mut nx, mut ny) = *LAST_WIN_POS.lock().unwrap_or_else(|e| e.into_inner());
-                    if nx < 0.0 {
-                        // 初回: 越えた境界の対応位置から入る(Windows 側の反対の辺)
-                        let r = g.along_ratio(dir, loc.x, loc.y);
-                        (nx, ny) = match dir {
-                            1 => (0.95, r),
-                            2 => (r, 0.95),
-                            3 => (r, 0.05),
-                            _ => (0.05, r),
-                        };
-                    }
-                    send_msg(&Msg::Warp { nx, ny });
-                    eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
                     // 絶対位置モードの仮想カーソルを Warp 先で初期化
                     {
                         let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -3777,7 +3877,7 @@ unsafe extern "C" fn tap_callback(
 
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20260927-201932-68d4857";
+const BUILD_ID: &str = "build-20260928-123220-fb6ce7a";
 
 fn main() {
     eprintln!("[info] tsunagu-mac {BUILD_ID}");
@@ -4476,12 +4576,16 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>, my_id: 
             Ok(_) => {
                 if let Some(msg) = decode(&line) {
                     match msg {
+                        // 返信はアクティブな相手へ出るため、それ以外の相手からは受けない
+                        // (相手側は押下の解放・時間切れで自ら取り消す)
                         Msg::DragOffer {
                             id,
                             count,
                             total,
                             position,
-                        } => incoming_drag::offer(id, count, total, position),
+                        } if is_active_peer(my_id) => {
+                            incoming_drag::offer(id, count, total, position)
+                        }
                         Msg::DragCommit { id } => incoming_drag::commit(id),
                         Msg::DragCancel { id } => incoming_drag::cancel(id),
                         Msg::AppsReply { apps } => {

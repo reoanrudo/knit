@@ -863,7 +863,14 @@ static BULK: std::sync::OnceLock<bulk::Endpoint> = std::sync::OnceLock::new();
 /// 大容量経路の受信完了(Mac からのファイル・画像)
 fn win_on_bulk(e: bulk::Event) {
     match e {
-        bulk::Event::Files { paths, drop, .. } => {
+        bulk::Event::Files {
+            paths,
+            drop,
+            drag_id,
+        } => {
+            if paths.is_empty() {
+                return;
+            }
             let files: Vec<String> = paths
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -872,7 +879,13 @@ fn win_on_bulk(e: bulk::Event) {
             FILES_RX.fetch_add(n as u64, Ordering::Relaxed);
             // 自分が渡す CF_HDROP を Mac へ送り返さない
             *LAST_RECV_FILES.lock().unwrap_or_else(|e| e.into_inner()) = Some(files_key(&files));
-            if drop && BTN_W[0].load(Ordering::Relaxed) {
+            // 受け渡しIDがあれば、越えてきた押下が続いている間だけ開始する。
+            // IDのない旧版Macからは、完了時点の押下状態で判断する
+            let carried = match drag_id {
+                Some(id) => dragdrop::claim(id),
+                None => drop && BTN_W[0].load(Ordering::Relaxed),
+            };
+            if carried {
                 // まだ押している=掴んだまま → 本物の OLE ドラッグを開始
                 dragdrop::start(files);
                 return;
@@ -1641,7 +1654,7 @@ fn refresh_vscreen() -> (i32, i32, i32, i32) {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20260927-201527-68d4857";
+const BUILD_ID: &str = "win-20260928-123138-fb6ce7a";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -2319,6 +2332,8 @@ fn session(
             None => continue,
         };
         match msg {
+            // Mac から掴んだまま越える予告。直後の押下を引き継いだ操作として扱う
+            Msg::DragOffer { id, .. } => dragdrop::expect(id),
             Msg::DragAccept { id } => dragdrop::edge::accept(id),
             Msg::DragReady { id } => dragdrop::edge::ready(id),
             Msg::DragCancel { id } | Msg::DragDone { id, .. } => dragdrop::edge::cancel(id),

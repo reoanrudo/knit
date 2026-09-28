@@ -17,6 +17,26 @@ mod live_tests;
 /// 進行中の OLE ドラッグを回しているスレッドのID(0=なし)。共有入力の
 /// 中継先を「進行中のドラッグ」に限定するために保持する
 pub static DRAG_THREAD: AtomicU32 = AtomicU32::new(0);
+/// Macから掴んだまま越えてきた操作。離した後に届いた転送を別の押下で開始しない
+static CARRIED: std::sync::Mutex<tsunagu_common::drag::Carried> =
+    std::sync::Mutex::new(tsunagu_common::drag::Carried::new());
+
+pub fn expect(id: u64) {
+    CARRIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .announce(id);
+}
+
+fn release_expected() {
+    CARRIED.lock().unwrap_or_else(|e| e.into_inner()).release();
+}
+
+/// 届いた転送が、いま掴んでいる操作のものか(一度だけ真)。押下は別接続の
+/// 本線で届くため、到着の前後は start が待って吸収する
+pub fn claim(id: u64) -> bool {
+    CARRIED.lock().unwrap_or_else(|e| e.into_inner()).claim(id)
+}
 #[cfg(test)]
 static TEST_DRAG_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -522,7 +542,15 @@ pub fn start(paths: Vec<String>) {
             fallback(&paths);
             return;
         }
+        // 転送(別接続)が本線の押下より先に届いた場合に備えて少し待つ
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        while (host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         if host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed) {
+            fallback(&paths);
             OleUninitialize();
             return;
         }
@@ -587,6 +615,21 @@ mod tests {
         static SDK_IDROP_TARGET: Guid;
         #[link_name = "BHID_SFUIObject"]
         static SDK_SHELL_UI_OBJECT: Guid;
+    }
+
+    #[test]
+    fn transfer_from_mac_starts_a_drag_only_while_the_carried_press_continues() {
+        crate::BTN_W[0].store(true, Ordering::Relaxed);
+        expect(9);
+        relay_up();
+        assert!(!claim(9), "離した後に届いた転送は通常の受信へ");
+        expect(10);
+        relay_cancel();
+        assert!(!claim(10), "Macへ戻った後の転送をドラッグにしない");
+        expect(11);
+        assert!(claim(11));
+        assert!(!claim(11), "同じ転送で二度開始しない");
+        crate::BTN_W[0].store(false, Ordering::Relaxed);
     }
 
     #[test]
