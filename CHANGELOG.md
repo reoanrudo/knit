@@ -531,7 +531,7 @@
 ## [0.8.0] - 2026-09-25
 
 ### 追加
-- **Tsunagu(つなぐ)へ改名**(旧: seamless-desk)。Deskflow 等の既存ソフトとの混同を排除し、
+- **Knit（旧名 Tsunagu）へ改名**(旧: seamless-desk)。Deskflow 等の既存ソフトとの混同を排除し、
   独自ブランドとしての配布を可能にする
 - LICENSE(MIT)を新設
 - CHANGELOG.md を新設
