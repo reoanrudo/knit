@@ -9,3 +9,10 @@ output/
 .omc/
 .zcode/
 __pycache__/
+# 開発者の2台運用専用スクリプト(公開リポジトリ外。ローカルにのみ置く)
+scripts/deploy-win.sh
+scripts/verify.sh
+scripts/snap-win.bat
+scripts/check-mouse.sh
+scripts/restart-mac.sh
+scripts/dev.sh
