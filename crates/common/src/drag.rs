@@ -71,11 +71,66 @@ impl Incoming {
     }
 }
 
+/// 相手から掴んだまま越えてきた操作。本線の予告と別接続で届くファイルを
+/// 受け渡しIDで結びつけ、同じ押下が続いている間に届いた転送だけをドラッグにする。
+/// 離した・制御が戻った後に届いた転送は、通常の受信として扱わせる。
+pub struct Carried {
+    expected: Option<(u64, bool)>,
+}
+
+impl Carried {
+    pub const fn new() -> Self {
+        Self { expected: None }
+    }
+    pub fn announce(&mut self, id: u64) {
+        if id != 0 {
+            self.expected = Some((id, false));
+        }
+    }
+    pub fn release(&mut self) {
+        if let Some((_, released)) = &mut self.expected {
+            *released = true;
+        }
+    }
+    pub fn claim(&mut self, id: u64) -> bool {
+        match self.expected {
+            Some((expected, released)) if expected == id => {
+                self.expected = None;
+                !released
+            }
+            _ => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     fn files() -> Vec<PathBuf> {
         vec![PathBuf::from("received.txt")]
+    }
+
+    #[test]
+    fn carried_drag_starts_only_while_the_same_press_continues() {
+        let mut carried = Carried::new();
+        assert!(!carried.claim(5), "予告のない転送はドラッグにしない");
+        carried.announce(5);
+        assert!(carried.claim(5));
+        assert!(!carried.claim(5), "同じ転送で二度開始しない");
+        carried.announce(6);
+        carried.release();
+        assert!(!carried.claim(6), "離した後に届いた転送は通常の受信へ");
+        carried.announce(0);
+        assert!(!carried.claim(0));
+    }
+
+    #[test]
+    fn late_transfer_of_an_older_drag_does_not_take_over_the_next_one() {
+        let mut carried = Carried::new();
+        carried.announce(1);
+        carried.announce(2);
+        assert!(!carried.claim(1), "前の操作の転送を新しい押下に混ぜない");
+        assert!(carried.claim(2));
     }
 
     #[test]

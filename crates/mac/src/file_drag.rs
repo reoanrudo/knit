@@ -9,9 +9,14 @@ pub(crate) struct Probe {
 
 enum Phase {
     Idle,
-    Pressed { probe: Probe, moved: bool },
+    Pressed {
+        probe: Probe,
+        moved: bool,
+    },
     Ready(Vec<PathBuf>),
     HandedOff,
+    /// 相手へ渡せなかった掴み。離すまで境界を越えさせない
+    Refused,
 }
 
 pub(crate) struct FileDrag {
@@ -75,6 +80,14 @@ impl FileDrag {
             Phase::Ready(files) => Some(files),
             _ => unreachable!(),
         }
+    }
+
+    pub(crate) fn refuse(&mut self) {
+        self.phase = Phase::Refused;
+    }
+
+    pub(crate) fn refused(&self) -> bool {
+        matches!(self.phase, Phase::Refused)
     }
 
     pub(crate) fn end(&mut self) {
@@ -153,6 +166,20 @@ mod tests {
             drag.probe().is_none(),
             "基準値が取得できなければ残骸を渡さない"
         );
+    }
+
+    #[test]
+    fn refused_drag_holds_the_edge_until_release() {
+        let mut drag = FileDrag::new();
+        drag.begin(Some(3));
+        drag.moved();
+        assert!(drag.complete(drag.probe().unwrap(), 4, files()));
+        assert!(drag.take().is_some());
+        drag.refuse();
+        assert!(drag.refused(), "渡せなかった掴みで境界を越えない");
+        assert!(!drag.ready() && drag.take().is_none());
+        drag.end();
+        assert!(!drag.refused(), "離せば通常の切替に戻る");
     }
 
     #[test]
