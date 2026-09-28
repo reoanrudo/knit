@@ -343,7 +343,7 @@ unsafe extern "C" fn imp_edge_taps(_s: ID, _c: SEL, _n: ID) {
 }
 unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
     let _ = std::process::Command::new("open")
-        .args(["-a", "Console", "/tmp/tsunagu-mac.log"])
+        .args(["-a", "Console", "/tmp/knit-mac.log"])
         .spawn();
 }
 
@@ -682,7 +682,7 @@ unsafe fn run_search_hit(index: usize, throw: bool) {
             if crate::send_msg_reported(&crate::Msg::OpenUrl { url: text.clone() }) {
                 eprintln!("[search] Windows で開くよう送信: {text}");
             } else {
-                crate::notify("Tsunagu", "未接続のため Windows で開けませんでした");
+                crate::notify("Knit", "未接続のため Windows で開けませんでした");
             }
         }
         3 => {
@@ -690,7 +690,7 @@ unsafe fn run_search_hit(index: usize, throw: bool) {
             if crate::send_msg_reported(&crate::Msg::RunApp { path: text.clone() }) {
                 eprintln!("[search] Windows へ起動指示: {text}");
             } else {
-                crate::notify("Tsunagu", "未接続のため Windows で起動できませんでした");
+                crate::notify("Knit", "未接続のため Windows で起動できませんでした");
             }
         }
         5 => crate::run_desk_command(&text),
@@ -721,7 +721,7 @@ unsafe fn refresh_search_results(query: &str) {
         .lock()
         .map(|h| h.entries().iter().map(|e| (e.id, e.text.clone())).collect())
         .unwrap_or_default();
-    let mut rows: Vec<Row> = tsunagu_common::desksearch::search(
+    let mut rows: Vec<Row> = knit_common::desksearch::search(
         query,
         &apps,
         &files,
@@ -732,11 +732,11 @@ unsafe fn refresh_search_results(query: &str) {
     .into_iter()
     .map(|h| {
         let kind = match h.kind {
-            tsunagu_common::desksearch::Kind::App => 0u8,
-            tsunagu_common::desksearch::Kind::History => 1,
-            tsunagu_common::desksearch::Kind::Url => 2,
-            tsunagu_common::desksearch::Kind::File => 4,
-            tsunagu_common::desksearch::Kind::Cmd => 5,
+            knit_common::desksearch::Kind::App => 0u8,
+            knit_common::desksearch::Kind::History => 1,
+            knit_common::desksearch::Kind::Url => 2,
+            knit_common::desksearch::Kind::File => 4,
+            knit_common::desksearch::Kind::Cmd => 5,
         };
         Row {
             kind,
@@ -756,8 +756,8 @@ unsafe fn refresh_search_results(query: &str) {
             .unwrap_or_default();
         if !win_apps.is_empty() {
             let remain = SEARCH_BUTTONS.len() - rows.len();
-            for h in tsunagu_common::desksearch::search(query, &win_apps, &[], &[], &[], remain) {
-                if !matches!(h.kind, tsunagu_common::desksearch::Kind::App) {
+            for h in knit_common::desksearch::search(query, &win_apps, &[], &[], &[], remain) {
+                if !matches!(h.kind, knit_common::desksearch::Kind::App) {
                     continue;
                 }
                 rows.push(Row {
@@ -931,7 +931,7 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
         }
         None => {
             eprintln!("[gui] 再起動スクリプトが見つかりません(.app 配布時は終了後に LaunchAgent が再起動します)");
-            crate::notify("tsunagu", "再起動スクリプトが見つかりません");
+            crate::notify("Knit", "再起動スクリプトが見つかりません");
         }
     }
 }
@@ -1158,7 +1158,7 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
         sel(c"setMessage:"),
         crate::nsstring(&format!(
             "Windows へ送信します(1回の合計 {} まで)",
-            tsunagu_common::bulk::file_limit_label()
+            knit_common::bulk::file_limit_label()
         )),
     );
     // runModal は選択が確定するまで戻らない(メイン RunLoop を内回りする)
@@ -1670,9 +1670,9 @@ unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
     // (run 前のウィンドウ操作は NSException で abort するため遅延させる)
     if SHOW_AT_START.swap(false, Ordering::Relaxed) {
         show_prefs();
-        // 検証用: TSUNAGU_SHOW_LAYOUT=1 で配置ウィンドウも同時オープン
+        // 検証用: KNIT_SHOW_LAYOUT=1 で配置ウィンドウも同時オープン
         if !UI_PREVIEW.load(Ordering::Relaxed)
-            && crate::envutil::get("TSUNAGU_SHOW_LAYOUT").as_deref() == Some("1")
+            && crate::envutil::get("KNIT_SHOW_LAYOUT").as_deref() == Some("1")
         {
             show_layout();
         }
@@ -1680,7 +1680,7 @@ unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
     refresh_status();
 }
 
-/// 開発環境のリポジトリを探す(<repo>/target/release/tsunagu-mac から3階層上)
+/// 開発環境のリポジトリを探す(<repo>/target/release/knit-mac から3階層上)
 fn restart_script() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut p = exe.clone();
@@ -1850,7 +1850,7 @@ unsafe fn rebuild_peers_menu(menu: ID) {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let mons = tsunagu_common::proto::Monitor::summary(&p.monitors);
+                let mons = knit_common::proto::Monitor::summary(&p.monitors);
                 let title = if p.monitors.len() > 1 {
                     format!("{} ・{}面", p.name, p.monitors.len())
                 } else if p.monitors.len() == 1 {
@@ -1929,10 +1929,10 @@ unsafe fn rebuild_history_menu(menu: ID) {
         msg1_void_id(holder, sel(c"setTitle:"), nsstring(&t));
     }
     let items = crate::HISTORY.lock().ok().map(|h| {
-        let now = tsunagu_common::history::now_epoch_ms();
-        h.recent(tsunagu_common::history::MENU_ITEMS)
+        let now = knit_common::history::now_epoch_ms();
+        h.recent(knit_common::history::MENU_ITEMS)
             .into_iter()
-            .map(|e| (tsunagu_common::history::label(e, now, 34), e.text.clone()))
+            .map(|e| (knit_common::history::label(e, now, 34), e.text.clone()))
             .collect::<Vec<_>>()
     });
     let items = items.unwrap_or_default();
@@ -2220,7 +2220,7 @@ pub fn start() -> bool {
             menu,
             msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
         );
-        let quit = menu_item("tsunagu を終了", Some(c"sdQuit:"), "q");
+        let quit = menu_item("knit を終了", Some(c"sdQuit:"), "q");
         if quit.is_null() {
             return false;
         }

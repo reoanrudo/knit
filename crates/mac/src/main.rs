@@ -1,4 +1,4 @@
-// tsunagu-mac: Mac 側クライアント。CGEventTap で入力を横流しし、Windows へ送信する。
+// knit-mac: Mac 側クライアント。CGEventTap で入力を横流しし、Windows へ送信する。
 // 画面右端でカーソルが Mac→Windows 切替、Windows カーソル左端(または F13)で復帰。
 #![allow(non_camel_case_types)]
 
@@ -7,13 +7,13 @@ mod file_drag;
 mod gui;
 mod incoming_drag;
 
+use knit_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
+use knit_common::{bulk, envutil, secure};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tsunagu_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
-use tsunagu_common::{bulk, envutil, secure};
 
 // ---------- CoreGraphics C API 直宣言 ----------
 #[repr(C)]
@@ -78,7 +78,7 @@ const FLAG_CMD: CGEventFlags = 0x0010_0000;
 const FLAG_FN: CGEventFlags = 0x8000_0000; // kCGEventFlagMaskSecondaryFn
 
 const KC_F13: i64 = 105;
-/// 切替ホットキー(Mac keycode)。TSUNAGU_HOTKEY_KC で変更可。
+/// 切替ホットキー(Mac keycode)。KNIT_HOTKEY_KC で変更可。
 /// MacBook 内蔵キーボードには F13 が無いため、例えば右Cmd(54)等に変えられる
 static HOTKEY_KC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(KC_F13);
 
@@ -217,17 +217,16 @@ static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::Atom
 // ---------- クリップボード履歴(Universal Clipboard History) ----------
 /// 送信・受信したテキストの履歴。メニューバーから選んで Mac のクリップボードへ
 /// 復元できる。機密判定(smartguard)と秘匿指定は送信側で弾くため、履歴へは届かない
-pub static HISTORY: Mutex<tsunagu_common::history::History> =
-    Mutex::new(tsunagu_common::history::History::new(50));
+pub static HISTORY: Mutex<knit_common::history::History> =
+    Mutex::new(knit_common::history::History::new(50));
 /// GUI の履歴メニュー再構築用の世代(push で更新、gui.rs が変化検知に使う)
 pub static HISTORY_LAST_ID: AtomicU64 = AtomicU64::new(0);
 /// 接続相手の名前(hello で受け取る)。通知へ出す
 pub static PEER_NAME: Mutex<String> = Mutex::new(String::new());
 
-/// 履歴の保存先(env と同じ ~/.config/tsunagu/)。アプリバンドルには書かない
+/// 履歴の保存先(env と同じ ~/.config/knit/)。アプリバンドルには書かない
 pub fn history_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| std::path::Path::new(&home).join(".config/tsunagu/history.json"))
+    knit_common::envutil::config_dir().map(|dir| dir.join("history.json"))
 }
 
 pub fn history_save() {
@@ -257,7 +256,7 @@ pub fn history_clear() {
 }
 
 fn history_push(text: &str, device: &str) {
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_text(text, device, ts).is_some() {
             HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
@@ -270,7 +269,7 @@ fn history_push(text: &str, device: &str) {
 /// ファイル群を履歴へ載せる(ビジョン§10 の File 分類)。送信・受信・掴み投げの
 /// すべてのファイル移動で呼ぶ
 fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_files(paths, device, ts).is_some() {
             HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
@@ -280,9 +279,9 @@ fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
     }
 }
 
-/// 画像履歴の本体を置くディレクトリ(env と同じ ~/.config/tsunagu/images/)
+/// 画像履歴の本体を置くディレクトリ(env と同じ ~/.config/knit/images/)
 fn image_store_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join(".config/tsunagu/images"))
+    knit_common::envutil::config_dir().map(|dir| dir.join("images"))
 }
 
 /// images/ に残す実体の上限。履歴 cap(50)より少し余裕を持たせた件数
@@ -293,19 +292,18 @@ const IMAGE_KEEP: usize = 60;
 /// 残す。同名=同一内容のため二重保存は起きない
 fn history_push_image(bmp: &[u8], device: &str) {
     let Some(dir) = image_store_dir() else { return };
-    let name =
-        tsunagu_common::history::image_file_name(tsunagu_common::history::fnv1a64(bmp), "bmp");
+    let name = knit_common::history::image_file_name(knit_common::history::fnv1a64(bmp), "bmp");
     let _ = std::fs::create_dir_all(&dir);
-    tsunagu_common::history::restrict_dir(&dir);
+    knit_common::history::restrict_dir(&dir);
     let path = dir.join(&name);
     if !path.exists() {
-        if tsunagu_common::history::write_private(&path, bmp).is_err() {
+        if knit_common::history::write_private(&path, bmp).is_err() {
             eprintln!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
             return;
         }
-        tsunagu_common::history::prune_image_store(&dir, IMAGE_KEEP);
+        knit_common::history::prune_image_store(&dir, IMAGE_KEEP);
     }
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_image(&name, bmp.len(), device, ts).is_some() {
             HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
@@ -321,13 +319,13 @@ fn history_push_image(bmp: &[u8], device: &str) {
 /// 絶対パスの並び(ファイル参照)なら Finder の ⌘C 相当へ載せ直す
 pub fn history_restore(text: String) {
     // 画像の履歴(ビジョン§10): images/ から本体を読み戻してクリップボードへ
-    if let Some((name, _size)) = tsunagu_common::history::parse_image_entry(&text) {
+    if let Some((name, _size)) = knit_common::history::parse_image_entry(&text) {
         let path = image_store_dir().map(|d| d.join(&name));
         let bmp = path.and_then(|p| std::fs::read(p).ok());
         let Some(bmp) = bmp else {
             eprintln!("[clip] 履歴の画像本体が見つからないため復元しません");
             notify(
-                "tsunagu",
+                "Knit",
                 "履歴の画像が見つからないため復元できませんでした(削除済み)",
             );
             return;
@@ -346,7 +344,7 @@ pub fn history_restore(text: String) {
         }
         return;
     }
-    if tsunagu_common::history::looks_like_file_paths(&text) {
+    if knit_common::history::looks_like_file_paths(&text) {
         let paths: Vec<std::path::PathBuf> = text
             .lines()
             .map(|l| std::path::PathBuf::from(l.trim()))
@@ -354,7 +352,7 @@ pub fn history_restore(text: String) {
         if !paths.iter().all(|p| p.exists()) {
             eprintln!("[clip] 履歴のファイル参照の一部が見つからないため復元しません");
             notify(
-                "tsunagu",
+                "Knit",
                 "履歴のファイルが見つからないため復元できませんでした(移動・削除済み)",
             );
             return;
@@ -525,7 +523,7 @@ fn sync_clipboard_to_win() {
             // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
             // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結し
             // 入力経路(タップ)は塞がない
-            if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
+            if knit_common::smartguard::looks_secret(&text) == Some(true) {
                 eprintln!("[clip] smartguard: 機密の可能性が高いため Windows へ送りません");
                 smart_secret_notify("Windows へは送りませんでした");
                 return;
@@ -545,8 +543,8 @@ fn smart_secret_notify(detail: &str) {
         return;
     }
     notify(
-        "tsunagu",
-        &format!("クリップボードに機密の可能性があるため {detail}、履歴にも載せません(TSUNAGU_SMART_SECRET=0 で無効化)"),
+        "Knit",
+        &format!("クリップボードに機密の可能性があるため {detail}、履歴にも載せません(KNIT_SMART_SECRET=0 で無効化)"),
     );
 }
 
@@ -934,7 +932,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
         if paths.is_empty() || total > bulk::MAX_TOTAL {
             eprintln!("[file] 送信拒否: {} 件 / 合計 {total} bytes", paths.len());
             notify(
-                "tsunagu",
+                "Knit",
                 &format!(
                     "ファイルを送信できません(合計 {}MiB。1回の上限 {})",
                     total / 1024 / 1024,
@@ -986,7 +984,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
                 notify(
-                    "tsunagu",
+                    "Knit",
                     &format!(
                         "{n} 件({})を Windows へ送信しました(Ctrl+V で貼り付け)",
                         human_bytes(total)
@@ -996,7 +994,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
             Err(e) => {
                 eprintln!("[file] 送信失敗: {e}");
                 notify(
-                    "tsunagu",
+                    "Knit",
                     "Windows へファイルを送れませんでした(ファイル転送経路が未接続)",
                 );
             }
@@ -1013,7 +1011,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) {
 fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     let mut total = 0u64;
     let supported = !paths.is_empty()
-        && paths.len() <= tsunagu_common::drag::MAX_FILES
+        && paths.len() <= knit_common::drag::MAX_FILES
         && paths.iter().all(|p| match std::fs::metadata(p) {
             Ok(meta) if meta.is_file() => {
                 total = total.saturating_add(meta.len());
@@ -1025,10 +1023,10 @@ fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     if !supported {
         eprintln!("[drag] mac->win 対象外: {} 件", paths.len());
         notify(
-            "tsunagu",
+            "Knit",
             &format!(
                 "掴んだまま渡せるのは通常のファイル {} 件・合計 {} までです(フォルダは未対応)",
-                tsunagu_common::drag::MAX_FILES,
+                knit_common::drag::MAX_FILES,
                 bulk::file_limit_label()
             ),
         );
@@ -1037,7 +1035,7 @@ fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
         eprintln!("[drag] mac->win 送信中のため受け付けません");
         notify(
-            "tsunagu",
+            "Knit",
             "前のファイルを転送中です。完了後にもう一度掴んでください",
         );
         return None;
@@ -1084,7 +1082,7 @@ fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
             Err(e) => {
                 eprintln!("[drag] mac->win {id} 転送失敗: {e}");
                 notify(
-                    "tsunagu",
+                    "Knit",
                     "Windows へファイルを渡せませんでした。接続を確認してもう一度掴んでください",
                 );
             }
@@ -1152,11 +1150,11 @@ fn mac_on_bulk(e: bulk::Event) {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 history_push_files(&paths, "Windows");
                 let dir = std::env::var_os("HOME")
-                    .map(|h| std::path::Path::new(&h).join("Downloads/Tsunagu"))
+                    .map(|h| std::path::Path::new(&h).join("Downloads/Knit"))
                     .unwrap_or_default();
-                let total = tsunagu_common::bulk::total_size(&paths);
+                let total = knit_common::bulk::total_size(&paths);
                 notify(
-                    "tsunagu",
+                    "Knit",
                     &format!(
                         "ファイルを受信: {n} 件({})(⌘V で貼り付け可)。実体は {}",
                         human_bytes(total),
@@ -1251,20 +1249,20 @@ pub(crate) fn mac_shortcut_translation(
 /// ゲームモード(Windows 側がカーソルの閉じ込め等を検知して要求)。true の間は
 /// 絶対位置ではなく相対移動で送る(FPS・3D ソフトの視点回転のため)
 static GAME_REL: AtomicBool = AtomicBool::new(false);
-/// 画面ロックの連動(TSUNAGU_LOCK_SYNC=0 で無効)
+/// 画面ロックの連動(KNIT_LOCK_SYNC=0 で無効)
 static LOCK_SYNC: AtomicBool = AtomicBool::new(true);
-/// 右⌘ → Windows の右 Ctrl(TSUNAGU_RCMD_CTRL=0 で無効)。
-/// 右⌘をホットキー(TSUNAGU_HOTKEY_KC=54 等)に設定している場合は
+/// 右⌘ → Windows の右 Ctrl(KNIT_RCMD_CTRL=0 で無効)。
+/// 右⌘をホットキー(KNIT_HOTKEY_KC=54 等)に設定している場合は
 /// 先の分岐で握られるため適用されない(競合しない)
 static RCMD_CTRL: AtomicBool = AtomicBool::new(true);
 /// 右⌘(kc 54)の押下状態。押下中は cmd フラグを rcmd へ置き換えて送る
 ///(フラグだけだと左右を区別できないため、kc 単位でここで分離する)
 static R_RIGHT_CMD: AtomicBool = AtomicBool::new(false);
 /// IME 状態同期: Windows へ入る時に Mac のかな/英数を相手の IME 開閉へ反映
-///(TSUNAGU_IME_SYNC=0 で無効)
+///(KNIT_IME_SYNC=0 で無効)
 static IME_SYNC: AtomicBool = AtomicBool::new(true);
 /// Continue Here: Windows 画面操作中の ⌥⌘T で Mac の前面ブラウザの URL を
-/// Windows の既定ブラウザで開く(TSUNAGU_CONTINUE_HERE=0 で無効)
+/// Windows の既定ブラウザで開く(KNIT_CONTINUE_HERE=0 で無効)
 static CONTINUE_HERE: AtomicBool = AtomicBool::new(true);
 
 #[link(name = "Carbon", kind = "framework")]
@@ -1373,7 +1371,7 @@ fn frontmost_browser_url() -> Option<String> {
 fn continue_here() {
     static LAST_ERR_MS: AtomicU64 = AtomicU64::new(0);
     match frontmost_browser_url() {
-        Some(url) if tsunagu_common::urlx::transferable(&url) => {
+        Some(url) if knit_common::urlx::transferable(&url) => {
             send_msg(&Msg::OpenUrl { url });
             eprintln!("[url] Continue Here: 送信しました");
         }
@@ -1383,7 +1381,7 @@ fn continue_here() {
             let now = now_ms();
             if now.saturating_sub(LAST_ERR_MS.swap(now, Ordering::Relaxed)) > 60_000 {
                 notify(
-                    "tsunagu",
+                    "Knit",
                     "ブラウザの URL を取得できませんでした(初回は Mac 側で自動化の許可が必要です)",
                 );
             }
@@ -1474,7 +1472,7 @@ pub(crate) struct PeerEntry {
     /// 相手の代表画面サイズ(スケール算出用)
     pub screen: (f64, f64),
     /// 相手の全モニター構成(版 13 以降で自動交換。旧版相手は空)
-    pub monitors: Vec<tsunagu_common::proto::Monitor>,
+    pub monitors: Vec<knit_common::proto::Monitor>,
     /// 非アクティブ時の送信口(アクティブ時は None: STREAM_SLOT が保持する)
     pub writer: Option<secure::Writer>,
     /// セッションの世代(同一端末の再接続で置き換えを判別する。大きいほど新しい)
@@ -1487,7 +1485,7 @@ pub(crate) static ACTIVE_PEER: Mutex<usize> = Mutex::new(usize::MAX);
 static PEER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 自分(Mac)の全モニターを列挙する(自動認知。CG 座標系のまま相手へ渡す)
-fn mac_monitors() -> Vec<tsunagu_common::proto::Monitor> {
+fn mac_monitors() -> Vec<knit_common::proto::Monitor> {
     let mut out = Vec::new();
     unsafe {
         let mut ids = [0u32; 16];
@@ -1495,7 +1493,7 @@ fn mac_monitors() -> Vec<tsunagu_common::proto::Monitor> {
         if CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) == 0 {
             for id in &ids[..(n as usize).min(16)] {
                 let b = CGDisplayBounds(*id);
-                out.push(tsunagu_common::proto::Monitor {
+                out.push(knit_common::proto::Monitor {
                     x: b.origin.x as i32,
                     y: b.origin.y as i32,
                     w: b.size.w as i32,
@@ -1554,7 +1552,7 @@ pub(crate) fn activate_peer(new: usize, reason: &str) {
     eprintln!("[conn] 接続先を {name} へ切り替え({reason})");
     // 再接続・経路昇格の置き換えは頻発するため通知は出さない(明示的な切替だけ知らせる)
     if !reason.contains("再接続") {
-        notify("tsunagu", &format!("{name} へ切り替えました({reason})"));
+        notify("Knit", &format!("{name} へ切り替えました({reason})"));
     }
 }
 
@@ -1602,7 +1600,7 @@ fn keepalive_inactive_peers() {
 /// 接続経路の短い表示(メニューバー用)。LAN 内なら "LAN 直"、100.x なら "Tailscale"
 pub fn route_label() -> &'static str {
     match *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) {
-        Some(ip) if tsunagu_common::net::is_tailscale(ip) => "Tailscale",
+        Some(ip) if knit_common::net::is_tailscale(ip) => "Tailscale",
         Some(_) => "LAN 直",
         None => "",
     }
@@ -1689,13 +1687,13 @@ fn notify(title: &str, body: &str) {
 
 // ---------- Search My Desk(ビジョン§14: デスク横断検索) ----------
 /// Mac 操作中の ⌥⌘S で開く検索窓。アプリ・デスクのファイル/フォルダ・コマンド・
-/// 履歴・URL を 1 つの窓から扱う。`TSUNAGU_DESK_SEARCH=0` で無効化
+/// 履歴・URL を 1 つの窓から扱う。`KNIT_DESK_SEARCH=0` で無効化
 pub static DESK_SEARCH: AtomicBool = AtomicBool::new(true);
 /// Windows 側のアプリ候補(AppsReply で受け取る。検索窓が開いている間に届く)
 pub static WIN_APPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// 越境 App Handoff(ビジョン§12 の第一歩・実験的): Windows へ切り替えたとき
 /// Mac の最前面アプリと同じアプリを Windows で起動する。勝手にアプリが
-/// 開く驚きを避けるため既定は無効(`TSUNAGU_APP_HANDOFF=1` で有効)
+/// 開く驚きを避けるため既定は無効(`KNIT_APP_HANDOFF=1` で有効)
 static APP_HANDOFF: AtomicBool = AtomicBool::new(false);
 /// デスクのファイル/フォルダ候補(検索窓の Files/Folders 対象)。
 /// 走査が重いため 10 分キャッシュし、検索窓を開くたびに裏で更新する
@@ -1874,7 +1872,7 @@ pub fn run_desk_command(id: &str) {
             if send_msg_reported(&Msg::Lock) {
                 eprintln!("[cmd] Windows をロックしました");
             } else {
-                notify("Tsunagu", "未接続のため Windows をロックできませんでした");
+                notify("Knit", "未接続のため Windows をロックできませんでした");
             }
         }
         "display_sleep" => {
@@ -1888,7 +1886,7 @@ pub fn run_desk_command(id: &str) {
             let next = !CLIP_SHARE.load(Ordering::Relaxed);
             CLIP_SHARE.store(next, Ordering::Relaxed);
             notify(
-                "tsunagu",
+                "Knit",
                 if next {
                     "クリップボード共有をオンにしました"
                 } else {
@@ -2360,7 +2358,7 @@ static CONNECTED: AtomicBool = AtomicBool::new(false);
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。トグル時に Windows へ Cfg で同期
 static CMD_ALT: AtomicBool = AtomicBool::new(false);
 /// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
-/// トグル時に Windows へ Cfg で同期(TSUNAGU_MUTE_SPK=0 で初期無効化)
+/// トグル時に Windows へ Cfg で同期(KNIT_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE: AtomicBool = AtomicBool::new(true);
 /// スクロール方向の反転(既定 false=Windows 標準の指の動きに合わせてある)
 /// スクロール方向の手動上書き(true=Windows 標準。false 既定=Mac の設定に合わせる)
@@ -2401,7 +2399,7 @@ static TAP_REARM_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static LAST_EVENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_ABS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// 境界ダブルタップ切替(Deskflow switchDoubleTap 相当)。
-/// TSUNAGU_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
+/// KNIT_EDGE_TAPS(既定2)= 境界に連続で2回当てた時だけ切替。1回の到達では
 /// 切替しないため、境界付近での日常作業と Windows への移動が分離される。
 /// GUI から実行中に切り替え可能なため AtomicU32(初期値は起動時に store)
 static EDGE_TAPS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(2);
@@ -2419,7 +2417,7 @@ pub static DOUBLE_TAP_MS: AtomicU64 = AtomicU64::new(700);
 pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
 /// クリップボード共有(clipboardSharing)
 pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
-/// スクロール互換モード(TSUNAGU_SCROLL_COMPAT=1 / 設定窓): 120 未満の
+/// スクロール互換モード(KNIT_SCROLL_COMPAT=1 / 設定窓): 120 未満の
 /// ホイール量を無視する古い設計のアプリ向けに 1 ノッチ(120)単位で送る。
 /// 既定 OFF=高解像度(0.05 ノッチ刻み)で滑らかに
 pub static SCROLL_COMPAT: AtomicBool = AtomicBool::new(false);
@@ -2427,15 +2425,15 @@ pub static SCROLL_COMPAT: AtomicBool = AtomicBool::new(false);
 static EDGE_STAY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// 横スワイプ(戻る/進む)の状態: (累積 dx, 最終イベント時刻, 最終発火時刻)
 static SWIPE_ACC: std::sync::Mutex<(f64, u64, u64)> = std::sync::Mutex::new((0.0, 0, 0));
-/// ドラッグ中切替(TSUNAGU_DRAG_SWITCH=1): 押したまま境界を越えられる
+/// ドラッグ中切替(KNIT_DRAG_SWITCH=1): 押したまま境界を越えられる
 pub static DRAG_SWITCH: AtomicBool = AtomicBool::new(false);
 /// 速度越境(Crossing Intelligence・ビジョン§24): 境界への速度が十分大きい越えは
-/// 滞在待ち/ダブルタップをスキップする。`TSUNAGU_FAST_EDGE=0` で無効化
+/// 滞在待ち/ダブルタップをスキップする。`KNIT_FAST_EDGE=0` で無効化
 pub static FAST_EDGE: AtomicBool = AtomicBool::new(true);
-/// Mac 流ショートカット翻訳(TSUNAGU_MAC_KEYS=0 で無効)。タップ内で毎イベント
+/// Mac 流ショートカット翻訳(KNIT_MAC_KEYS=0 で無効)。タップ内で毎イベント
 /// 設定を引かないよう起動時にキャッシュする
 static MAC_KEYS: AtomicBool = AtomicBool::new(true);
-/// 2本指横スワイプ→戻る/進む(TSUNAGU_SWIPE_NAV=0 で横ホイールのまま)
+/// 2本指横スワイプ→戻る/進む(KNIT_SWIPE_NAV=0 で横ホイールのまま)
 static SWIPE_NAV: AtomicBool = AtomicBool::new(true);
 /// 現在押下中のマウスボタン(0=左,1=右,2=中)。切替時の持ち込み再送に使う
 static BTN_DOWN: [AtomicBool; 3] = [
@@ -2449,7 +2447,7 @@ static BTN_DOWN: [AtomicBool; 3] = [
 static FILE_DRAG: Mutex<file_drag::FileDrag> = Mutex::new(file_drag::FileDrag::new());
 /// 合成 LeftMouseUp(kCGEventSourceUserData=42)に刻む識別マジック。
 /// 掴み切替直後の Mac 側ドラッグ完結用投稿であり、Win へ転送してはならない
-const SYNTH_UP_MAGIC: i64 = 0x54554e41475550; // "TSUNAGUP" 的な一意値
+const SYNTH_UP_MAGIC: i64 = 0x54554e41475550; // 自己投稿イベントを識別する一意値
 const FIELD_EVENT_SOURCE_USER_DATA: i32 = 42;
 
 unsafe fn make_drag_end_event(pos: CGPoint) -> CGEventRef {
@@ -2557,10 +2555,10 @@ fn rescale_win_cur(wc: (f64, f64), old: (f64, f64), new: (f64, f64)) -> (f64, f6
 }
 /// 前回 Windows モードを出た位置(0..1)。次回の切替はそこへ戻る(Deskflow 標準の体験)
 static LAST_WIN_POS: Mutex<(f64, f64)> = Mutex::new((-1.0, -1.0));
-/// 絶対位置送信モード(既定ON。TSUNAGU_MOUSE_MODE=rel で旧・相対移動に戻す)
+/// 絶対位置送信モード(既定ON。KNIT_MOUSE_MODE=rel で旧・相対移動に戻す)
 static MOUSE_ABS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// 切替方式: false=境界+ホットキー(既定)/ true=ホットキー(F13)のみで切替、
-/// 切替後は境界を超えても戻らないロック状態になる(TSUNAGU_SWITCH_MODE=hotkey)
+/// 切替後は境界を超えても戻らないロック状態になる(KNIT_SWITCH_MODE=hotkey)
 static HOTKEY_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CUR_SYNC_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2579,7 +2577,7 @@ static LOCK_POS: Mutex<Option<(f64, f64)>> = Mutex::new(None);
 /// スクロール変換の累積残高(dx, dy)[ノッチ]。除数を大きくしても細かい動きを失わないための仕組み。
 static SCROLL_ACC: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 /// スクロール速度除数(ピクセル→ノッチ変換。大きいほど遅い)。設定ウィンドウの
-/// スライダーからも可変(TSUNAGU_SCROLL_DIV は初期値)。f64 を AtomicU64 ビットで保持
+/// スライダーからも可変(KNIT_SCROLL_DIV は初期値)。f64 を AtomicU64 ビットで保持
 static SCROLL_DIV: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(60.0f64.to_bits());
 
@@ -2856,7 +2854,7 @@ fn enter_win_mode_cursor_lock() {
             let now = now_ms();
             if now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) > 60_000 {
                 notify(
-                    "tsunagu",
+                    "Knit",
                     &format!("「{app}」がパスワード入力等の保護を有効にしているため、キーボードを Windows へ送れません。そのアプリの入力欄から離れてください"),
                 );
             }
@@ -2945,7 +2943,7 @@ fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
                                                   // 復帰位置: ダブルタップ切替が有効な間は出た境界のすぐ内側(60px)へ戻す。
                                                   // 1回の到達では切替しなくなったため境界近くでも再突入せず、境界を
                                                   // 跨いで戻ってくる連続的な体験になる。
-                                                  // 1回切替(TSUNAGU_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
+                                                  // 1回切替(KNIT_EDGE_TAPS=1)では従来どおり MacBook 側へ退けて
                                                   // 誤再突入を防ぐ
                                                   // SIDE(Windows の位置)に応じた復帰座標: 出てきた境界のすぐ内側へ。
                                                   // ny は Windows 側カーソルの「境界に沿った比率」(side 0/1=縦、2/3=横)
@@ -3059,7 +3057,7 @@ unsafe extern "C" fn tap_callback(
     let win_mode = WIN_MODE.load(Ordering::Relaxed);
     let connected = CONNECTED.load(Ordering::Relaxed);
 
-    // ホットキー(F13 既定 / TSUNAGU_HOTKEY_KC)= 手動トグル(常に有効、握る)。
+    // ホットキー(F13 既定 / KNIT_HOTKEY_KC)= 手動トグル(常に有効、握る)。
     // 修飾キー(右Cmd=54 等)は flagsChanged として届くため、flags の該当ビットで
     // 押下/解放を判別し、押下側でのみトグルする(up・解放側は握るだけ)。
     // 旧実装は KEY_DOWN しかトグルせず(=修飾キー指定が機能しない)、かつ up 把握の
@@ -3249,7 +3247,7 @@ unsafe extern "C" fn tap_callback(
                         let now = now_ms();
                         if now.saturating_sub(DRAG_GUIDE_MS.swap(now, Ordering::Relaxed)) >= 120_000
                         {
-                            notify("tsunagu", "ファイルを掴んだままです。Mac のドロップ先でボタンを離すとそこへ置けます(境界では切り替わりません)");
+                            notify("Knit", "ファイルを掴んだままです。Mac のドロップ先でボタンを離すとそこへ置けます(境界では切り替わりません)");
                         }
                         return event;
                     }
@@ -3276,7 +3274,7 @@ unsafe extern "C" fn tap_callback(
                     // 「意図的な越え」とみなして滞在待ち(switchDelay)とダブルタップを
                     // スキップする。ゆっくり端に触れた場合だけ従来どおりの誤爆防止が働く。
                     // 計装(下のログ)で集めた分布をもとに閾値は 1200px/s とする。
-                    // `TSUNAGU_FAST_EDGE=0` で無効化
+                    // `KNIT_FAST_EDGE=0` で無効化
                     let speed = {
                         let r = *RECENT_PX.lock().unwrap_or_else(|e| e.into_inner());
                         px_per_sec(r.0, now_ms().saturating_sub(r.1))
@@ -3393,7 +3391,7 @@ unsafe extern "C" fn tap_callback(
                     send_msg(&Msg::Warp { nx, ny });
                     eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
                     // ドラッグ中の切替: 既定は全ボタンを離して持ち込まない(誤ドラッグ防止。
-                    // レビュー Wave1 C-S13)。TSUNAGU_DRAG_SWITCH=1 では逆に押下中の
+                    // レビュー Wave1 C-S13)。KNIT_DRAG_SWITCH=1 では逆に押下中の
                     // ボタンを Windows 側で押し直す=「掴んだまま境界を越える」体験。
                     // 掴みドラッグ中は EVT_MOUSE_MOVED 由来の切替でも持ち込む
                     // (押下直後の軽い移動は MOVED として届くことがある=実測。
@@ -3670,7 +3668,7 @@ unsafe extern "C" fn tap_callback(
             // 元キーは握りつぶし、翻訳先の Key を送る。修飾の対応:
             //   cmd→Win Ctrl / opt→Win Alt / ctrl→Win キー(既定マップ)
             // 注意: flagsChanged(mod キー単体)は翻訳しない。
-            // 常時有効(マスト機能)。TSUNAGU_MAC_KEYS=0 でのみオフ
+            // 常時有効(マスト機能)。KNIT_MAC_KEYS=0 でのみオフ
             if event_type != EVT_FLAGS_CHANGED && MAC_KEYS.load(Ordering::Relaxed) {
                 // 翻訳先の修飾は「既定マップ(cmd→Ctrl / opt→Alt)」で解釈させる。
                 // CMD_ALT=true でも翻訳の意味が変わらないよう、cmd/opt を差し替える
@@ -3794,7 +3792,7 @@ unsafe extern "C" fn tap_callback(
             // 忠実に再現する: ジェスチャは「300ms イベントが途切れるまで」を一続きと
             // みなし、その間の発火は 1 回だけ(指を離した後の慣性 delta が届いても
             // 再発火しない=2段階戻りの防止)。閾値 60px・横優勢(|dx|*2>|dy|)のみ。
-            // TSUNAGU_SWIPE_NAV=0 で従来の横ホイールへ戻せる
+            // KNIT_SWIPE_NAV=0 で従来の横ホイールへ戻せる
             let swipe_nav = SWIPE_NAV.load(Ordering::Relaxed);
             if swipe_nav && win_mode && dx != 0.0 && dx.abs() * 2.0 > dy.abs() {
                 let now = now_ms();
@@ -3880,7 +3878,7 @@ pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
 const BUILD_ID: &str = "build-20260928-123220-fb6ce7a";
 
 fn main() {
-    eprintln!("[info] tsunagu-mac {BUILD_ID}");
+    eprintln!("[info] knit-mac {BUILD_ID}");
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--probe-search") {
         // Search My Desk の実機検証。AppKit を使うため対話セッション(GUI)で実行する
@@ -3925,17 +3923,19 @@ fn main() {
         .unwrap_or(PORT);
     // 既存のenvを優先。新規利用者だけOS保護の接続キーと初回導入を使用する。
     let no_gui = args.iter().any(|a| a == "--no-gui")
-        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v| v == "1");
+        || envutil::get("KNIT_NO_GUI").is_some_and(|v| v == "1");
     let mut registered_now = false;
     // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
     // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
-    let token = if let Some(t) = envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32) {
+    let token = if let Some(t) = envutil::get("KNIT_TOKEN").filter(|t| t.len() >= 32) {
         t
-    } else if envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
-        eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
+    } else if envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty()) {
+        eprintln!(
+            "[fatal] KNIT_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください"
+        );
         std::process::exit(1);
     } else {
-        match tsunagu_common::credentials::load() {
+        match knit_common::credentials::load() {
             Ok(Some(t)) => t,
             Ok(None) if !no_gui => match gui::setup::first_run(false) {
                 Some(t) => {
@@ -3972,37 +3972,37 @@ fn main() {
             *CUR_POS.lock().unwrap_or_else(|e| e.into_inner()) = (loc.x, loc.y);
         }
     }
-    if let Some(d) = envutil::get("TSUNAGU_SCROLL_DIV").and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(d) = envutil::get("KNIT_SCROLL_DIV").and_then(|v| v.parse::<f64>().ok()) {
         if d > 0.0 {
             set_scroll_div(d);
         }
     }
-    if let Some(m) = envutil::get("TSUNAGU_MOUSE_SCALE").and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(m) = envutil::get("KNIT_MOUSE_SCALE").and_then(|v| v.parse::<f64>().ok()) {
         if m > 0.0 {
             set_mouse_scale(m);
         }
     }
-    if let Some(e) = envutil::get("TSUNAGU_EDGE_PX").and_then(|v| v.parse::<f64>().ok()) {
+    if let Some(e) = envutil::get("KNIT_EDGE_PX").and_then(|v| v.parse::<f64>().ok()) {
         if e >= 0.0 && e < 100.0 {
             set_edge_px(e);
         }
     }
-    if let Some(m) = envutil::get("TSUNAGU_MOUSE_MODE") {
+    if let Some(m) = envutil::get("KNIT_MOUSE_MODE") {
         if m.eq_ignore_ascii_case("rel") {
             MOUSE_ABS_MODE.store(false, Ordering::Relaxed);
         }
     }
-    if let Some(m) = envutil::get("TSUNAGU_SWITCH_MODE") {
+    if let Some(m) = envutil::get("KNIT_SWITCH_MODE") {
         if m.eq_ignore_ascii_case("hotkey") {
             HOTKEY_ONLY.store(true, Ordering::Relaxed);
         }
     }
-    if let Some(t) = envutil::get("TSUNAGU_EDGE_TAPS").and_then(|v| v.parse::<u32>().ok()) {
+    if let Some(t) = envutil::get("KNIT_EDGE_TAPS").and_then(|v| v.parse::<u32>().ok()) {
         if t >= 1 && t <= 3 {
             EDGE_TAPS.store(t, Ordering::Relaxed);
         }
     }
-    if let Some(k) = envutil::get("TSUNAGU_HOTKEY_KC").and_then(|v| v.parse::<i64>().ok()) {
+    if let Some(k) = envutil::get("KNIT_HOTKEY_KC").and_then(|v| v.parse::<i64>().ok()) {
         if (1..=127).contains(&k) {
             HOTKEY_KC.store(k, Ordering::Relaxed);
         }
@@ -4010,23 +4010,23 @@ fn main() {
     // メニューで切替可能な設定の初期値(.env 経由でも指定できる)
     NATURAL_SCROLL.store(detect_natural_scroll(), Ordering::Relaxed);
     eprintln!(
-        "[info] macOS scroll: {} / tsunagu 方向: {}",
+        "[info] macOS scroll: {} / knit 方向: {}",
         if NATURAL_SCROLL.load(Ordering::Relaxed) {
             "自然スクロール"
         } else {
             "標準(非自然)"
         },
-        if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
+        if envutil::get("KNIT_SCROLL_FLIP").as_deref() == Some("1") {
             "Windows 標準(手動上書き)"
         } else {
             "Mac に合わせる"
         },
     );
-    if envutil::get("TSUNAGU_SCROLL_FLIP").as_deref() == Some("1") {
+    if envutil::get("KNIT_SCROLL_FLIP").as_deref() == Some("1") {
         SCROLL_FLIP.store(true, Ordering::Relaxed);
     }
     // Deskflow 標準オプション(画面位置/切替/隅/クリップボード)
-    match envutil::get("TSUNAGU_SIDE").as_deref() {
+    match envutil::get("KNIT_SIDE").as_deref() {
         Some("left") => SIDE.store(1, Ordering::Relaxed),
         Some("up") => SIDE.store(2, Ordering::Relaxed),
         Some("down") => SIDE.store(3, Ordering::Relaxed),
@@ -4036,56 +4036,56 @@ fn main() {
         Some("lowleft") | Some("downleft") => SIDE.store(7, Ordering::Relaxed),
         _ => {}
     }
-    if let Some(v) = envutil::get("TSUNAGU_SWITCH_DELAY").and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(v) = envutil::get("KNIT_SWITCH_DELAY").and_then(|v| v.parse::<u64>().ok()) {
         SWITCH_DELAY_MS.store(v.min(5000), Ordering::Relaxed);
     }
-    if let Some(v) = envutil::get("TSUNAGU_DOUBLE_TAP_MS").and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(v) = envutil::get("KNIT_DOUBLE_TAP_MS").and_then(|v| v.parse::<u64>().ok()) {
         DOUBLE_TAP_MS.store(v.clamp(100, 3000), Ordering::Relaxed);
     }
-    if let Some(v) = envutil::get("TSUNAGU_CORNER_PX").and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(v) = envutil::get("KNIT_CORNER_PX").and_then(|v| v.parse::<u64>().ok()) {
         CORNER_PX.store(v.min(500), Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_CLIP").as_deref() == Some("0") {
+    if envutil::get("KNIT_CLIP").as_deref() == Some("0") {
         CLIP_SHARE.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_DRAG_SWITCH").as_deref() == Some("1") {
+    if envutil::get("KNIT_DRAG_SWITCH").as_deref() == Some("1") {
         DRAG_SWITCH.store(true, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_FAST_EDGE").as_deref() == Some("0") {
+    if envutil::get("KNIT_FAST_EDGE").as_deref() == Some("0") {
         FAST_EDGE.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_DESK_SEARCH").as_deref() == Some("0") {
+    if envutil::get("KNIT_DESK_SEARCH").as_deref() == Some("0") {
         DESK_SEARCH.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_APP_HANDOFF").as_deref() == Some("1") {
+    if envutil::get("KNIT_APP_HANDOFF").as_deref() == Some("1") {
         APP_HANDOFF.store(true, Ordering::Relaxed);
-        eprintln!("[handoff] 越境 App Handoff を有効化しました(TSUNAGU_APP_HANDOFF=1)");
+        eprintln!("[handoff] 越境 App Handoff を有効化しました(KNIT_APP_HANDOFF=1)");
     }
-    if envutil::get("TSUNAGU_MAC_KEYS").as_deref() == Some("0") {
+    if envutil::get("KNIT_MAC_KEYS").as_deref() == Some("0") {
         MAC_KEYS.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_SWIPE_NAV").as_deref() == Some("0") {
+    if envutil::get("KNIT_SWIPE_NAV").as_deref() == Some("0") {
         SWIPE_NAV.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_LOCK_SYNC").as_deref() == Some("0") {
+    if envutil::get("KNIT_LOCK_SYNC").as_deref() == Some("0") {
         LOCK_SYNC.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_IME_SYNC").as_deref() == Some("0") {
+    if envutil::get("KNIT_IME_SYNC").as_deref() == Some("0") {
         IME_SYNC.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_CONTINUE_HERE").as_deref() == Some("0") {
+    if envutil::get("KNIT_CONTINUE_HERE").as_deref() == Some("0") {
         CONTINUE_HERE.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_RCMD_CTRL").as_deref() == Some("0") {
+    if envutil::get("KNIT_RCMD_CTRL").as_deref() == Some("0") {
         RCMD_CTRL.store(false, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_SCROLL_COMPAT").as_deref() == Some("1") {
+    if envutil::get("KNIT_SCROLL_COMPAT").as_deref() == Some("1") {
         SCROLL_COMPAT.store(true, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_CMD_ALT").as_deref() == Some("1") {
+    if envutil::get("KNIT_CMD_ALT").as_deref() == Some("1") {
         CMD_ALT.store(true, Ordering::Relaxed);
     }
-    if envutil::get("TSUNAGU_MUTE_SPK").as_deref() == Some("0") {
+    if envutil::get("KNIT_MUTE_SPK").as_deref() == Some("0") {
         SPK_MUTE.store(false, Ordering::Relaxed);
     }
     eprintln!(
@@ -4102,7 +4102,7 @@ fn main() {
     // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
     let _ = std::fs::create_dir_all(
         std::env::var_os("HOME")
-            .map(|h| std::path::Path::new(&h).join("Downloads/Tsunagu"))
+            .map(|h| std::path::Path::new(&h).join("Downloads/Knit"))
             .unwrap_or_default(),
     );
     history_load();
@@ -4249,7 +4249,7 @@ fn main() {
         std::thread::sleep(Duration::from_secs(30));
         let peer = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
         let Some(peer) = peer
-            .filter(|p| CONNECTED.load(Ordering::Relaxed) && tsunagu_common::net::is_tailscale(*p))
+            .filter(|p| CONNECTED.load(Ordering::Relaxed) && knit_common::net::is_tailscale(*p))
         else {
             continue;
         };
@@ -4263,28 +4263,28 @@ fn main() {
                 if now == 1 { "直結" } else { "中継(DERP)" }
             );
             if now == 2 {
-                notify("tsunagu", "Windows との通信が中継経由になりました(遅延が増えます)。同じネットワークか有線直結を推奨します");
+                notify("Knit", "Windows との通信が中継経由になりました(遅延が増えます)。同じネットワークか有線直結を推奨します");
             }
         }
     });
 
-    // 音声受信・再生(Windows→Mac。独立ポート 24901。TSUNAGU_AUDIO=0 で無効)
-    if envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
+    // 音声受信・再生(Windows→Mac。独立ポート 24901。KNIT_AUDIO=0 で無効)
+    if envutil::get("KNIT_AUDIO").as_deref() != Some("0") {
         // 音声は本線ポートからの差分 +1(24900→24901)
         audio::start(token.clone(), port + 1);
     }
 
-    // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。TSUNAGU_ROLE=client +
-    // TSUNAGU_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
-    // その場合は Windows 側を TSUNAGU_ROLE=server で待ち受ける)
-    let client_role = envutil::get("TSUNAGU_ROLE").as_deref() == Some("client");
+    // 接続方向: 既定は Mac=サーバ(本環境のAP隔離対策)。KNIT_ROLE=client +
+    // KNIT_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
+    // その場合は Windows 側を KNIT_ROLE=server で待ち受ける)
+    let client_role = envutil::get("KNIT_ROLE").as_deref() == Some("client");
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
         token: token.clone(),
         dir: std::env::var_os("HOME")
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
-            .join("Downloads/Tsunagu"),
+            .join("Downloads/Knit"),
         on_event: mac_on_bulk,
         log: |s| eprintln!("{s}"),
     });
@@ -4294,7 +4294,7 @@ fn main() {
             .position(|a| a == "--host")
             .and_then(|i| args.get(i + 1))
             .cloned()
-            .or_else(|| envutil::get("TSUNAGU_HOST"));
+            .or_else(|| envutil::get("KNIT_HOST"));
         eprintln!(
             "[info] client mode: connecting to {}",
             host.as_deref().unwrap_or("LAN から自動検出")
@@ -4311,15 +4311,15 @@ fn main() {
         });
         std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
     } else {
-        let bind = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind = envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
         let tk = token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = tsunagu_common::discover::respond(
+            if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
-                port + tsunagu_common::discover::PORT_OFFSET,
+                port + knit_common::discover::PORT_OFFSET,
                 &tk,
-                tsunagu_common::net::is_allowed,
+                knit_common::net::is_allowed,
             ) {
                 eprintln!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
             }
@@ -4329,7 +4329,7 @@ fn main() {
                 bulk_ep,
                 &bind,
                 port + bulk::PORT_OFFSET,
-                tsunagu_common::net::is_allowed,
+                knit_common::net::is_allowed,
             )
         });
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
@@ -4344,7 +4344,7 @@ fn main() {
         // 他ユーザーから切替できるため temp_dir()=$TMPDIR(ユーザー固有)へ置く
         std::thread::spawn(|| loop {
             std::thread::sleep(Duration::from_millis(200));
-            let p = std::env::temp_dir().join("tsunagu-cmd");
+            let p = std::env::temp_dir().join("knit-cmd");
             if let Ok(cmd) = std::fs::read_to_string(&p) {
                 let _ = std::fs::remove_file(&p);
                 if cmd.trim() == "toggle" {
@@ -4531,11 +4531,11 @@ fn main() {
     eprintln!(
         "[info] tap active. カーソルを画面右端へ動かすと Windows モード / F13・メニューでトグル"
     );
-    // メニューバー GUI(既定ON。--no-gui / TSUNAGU_NO_GUI=1 で CUI のみ)。
+    // メニューバー GUI(既定ON。--no-gui / KNIT_NO_GUI=1 で CUI のみ)。
     // AppKit が使えない環境(ssh 由来のセッション等)では start() が失敗し、
     // 従来どおり CFRunLoop で継続する(タップはメインRunLoop共通モードのため共存可)
     let no_gui = args.iter().any(|a| a == "--no-gui")
-        || envutil::get("TSUNAGU_NO_GUI").is_some_and(|v| v == "1");
+        || envutil::get("KNIT_NO_GUI").is_some_and(|v| v == "1");
     if !no_gui && gui::start() {
         eprintln!("[gui] メニューバー常駐を開始しました");
         // --show-prefs: 起動直後に設定ウィンドウを開く(スクリーンショット検証用)。
@@ -4622,7 +4622,7 @@ fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>, my_id: 
                                     .saturating_sub(BIG_CLIP_NOTIFY_MS.swap(now, Ordering::Relaxed))
                                     >= 60_000
                                 {
-                                    notify("tsunagu", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_BYTES / (1024 * 1024)));
+                                    notify("Knit", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_BYTES / (1024 * 1024)));
                                 }
                                 continue;
                             }
@@ -4725,7 +4725,7 @@ fn on_disconnect() {
         leave_win_mode_cursor_unlock(None);
     }
     eprintln!("[conn] lost. waiting for reconnect...");
-    notify("tsunagu", "切断しました(自動で再接続します)");
+    notify("Knit", "切断しました(自動で再接続します)");
 }
 
 /// 待受モード(既定): Windows からの接続を受け入れる
@@ -4734,7 +4734,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
     use std::io::{BufRead, Read};
     // 待受アドレス: 既定は全インターフェース(LAN 直を受け入れる)。
     // 防御は is_allowed(接続元絞り)+ Noise ハンドシェイクが担う
-    let bind_ip = envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_ip = envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -4767,14 +4767,14 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
         };
         eprintln!("[conn] accepted from {peer}");
         // 接続元の制限(LAN・有線直結・Tailscale のみ)。認証は暗号化ハンドシェイクで行う
-        if !tsunagu_common::net::is_allowed(peer.ip()) {
-            eprintln!("[conn] rejected: {peer} は許可範囲外です(TSUNAGU_ALLOW_ANY=1 で許可)");
+        if !knit_common::net::is_allowed(peer.ip()) {
+            eprintln!("[conn] rejected: {peer} は許可範囲外です(KNIT_ALLOW_ANY=1 で許可)");
             continue;
         }
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        let (r, mut w) = match secure::accept(stream, &token, b"tsunagu-main") {
+        let (r, mut w) = match secure::accept(stream, &token, b"knit-main") {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
@@ -4838,7 +4838,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
             "[conn] established: {disp} (id={dev}) 画面 {}x{} モニター: {}",
             win_w as i32,
             win_h as i32,
-            tsunagu_common::proto::Monitor::summary(&mons)
+            knit_common::proto::Monitor::summary(&mons)
         );
         // セッションはスレッドへ分離し、accept 側は次の接続を待つ(複数台の同時保持)
         std::thread::spawn(move || {
@@ -4849,7 +4849,7 @@ fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
                 w: screen_w as i32,
                 h: screen_h as i32,
                 ver: VERSION,
-                id: tsunagu_common::proto::device_id(),
+                id: knit_common::proto::device_id(),
                 monitors: mac_monitors(),
             });
             if w.write_all(ok.as_bytes()).and_then(|_| w.flush()).is_err() {
@@ -4959,7 +4959,7 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
     eprintln!("[conn] connected");
     s.set_nodelay(true).ok();
     s.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let (r, mut hw) = secure::connect(s, token, b"tsunagu-main")
+    let (r, mut hw) = secure::connect(s, token, b"knit-main")
         .map_err(|e| format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"))?;
     // hello(自画面サイズを相手へ伝える。相手は hello_ok で自画面を返す)
     let hello = encode(&Msg::Hello {
@@ -4968,7 +4968,7 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
         token: String::new(),
         w: screen_w as i32,
         h: screen_h as i32,
-        id: tsunagu_common::proto::device_id(),
+        id: knit_common::proto::device_id(),
         monitors: mac_monitors(),
     });
     hw.write_all(hello.as_bytes())
@@ -5003,7 +5003,7 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
             };
             eprintln!(
                 "[info] win screen {mw}x{mh} モニター: {}",
-                tsunagu_common::proto::Monitor::summary(&monitors)
+                knit_common::proto::Monitor::summary(&monitors)
             );
         }
         _ => return Err("invalid hello_ok".into()),
@@ -5024,7 +5024,7 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
     eprintln!("[conn] established");
     let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
     notify(
-        "tsunagu",
+        "Knit",
         &format!(
             "{} と接続しました",
             if peer.is_empty() {
@@ -5040,11 +5040,11 @@ fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h: f64) -> Re
     Ok(())
 }
 
-/// 接続モード(TSUNAGU_ROLE=client): Windows(サーバ)へ接続し続ける
+/// 接続モード(KNIT_ROLE=client): Windows(サーバ)へ接続し続ける
 fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, screen_h: f64) {
     let mut backoff = 500u64;
     loop {
-        let addrs = tsunagu_common::connect::resolve(host.as_deref(), port, &token);
+        let addrs = knit_common::connect::resolve(host.as_deref(), port, &token);
         if addrs.is_empty() {
             // 候補が空なら first_reachable を呼ばない(Windows 側と同じ: 3.5 秒の空待ち防止)
             eprintln!("[conn] 接続先が見つかりません");
@@ -5053,7 +5053,7 @@ fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, 
             continue;
         }
         let t0 = std::time::Instant::now();
-        match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
+        match knit_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());

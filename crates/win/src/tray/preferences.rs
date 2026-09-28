@@ -1,9 +1,9 @@
 //! 音声設定はユーザープロファイルへ保存し、配布先フォルダの書込み権限に依存させない。
 use super::*;
 fn path() -> std::io::Result<std::path::PathBuf> {
-    let root = std::env::var_os("LOCALAPPDATA")
+    let dir = knit_common::envutil::data_dir()
         .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is unavailable"))?;
-    Ok(std::path::PathBuf::from(root).join("Tsunagu/preferences.json"))
+    Ok(dir.join("preferences.json"))
 }
 pub(super) fn restore() {
     let Ok(path) = path() else { return };

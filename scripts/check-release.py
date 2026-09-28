@@ -28,10 +28,10 @@ def check_release(path):
             raise ValueError('リリース情報が不正です')
         root = manifests[0].split('/')[0]
         platform = manifest.get('platform')
-        binary = {'macos-arm64': 'Tsunagu.app/Contents/MacOS/Tsunagu', 'windows-x64': 'tsunagu-win.exe'}.get(platform)
+        binary = {'macos-arm64': 'Knit.app/Contents/MacOS/Knit', 'windows-x64': 'knit-win.exe'}.get(platform)
         if not binary:
             raise ValueError('未対応の配布先です')
-        required = [binary, 'Tsunagu.app/Contents/Info.plist', 'Tsunagu.app/Contents/Resources/AppIcon.icns', 'README-Mac.txt'] if platform == 'macos-arm64' else [binary, 'app.ico', 'install.bat', 'uninstall.bat', 'run_tsunagu.bat', 'run_tsunagu.vbs', 'README-win.txt']
+        required = [binary, 'Knit.app/Contents/Info.plist', 'Knit.app/Contents/Resources/AppIcon.icns', 'README-Mac.txt'] if platform == 'macos-arm64' else [binary, 'app.ico', 'install.bat', 'uninstall.bat', 'run_knit.bat', 'run_knit.vbs', 'README-win.txt']
         for file in required:
             if f'{root}/{file}' not in names:
                 raise ValueError(f'必須ファイルがありません: {file}')

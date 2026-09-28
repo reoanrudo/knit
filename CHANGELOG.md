@@ -4,6 +4,22 @@
 
 ## [未リリース]
 
+### 変更(名称を Tsunagu から Knit へ)
+- アプリ名・クレート名(knit-common / knit-mac / knit-win)・実行ファイル名・
+  配布物(Knit.app、Knit-win-*.zip)・受信フォルダ(Downloads/Knit)・ログ名を変更
+- 環境変数は `KNIT_*` へ。旧名 `TSUNAGU_*`・`SEAMLESS_*` も引き続き読む
+- 設定は `~/.config/knit`、端末データは `%LOCALAPPDATA%\Knit` /
+  `~/Library/Application Support/Knit` へ。初回起動時に旧フォルダを複製して引き継ぐ
+  (旧版へ戻せるよう元は残す)
+- Windows の導入先は `%USERPROFILE%\knit`、タスクは `knit` / `knit_run` / `knit_watch`。
+  install.bat が旧タスク・旧プロセスを止め、旧 `.env` を引き継ぐ
+- Mac は `Knit.app`(バンドル ID `local.knit`)、LaunchAgent `local.knit`。
+  install-mac.sh が旧 `local.tsunagu` を解除する。**アクセシビリティと入力監視の
+  権限は新しいアプリに付け直しが必要**
+- 暗号・相互認証・LAN 自動発見・初回登録の識別子(`knit-psk-v1`・`knit-main` 等)、
+  接続キーの表示形式(`knit1:`)、キーチェーンの項目名(`local.knit.connection`)も変更。
+  **旧版(Tsunagu)とは接続できないため、両端末を同時に更新し、初回登録をやり直す**
+
 ### 修正(Mac→Windows の掴みドラッグ)
 - **受け渡しIDで操作を結びつける**: Windows→Mac と同じく、Mac は越える前に
   本線へ予告(drag_offer)を積み、ファイル転送にも同じIDを付ける。Windows は

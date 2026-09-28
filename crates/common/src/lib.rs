@@ -6,24 +6,73 @@ pub mod pairing;
 pub mod smartguard;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil {
-    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env。
+    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/knit/env。
     //! 配布形態(.app バンドル埋め込み / exe 同梱 .env / ホーム設定)のどれでも
     //! 同一コードで動かすための仕組み。KEY=VALUE 形式(1行1エントリ、# はコメント)。
-    //! 旧名称(v0.7 以前の seamless-desk)の環境変数・設定パスもフォールバックで
-    //! 読むため、既存環境を書き換えずにそのまま移行できる。
+    //! 旧名称(v0.25 までの Tsunagu、v0.7 以前の seamless-desk)の環境変数・設定パスも
+    //! フォールバックで読むため、既存環境を書き換えずにそのまま移行できる。
 
+    use std::path::{Path, PathBuf};
     use std::sync::OnceLock;
 
-    /// 旧名称(v0.7 以前)へのキー変換。
-    /// TSUNAGU_TOKEN ← SEAMLESS_DESK_TOKEN、TSUNAGU_X ← SEAMLESS_X
-    fn legacy_key(key: &str) -> String {
-        if key == "TSUNAGU_TOKEN" {
-            return "SEAMLESS_DESK_TOKEN".to_string();
+    /// 旧名称へのキー変換(新しい順)。
+    /// KNIT_X ← TSUNAGU_X ← SEAMLESS_X(トークンだけは SEAMLESS_DESK_TOKEN)
+    fn legacy_keys(key: &str) -> Vec<String> {
+        let Some(rest) = key.strip_prefix("KNIT_") else {
+            return Vec::new();
+        };
+        let oldest = if rest == "TOKEN" {
+            "SEAMLESS_DESK_TOKEN".to_string()
+        } else {
+            format!("SEAMLESS_{rest}")
+        };
+        vec![format!("TSUNAGU_{rest}"), oldest]
+    }
+
+    /// 旧名称の設定フォルダを、新しいフォルダが無い時だけ丸ごと複製する。
+    /// 旧版へ戻しても設定が残るよう、移動ではなく複製にする
+    pub fn migrate_dir(old: &Path, new: &Path) {
+        fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+            std::fs::create_dir_all(to)?;
+            for entry in std::fs::read_dir(from)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                let target = to.join(entry.file_name());
+                if kind.is_dir() {
+                    copy(&entry.path(), &target)?;
+                } else if kind.is_file() {
+                    std::fs::copy(entry.path(), target)?;
+                }
+            }
+            Ok(())
         }
-        match key.strip_prefix("TSUNAGU_") {
-            Some(rest) => format!("SEAMLESS_{rest}"),
-            None => String::new(),
+        if new.exists() || !old.is_dir() {
+            return;
         }
+        if let Err(e) = copy(old, new) {
+            eprintln!("[config] 旧設定 {} の移行に失敗: {e}", old.display());
+        }
+    }
+
+    /// 設定フォルダ(~/.config/knit)。初回は旧名称のフォルダから移行する
+    pub fn config_dir() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+        let cfg = Path::new(&home).join(".config");
+        let dir = cfg.join("knit");
+        migrate_dir(&cfg.join("tsunagu"), &dir);
+        Some(dir)
+    }
+
+    /// 端末固有データの置き場(Windows は %LOCALAPPDATA%\Knit、Mac は
+    /// ~/Library/Application Support/Knit)。初回は旧名称のフォルダから移行する
+    pub fn data_dir() -> Option<PathBuf> {
+        #[cfg(target_os = "windows")]
+        let root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+        #[cfg(not(target_os = "windows"))]
+        let root = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support");
+        let dir = root.join("Knit");
+        migrate_dir(&root.join("Tsunagu"), &dir);
+        Some(dir)
     }
 
     fn entries() -> &'static Vec<(String, String)> {
@@ -44,9 +93,10 @@ pub mod envutil {
             }
             for key in ["HOME", "USERPROFILE"] {
                 if let Some(home) = std::env::var_os(key) {
-                    let cfg = std::path::Path::new(&home).join(".config");
+                    let cfg = Path::new(&home).join(".config");
+                    paths.push(cfg.join("knit/env"));
+                    // 旧名称時代の設定パス(移行措置)
                     paths.push(cfg.join("tsunagu/env"));
-                    // 旧名称時代の設定パス(v0.7 からの移行措置)
                     paths.push(cfg.join("seamless-desk/env"));
                 }
             }
@@ -71,35 +121,62 @@ pub mod envutil {
         })
     }
 
+    fn env_var(key: &str) -> Option<String> {
+        std::env::var(key).ok().filter(|v| !v.is_empty())
+    }
+
     /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する。
-    /// 旧名称のキー(SEAMLESS_*)も最後に確認する(v0.7 設定からの移行)
+    /// 旧名称のキー(TSUNAGU_*・SEAMLESS_*)も新しい順に確認する
     pub fn get(key: &str) -> Option<String> {
-        if let Ok(v) = std::env::var(key) {
-            if !v.is_empty() {
-                return Some(v);
-            }
+        if let Some(v) = env_var(key) {
+            return Some(v);
         }
-        let legacy = legacy_key(key);
-        let hit = entries()
-            .iter()
-            .find(|(k, _)| k == key)
-            .or_else(|| {
-                if legacy.is_empty() {
-                    None
-                } else {
-                    entries().iter().find(|(k, _)| *k == legacy)
-                }
-            })
-            .map(|(_, v)| v.clone());
-        // 旧名称の環境変数も受け入れる(スクリプト側の書き換え漏れ保険)
-        if hit.is_none() && !legacy.is_empty() {
-            if let Ok(v) = std::env::var(&legacy) {
-                if !v.is_empty() {
-                    return Some(v);
-                }
-            }
+        let legacy = legacy_keys(key);
+        let find = |k: &str| {
+            entries()
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+        };
+        find(key)
+            .or_else(|| legacy.iter().find_map(|k| find(k)))
+            // 旧名称の環境変数も受け入れる(スクリプト側の書き換え漏れ保険)
+            .or_else(|| legacy.iter().find_map(|k| env_var(k)))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn new_keys_fall_back_to_both_older_names() {
+            assert_eq!(
+                legacy_keys("KNIT_TOKEN"),
+                ["TSUNAGU_TOKEN", "SEAMLESS_DESK_TOKEN"]
+            );
+            assert_eq!(legacy_keys("KNIT_HOST"), ["TSUNAGU_HOST", "SEAMLESS_HOST"]);
+            assert!(legacy_keys("OTHER").is_empty());
         }
-        hit
+
+        #[test]
+        fn migrates_old_config_once_without_touching_it() {
+            let base = std::env::temp_dir().join(format!("knit-migrate-{}", std::process::id()));
+            let (old, new) = (base.join("tsunagu"), base.join("knit"));
+            std::fs::create_dir_all(old.join("images")).unwrap();
+            std::fs::write(old.join("env"), "TSUNAGU_TOKEN=x\n").unwrap();
+            std::fs::write(old.join("images/a.png"), b"png").unwrap();
+            migrate_dir(&old, &new);
+            assert_eq!(std::fs::read(new.join("images/a.png")).unwrap(), b"png");
+            assert!(old.join("env").exists(), "旧版へ戻せるよう元は残す");
+            std::fs::write(new.join("env"), "KNIT_TOKEN=y\n").unwrap();
+            migrate_dir(&old, &new);
+            assert_eq!(
+                std::fs::read_to_string(new.join("env")).unwrap(),
+                "KNIT_TOKEN=y\n",
+                "移行済みの設定を上書きしない"
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
     }
 }
 
@@ -468,7 +545,7 @@ pub mod files {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             // 形式: フラグ;時刻(16進);取得元アプリ;UUID(省略可)
-            let value = format!("0081;{secs:x};Tsunagu;");
+            let value = format!("0081;{secs:x};Knit;");
             let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
                 return;
             };
@@ -537,7 +614,7 @@ pub mod secure {
     fn psk(token: &str) -> [u8; 32] {
         use blake2::Digest;
         let mut h = blake2::Blake2s256::new();
-        h.update(b"tsunagu-psk-v1\0");
+        h.update(b"knit-psk-v1\0");
         h.update(token.as_bytes());
         h.finalize().into()
     }
@@ -742,10 +819,10 @@ pub mod net {
 
     /// 接続を受け入れてよい相手か。通信は暗号化と相互認証(secure)で守られるため、
     /// 家庭・社内の LAN、有線直結(リンクローカル)、Tailscale を許可する。
-    /// インターネット側のアドレスは TSUNAGU_ALLOW_ANY=1 の時だけ許可する
+    /// インターネット側のアドレスは KNIT_ALLOW_ANY=1 の時だけ許可する
     /// (旧: Tailscale のみ許可で、usage.md が勧める有線直結 169.254.x.x が繋がらなかった)
     pub fn is_allowed(ip: IpAddr) -> bool {
-        if crate::envutil::get("TSUNAGU_ALLOW_ANY").as_deref() == Some("1") {
+        if crate::envutil::get("KNIT_ALLOW_ANY").as_deref() == Some("1") {
             return true;
         }
         match ip {
@@ -776,8 +853,8 @@ pub mod net {
 pub mod discover {
     //! 同じ LAN にいる相手の自動発見(接続先の IP を手で入れずに済むように)。
     //! 問い合わせと応答には、トークンから導いた「部屋 ID」だけを載せる(トークンそのもの
-    //! は含まない)。同じトークンを持つ相手だけが応答するため、他人の Tsunagu とは混ざらない。
-    //! Tailscale や AP 隔離の環境ではブロードキャストが届かないため TSUNAGU_HOST を併用する
+    //! は含まない)。同じトークンを持つ相手だけが応答するため、他人の Knit とは混ざらない。
+    //! Tailscale や AP 隔離の環境ではブロードキャストが届かないため KNIT_HOST を併用する
     use std::net::{IpAddr, SocketAddr, UdpSocket};
     use std::time::{Duration, Instant};
 
@@ -787,7 +864,7 @@ pub mod discover {
     pub fn room_id(token: &str) -> String {
         use blake2::Digest;
         let mut h = blake2::Blake2s256::new();
-        h.update(b"tsunagu-room-v1\0");
+        h.update(b"knit-room-v1\0");
         h.update(token.as_bytes());
         h.finalize()[..8]
             .iter()
@@ -804,8 +881,8 @@ pub mod discover {
         allow: fn(IpAddr) -> bool,
     ) -> std::io::Result<()> {
         let sock = UdpSocket::bind((bind, port))?;
-        let ask = format!("TSUNAGU?{}", room_id(token));
-        let ans = format!("TSUNAGU!{}", room_id(token));
+        let ask = format!("KNIT?{}", room_id(token));
+        let ans = format!("KNIT!{}", room_id(token));
         let mut buf = [0u8; 128];
         while let Ok((n, from)) = sock.recv_from(&mut buf) {
             if allow(from.ip()) && &buf[..n] == ask.as_bytes() {
@@ -822,8 +899,8 @@ pub mod discover {
             return None;
         };
         let _ = sock.set_broadcast(true);
-        let ask = format!("TSUNAGU?{}", room_id(token));
-        let ans = format!("TSUNAGU!{}", room_id(token));
+        let ask = format!("KNIT?{}", room_id(token));
+        let ans = format!("KNIT!{}", room_id(token));
         sock.send_to(ask.as_bytes(), target).ok()?;
         let until = Instant::now() + wait;
         let mut buf = [0u8; 128];
@@ -901,7 +978,7 @@ pub mod connect {
         addrs
     }
 
-    /// 接続候補: LAN 自動発見の結果を先頭に、指定(TSUNAGU_HOST)を併せて返す。
+    /// 接続候補: LAN 自動発見の結果を先頭に、指定(KNIT_HOST)を併せて返す。
     /// 同じ LAN にいれば発見=LAN 直が最速で、いなければ指定(Tailscale 等)へフォールバックする
     pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
         let found = crate::discover::seek_first_lan(port, token)
@@ -950,7 +1027,7 @@ pub mod bulk {
     /// ファイル指紋の再公開(利用側は bulk 経由で呼ぶことが多いため)
     pub use crate::files::key as files_key;
     /// 暗号化ハンドシェイクで経路を識別するラベル
-    const LABEL: &[u8] = b"tsunagu-bulk";
+    const LABEL: &[u8] = b"knit-bulk";
     /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
     pub const MAX_FRAME: usize = 1024 * 1024;
     /// ファイル・画像データを分割する単位
@@ -1849,7 +1926,7 @@ mod tests {
     #[test]
     fn files_key_is_stable_and_size_aware() {
         use super::files::key;
-        let base = std::env::temp_dir().join(format!("tsunagu-key-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-key-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.txt"), b"hello").unwrap();
         let a = base.join("a.txt").to_string_lossy().into_owned();
@@ -1868,7 +1945,7 @@ mod tests {
 
     #[test]
     fn same_name_is_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!("tsunagu-files-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-files-{}", std::process::id()));
         let (_, a) = super::files::create_unique(&dir, "x.txt").unwrap();
         let (_, b) = super::files::create_unique(&dir, "x.txt").unwrap();
         assert_ne!(a, b);
@@ -1882,7 +1959,7 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(
-                String::from_utf8_lossy(&out.stdout).contains(";Tsunagu;"),
+                String::from_utf8_lossy(&out.stdout).contains(";Knit;"),
                 "quarantine 属性が付いていない"
             );
         }
@@ -1892,7 +1969,7 @@ mod tests {
     #[test]
     fn bulk_roundtrip_files_and_image() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-bulk-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-bulk-{}", std::process::id()));
         let src = base.join("src");
         std::fs::create_dir_all(&src).unwrap();
         let big: Vec<u8> = (0..(CHUNK * 2 + 123)).map(|i| (i % 251) as u8).collect();
@@ -1935,7 +2012,7 @@ mod tests {
         assert!(read_frame(&mut std::io::Cursor::new(wire), &mut Vec::new()).is_err());
 
         // 宣言サイズより多いデータを送られたらファイルごと破棄する
-        let base = std::env::temp_dir().join(format!("tsunagu-bulk-bad-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-bulk-bad-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         rx.feed(FILE_BEGIN, br#"{"name":"x.bin","size":3}"#);
         rx.feed(DATA, b"toolong");
@@ -1950,7 +2027,7 @@ mod tests {
         use super::bulk::*;
         // 一部だけ届いて成功に見えないよう、超過は送信開始前に拒否する。
         // 超過ファイルはスパース(実データなし)で作る
-        let base = std::env::temp_dir().join(format!("tsunagu-bulk-cap-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-bulk-cap-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("ok.txt"), b"ok").unwrap();
         let huge = std::fs::File::create(base.join("huge.bin")).unwrap();
@@ -1985,7 +2062,7 @@ mod tests {
     #[test]
     fn bulk_sender_reports_files_shortened_during_transfer() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-shortened-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-shortened-{}", std::process::id()));
         std::fs::create_dir_all(&base).unwrap();
         let src = base.join("source.bin");
         std::fs::write(&src, vec![5u8; CHUNK * 2]).unwrap();
@@ -2024,8 +2101,8 @@ mod tests {
         // 応答側を立てて、そのポートへ問い合わせる
         let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = responder.local_addr().unwrap().port();
-        let ask = format!("TSUNAGU?{}", room_id(token));
-        let ans = format!("TSUNAGU!{}", room_id(token));
+        let ask = format!("KNIT?{}", room_id(token));
+        let ans = format!("KNIT!{}", room_id(token));
         let answerer = std::thread::spawn(move || {
             let mut buf = [0u8; 128];
             let (n, from) = responder.recv_from(&mut buf).unwrap();
@@ -2084,7 +2161,7 @@ mod tests {
     #[test]
     fn bulk_receiver_caps_total_and_taints() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-cap-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-cap-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         rx.set_limit_for_test(1_000);
         // 600B × 2 ファイルで 1,200B > 上限 1,000B
@@ -2119,7 +2196,7 @@ mod tests {
     #[test]
     fn bulk_receiver_limit_applies_to_each_completed_batch() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-batches-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-batches-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         rx.set_limit_for_test(1_000);
         for i in 0..3 {
@@ -2143,7 +2220,7 @@ mod tests {
     #[test]
     fn bulk_receiver_checks_declared_capacity_and_cleans_unfinished_files() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-declared-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-declared-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         // 4GiB を超えるヘッダも扱える。実データなしで新上限の境界を確認する。
         let size = 10u64 * 1024 * 1024 * 1024;
@@ -2184,7 +2261,7 @@ mod tests {
     #[test]
     fn bulk_receiver_discards_partial_on_drop() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-drop-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-drop-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         // 1 件目は完了、2 件目は DATA 途中で切断
         rx.feed(FILE_BEGIN, br#"{"name":"done.bin","size":3}"#);
@@ -2203,7 +2280,7 @@ mod tests {
     #[test]
     fn send_files_progress_is_monotonic_and_reaches_total() {
         use super::bulk::*;
-        let base = std::env::temp_dir().join(format!("tsunagu-prog-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-prog-{}", std::process::id()));
         let src = base.join("src");
         std::fs::create_dir_all(&src).unwrap();
         // 1.5 チャンク分のファイル(複数チャンクをまたぐ)
@@ -2239,11 +2316,7 @@ mod tests {
         let found: Vec<IpAddr> = vec!["192.168.0.1".parse().unwrap()];
         let merged = merge_candidates(found, Some("100.100.10.9,192.168.0.1"), 24900);
         assert_eq!(merged.len(), 2, "発見と指定の同じ IP は 1 つに: {merged:?}");
-        assert_eq!(
-            merged[0].to_string(),
-            "192.168.0.1:24900",
-            "発見結果が先頭"
-        );
+        assert_eq!(merged[0].to_string(), "192.168.0.1:24900", "発見結果が先頭");
         assert_eq!(merged[1].to_string(), "100.100.10.9:24900");
 
         // 指定なし → 発見のみ
@@ -2267,7 +2340,7 @@ mod tests {
         static SERVER: OnceLock<Endpoint> = OnceLock::new();
         static CLIENT: OnceLock<Endpoint> = OnceLock::new();
         static GOT: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-        let base = std::env::temp_dir().join(format!("tsunagu-link-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("knit-link-{}", std::process::id()));
         let port = {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
@@ -2317,7 +2390,7 @@ mod tests {
         let bad = std::net::TcpStream::connect(addr).unwrap();
         bad.set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
-        assert!(crate::secure::connect(bad, "wrong", b"tsunagu-bulk").is_err());
+        assert!(crate::secure::connect(bad, "wrong", b"knit-bulk").is_err());
         let _ = std::fs::remove_dir_all(base);
     }
 

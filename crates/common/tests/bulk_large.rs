@@ -1,11 +1,11 @@
 //! 10GiB を実際に暗号化転送する検証。通常の単体テストからは除外する。
-//! cargo test --locked --release -p tsunagu-common --test bulk_large -- --ignored --nocapture
+//! cargo test --locked --release -p knit-common --test bulk_large -- --ignored --nocapture
 use blake2::{Blake2s256, Digest};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tsunagu_common::{bulk, secure};
+use knit_common::{bulk, secure};
 
 struct TempDir(PathBuf);
 
@@ -32,7 +32,7 @@ fn digest(path: &Path) -> Vec<u8> {
 #[ignore = "10GiB の転送・照合を実行し、受信先に10GiBの空き容量を使う"]
 fn encrypted_transfer_at_limit_then_another_batch() {
     let base = TempDir(std::env::temp_dir().join(format!(
-            "tsunagu-large-{}-{}",
+            "knit-large-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -49,7 +49,7 @@ fn encrypted_transfer_at_limit_then_another_batch() {
     file.set_len(size).unwrap();
     for offset in [0, (1u64 << 32) - 8, size - 32] {
         file.seek(SeekFrom::Start(offset)).unwrap();
-        file.write_all(b"tsunagu-large-file-marker").unwrap();
+        file.write_all(b"knit-large-file-marker").unwrap();
     }
     drop(file);
     eprintln!("送信元10GiBのハッシュを計算");
@@ -66,7 +66,7 @@ fn encrypted_transfer_at_limit_then_another_batch() {
             .set_write_timeout(Some(Duration::from_secs(60)))
             .unwrap();
         let (reader, mut writer) =
-            secure::accept(stream, "large-transfer-test", b"tsunagu-bulk").unwrap();
+            secure::accept(stream, "large-transfer-test", b"knit-bulk").unwrap();
         let mut reader = std::io::BufReader::with_capacity(bulk::CHUNK + 16, reader);
         let mut receiver = bulk::Receiver::new(&destination);
         let mut frame = Vec::new();
@@ -97,7 +97,7 @@ fn encrypted_transfer_at_limit_then_another_batch() {
         .set_write_timeout(Some(Duration::from_secs(60)))
         .unwrap();
     let (mut reader, mut writer) =
-        secure::connect(stream, "large-transfer-test", b"tsunagu-bulk").unwrap();
+        secure::connect(stream, "large-transfer-test", b"knit-bulk").unwrap();
     let mut last_step = 0;
     assert_eq!(
         bulk::send_files_with_progress(&mut writer, &[source], false, |sent, total| {

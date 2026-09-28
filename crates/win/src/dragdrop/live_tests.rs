@@ -85,14 +85,14 @@ fn shared_mouse_release_completes_native_shell_drop() {
         let foreground = GetForegroundWindow();
         let mut cursor = std::mem::zeroed();
         GetCursorPos(&mut cursor);
-        let dir = std::env::temp_dir().join(format!("tsunagu-live-drop-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("knit-live-drop-{}", std::process::id()));
         let dest = dir.join("destination");
         std::fs::create_dir_all(&dest).unwrap();
         let source = dir.join("操作テスト.txt");
         let contents = b"native mouse release must complete this exact copy\n";
         std::fs::write(&source, contents).unwrap();
         let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
-        let title: Vec<u16> = "Tsunagu drag verification\0".encode_utf16().collect();
+        let title: Vec<u16> = "Knit drag verification\0".encode_utf16().collect();
         let window = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class.as_ptr(),

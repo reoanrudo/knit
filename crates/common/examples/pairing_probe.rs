@@ -1,6 +1,6 @@
 //! Isolated enrollment test. Uses an ephemeral token and never reads/writes the
 //! real credential store. Run server on Mac and client <ip> <code> on Windows.
-use tsunagu_common::{credentials, pairing};
+use knit_common::{credentials, pairing};
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {

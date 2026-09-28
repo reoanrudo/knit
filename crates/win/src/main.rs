@@ -1,4 +1,4 @@
-// tsunagu-win: Windows 側サーバ。TCP で受けた入力イベントを SendInput で注入する。
+// knit-win: Windows 側サーバ。TCP で受けた入力イベントを SendInput で注入する。
 // 必須: 対話セッション起動 + OpenInputDesktop(フル権限) + SetThreadDesktop
 // v0.5: GUI サブシステム化(コンソール非依存)+タスクトレイ常駐+待受モード追加
 #![allow(non_snake_case)]
@@ -9,17 +9,17 @@ mod audio;
 mod dragdrop;
 mod tray;
 
-use tsunagu_common::keymap::mac_kc_to_win_vk;
-use tsunagu_common::{bulk, secure};
+use knit_common::keymap::mac_kc_to_win_vk;
+use knit_common::{bulk, secure};
 
 static DEBUG_KEYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+use knit_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tsunagu_common::proto::{compatible, decode, encode, safe_peer_name, Msg, PORT, VERSION};
 
 use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::System::Threading::{PROCESS_INFORMATION, STARTUPINFOW};
@@ -174,7 +174,7 @@ static CONNECTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)。Mac から Cfg で同期される
 static CMD_ALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 接続中の Windows スピーカーミュート(true=Mac のみ発音。既定 ON)。
-/// Mac から Cfg で同期される(TSUNAGU_MUTE_SPK=0 で初期無効化)
+/// Mac から Cfg で同期される(KNIT_MUTE_SPK=0 で初期無効化)
 static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 /// Mac が測定した RTT(ms)。Mac から Stat で届く(ステータス窓の表示用)
 static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -227,15 +227,14 @@ static LAST_SYNC_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 // ---------- クリップボード履歴(Universal Clipboard History) ----------
 /// 送信・受信したテキストの履歴。トレイメニューから選んで復元できる。
 /// 機密判定(smartguard)と秘匿指定は送信側で弾くため、履歴へは届かない
-pub static HISTORY: std::sync::Mutex<tsunagu_common::history::History> =
-    std::sync::Mutex::new(tsunagu_common::history::History::new(50));
+pub static HISTORY: std::sync::Mutex<knit_common::history::History> =
+    std::sync::Mutex::new(knit_common::history::History::new(50));
 /// 接続・切断通知の間引き(断続的な切替で連打しない。種別が変われば都度出す)
 static CONN_NOTIFY: std::sync::Mutex<Option<(bool, Instant)>> = std::sync::Mutex::new(None);
 
 /// 履歴の保存先(音声設定と同じユーザープロファイル。配布先の書込み権限に依存しない)
 pub fn history_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|root| std::path::PathBuf::from(root).join("Tsunagu/history.json"))
+    knit_common::envutil::data_dir().map(|dir| dir.join("history.json"))
 }
 
 pub fn history_save() {
@@ -253,7 +252,7 @@ pub fn history_load() {
 }
 
 fn history_push(text: &str, device: &str) {
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_text(text, device, ts).is_some() {
             drop(h);
@@ -265,7 +264,7 @@ fn history_push(text: &str, device: &str) {
 /// ファイル群を履歴へ載せる(ビジョン§10 の File 分類)。送信・受信の
 /// すべてのファイル移動で呼ぶ
 fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_files(paths, device, ts).is_some() {
             drop(h);
@@ -274,10 +273,9 @@ fn history_push_files(paths: &[std::path::PathBuf], device: &str) {
     }
 }
 
-/// 画像履歴の本体を置くディレクトリ(履歴 JSON と同じ %LOCALAPPDATA%\Tsunagi\images)
+/// 画像履歴の本体を置くディレクトリ(履歴 JSON と同じ %LOCALAPPDATA%\Knit\images)
 fn image_store_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("LOCALAPPDATA")
-        .map(|root| std::path::PathBuf::from(root).join("Tsunagu/images"))
+    knit_common::envutil::data_dir().map(|dir| dir.join("images"))
 }
 
 /// images/ に残す実体の上限。履歴 cap(50)より少し余裕を持たせた件数
@@ -287,19 +285,18 @@ const IMAGE_KEEP: usize = 60;
 /// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ残す
 fn history_push_image(dib: &[u8], device: &str) {
     let Some(dir) = image_store_dir() else { return };
-    let name =
-        tsunagu_common::history::image_file_name(tsunagu_common::history::fnv1a64(dib), "dib");
+    let name = knit_common::history::image_file_name(knit_common::history::fnv1a64(dib), "dib");
     let _ = std::fs::create_dir_all(&dir);
-    tsunagu_common::history::restrict_dir(&dir);
+    knit_common::history::restrict_dir(&dir);
     let path = dir.join(&name);
     if !path.exists() {
-        if tsunagu_common::history::write_private(&path, dib).is_err() {
+        if knit_common::history::write_private(&path, dib).is_err() {
             println!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
             return;
         }
-        tsunagu_common::history::prune_image_store(&dir, IMAGE_KEEP);
+        knit_common::history::prune_image_store(&dir, IMAGE_KEEP);
     }
-    let ts = tsunagu_common::history::now_epoch_ms();
+    let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_image(&name, dib.len(), device, ts).is_some() {
             drop(h);
@@ -350,7 +347,7 @@ fn conn_notify(connected: bool, text: &str) {
         ok
     };
     if due {
-        tray::notify("Tsunagu", text);
+        tray::notify("Knit", text);
     }
 }
 
@@ -363,14 +360,14 @@ pub fn history_restore_by_id(id: u64) {
         return;
     };
     // 画像の履歴(ビジョン§10): images/ から CF_DIB の本体を読み戻す
-    if entry.kind == tsunagu_common::history::Kind::Image {
-        let Some((name, _)) = tsunagu_common::history::parse_image_entry(&entry.text) else {
+    if entry.kind == knit_common::history::Kind::Image {
+        let Some((name, _)) = knit_common::history::parse_image_entry(&entry.text) else {
             return;
         };
         let dib = image_store_dir().and_then(|d| std::fs::read(d.join(&name)).ok());
         let Some(dib) = dib else {
             tray::notify(
-                "Tsunagu",
+                "Knit",
                 "履歴の画像が見つからないため復元できませんでした(削除済み)",
             );
             return;
@@ -385,14 +382,14 @@ pub fn history_restore_by_id(id: u64) {
             );
         } else {
             tray::notify(
-                "Tsunagu",
+                "Knit",
                 "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
             );
         }
         return;
     }
-    if entry.kind == tsunagu_common::history::Kind::File
-        || tsunagu_common::history::looks_like_file_paths(&entry.text)
+    if entry.kind == knit_common::history::Kind::File
+        || knit_common::history::looks_like_file_paths(&entry.text)
     {
         let paths: Vec<String> = entry
             .text
@@ -402,7 +399,7 @@ pub fn history_restore_by_id(id: u64) {
             .collect();
         if paths.is_empty() {
             tray::notify(
-                "Tsunagu",
+                "Knit",
                 "履歴のファイルが見つからないため復元できませんでした(移動・削除済み)",
             );
             return;
@@ -418,7 +415,7 @@ pub fn history_restore_by_id(id: u64) {
             );
         } else {
             tray::notify(
-                "Tsunagu",
+                "Knit",
                 "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
             );
         }
@@ -434,7 +431,7 @@ pub fn history_restore_by_id(id: u64) {
         );
     } else {
         tray::notify(
-            "Tsunagu",
+            "Knit",
             "クリップボードを書き込めませんでした(他アプリが使用中。少し待って再試行)",
         );
     }
@@ -457,8 +454,8 @@ fn smart_secret_notify() {
     };
     if due {
         tray::notify(
-            "tsunagu",
-            "クリップボードに機密の可能性があるため Mac へは送りませんでした(履歴にも載りません。TSUNAGU_SMART_SECRET=0 で無効化)",
+            "Knit",
+            "クリップボードに機密の可能性があるため Mac へは送りませんでした(履歴にも載りません。KNIT_SMART_SECRET=0 で無効化)",
         );
     }
 }
@@ -517,7 +514,7 @@ fn sync_clipboard_to_mac() {
             if !text.is_empty() && text.len() <= CLIP_MAX_CHARS && !echo {
                 // 実験的ガード: ローカル ollaya が動いていれば機密テキストを検査する。
                 // 無し・失敗は None=現行どおり送る。判定はこの同期スレッド内で完結
-                if tsunagu_common::smartguard::looks_secret(&text) == Some(true) {
+                if knit_common::smartguard::looks_secret(&text) == Some(true) {
                     println!("[clip] smartguard: 機密の可能性が高いため Mac へ送りません");
                     smart_secret_notify();
                     return;
@@ -778,7 +775,7 @@ fn send_files_to_mac(paths: &[String]) {
             paths.len()
         );
         tray::notify(
-            "tsunagu",
+            "Knit",
             &format!(
                 "ファイルを送信できません(合計 {}MiB。1回の上限 {})",
                 total / 1024 / 1024,
@@ -901,9 +898,9 @@ fn win_on_bulk(e: bulk::Event) {
                     .map(std::path::PathBuf::from)
                     .unwrap_or_default()
                     .join("Downloads")
-                    .join("Tsunagu");
+                    .join("Knit");
                 tray::notify(
-                    "Tsunagu",
+                    "Knit",
                     &format!(
                         "ファイルを受信: {n} 件(Ctrl+V で貼り付け可)。実体は {}",
                         dir.display()
@@ -1279,11 +1276,11 @@ struct CursorInfo {
 
 /// Mac の Control を Windows の Ctrl として送るアプリ(実行ファイル名、小文字)。
 /// 既定のキー配置では Control→Win キーのため、ターミナルの Ctrl+A/E/R/C が
-/// Win+A 等に化けて使えない。TSUNAGU_CTRL_APPS(カンマ区切り)で置き換えられる
+/// Win+A 等に化けて使えない。KNIT_CTRL_APPS(カンマ区切り)で置き換えられる
 fn ctrl_apps() -> &'static Vec<String> {
     static APPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     APPS.get_or_init(|| {
-        let list = tsunagu_common::envutil::get("TSUNAGU_CTRL_APPS").unwrap_or_else(|| {
+        let list = knit_common::envutil::get("KNIT_CTRL_APPS").unwrap_or_else(|| {
             "windowsterminal.exe,cmd.exe,powershell.exe,pwsh.exe,wsl.exe,conhost.exe,mintty.exe,\
              alacritty.exe,wezterm-gui.exe,putty.exe,kitty.exe,tabby.exe,hyper.exe"
                 .into()
@@ -1508,7 +1505,7 @@ fn ensure_stdout() {
 /// 二重起動防止(5分毎の自動復帰タスクが既存インスタンスと並走しないように)
 fn acquire_single_instance() -> bool {
     unsafe {
-        let mut name: Vec<u16> = "Local\\Tsunagu-Instance".encode_utf16().collect();
+        let mut name: Vec<u16> = "Local\\Knit-Instance".encode_utf16().collect();
         name.push(0);
         let h = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
         if windows_sys::Win32::Foundation::GetLastError() == 183 {
@@ -1592,16 +1589,16 @@ fn vscreen() -> (i32, i32, i32, i32) {
 
 /// 自環境の全モニターを仮想画面座標系で列挙する(接続先へ自動通知)。
 /// モニターの増減は接続の再確立時に相手へ反映される
-fn list_monitors() -> Vec<tsunagu_common::proto::Monitor> {
+fn list_monitors() -> Vec<knit_common::proto::Monitor> {
     unsafe extern "system" fn cb(
         _hm: *mut std::ffi::c_void,
         _hdc: *mut std::ffi::c_void,
         rect: *mut windows_sys::Win32::Foundation::RECT,
         ctx: isize,
     ) -> i32 {
-        let out = unsafe { &mut *(ctx as *mut Vec<tsunagu_common::proto::Monitor>) };
+        let out = unsafe { &mut *(ctx as *mut Vec<knit_common::proto::Monitor>) };
         let r = unsafe { &*rect };
-        out.push(tsunagu_common::proto::Monitor {
+        out.push(knit_common::proto::Monitor {
             x: r.left,
             y: r.top,
             w: r.right - r.left,
@@ -1609,7 +1606,7 @@ fn list_monitors() -> Vec<tsunagu_common::proto::Monitor> {
         });
         1
     }
-    let mut out: Vec<tsunagu_common::proto::Monitor> = Vec::new();
+    let mut out: Vec<knit_common::proto::Monitor> = Vec::new();
     unsafe {
         windows_sys::Win32::Graphics::Gdi::EnumDisplayMonitors(
             std::ptr::null_mut(),
@@ -1669,7 +1666,7 @@ fn main() {
     #[cfg(debug_assertions)]
     if std::env::args().any(|a| a == "--probe-setup") {
         // The test runner supplies an isolated LOCALAPPDATA directory.
-        if let Some(root) = std::env::var_os("TSUNAGU_PROBE_DATA") {
+        if let Some(root) = std::env::var_os("KNIT_PROBE_DATA") {
             std::env::set_var("LOCALAPPDATA", root);
             let _ = tray::setup::first_run(false);
         }
@@ -1729,13 +1726,13 @@ fn main() {
         return;
     }
 
-    println!("[info] tsunagu-win {BUILD_ID}");
+    println!("[info] knit-win {BUILD_ID}");
     // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
     let recv_dir = std::env::var_os("USERPROFILE")
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
         .join("Downloads")
-        .join("Tsunagu");
+        .join("Knit");
     let _ = std::fs::create_dir_all(&recv_dir);
     history_load();
     println!("[info] 操作ガイド: Mac から来るカーソルはそのまま操作できます。トレイ右クリックにクリップボード履歴があります");
@@ -1756,15 +1753,15 @@ fn main() {
 
     // トークンは双方向の共有鍵。ハンドシェイクの成否が oracle になるため短い
     // トークンは LAN 内の総当たりで破られる。128bit 相当(32 文字)を下限に
-    let token = if let Some(t) =
-        tsunagu_common::envutil::get("TSUNAGU_TOKEN").filter(|t| t.len() >= 32)
-    {
+    let token = if let Some(t) = knit_common::envutil::get("KNIT_TOKEN").filter(|t| t.len() >= 32) {
         t
-    } else if tsunagu_common::envutil::get("TSUNAGU_TOKEN").is_some_and(|t| !t.is_empty()) {
-        eprintln!("[fatal] TSUNAGU_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください");
+    } else if knit_common::envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty()) {
+        eprintln!(
+            "[fatal] KNIT_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください"
+        );
         exit(1);
     } else {
-        match tsunagu_common::credentials::load() {
+        match knit_common::credentials::load() {
             Ok(Some(t)) => t,
             Ok(None) if args.iter().any(|a| a == "--background") => return,
             Ok(None) => match tray::setup::first_run(false) {
@@ -1796,14 +1793,14 @@ fn main() {
     if args.iter().any(|a| a == "--debug-keys") {
         DEBUG_KEYS.store(true, Ordering::Relaxed);
     }
-    // 接続先は優先度順に: --host 引数 > TSUNAGU_HOST(.env 可)> Tailscale の既定
+    // 接続先は優先度順に: --host 引数 > KNIT_HOST(.env 可)> Tailscale の既定
     // (有線直結 Thunderbolt ブリッジ / USB-LAN 直結の際は .env で指定する)
     let host = args
         .iter()
         .position(|a| a == "--host")
         .and_then(|i| args.get(i + 1))
         .cloned()
-        .or_else(|| tsunagu_common::envutil::get("TSUNAGU_HOST"));
+        .or_else(|| knit_common::envutil::get("KNIT_HOST"));
     // 接続先の既定値(開発者の環境の固定 IP)は持たない。未指定なら LAN で自動発見する
     let host_label = host.clone().unwrap_or_else(|| "LAN から自動検出".into());
     println!("[info] connecting to {host_label}");
@@ -1812,13 +1809,13 @@ fn main() {
         .unwrap_or_else(|e| e.into_inner()) = host_label;
 
     // 接続方向: 既定は Win=クライアント(本環境のAP隔離対策)。
-    // TSUNAGU_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
+    // KNIT_ROLE=server(--listen)で Win=サーバ(Mac=クライアント)に反転できる
     // (通常ネットワークの配布先向け)
     let role_server = args.iter().any(|a| a == "--listen")
-        || tsunagu_common::envutil::get("TSUNAGU_ROLE").as_deref() == Some("server");
+        || knit_common::envutil::get("KNIT_ROLE").as_deref() == Some("server");
 
     // 接続中スピーカーミュートの初期値(既定 ON=Mac のみ発音)
-    if tsunagu_common::envutil::get("TSUNAGU_MUTE_SPK").as_deref() == Some("0") {
+    if knit_common::envutil::get("KNIT_MUTE_SPK").as_deref() == Some("0") {
         SPK_MUTE_MODE.store(false, Ordering::Relaxed);
     }
 
@@ -1827,19 +1824,16 @@ fn main() {
     dragdrop::edge::start();
 
     // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
-    // (サーバモードは TSUNAGU_AUDIO_HOST で明示指定した時のみ)
-    if tsunagu_common::envutil::get("TSUNAGU_AUDIO").as_deref() != Some("0") {
+    // (サーバモードは KNIT_AUDIO_HOST で明示指定した時のみ)
+    if knit_common::envutil::get("KNIT_AUDIO").as_deref() != Some("0") {
         // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
-        match (
-            tsunagu_common::envutil::get("TSUNAGU_AUDIO_HOST"),
-            role_server,
-        ) {
+        match (knit_common::envutil::get("KNIT_AUDIO_HOST"), role_server) {
             // 音声は本線ポートからの差分 +1(24900→24901)
             (Some(h), _) => audio::start(Some(h), token.clone(), port + 1),
             (None, false) => audio::start(None, token.clone(), port + 1),
-            (None, true) => println!(
-                "[audio] サーバモードで音声先未指定のため無効(TSUNAGU_AUDIO_HOST で指定可)"
-            ),
+            (None, true) => {
+                println!("[audio] サーバモードで音声先未指定のため無効(KNIT_AUDIO_HOST で指定可)")
+            }
         }
     }
 
@@ -1850,31 +1844,30 @@ fn main() {
             .map(std::path::PathBuf::from)
             .unwrap_or_default()
             .join("Downloads")
-            .join("Tsunagu"),
+            .join("Knit"),
         on_event: win_on_bulk,
         log: |s| println!("{s}"),
     });
 
     if role_server {
         println!("[info] server mode. screen {w}x{h}");
-        let bind =
-            tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        let bind = knit_common::envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let ep = bulk_ep;
         std::thread::spawn(move || {
             bulk::serve(
                 ep,
                 &bind,
                 port + bulk::PORT_OFFSET,
-                tsunagu_common::net::is_allowed,
+                knit_common::net::is_allowed,
             )
         });
         let tk = token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = tsunagu_common::discover::respond(
+            if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
-                port + tsunagu_common::discover::PORT_OFFSET,
+                port + knit_common::discover::PORT_OFFSET,
                 &tk,
-                tsunagu_common::net::is_allowed,
+                knit_common::net::is_allowed,
             ) {
                 println!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
             }
@@ -1904,22 +1897,24 @@ pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
     *PEER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 接続モード(既定): 候補(TSUNAGU_HOST のカンマ区切り)へ同時に接続を試み、
+/// 接続モード(既定): 候補(KNIT_HOST のカンマ区切り)へ同時に接続を試み、
 /// 最初に繋がった経路を使う。切断は指数バックオフで再接続
 fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
     let mut backoff = 500u64;
     loop {
-        let addrs = tsunagu_common::connect::resolve(hosts.as_deref(), port, token);
+        let addrs = knit_common::connect::resolve(hosts.as_deref(), port, token);
         if addrs.is_empty() {
             // 候補が空なら first_reachable を呼ばない(スレッド 0 のまま 3.5 秒待つだけの
             // 無駄。発見 600ms と合算して再接続が遅れる)
-            println!("[conn] 接続先が見つかりません(LAN の Mac を発見できず TSUNAGU_HOST の候補も空です)");
+            println!(
+                "[conn] 接続先が見つかりません(LAN の Mac を発見できず KNIT_HOST の候補も空です)"
+            );
             std::thread::sleep(Duration::from_millis(backoff));
             backoff = (backoff * 2).min(3000);
             continue;
         }
         let t0 = Instant::now();
-        match tsunagu_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
+        match knit_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
             Some((s, a)) => {
                 println!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
@@ -1929,7 +1924,7 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
                 // 起動一発目は LAN 発見が間に合わず Tailscale へ落ちることがある
                 //(発見は 600ms で諦めるため)。Tailscale 接続の間は 30 秒毎に LAN を
                 // 探し直し、見つかれば本線を張り直して次の再接続で LAN 直へ昇格する
-                if tsunagu_common::net::is_tailscale(a.ip()) {
+                if knit_common::net::is_tailscale(a.ip()) {
                     let tk = token.to_string();
                     std::thread::spawn(move || loop {
                         std::thread::sleep(Duration::from_secs(30));
@@ -1937,11 +1932,11 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
                             return; // セッション終了済み(次セッションで改めて起こる)
                         }
                         match peer_ip() {
-                            Some(p) if !tsunagu_common::net::is_tailscale(p) => return, // 昇格済み
+                            Some(p) if !knit_common::net::is_tailscale(p) => return, // 昇格済み
                             None => return,
                             _ => {}
                         }
-                        if let Some(ip) = tsunagu_common::discover::seek_first_lan(port, &tk) {
+                        if let Some(ip) = knit_common::discover::seek_first_lan(port, &tk) {
                             println!("[conn] LAN 直の相手を発見({ip})。経路昇格のため張り直します");
                             if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
                             {
@@ -1966,12 +1961,11 @@ fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
     }
 }
 
-/// 待受モード(TSUNAGU_ROLE=server): 相手(Mac=クライアント)からの接続を受け入れる。
+/// 待受モード(KNIT_ROLE=server): 相手(Mac=クライアント)からの接続を受け入れる。
 /// hello のトークン検証後に hello_ok(自画面 w/h 付き)を返す
 fn server_loop(token: &str, port: u16, w: i32, h: i32) {
     use std::io::Read;
-    let bind_ip =
-        tsunagu_common::envutil::get("TSUNAGU_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+    let bind_ip = knit_common::envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
     let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
         Ok(l) => l,
         Err(e) => {
@@ -1993,15 +1987,15 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         };
         println!("[conn] accepted from {peer}");
         // 接続元の制限(LAN・有線直結・Tailscale のみ)。認証は暗号化ハンドシェイクで行う
-        if !tsunagu_common::net::is_allowed(peer.ip()) {
-            println!("[conn] rejected: {peer} は許可範囲外です(TSUNAGU_ALLOW_ANY=1 で許可)");
+        if !knit_common::net::is_allowed(peer.ip()) {
+            println!("[conn] rejected: {peer} は許可範囲外です(KNIT_ALLOW_ANY=1 で許可)");
             std::thread::sleep(throttle.fail());
             continue;
         }
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(9))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        let (r, mut wr) = match secure::accept(stream, token, b"tsunagu-main") {
+        let (r, mut wr) = match secure::accept(stream, token, b"knit-main") {
             Ok(x) => x,
             Err(e) => {
                 println!("[conn] 暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)");
@@ -2045,7 +2039,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
                 println!(
                     "[hello] from {} モニター: {}",
                     log_safe(&name),
-                    tsunagu_common::proto::Monitor::summary(&monitors)
+                    knit_common::proto::Monitor::summary(&monitors)
                 );
                 true
             }
@@ -2064,7 +2058,7 @@ fn server_loop(token: &str, port: u16, w: i32, h: i32) {
                     w,
                     h,
                     ver: VERSION,
-                    id: tsunagu_common::proto::device_id(),
+                    id: knit_common::proto::device_id(),
                     monitors: list_monitors(),
                 })
                 .as_bytes(),
@@ -2111,7 +2105,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     // 暗号化ハンドシェイクと hello_ok 待ちに期限を切る(Mac が accept 後に応答しない場合に
     // 再接続ループへ戻れるように)。本体の受信タイムアウトは session で設定し直す
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let (r, mut writer) = secure::connect(stream, token, b"tsunagu-main").map_err(|e| {
+    let (r, mut writer) = secure::connect(stream, token, b"knit-main").map_err(|e| {
         std::io::Error::new(
             e.kind(),
             format!("暗号化ハンドシェイク失敗: {e}(トークン不一致の可能性)"),
@@ -2123,7 +2117,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
         token: String::new(),
         w,
         h,
-        id: tsunagu_common::proto::device_id(),
+        id: knit_common::proto::device_id(),
         monitors: list_monitors(),
     });
     writer
@@ -2155,7 +2149,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
             println!(
                 "[hello] ok from {} (mac screen {mw}x{mh}) モニター: {}",
                 log_safe(&name),
-                tsunagu_common::proto::Monitor::summary(&monitors)
+                knit_common::proto::Monitor::summary(&monitors)
             );
         }
         _ => {
@@ -2250,8 +2244,8 @@ fn session(
     }
 
     // ゲームモード監視(250ms 毎)。隠れカーソルは「入力中にポインタを隠す」設定等でも
-    // 起きるため、全画面かつ 1.5 秒継続した時だけ採用する。TSUNAGU_GAME_MODE=0 で無効
-    if tsunagu_common::envutil::get("TSUNAGU_GAME_MODE").as_deref() != Some("0") {
+    // 起きるため、全画面かつ 1.5 秒継続した時だけ採用する。KNIT_GAME_MODE=0 で無効
+    if knit_common::envutil::get("KNIT_GAME_MODE").as_deref() != Some("0") {
         let tx = wtx.clone();
         let running = running.clone();
         std::thread::spawn(move || {
@@ -2380,7 +2374,7 @@ fn session(
                 match op {
                     3..=5 => {
                         // メディア制御(前へ/再生切替/次へ)= Mac の F7/F8/F9 転送
-                        if let Some(vk) = tsunagu_common::proto::media_vk(op) {
+                        if let Some(vk) = knit_common::proto::media_vk(op) {
                             inject_key(vk, false);
                             inject_key(vk, true);
                             println!("[vol] media op={op}");
@@ -2423,7 +2417,7 @@ fn session(
                 rcmd,
             } => {
                 if DEBUG_KEYS.load(Ordering::Relaxed) && down {
-                    let ch = tsunagu_common::charmap::mac_kc_to_char(kc);
+                    let ch = knit_common::charmap::mac_kc_to_char(kc);
                     println!("[key] kc={kc} ch={ch:?} mods c={ctrl} o={opt} m={cmd} s={shift}");
                 }
                 // 右⌘(kc 54)の到着と注入後の実状態を記録(「効かない」報告の切り分け)。
@@ -2584,7 +2578,7 @@ fn session(
                         })
                         .unwrap_or(false);
                     if due {
-                        tray::notify("Tsunagu", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_CHARS / (1024 * 1024)));
+                        tray::notify("Knit", &format!("クリップボードが大きすぎるため同期しません(上限 {}MB。履歴にも載りません)", CLIP_MAX_CHARS / (1024 * 1024)));
                     }
                     continue;
                 }
@@ -2634,7 +2628,7 @@ fn session(
             Msg::OpenUrl { url } => {
                 // Continue Here: Mac の前面ブラウザの URL を既定ブラウザで開く。
                 // 相手から来る文字列のため、検査(common urlx)を通るものだけ開く
-                if tsunagu_common::urlx::transferable(&url) {
+                if knit_common::urlx::transferable(&url) {
                     if open_default_browser(&url) {
                         println!("[url] Continue Here: 既定ブラウザで開きました");
                     } else {
@@ -2674,7 +2668,7 @@ fn session(
                     );
                 } else if launch_path(&path) {
                     println!("[search] Windows アプリを起動: {}", log_safe(&path));
-                    tray::notify("Tsunagu", &format!("Mac から起動: {}", log_safe(&path)));
+                    tray::notify("Knit", &format!("Mac から起動: {}", log_safe(&path)));
                 } else {
                     println!("[search] 起動失敗: {}", log_safe(&path));
                 }

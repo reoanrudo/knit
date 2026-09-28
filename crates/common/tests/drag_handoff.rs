@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use tsunagu_common::{
+use knit_common::{
     bulk,
     proto::{self, Msg},
 };
@@ -17,7 +17,7 @@ impl Temp {
             .unwrap()
             .as_nanos();
         let p = std::env::temp_dir().join(format!(
-            "tsunagu-drag-test-{}-{stamp}-{}",
+            "knit-drag-test-{}-{stamp}-{}",
             std::process::id(),
             NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
         ));

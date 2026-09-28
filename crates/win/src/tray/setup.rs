@@ -1,10 +1,10 @@
 //! Native enrollment: discovery is a hint; only PAKE authentication grants trust.
 use super::*;
-use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
-use tsunagu_common::{
+use knit_common::{
     credentials,
     pairing::{self, Candidate},
 };
+use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 static RESULT: Mutex<Option<String>> = Mutex::new(None);
 static FIELD: AtomicUsize = AtomicUsize::new(0);
@@ -234,7 +234,7 @@ pub fn first_run(preview: bool) -> Option<String> {
             fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
         }
         let instance = GetModuleHandleW(std::ptr::null());
-        let class = wide("TsunaguFirstConnection");
+        let class = wide("KnitFirstConnection");
         let brush = CreateSolidBrush(rgb(CLR_CARD));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(procedure),
@@ -257,7 +257,7 @@ pub fn first_run(preview: bool) -> Option<String> {
         let window = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             class.as_ptr(),
-            wide("Tsunagu — はじめての接続").as_ptr(),
+            wide("Knit — はじめての接続").as_ptr(),
             style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -439,7 +439,7 @@ pub fn error(text: &str) {
         MessageBoxW(
             std::ptr::null_mut(),
             wide(text).as_ptr(),
-            wide("Tsunagu — 接続の準備").as_ptr(),
+            wide("Knit — 接続の準備").as_ptr(),
             MB_OK | MB_ICONERROR,
         );
     }

@@ -2,8 +2,8 @@
 
 ## 利用者の操作
 
-1. MacでTsunaguを起動し、「Windowsを登録」を開く。
-2. WindowsでTsunaguを起動し、近くのMacを選ぶ。見つからなければMacのIPv4アドレスを入力する。
+1. MacでKnitを起動し、「Windowsを登録」を開く。
+2. WindowsでKnitを起動し、近くのMacを選ぶ。見つからなければMacのIPv4アドレスを入力する。
 3. Macに表示された6桁コードをWindowsへ入力し、「登録する」を押す。
 4. Macの完了画面を閉じ、必要なアクセシビリティ権限を許可する。以後は保存した鍵で自動接続する。
 
@@ -24,8 +24,8 @@
 
 ## 保存と既存設定
 
-MacはKeychainのgeneric passwordを使用。サービス `local.tsunagu.connection`、アカウント `pairing-token-v1`。
-WindowsはDPAPIのユーザースコープで保護し、`%LOCALAPPDATA%/Tsunagu/connection.dpapi` へ保存。平文の長期キーを設定ファイルやコマンドラインに書かない。保存時は一時ファイルへの書込み・同期・上書き禁止の移動を行う。
+MacはKeychainのgeneric passwordを使用。サービス `local.knit.connection`、アカウント `pairing-token-v1`。
+WindowsはDPAPIのユーザースコープで保護し、`%LOCALAPPDATA%/Knit/connection.dpapi` へ保存。平文の長期キーを設定ファイルやコマンドラインに書かない。保存時は一時ファイルへの書込み・同期・上書き禁止の移動を行う。
 
 Windowsの接続先ヒントは同じディレクトリの `paired-host.txt`。秘密情報ではなく、常に保存キーによる認証が別途必要。明示的なhost設定を優先し、未指定時にヒントを再接続候補として使う。鍵・接続先ファイルは公開ZIPへ含めない。
 
@@ -42,7 +42,7 @@ Windowsの自動起動は `--background` を使い、未登録時に案内を繰
 - Macの招待画面→Windowsの実際の入力画面→認証→DPAPI保存→Macの完了表示まで実機で検証。保存先は一時ディレクトリに隔離し、復号と接続先の保存を確認して試験後に削除。
 - 両OSのネイティブ画面とWindowsの入力エラーを確認。確認モードの探索先・コードはサンプル。
 - Keychainの一時項目で保存・読込・重複拒否を検証済み。Windows実機のDPAPI・保護ファイルの保存/読込/改ざん拒否も検証済み。
-- `--preview-setup` は保存・通信を行わない。debugビルド専用の `--probe-setup` は実通信の登録試験用。Macは一時キー、Windowsは `TSUNAGU_PROBE_DATA` で指定した隔離保存先を使う。releaseビルドにはこの入口を含めない。
+- `--preview-setup` は保存・通信を行わない。debugビルド専用の `--probe-setup` は実通信の登録試験用。Macは一時キー、Windowsは `KNIT_PROBE_DATA` で指定した隔離保存先を使う。releaseビルドにはこの入口を含めない。
 
 ## 残る商品化工程
 

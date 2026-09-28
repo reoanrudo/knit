@@ -1,4 +1,4 @@
-# Tsunagu 配布手順書
+# Knit 配布手順書
 
 更新日: 2026-09-27。公開用パッケージと、自分の2台へ設定を配る開発運用を分けます。
 
@@ -6,8 +6,8 @@
 
 | 対象 | 生成 | 出力 |
 |---|---|---|
-| Mac | `bash scripts/package-mac.sh` | `dist/Tsunagu-<ver>.zip` と SHA-256 |
-| Windows | `bash scripts/package-win.sh` | `dist/Tsunagu-win-<ver>.zip` と SHA-256 |
+| Mac | `bash scripts/package-mac.sh` | `dist/Knit-<ver>.zip` と SHA-256 |
+| Windows | `bash scripts/package-win.sh` | `dist/Knit-win-<ver>.zip` と SHA-256 |
 
 両スクリプトは `.env`・個人設定・認証トークンを同梱しません。`NO_TOKEN` の指定は不要です。
 ビルドは `--locked` で1回実行し、失敗すると終了します。検査に成功するまでは既存ZIPを保持します。
@@ -19,8 +19,8 @@
 Mac zip には README-Mac.txt(初回の開き方・権限・登録手順)が同梱されます。
 
 **署名と公証**: `package-mac.sh` は開発者証明書に対応済みです。環境変数
-`TSUNAGU_SIGN_IDENTITY`(Developer ID Application の証明書名)がある場合は
-hardened runtime 付きで本署名し、`TSUNAGU_NOTARY_PROFILE`(事前に
+`KNIT_SIGN_IDENTITY`(Developer ID Application の証明書名)がある場合は
+hardened runtime 付きで本署名し、`KNIT_NOTARY_PROFILE`(事前に
 `xcrun notarytool store-credentials` で登録したプロファイル)がある場合は
 公証を提出・承認後にステープルします。どちらも未設定の場合は従来どおり
 アドホック署名で動作します(他 Mac では初回に右クリック>開く が必要)。
@@ -44,42 +44,42 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 ./scripts/install-mac.sh    # ~/Applications へ配置 + LaunchAgent 登録 + 即時起動
 ```
 
-- ログイン時に自動起動(LaunchAgent `local.tsunagu`)。ログは /tmp/tsunagu-mac.log
+- ログイン時に自動起動(LaunchAgent `local.knit`)。ログは /tmp/knit-mac.log
 - 初回起動時、アクセシビリティ権限の許可を求められたら許可する
   (許可がないと `[fatal] CGEventTapCreate failed` で終了する)
-- メニューバーに Tsunagu のアイコンが出れば起動完了(未接続の間は「未接続」と
+- メニューバーに Knit のアイコンが出れば起動完了(未接続の間は「未接続」と
   併記。接続中はアイコンのみで、メニュー内に状態・遅延・履歴件数が出る)
-- アンインストール: `launchctl unload ~/Library/LaunchAgents/local.tsunagu.plist`
-  → plist と ~/Applications/Tsunagu.app を削除
+- アンインストール: `launchctl unload ~/Library/LaunchAgents/local.knit.plist`
+  → plist と ~/Applications/Knit.app を削除
 
 手動起動(.app を使わない)は開発環境専用スクリプト(リポジトリ外)で行う
 
 ## 4. Windows へのインストール
 
-1. `win-dist/` 一式(tsunagu-win.exe・app.ico・install.bat・run_tsunagu.bat・run_tsunagu.vbs・.env)を
-   `C:\Users\<user>\tsunagu` へコピー
+1. `win-dist/` 一式(knit-win.exe・app.ico・install.bat・run_knit.bat・run_knit.vbs・.env)を
+   `C:\Users\<user>\knit` へコピー
 2. install.bat を**管理者として実行**(スタートアップ登録のため。以降の起動に管理者権限は不要)
 3. **タスクトレイ(通知領域)にアイコンが常駐する**。左クリックでステータスウィンドウ
    (状態/ビルド/音声の表示と「ログを開く」「音声 ON/OFF」「終了」)、右クリックでメニュー
 
-- ログオン時に自動起動(schtasks `tsunagu` / ONLOGON)
-- **自動復帰ウォッチ**(schtasks `tsunagu_watch` / 毎分): 何らかの理由で落ちても
+- ログオン時に自動起動(schtasks `knit` / ONLOGON)
+- **自動復帰ウォッチ**(schtasks `knit_watch` / 毎分): 何らかの理由で落ちても
   1分以内に自動再起動する(二重起動は exe 内蔵の名前付きミューテックスが即終了させる)
 - **コンソール/ターミナル不要**: GUI サブシステム化済みで、exe を直接ダブルクリック
   しても動く。**ターミナル/cmd/Windows Terminal から起動した場合も、exe は起動直後に
   コンソールから独立したプロセスへ自動置換されるため、ターミナルを閉じても接続は維持される**
 - 接続/切断はバルーン通知で可視化される
-- ログ: `C:\Users\<user>\tsunagu\tsunagu-win.log`(1世代ローテーション)
+- ログ: `C:\Users\<user>\knit\knit-win.log`(1世代ローテーション)
 - 新規環境では登録画面が開きます。自動復帰・ログオン用の `--background` 起動では、未登録なら静かに終了します。初回はアプリを直接起動してください。
 
 ## 5. トークン運用
 
-- 生成: `./scripts/gen-token.sh`(~/.config/tsunagu/env に 256bit ランダム値)
-- 参照順序(両バイナリ共通): 環境変数 > 実行ファイル同階層の .env > ~/.config/tsunagu/env
+- 生成: `./scripts/gen-token.sh`(~/.config/knit/env に 256bit ランダム値)
+- 参照順序(両バイナリ共通): 環境変数 > 実行ファイル同階層の .env > ~/.config/knit/env
 - **Mac の .app で .env を使う場合の注意**: 署名済み .app へ後から .env を
   Contents/Resources/ へ置くとコード署名の検証が壊れます(sealed resource)。
-  トークンは ~/.config/tsunagu/env へ置くのが最も簡単です。
-  .app 内へ同梱したい場合は配置後に `codesign --force --sign - Tsunagu.app`
+  トークンは ~/.config/knit/env へ置くのが最も簡単です。
+  .app 内へ同梱したい場合は配置後に `codesign --force --sign - Knit.app`
   で再署名すると検証が通ります(ad-hoc 署名のためローカルで再署名可)
 - Mac と Windows で**同じ値**である必要がある(不一致は `[conn] invalid hello` で接続拒否)
 - トークンを変更する場合: 両側の .env を更新して両側を再起動(片方だけ更新すると切断が続く)
@@ -92,11 +92,11 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 
 | | 既定(Mac=サーバ) | 逆方向(Win=サーバ) |
 |---|---|---|
-| Mac | TSUNAGU_ROLE 未設定 | `.env` に `TSUNAGU_ROLE=client` と `TSUNAGU_HOST=<Windows側Tailscale IP>` |
-| Windows | TSUNAGU_ROLE 未設定 | `.env` に `TSUNAGU_ROLE=server` |
-| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="tsunagu-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
+| Mac | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=client` と `KNIT_HOST=<Windows側Tailscale IP>` |
+| Windows | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=server` |
+| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="knit-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
 
-設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/tsunagu/env)。
+設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/knit/env)。
 変更後は**両側の再起動**が必要(片方だけ変えると切断が続く)。
 Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接続元を即拒否します。
 
@@ -108,18 +108,18 @@ Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接�
   実効遅延はおおむね 60〜110ms で、時間が経っても増えない(クロック差の蓄積を
   クリップが吸収する)。diag ログの `lag=` が実効滞留遅延
 - ON/OFF: Windows=ステータスウィンドウ/トレイメニューの「音声 ON/OFF」、
-  Mac=メニューバー「音声転送」。完全無効化は .env に `TSUNAGU_AUDIO=0`
+  Mac=メニューバー「音声転送」。完全無効化は .env に `KNIT_AUDIO=0`
 - 帯域: 無音時はキープアライブのみ(約 4B/秒)。鳴っている間は約 384KB/s
 - 注意: Windows の**システム通知音**は環境によって既定デバイス以外へ流れる場合がある
   (実機では通知音はごく僅かしか取得できず、メディア再生は全量取得を確認済み)。
   音が来ない場合は Windows のサウンド設定で既定デバイスを確認する
-- 逆方向(Win=サーバ)モードでは TSUNAGU_AUDIO_HOST=<Mac側IP> の指定が必要
+- 逆方向(Win=サーバ)モードでは KNIT_AUDIO_HOST=<Mac側IP> の指定が必要
 - **音声出力の集中(接続中スピーカーミュート、既定 ON)**: 接続中は Windows 側の
   スピーカーを自動ミュートし、**Mac のみで音を鳴らす**(二重発音の防止)。
   切断すると元の状態へ自動復元する。Mac メニュー「Windowsスピーカー」で
   「接続中ミュート(Macのみ発音)」⇄「常時鳴らす」を切替(即時反映)。
   Windows のステータス窓にもスピーカー状態を表示。
-  無効化は .env に `TSUNAGU_MUTE_SPK=0`(ミュートするとキャプチャも止まる
+  無効化は .env に `KNIT_MUTE_SPK=0`(ミュートするとキャプチャも止まる
   環境では OFF にすること。実機ではミュート中もキャプチャ継続を確認済み)
 
 ## 6.6 ファイル送信(双方向。v0.23 から専用経路 TCP 24902・暗号化)
@@ -128,7 +128,7 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
 
 - Mac 側のクリップボード監視がファイル参照(Finder の ⌘C)を検出すると自動送信される
   (`readObjectsForClasses` で file URL を読むため、Finder 以外のアプリの ⌘C でも動く)
-- Windows 側は `Downloads\Tsunagu\` へ保存し、クリップボード(CF_HDROP)へ載せる。
+- Windows 側は `Downloads\Knit\` へ保存し、クリップボード(CF_HDROP)へ載せる。
   エクスプローラで Ctrl+V による貼り付けがそのまま使える。受信はバルーン通知で分かる
 - メニューバー「Windows へファイルを送る…」からファイル選択ダイアログで選んでも送れる
 - 上限: 1ファイル・1回の合計ともに10GiB(10,737,418,240バイト)。正常に完了した転送の容量は次回に持ち越さない。
@@ -143,7 +143,7 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
 - **Windows の音量制御**: Mac メニューバーから「Windows の音量 ▲ / ▼ / ミュート」を送れる
 - **⌘キーの行き先**: メニューで Ctrl(既定)⇄ Alt を切替。接続確立時に自動同期される
 - **スクロール方向**: メニューで「標準(Windows準拠)⇄ 反転(Mac準拠)」を切替。
-  .env は `TSUNAGU_SCROLL_FLIP=1` / `TSUNAGU_CMD_ALT=1` でも指定可
+  .env は `KNIT_SCROLL_FLIP=1` / `KNIT_CMD_ALT=1` でも指定可
 
 ## 7. 検証
 
@@ -160,9 +160,9 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
 | 症状 | 原因と対処 |
 |---|---|
 | Mac 起動直後に終了(`[fatal] CGEventTapCreate failed`) | アクセシビリティ権限がない。システム設定で許可して再起動 |
-| Mac 起動直後に終了(`[fatal] TSUNAGU_TOKEN が未設定`) | gen-token.sh 未実行 or .env 未封入 |
+| Mac 起動直後に終了(`[fatal] KNIT_TOKEN が未設定`) | gen-token.sh 未実行 or .env 未封入 |
 | `[conn] invalid hello` が続く | トークン不一致。両側の .env を確認 |
-| `[fatal] listen ... failed` | Tailscale IP 変更後の TSUNAGU_BIND 指定が旧IPのまま。install-mac.sh を再実行 |
+| `[fatal] listen ... failed` | Tailscale IP 変更後の KNIT_BIND 指定が旧IPのまま。install-mac.sh を再実行 |
 | `[conn] rejected: ... は Tailscale 範囲外です` | 接続元が tailnet 外。Tailscale の接続状態を確認 |
 | 接続したのに操作できない | Windows 側が SSH 起動(別デスクトップ)の疑い。schtasks 起動に戻す |
 | メニューバーに表示されない | AppKit が使えないセッション(ssh 経由等)。CUI で稼働は継続する。`[gui]` ログを確認 |
@@ -180,5 +180,5 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
   (「詳細情報」→「実行」で進める。解除にはコード署名証明書の購入が必要)
 - ファイアウォール: 逆方向(Windows=サーバ)で使う場合は TCP 24900〜24902 と UDP 24903 の受信許可が必要
 - 待受は連続する認証失敗で受け付けが徐々に鈍ります(最大5秒。正規接続の成功で即回復)
-- Mac のクリップボード履歴・設定(~/.config/tsunagu)は所有者のみの権限(600/700)で
+- Mac のクリップボード履歴・設定(~/.config/knit)は所有者のみの権限(600/700)で
   保存されます。旧版の 644 ファイルは起動時に自動で 600 へ是正されます

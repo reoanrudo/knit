@@ -495,7 +495,7 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .ok();
-        let (r, mut w) = match tsunagu_common::secure::connect(stream, &token, b"tsunagu-audio") {
+        let (r, mut w) = match knit_common::secure::connect(stream, &token, b"knit-audio") {
             Ok(x) => x,
             Err(e) => {
                 println!("[audio] 暗号化ハンドシェイク失敗: {e}");

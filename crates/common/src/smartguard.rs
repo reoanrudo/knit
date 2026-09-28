@@ -23,11 +23,11 @@ pub const BLOCK_THRESHOLD: f64 = 0.8;
 const DECIDE_TIMEOUT: Duration = Duration::from_millis(1_200);
 
 pub fn enabled() -> bool {
-    crate::envutil::get("TSUNAGU_SMART_SECRET").as_deref() != Some("0")
+    crate::envutil::get("KNIT_SMART_SECRET").as_deref() != Some("0")
 }
 
 fn port() -> u16 {
-    crate::envutil::get("TSUNAGU_OLLAYA_PORT")
+    crate::envutil::get("KNIT_OLLAYA_PORT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(PORT_DEFAULT)
 }

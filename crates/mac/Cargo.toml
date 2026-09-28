@@ -1,8 +1,8 @@
 [package]
-name = "tsunagu-mac"
+name = "knit-mac"
 version = "0.25.0"
 edition = "2021"
 
 [dependencies]
-tsunagu-common = { path = "../common" }
+knit-common = { path = "../common" }
 serde_json = { workspace = true }

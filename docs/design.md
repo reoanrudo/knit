@@ -1,4 +1,4 @@
-# tsunagu 設計書 (Phase 1)
+# knit 設計書 (Phase 1)
 
 ## 目的
 
@@ -20,7 +20,7 @@ Deskflow と同じ感覚(画面端で切替)で操作する。Phase 1 は入力�
 ## アーキテクチャ(実装で確定: 逆転構成)
 
 ```
-MacBook (tsunagu-mac = サーバ)              Windows Desktop (tsunagu-win = クライアント)
+MacBook (knit-mac = サーバ)              Windows Desktop (knit-win = クライアント)
 ┌────────────────────┐   Tailscale   ┌─────────────────────────┐
 │ TcpListener(:24900) │   TCP :24900   │ connect + 再接続ループ  │
 │ CGEventTap(フック)  │ ←───────────  │  hello 送信             │
@@ -49,7 +49,7 @@ hello は Win が送り、Mac が hello_ok で応答する。
   - 以後、Mac 側イベントを握りつぶし(return NULL)Windows へ転送
   - マウスは相対 delta(kCGMouseEventDeltaX/Y)を送る
 - Windows モード → Mac モード:
-  - Windows カーソルが左端 (x<=0) に達したら tsunagu-win が `return` 通知
+  - Windows カーソルが左端 (x<=0) に達したら knit-win が `return` 通知
   - またはホットキー F13(常に有効)
 - ホットキー F13: モード切替(双方向)
 
@@ -101,7 +101,7 @@ bulk 24902 へ、音声は 24901 へ分離(本線の入力遅延を守る)。
 ## Windows 起動方式(重要)
 
 SSH 起動プロセスは入力デスクトップに接続できないため:
-- `schtasks /Create /SC ONLOGON /TN tsunagu /TR <exe>` でログオン時対話起動
+- `schtasks /Create /SC ONLOGON /TN knit /TR <exe>` でログオン時対話起動
 - 開発中は `/SC ONCE` タスクを `schtasks /Run` で都度起動(POC で実証済み)
 - exe 起動直後に `OpenInputDesktop(0, 0, 0x01FF)` + `SetThreadDesktop` を実行
 - ファイアウォール: `netsh advfirewall` で TCP 24900 を許可(install.bat で実施)
@@ -109,22 +109,22 @@ SSH 起動プロセスは入力デスクトップに接続できないため:
 ## 成果物構成
 
 ```
-tsunagu/
+knit/
   Cargo.toml            (workspace)
   crates/
     common/             プロトコル・キーコード表
-    mac/                tsunagu-mac: CGEventTap・TCP クライアント・モード管理
-    win/                tsunagu-win: TCP サーバ・SendInput 注入・Return 監視
+    mac/                knit-mac: CGEventTap・TCP クライアント・モード管理
+    win/                knit-win: TCP サーバ・SendInput 注入・Return 監視
   win-dist/
     install.bat         配布+スタートアップ登録+ファイアウォール許可
-    run_tsunagu.bat          対話起動用(開発時 schtasks 経由)
+    run_knit.bat          対話起動用(開発時 schtasks 経由)
   docs/design.md        本書
   poc/                  検証コード(参照用)
 ```
 
 ## 開発運用(ssh 経由)
 
-1. Mac: `cargo build --release`→ tsunagu-mac 実行
+1. Mac: `cargo build --release`→ knit-mac 実行
 2. Win: `cargo build --target x86_64-pc-windows-gnu --release`
 3. `scp` で exe 配布 → `schtasks /Run` で対話起動
 4. ログ: 両側カレントディレクトリに `sd-*.log` + stdout
@@ -150,4 +150,4 @@ WIN モード中は Mac 側が Windows 画面の仮想カーソル(px, f64)を�
 正規化座標 MouseAbs を毎イベント送信する。Windows 側は MOUSEEVENTF_ABSOLUTE
 で注入(加速曲線を通らない)。画面比率の見た目距離は方向別スケール
 (win_w/mac_w, win_h/mac_h)で自動補正。左端到達の復帰は Mac 内完結で即時。
-TSUNAGU_MOUSE_MODE=rel で従来の相対移動に切替可能。
+KNIT_MOUSE_MODE=rel で従来の相対移動に切替可能。
