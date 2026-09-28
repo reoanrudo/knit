@@ -2,7 +2,7 @@
 
 **2台のPCを、1つのキーボードで。**
 
-> **Status: early stage (v0.25.0).** Core features work day-to-day on the
+> **Status: early stage (v0.26.0).** Core features work day-to-day on the
 > developer's machines, but this has not yet gone through the release
 > quality bar (first-time-user trials, long-run stability, high-DPI,
 > signed/verified installers). Binaries are unsigned — see

@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "knit-mac"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "knit-common",
  "serde_json",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "knit-win"
-version = "0.25.0"
+version = "0.26.0"
 dependencies = [
  "knit-common",
  "serde_json",
