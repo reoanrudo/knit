@@ -1,0 +1,4 @@
+# Knit の更新情報を検証する Ed25519 公開鍵(64桁の16進を1行に1本)。
+# 空の間は自動更新が無効。`cargo run -p knit-common --bin knit-sign -- keygen <秘密鍵の保存先>` で生成した公開鍵をここへ追加する。
+
+d4301d0c7fcbf9de88c3595924ceff0e4eb034e5ca58513f06ff34bc18df81de
