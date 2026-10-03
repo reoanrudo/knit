@@ -6,7 +6,11 @@
 //! 画像は履歴 JSON へは載せず、本体を端末ごとの images/ ディレクトリへ
 //! ハッシュ名で保存し、履歴には「ファイル名\tバイト数」だけ残す
 //! (Mac は BMP、Windows は DIB の生バイトで保存するため復元時に変換が要らない)。
-//! 本文は相手へ送る前に機密判定を通ったものだけなので、ここには検査を置かない。
+//! 履歴は平文の JSON に保存されるため、機密らしき桁列は push_text の段階で
+//! 加工する: 8 桁以上の連続数字は桁部分を ● へマスクして残し(長文が桁列ひとつで
+//! 丸ごと消えると履歴として使えなくなるため)、Luhn チェックを通るカード番号を
+//! 含む本文は保存から除外する(桁数・区切り位置ごと消す)。
+//! 相手への送信可否は smartguard/秘匿印が担っており、この判定は保存のみに働く。
 
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +49,20 @@ pub struct History {
     cap: usize,
 }
 
-/// 載せる本文の上限(クリップボード同期と同じ 1MB)
+/// 載せる本文の上限(クリップボード同期と同じ 1MB。バイト数で見るため
+/// 日本語の長文は約35万文字で引っかかる)
 pub const MAX_CHARS: usize = 1024 * 1024;
+
+/// クリップボード本文が上限(1MB)を超えたときの通知文。実サイズを文字数と
+/// バイト数の両方で伝える(上限がバイト数ベースのため、日本語の長文は約35万文字
+/// で引っかかる。「まだ 1MB 未満のはず」との誤解を防ぐための案内も添える)
+pub fn too_large_clip_message(text: &str) -> String {
+    format!(
+        "クリップボードが大きすぎるため同期しません({}文字・{}KB。上限は1MB(日本語の長文では約35万文字)です。履歴にも載りません)",
+        text.chars().count(),
+        text.len() / 1024
+    )
+}
 
 /// メニューへ出す最大件数
 pub const MENU_ITEMS: usize = 10;
@@ -69,13 +85,37 @@ impl History {
     }
 
     /// テキストを履歴へ追加する。直前と同じ内容は時刻だけ更新する。
-    /// 空・上限超過は載せない。戻り値は採用した項目の id(重複更新を含む)
+    /// 空・上限超過・Luhn 成立のカード番号を含む本文は載せない。
+    /// 8 桁以上の連続数字を含む本文は、その部分を ● へマスクして載せる。
+    /// 戻り値は採用した項目の id(重複更新を含む)
     pub fn push_text(&mut self, text: &str, device: &str, now_ms: u64) -> Option<u64> {
-        let text = text.trim();
-        if text.is_empty() || text.len() > MAX_CHARS {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
             return None;
         }
-        let text = text.to_string();
+        // 履歴は平文の JSON に残るため、カード番号(Luhn 成立)はマスクでも残さない。
+        // 除外されるのは履歴だけで、送信・貼り付け・復元には影響しない
+        if contains_luhn_card(trimmed) {
+            return None;
+        }
+        // 8 桁以上の連続数字(認証コード・日付(YYYYMMDD)・ISBN 等)は桁部分を
+        // ● へマスクして保存する。履歴からの復元・再コピーはマスク後の文字列に
+        // なる(元の数字は戻さない)
+        let text = if has_long_digit_run(trimmed) {
+            mask_digit_runs(trimmed)
+        } else {
+            trimmed.to_string()
+        };
+        if text.len() > MAX_CHARS
+            // 本文全体が桁列(マスクと空白以外に残るものが無い)は、マスクで中身が
+            // 残らないため載せない(ワンタイムコード単体のコピー等)
+            || !text.chars().any(|c| c != '●' && !c.is_whitespace())
+        {
+            return None;
+        }
+        if text != trimmed {
+            eprintln!("[history] 8桁以上の連続する数字を●へマスクして履歴へ保存します");
+        }
         if let Some(last) = self.entries.last_mut() {
             if last.text == text {
                 last.ts = now_ms;
@@ -248,20 +288,43 @@ impl History {
 /// トークン設定(~/.config/knit/env=600)と同じ土俵へ揃える。
 /// Windows はプロファイル直下の既定 ACL に任せる(何もしない)
 pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)?;
-    restrict(path);
+    // 作成時点から所有者のみにする(既定 644 で作ってから chmod する間に、
+    // 共有 Mac の別ユーザーへ本文が読まれる窓を残さない)
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(bytes)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+    }
+    let ok = restrict(path);
+    if !ok {
+        eprintln!("[history] 権限の限定(0600)に失敗しました: {}", path.display());
+    }
     Ok(())
 }
 
 /// 既存ファイルの権限を所有者のみへ是正する(起動時の読み込み後にも呼ぶ)
-pub fn restrict(path: &std::path::Path) {
+pub fn restrict(path: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok()
     }
     #[cfg(not(unix))]
-    let _ = path;
+    {
+        let _ = path;
+        true
+    }
 }
 
 /// 履歴・画像ディレクトリを所有者のみへ限定する
@@ -281,6 +344,105 @@ fn is_single_url(text: &str) -> bool {
     !t.is_empty()
         && !t.contains([' ', '\n', '\r', '\t'])
         && (t.starts_with("http://") || t.starts_with("https://"))
+}
+
+/// 「機密らしき桁列」の連続桁数の閾値。ワンタイムコード(6〜8桁)・口座番号・
+/// マイナンバー(12桁)などを 8 桁で拾う。注文番号・日付(YYYYMMDD)・ISBN も
+/// 含まれるが、履歴では桁部分がマスクされるだけで送信は妨げないため、安全側に倒す
+const LONG_DIGIT_RUN: usize = 8;
+
+/// 履歴保存前のマスク(平文で残す履歴専用。送信の可否には関与しない)。
+/// 8 桁以上の連続する数字を桁数分の ● へ置き換える。電話番号の区切り
+/// (03-1234-5678 等)など 8 桁未満のまとまりはそのまま残る
+fn mask_digit_runs(text: &str) -> String {
+    /// それまでに溜めた数字のまとまりを確定させる(長ければマスク)
+    fn flush(out: &mut String, run: &mut String) {
+        if run.len() >= LONG_DIGIT_RUN {
+            for _ in 0..run.len() {
+                out.push('●');
+            }
+        } else {
+            out.push_str(run);
+        }
+        run.clear();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut run = String::new();
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut out, &mut run);
+            out.push(c);
+        }
+    }
+    flush(&mut out, &mut run);
+    out
+}
+
+fn has_long_digit_run(text: &str) -> bool {
+    let mut run = 0usize;
+    for &b in text.as_bytes() {
+        if b.is_ascii_digit() {
+            run += 1;
+            if run >= LONG_DIGIT_RUN {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// 桁区切り(空白・ハイフン1文字)を挟んだ数字のまとまりのうち、クレジット
+/// カードの形式(13〜19 桁・Luhn 成立)のものがあれば true。連続桁のルールを
+/// 拾えない "4111 1111 1111 1111" 形式をカバーする
+fn contains_luhn_card(text: &str) -> bool {
+    let mut digits: Vec<u8> = Vec::new();
+    let mut after_separator = false;
+    // まとまりの終わりで判定して空に戻す。以降の桁は新しいまとまりとして扱う
+    // (長い番号の後ろに続いたカード番号も拾えるように、19 桁を超えたら切る)
+    fn finish(digits: &mut Vec<u8>, after_separator: &mut bool) -> bool {
+        let hit = is_card_number(digits);
+        digits.clear();
+        *after_separator = false;
+        hit
+    }
+    for &b in text.as_bytes() {
+        if b.is_ascii_digit() {
+            if digits.len() == 19 && finish(&mut digits, &mut after_separator) {
+                return true;
+            }
+            digits.push(b - b'0');
+            after_separator = false;
+        } else if !digits.is_empty() && (b == b' ' || b == b'-') && !after_separator {
+            // 桁と桁の間の区切り1文字。2文字続くか他の文字でまとまりは終わり
+            after_separator = true;
+        } else if finish(&mut digits, &mut after_separator) {
+            return true;
+        }
+    }
+    is_card_number(&digits)
+}
+
+fn is_card_number(digits: &[u8]) -> bool {
+    (13..=19).contains(&digits.len()) && luhn_ok(digits)
+}
+
+fn luhn_ok(digits: &[u8]) -> bool {
+    let mut sum = 0u32;
+    for (i, d) in digits.iter().rev().enumerate() {
+        let mut v = u32::from(*d);
+        if i % 2 == 1 {
+            v *= 2;
+            if v > 9 {
+                v -= 9;
+            }
+        }
+        sum += v;
+    }
+    sum % 10 == 0
 }
 
 /// 履歴本文がファイル参照の並びか(復元側の分岐用)。kind を保存していない旧
@@ -364,7 +526,7 @@ pub fn prune_image_store(dir: &std::path::Path, keep: usize) {
     if items.len() <= keep {
         return;
     }
-    items.sort_by(|a, b| b.1.cmp(&a.1)); // 新しい順
+    items.sort_by_key(|a| std::cmp::Reverse(a.1)); // 新しい順
     for (path, _) in items.into_iter().skip(keep) {
         let _ = std::fs::remove_file(path);
     }
@@ -464,6 +626,73 @@ mod tests {
             "Windows",
             "重複更新は最新側を示す"
         );
+    }
+
+    #[test]
+    fn digit_runs_are_masked_and_card_numbers_are_dropped() {
+        let mut h = History::new(10);
+        // 8 桁以上の連続数字(認証コード・口座番号・日付(YYYYMMDD)等)は桁部分を
+        // ● へマスクして履歴に残る(長文が桁列ひとつで丸ごと消えないようにするため)
+        let id = h.push_text("認証コードは 12345678 です", "Mac", 1).unwrap();
+        assert_eq!(h.get(id).unwrap().text, "認証コードは ●●●●●●●● です");
+        let id = h.push_text("予定日 20261004", "Mac", 5).unwrap();
+        assert_eq!(h.get(id).unwrap().text, "予定日 ●●●●●●●●");
+        // 本文全体が桁列(ワンタイムコード単体等)はマスクで中身が残らないため載せない
+        assert!(h.push_text("0123456789012345", "Windows", 2).is_none());
+        assert!(h.push_text("12345678 90123456", "Windows", 3).is_none());
+        // 桁区切りのクレジットカード番号(Luhn が成立する 13〜19 桁)を含む本文は
+        // マスクでも残さない(桁数・区切り位置から探索空間を絞れるため)
+        assert!(h.push_text("カード 4111 1111 1111 1111", "Mac", 3).is_none());
+        assert!(h.push_text("4111-1111-1111-1111", "Mac", 4).is_none());
+        // 通常の文・電話番号(区切りの桁が短い)・西暦はそのまま残る
+        assert!(h.push_text("電話 03-1234-5678 まで", "Mac", 6).is_some());
+        assert!(h.push_text("2026年10月4日の予定", "Windows", 7).is_some());
+        assert!(h.push_text("https://example.com/a?b=1", "Mac", 8).is_some());
+        // 16 桁でも Luhn に落ちる並びは「カード番号らしくない」ため残る
+        assert!(h.push_text("4111 1111 1111 1112", "Mac", 9).is_some());
+        // 区切りの長い番号の続きにカード番号が来ても、まとまりの切り替えで拾う
+        assert!(
+            h.push_text(
+                "伝票 012 3456 7890 1234 5678 9012 3456、カード 4242 4242 4242 4242",
+                "Mac",
+                10
+            )
+            .is_none()
+        );
+        // 記録されたのはマスク2件+通常4件(電話・西暦・URL・Luhn落ち16桁)
+        assert_eq!(h.entries().len(), 6);
+    }
+
+    /// 想定ユーザー(日本語の長文をコピーする人)の主要ケース: 日付・電話番号・
+    /// ISBN を含む長文が、桁部分だけマスクされて履歴に残る
+    #[test]
+    fn long_text_with_dates_phone_and_isbn_is_kept_masked() {
+        let mut h = History::new(10);
+        let text = "締切は 20261031、ISBN 9784865940658 で申請してください。問い合わせは 09012345678 まで";
+        let id = h.push_text(text, "Mac", 1).unwrap();
+        let e = h.get(id).unwrap();
+        assert_eq!(
+            e.text,
+            "締切は ●●●●●●●●、ISBN ●●●●●●●●●●●●● で申請してください。問い合わせは ●●●●●●●●●●● まで"
+        );
+        assert!(!e.text.contains("20261031"), "元の日付は残さない");
+        assert!(!e.text.contains("9784865940658"), "元の ISBN は残さない");
+        assert!(!e.text.contains("09012345678"), "元の電話番号は残さない");
+        // マスク済みの本文をそのまま push し直しても idempotent(● は数字ではない)
+        let masked = e.text.clone();
+        let again = h.push_text(&masked, "Windows", 2).unwrap();
+        assert_eq!(h.get(again).unwrap().text, masked);
+    }
+
+    #[test]
+    fn too_large_message_carries_actual_size_and_limit() {
+        // 日本語 40 万文字 = 約 1.14MB(UTF-8 で 3 バイト/文字)で上限超過
+        let text = "あ".repeat(400_000);
+        let m = too_large_clip_message(&text);
+        assert!(m.contains("400000文字"), "実際の文字数を含む: {m}");
+        assert!(m.contains("1171KB"), "実際のサイズを含む: {m}");
+        assert!(m.contains("1MB"), "上限を含む: {m}");
+        assert!(m.contains("35万"), "日本語長文の目安を含む: {m}");
     }
 
     #[test]
@@ -712,7 +941,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             names.push(n);
         }
-        std::fs::write(dir.join("readme.txt"), b"x"); // 対象外は触らない
+        let _ = std::fs::write(dir.join("readme.txt"), b"x"); // 対象外は触らない
         prune_image_store(&dir, 2);
         let left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()

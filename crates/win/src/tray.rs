@@ -4,9 +4,10 @@
 // NOTIFYICONDATAW は ABI が安定しているため自前定義(Shell feature への依存を避ける)
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 mod preferences;
 mod settings_ui;
+pub(crate) use preferences::{host_mode_pref, HOST_MODE};
 pub mod setup;
 static UI_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub fn preview() {
@@ -27,6 +28,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_NULL, WM_RBUTTONUP, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_VISIBLE,
 };
 
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn MessageBoxW(hwnd: HWND, text: *const u16, caption: *const u16, utype: u32) -> i32;
+}
+
 #[link(name = "shell32")]
 unsafe extern "system" {
     fn ShellExecuteW(
@@ -41,13 +47,94 @@ unsafe extern "system" {
 
 const WM_TRAY: u32 = WM_APP + 1;
 
-// ---------- ダークテーマ(モダンUI)の色定義(0xRRGGBB) ----------
-const CLR_BG: u32 = 0xF3F4F8; // 窓背景(Windows 標準ライト)
-const CLR_CARD: u32 = 0xFFFFFF; // カード面(白)
-const CLR_HEAD: u32 = 0x222638; // 見出し・状態行(黒)
-const CLR_TEXT: u32 = 0x424A5E; // 本文
-const CLR_SUB: u32 = 0x626B7D; // 補足
-const CLR_ACCENT: u32 = 0x515FD1; // 標準アクセント(Windows 11 青)
+// ---------- 設定画面の配色。Windows の「アプリをダークにする」個人設定に追従する ----------
+pub(super) struct Theme {
+    bg: u32,        // 窓背景
+    card: u32,      // カード面
+    head: u32,      // 見出し・状態行
+    text: u32,      // 本文
+    sub: u32,       // 補足・無効
+    accent: u32,    // 標準アクセント(Windows 11 青)
+    edge: u32,      // カードの縁
+    divider: u32,   // カード内の区切り線
+    nav_sel: u32,   // 選択中ナビ項目の面
+    btn_idle: u32,  // 通常ボタンの面
+    btn_pressed: u32, // 押下中ボタンの面
+    btn_primary_pressed: u32, // 押下中の主要ボタン
+    edit_text: u32, // 入力欄の文字
+    edit_bg: u32,   // 入力欄の面
+    diagram_fill: u32, // 配置図の四角
+    diagram_line: u32, // 配置図の線
+    diagram_mac: u32,  // 配置図の Mac 側
+}
+pub(super) fn theme() -> &'static Theme {
+    if DARK_MODE.load(Ordering::Relaxed) {
+        &DARK
+    } else {
+        &LIGHT
+    }
+}
+static DARK_MODE: AtomicBool = AtomicBool::new(false);
+static LIGHT: Theme = Theme {
+    bg: 0xF3F4F8, card: 0xFFFFFF, head: 0x222638, text: 0x424A5E, sub: 0x626B7D,
+    accent: 0x515FD1, edge: 0xE3E6ED, divider: 0xECEEF3, nav_sel: 0xE2E6FA,
+    btn_idle: 0xEEF0F7, btn_pressed: 0xDFE3EF, btn_primary_pressed: 0x3C49AE,
+    edit_text: 0x222638, edit_bg: 0xFFFFFF, diagram_fill: 0xF2F4FB,
+    diagram_line: 0xCDD2E4, diagram_mac: 0x7C869C,
+};
+static DARK: Theme = Theme {
+    bg: 0x202124, card: 0x2B2C30, head: 0xE8EAED, text: 0xC7CBD4, sub: 0x9AA0A6,
+    accent: 0x8F9BF5, edge: 0x3A3C42, divider: 0x3A3C42, nav_sel: 0x343A5E,
+    btn_idle: 0x3A3D45, btn_pressed: 0x4A4E59, btn_primary_pressed: 0x6C77D8,
+    edit_text: 0xE8EAED, edit_bg: 0x303236, diagram_fill: 0x2B2C30,
+    diagram_line: 0x4A4E59, diagram_mac: 0xA8AEBE,
+};
+/// 画面ロック連動(KNIT_LOCK_SYNC)。既定で有効(mac 側と同じ既定値)
+fn lock_sync_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        knit_common::envutil::get("KNIT_LOCK_SYNC")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// 「設定 > 個人用設定 > 色」のアプリモード(0=ダーク)をレジストリから読む。読めなければライト。
+fn system_dark() -> bool {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(
+            hkey: *mut core::ffi::c_void,
+            sub: *const u16,
+            name: *const u16,
+            flags: u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            data_len: *mut u32,
+        ) -> i32;
+    }
+    const HKEY_CURRENT_USER: *mut core::ffi::c_void = 0x8000_0001usize as _;
+    const RRF_RT_REG_DWORD: u32 = 0x10;
+    let mut v: u32 = 1;
+    let mut cb: u32 = 4;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize").as_ptr(),
+            wide("AppsUseLightTheme").as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            &mut v as *mut u32 as *mut u8,
+            &mut cb,
+        )
+    };
+    ok == 0 && v == 0
+}
+/// テーマを OS 設定へ同期し、変わったら true(呼び出し元は再描画する)。
+pub(super) fn sync_theme() -> bool {
+    let d = system_dark();
+    DARK_MODE.swap(d, Ordering::Relaxed) != d
+}
 /// 0xRRGGBB → COLORREF(0x00BBGGRR)
 fn rgb(c: u32) -> u32 {
     ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF)
@@ -136,6 +223,28 @@ const MENU_SAVEHOST: u32 = 1006;
 const MENU_BACKMAC: u32 = 1007;
 const MENU_OPENFOLDER: u32 = 1008;
 const MENU_REGISTER: u32 = 1012;
+const MENU_DIAGNOSE: u32 = 1017;
+const MENU_SHARE_CLIP: u32 = 1014;
+const MENU_SHARE_FILES: u32 = 1015;
+const MENU_UPDATE: u32 = 1013;
+// Mac の設定を Windows から変える部品(設定画面)
+const ID_SIDE_COMBO: u32 = 3101;
+const MENU_SIDE_RESET: u32 = 3102;
+const ID_METHOD_COMBO: u32 = 3103;
+const ID_HOTKEY_COMBO: u32 = 3104;
+const MENU_SCROLL_FLIP: u32 = 3105;
+const ID_SCROLL_TRACK: u32 = 3106;
+const MENU_PAD_NAV: u32 = 3107;
+const MENU_PAD_PINCH: u32 = 3108;
+const MENU_MAC_CLIP: u32 = 3110;
+const MENU_MAC_FILES: u32 = 3111;
+const MENU_MAC_HISTORY: u32 = 3112;
+const MENU_MAC_AUDIO: u32 = 3113;
+const MENU_MAC_SPK: u32 = 3114;
+const MENU_INPUT_HELPER: u32 = 1090;
+const MENU_HOSTMODE: u32 = 1016;
+const MENU_ROLE_CLIENT: u32 = 3120;
+const MENU_ROLE_HOST: u32 = 3121;
 /// クリップボード履歴の項目(MENU_HISTORY_FIRST + 表示順 index)。
 /// index→履歴 id の対応は開くたびに MENU_HISTORY_IDS へ保存する
 const MENU_HISTORY_FIRST: u32 = 1100;
@@ -205,9 +314,15 @@ static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
 /// 現在接続先としているホスト(サーバー編集欄の初期値)
 pub static HOST_NOW: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// UTF-16 への変換(固定幅バッファ用)。満杯時に終端 NUL が欠けないよう
+/// 1 手前まで書き、末尾は必ず 0 のまま残す
 fn wide_into(buf: &mut [u16], s: &str) {
-    for (dst, src) in buf.iter_mut().zip(s.encode_utf16()) {
+    let last = buf.len().saturating_sub(1);
+    for (dst, src) in buf[..last].iter_mut().zip(s.encode_utf16()) {
         *dst = src;
+    }
+    if let Some(tail) = buf.last_mut() {
+        *tail = 0;
     }
 }
 
@@ -276,7 +391,7 @@ fn maccfg_line() -> String {
     format!("Mac の設定: Windows は{side}・⌘キーは {cmd}")
 }
 
-/// フッター: 接続先サーバーと稼働時間(1 秒タイマーで更新)
+/// フッター: 接続先サーバー・最終接続・次の再試行・稼働時間(1 秒タイマーで更新)
 fn footer_line() -> String {
     let host = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let up = START_AT
@@ -284,13 +399,22 @@ fn footer_line() -> String {
         .elapsed()
         .as_secs();
     let (h, m) = (up / 3600, (up % 3600) / 60);
+    let conn = crate::last_connected_line().unwrap_or_default();
+    let retry = crate::next_retry_line().unwrap_or_default();
+    // 見つからない期間の常時表示(1 分超の断。ログでしか分からない問題を窓へ)
+    let missing = crate::conn::not_found_line().unwrap_or_default();
+    let extra = [conn, retry, missing]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("・{s}"))
+        .collect::<String>();
     let recv = std::env::var_os("USERPROFILE")
         .map(std::path::PathBuf::from)
         .unwrap_or_default()
         .join("Downloads")
         .join("Knit");
     format!(
-        "接続先: {host} ・ 稼働 {h}時間{m:02}分\n受信フォルダ: {}",
+        "接続先: {host} ・ 稼働 {h}時間{m:02}分{extra}\n受信フォルダ: {}",
         recv.display()
     )
 }
@@ -327,11 +451,30 @@ fn set_text(h: usize, s: &str) {
     unsafe { SetWindowTextW(h as _, w.as_ptr()) };
 }
 
+/// 一度でも接続キーの保存(登録)を確認できたら立てる(未接続時の案内分岐用)。
+/// 未登録の間は呼び出しのたびに見に行くが、未登録ならファイル自体が無く
+/// すぐ返るため負荷にならない
+static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn registered() -> bool {
+    if REGISTERED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let ok = matches!(knit_common::credentials::load(), Ok(Some(_)));
+    if ok {
+        REGISTERED.store(true, Ordering::Relaxed);
+    }
+    ok
+}
+
 fn tray_status_text() -> String {
     let conn = if crate::CONNECTED.load(Ordering::Relaxed) {
         "接続済み"
-    } else {
+    } else if registered() {
+        // 登録済みなら再接続は自動。初回ユーザーに「自動でつながる」という
+        // 不正確な期待を与えない(Mac 側の PAIRED 分岐と同じ方針)
         "未接続 · 自動再接続中"
+    } else {
+        "未接続 · はじめてなら「登録情報」から"
     };
     // 遅延と経路(接続中のみ。履歴件数は接続の有無に関係なく役立つ)
     let rtt = crate::RTT_MS.load(Ordering::Relaxed);
@@ -360,7 +503,12 @@ fn tray_status_text() -> String {
     } else {
         String::new()
     };
-    format!("Knit · {conn}{rtt_s}{route}{history_s}")
+    // 転送中は進捗を常に見える場所へ(ツールチップとステータス窓の状態行で共用)
+    let xfer_s = match crate::xfer_line() {
+        Some(x) => format!(" · {x}"),
+        None => String::new(),
+    };
+    format!("Knit · {conn}{rtt_s}{route}{history_s}{xfer_s}")
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -402,6 +550,26 @@ unsafe extern "system" fn tray_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    const WM_WTSSESSION_CHANGE2: u32 = 0x02B1;
+    // 電源イベント: 復帰後の再接続をソケットの読み出しタイムアウト(最長9秒)待たずに
+    // すぐ始める。スリープ入りでも古い接続を綺麗に切っておく
+    const WM_POWERBROADCAST: u32 = 0x218;
+    if msg == WM_POWERBROADCAST {
+        const PBT_APMSUSPEND: usize = 0x4;
+        const PBT_APMRESUMEAUTOMATIC: usize = 0x12;
+        const PBT_APMRESUMESUSPEND: usize = 0x7;
+        return match wparam {
+            PBT_APMSUSPEND => {
+                crate::on_power_event(false);
+                1
+            }
+            PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND => {
+                crate::on_power_event(true);
+                1
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        };
+    }
     match msg {
         WM_TRAY => {
             let mouse = (lparam & 0xFFFF) as u32;
@@ -417,6 +585,21 @@ unsafe extern "system" fn tray_wndproc(
         WM_TIMER => {
             update_tip();
             update_labels();
+            0
+        }
+        WM_WTSSESSION_CHANGE2 => {
+            // WTS_SESSION_LOCK(0x7)=このセッションがロックされた。Mac へ既存の
+            // Msg::Lock を送り、Mac 側で ⌘Ctrl+Q を発生させる(双方向のロック連動)。
+            // ロック済みで再送が返ってきても受信側の LockWorkStation は無害
+            const WTS_SESSION_LOCK: WPARAM = 0x7;
+            if wparam == WTS_SESSION_LOCK
+                && crate::CONNECTED.load(Ordering::Relaxed)
+                && lock_sync_enabled()
+            {
+                if !crate::state::send_main_msg(&knit_common::proto::Msg::Lock) {
+                    eprintln!("[lock] Mac へのロック指示を送れませんでした(未接続)");
+                }
+            }
             0
         }
         WM_COMMAND => {
@@ -437,9 +620,73 @@ unsafe extern "system" fn tray_wndproc(
 }
 
 /// メニュー/ボタン共通のコマンド処理
+/// 相手(Mac)の役割切替の適用完了(RoleAck)。再起動を待っていたメニュー処理が参照する
+static ROLE_ACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 本線受信ループから呼ぶ: 相手の適用が済んだ合図を立てる
+pub(crate) fn note_role_ack() {
+    ROLE_ACK.store(true, Ordering::Relaxed);
+}
+/// 相手の適用完了を待つ(旧版相手は返さないためタイムアウトで諦める)
+fn wait_role_ack(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if ROLE_ACK.load(Ordering::Relaxed) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// 相手から接続の方向の切替を知らされたときの対応。相手がホストになるなら自分は接続側へ、
+/// 相手が接続側へ戻るなら自分がホストへ。すでに合っていれば何もしない
+pub(crate) fn apply_peer_role(peer_is_host: bool) {
+    let want_host = !peer_is_host;
+    if preferences::host_mode_pref() == want_host {
+        return;
+    }
+    preferences::set_host_mode(want_host);
+    if let Err(e) = preferences::save() {
+        eprintln!("[prefs] save failed: {e}");
+    }
+    println!("[role] 相手の切替に合わせて {} へ変更します", if want_host { "ホスト" } else { "接続側" });
+    notify(
+        "Knit",
+        if want_host {
+            "相手がMac側のホストをやめたため、このPCをホスト(待受側)に切り替えて再起動します"
+        } else {
+            "相手がホストになったため、このPCを接続側に切り替えて再起動します"
+        },
+    );
+    crate::audio::speaker_disconnect();
+    crate::release_all_input();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    restart_self();
+}
+
+/// 自分を終了して、すぐ起こし直す。終了だけだと毎分の自動復帰タスクが起こすまで
+/// 最長 1 分アプリが消えたままになる。古いプロセスが抜ける(単一起動の排他が空く)のを
+/// 少し待ってから、導入済みの起動タスク(knit_run)を走らせる
+fn restart_self() -> ! {
+    use std::os::windows::process::CommandExt;
+    // 自発的切替と相手からの切替要求の両方から呼ばれるため、二重進入で
+    // 起動タスクを二重発火させないよう1回だけ通す
+    static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if RESTARTING.swap(true, Ordering::Relaxed) {
+        std::process::exit(0);
+    }
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "ping -n 3 127.0.0.1 >nul & schtasks /Run /TN knit_run"])
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn();
+    std::process::exit(0);
+}
+
 unsafe fn handle_command(id: u32) {
     match id {
-        id if id >= MENU_HISTORY_FIRST && id < MENU_HISTORY_CLEAR => {
+        id if (MENU_HISTORY_FIRST..MENU_HISTORY_CLEAR).contains(&id) => {
             // 履歴からの復元。index→id はメニューを開いた時点の対応を使う
             let idx = (id - MENU_HISTORY_FIRST) as usize;
             let target = MENU_HISTORY_IDS
@@ -458,6 +705,9 @@ unsafe fn handle_command(id: u32) {
         }
         3000..=3003 => settings_ui::select((id - settings_ui::NAV_FIRST) as usize),
         MENU_STATUS => open_status_window(),
+        MENU_AUDIO if !knit_common::share::env_cap().audio => {
+            notify("このPCでは音声を共有できません", "KNIT_SHARE の設定で制限されています。");
+        }
         MENU_AUDIO => {
             let next = !crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed);
             crate::audio::AUDIO_ENABLED.store(next, Ordering::Relaxed);
@@ -473,6 +723,30 @@ unsafe fn handle_command(id: u32) {
             println!("[tray] 音声転送 -> {next}");
             update_labels();
             update_tip();
+        }
+        MENU_DIAGNOSE => {
+            // 接続診断(Mac の「接続を診断…」と同じ)。実測に最大3秒かかるため
+            // 別スレッドで回し、結果をテキストボックスで表示する。
+            // 連打で診断と MessageBox が重ならないよう1つだけ動かす
+            static DIAG_RUNNING: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if DIAG_RUNNING.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            std::thread::spawn(|| {
+                let report = crate::diag::run();
+                DIAG_RUNNING.store(false, Ordering::Relaxed);
+                let w: Vec<u16> = report.encode_utf16().chain(std::iter::once(0)).collect();
+                let caption = wide("Knit 接続診断");
+                unsafe {
+                    MessageBoxW(
+                        std::ptr::null_mut(),
+                        w.as_ptr(),
+                        caption.as_ptr(),
+                        0x0001_0040 /*MB_ICONINFORMATION | MB_SETFOREGROUND*/,
+                    );
+                }
+            });
         }
         MENU_OPENLOG => {
             // ログは exe と同じフォルダ(run_knit.bat が書き出す)
@@ -554,25 +828,140 @@ unsafe fn handle_command(id: u32) {
                         return;
                     }
                     eprintln!("[tray] サーバーを {host} へ変更し再起動します");
+                    // 接続中ミュートの状態を復帰させてから終わる(ミュート恒久化の防止)。
+                    // 終了だけだと毎分の自動復帰タスクが起こすまで最長 1 分消えたままに
+                    // なるため、restart_self で即座に起こし直す(MENU_RESTART と同じ)
+                    crate::audio::speaker_disconnect();
                     crate::release_all_input();
-                    std::process::exit(0);
+                    restart_self();
                 }
+            }
+        }
+        MENU_SIDE_RESET => {
+            // 辺とモニター指定の両方を既定へ戻す(Mac 設定画面の「配置を初期化」と同じ効果)
+            crate::state::set_mac_pref("side", serde_json::json!(0));
+            crate::state::set_mac_pref("peer_layout_reset", serde_json::json!(true));
+        }
+        MENU_SCROLL_FLIP | MENU_PAD_NAV | MENU_PAD_PINCH | MENU_MAC_CLIP | MENU_MAC_FILES
+        | MENU_MAC_HISTORY | MENU_MAC_AUDIO | MENU_MAC_SPK => {
+            let key = match id {
+                MENU_SCROLL_FLIP => "scroll_flip",
+                MENU_PAD_NAV => "android_navigation",
+                MENU_PAD_PINCH => "android_pinch",
+                MENU_MAC_CLIP => "clip_share",
+                MENU_MAC_FILES => "share_files",
+                MENU_MAC_HISTORY => "local_history",
+                MENU_MAC_AUDIO => "audio_muted",
+                _ => "spk_mute",
+            };
+            // Mac から一覧が届いていない間は何も変えない(現在値が分からない)
+            if let Some(cur) = crate::state::mac_pref(key).and_then(|v| v.as_bool()) {
+                crate::state::set_mac_pref(key, serde_json::json!(!cur));
+                update_labels();
             }
         }
         MENU_REGISTER => {
             notify(
                 "このWindowsは登録済みです",
-                "暗号化キーはアプリが管理しています。接続先を探せない場合はIPを設定してください。",
+                "接続キーはアプリが管理しています。接続先を探せない場合はIPを設定してください。",
             );
+        }
+        MENU_SHARE_CLIP | MENU_SHARE_FILES => {
+            // 環境変数 KNIT_SHARE が禁じた項目は、設定画面から許可できない
+            let cap = knit_common::share::env_cap();
+            if id == MENU_SHARE_CLIP && cap.clip {
+                let next = !knit_common::share::user_clip();
+                knit_common::share::set_user_clip(next);
+                println!("[tray] テキストと画像の共有 -> {next}");
+            } else if id == MENU_SHARE_FILES && cap.files {
+                let next = !knit_common::share::user_files();
+                knit_common::share::set_user_files(next);
+                println!("[tray] ファイルの受け渡し -> {next}");
+            }
+            if !UI_PREVIEW.load(Ordering::Relaxed) {
+                if let Err(e) = preferences::save() {
+                    eprintln!("[prefs] save failed: {e}");
+                    notify(
+                        "設定を保存できません",
+                        "変更は今回の起動中のみ有効です。ログを確認してください。",
+                    );
+                }
+            }
+            update_labels();
+        }
+        MENU_HOSTMODE | MENU_ROLE_CLIENT | MENU_ROLE_HOST => {
+            // 接続の方向は起動時に決まるため、切り替えたら再起動して即反映する
+            if UI_PREVIEW.load(Ordering::Relaxed) {
+                return;
+            }
+            let want = match id {
+                MENU_ROLE_HOST => true,
+                MENU_ROLE_CLIENT => false,
+                _ => !HOST_MODE.load(Ordering::Relaxed),
+            };
+            if want == HOST_MODE.load(Ordering::Relaxed) {
+                update_labels(); // すでにその役割。選択表示だけ合わせ直す
+                return;
+            }
+            preferences::set_host_mode(want);
+            let next = want;
+            if let Err(e) = preferences::save() {
+                eprintln!("[prefs] save failed: {e}");
+            }
+            notify(
+                "Knit",
+                if next {
+                    "このPCをホスト(待受側)に切り替えました。Knit を再起動します"
+                } else {
+                    "このPCを接続側に戻しました。Knit を再起動します"
+                },
+            );
+            // 相手(Mac)にも反対の役割へ合わせさせる(双方が待ち受け/双方が接続側になり、
+            // つながらなくなるのを防ぐ)。版 15 以降の相手は適用済みの RoleAck を返す
+            // ので、それを確認してから再起動する(行き損ねで双方が同役割のまま沈黙するのを
+            // 防ぐ)。旧版は応答しないため時間経過で再起動する。
+            // この処理はウィンドウプロシージャ(メッセージループ)から呼ばれるため、
+            // 最大2秒の待ちをここで行うと描画・トレイ操作が固まる。別スレッドで待つ
+            ROLE_ACK.store(false, Ordering::Relaxed);
+            crate::state::send_main_msg(&knit_common::proto::Msg::Role { host: next });
+            crate::audio::speaker_disconnect();
+            crate::release_all_input();
+            std::thread::spawn(|| {
+                if wait_role_ack(std::time::Duration::from_millis(2000)) {
+                    println!("[role] 相手の適用を確認しました");
+                } else {
+                    println!("[role] 相手の適用確認が取れないため時間経過で再起動します");
+                }
+                restart_self();
+            });
+        }
+        MENU_UPDATE => crate::updater::on_click(),
+        MENU_INPUT_HELPER => {
+            // 管理者権限が要るため UAC の確認を出して自分自身を昇格起動する(一度だけ)
+            if let Ok(exe) = std::env::current_exe() {
+                let verb = wide("runas");
+                let file = wide(&exe.to_string_lossy());
+                let args = wide("--install-input-helper");
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    verb.as_ptr(),
+                    file.as_ptr(),
+                    args.as_ptr(),
+                    std::ptr::null(),
+                    0, /*SW_HIDE*/
+                );
+            }
         }
         MENU_RESTART => {
             // exe を止めると毎分の自動復帰タスクが起こす=確実な再起動
-            eprintln!("[tray] 再起動します(自動復帰タスクが起こします)");
+            eprintln!("[tray] 再起動します");
+            crate::audio::speaker_disconnect();
             crate::release_all_input();
-            std::process::exit(0);
+            restart_self();
         }
         MENU_QUIT => {
             eprintln!("[tray] メニューから終了しました");
+            crate::audio::speaker_disconnect();
             crate::release_all_input();
             std::process::exit(0);
         }
@@ -591,14 +980,37 @@ unsafe extern "system" fn status_wndproc(
     const WM_CTLCOLORSTATIC2: u32 = 0x0138;
     const WM_CTLCOLOREDIT2: u32 = 0x0133;
     const WM_DRAWITEM2: u32 = 0x002B;
+    const WM_SETTINGCHANGE2: u32 = 0x001A;
     match msg {
         WM_COMMAND => {
-            handle_command((wparam & 0xFFFF) as u32);
+            let id = (wparam & 0xFFFF) as u32;
+            const CBN_SELCHANGE: usize = 1;
+            if (wparam >> 16) & 0xFFFF == CBN_SELCHANGE
+                && matches!(id, ID_SIDE_COMBO | ID_METHOD_COMBO | ID_HOTKEY_COMBO)
+            {
+                let sel = windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(lparam as HWND, 0x147 /*CB_GETCURSEL*/, 0, 0);
+                if sel >= 0 {
+                    settings_ui::combo_changed(id, sel as usize);
+                }
+            } else {
+                handle_command(id);
+            }
+            0
+        }
+        0x0114 /*WM_HSCROLL*/ => {
+            settings_ui::scroll_changed(wparam, lparam as HWND);
             0
         }
         WM_CLOSE => {
             // 閉じても破棄せず隠すだけ(常駐アプリの標準動作)
             ShowWindow(hwnd, SW_HIDE);
+            0
+        }
+        WM_SETTINGCHANGE2 => {
+            // 「アプリをダークにする」の切替に追従して全面を再描画する
+            if sync_theme() {
+                windows_sys::Win32::Graphics::Gdi::InvalidateRect(hwnd, std::ptr::null(), 1);
+            }
             0
         }
         WM_ERASEBKGND2 => 1, // 背景は WM_PAINT で全描き(ちらつき防止)
@@ -607,18 +1019,24 @@ unsafe extern "system" fn status_wndproc(
             0
         }
         WM_CTLCOLOREDIT2 => {
-            // サーバー編集欄: 白背景+黒文字(標準ライト)
+            // 入力欄: テーマの面と文字色(ライト=白地+黒文字、ダーク=暗面+明文字)
             unsafe {
                 let hdc = wparam as *mut core::ffi::c_void;
-                SetTextColor(hdc, 0x222638);
-                SetBkColor(hdc, 0xFFFFFF);
-                static EDIT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                let b = *EDIT_BRUSH.get_or_init(|| CreateSolidBrush(0xFFFFFF) as usize);
+                let t = theme();
+                SetTextColor(hdc, rgb(t.edit_text));
+                SetBkColor(hdc, rgb(t.edit_bg));
+                static EDIT_LIGHT_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                static EDIT_DARK_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                let b = if DARK_MODE.load(Ordering::Relaxed) {
+                    *EDIT_DARK_BRUSH.get_or_init(|| CreateSolidBrush(rgb(DARK.edit_bg)) as usize)
+                } else {
+                    *EDIT_LIGHT_BRUSH.get_or_init(|| CreateSolidBrush(rgb(LIGHT.edit_bg)) as usize)
+                };
                 b as LRESULT
             }
         }
         WM_CTLCOLORSTATIC2 => {
-            // ラベルの文字色をテーマへ(見出し/状態=白、本文=グレー、補助=暗グレー)。
+            // ラベルの文字色をテーマへ(見出し/状態=強調、本文=本文色、補助=補足色)。
             // 背景は透過(WM_PAINT のカード面がそのまま見える)
             unsafe {
                 let hdc = wparam as *mut core::ffi::c_void;
@@ -627,23 +1045,37 @@ unsafe extern "system" fn status_wndproc(
                     fn GetDlgCtrlID(hwnd: HWND) -> i32;
                 }
                 let id = GetDlgCtrlID(child);
+                let t = theme();
                 // RTT は値で色分け(緑=快適/黄=やや遅延/赤=遅延)
                 let color = match id as u32 {
-                    ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT | 223 => rgb(CLR_HEAD),
-                    ID_LBL_BUILD | 221 | 222 => rgb(CLR_SUB),
-                    ID_LBL_RTT => rgb(CLR_SUB),
-                    _ => rgb(CLR_TEXT),
+                    ID_LBL_STATE | ID_HEAD_CONN | ID_HEAD_ACT | 223 => rgb(t.head),
+                    ID_LBL_BUILD | 221 | 222 => rgb(t.sub),
+                    ID_LBL_RTT => rgb(t.sub),
+                    _ => rgb(t.text),
                 };
                 SetTextColor(hdc, color);
                 SetBkMode(hdc, TRANSPARENT_BK);
                 // 背景ブラシを窓背景色で返す: 透過(NULL_BRUSH)だと文字更新時に
                 // 古い文字が残って重なって見える(ゴースト)ため不透明で塗る
-                static BG_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-                static CARD_BRUSH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                static BG_BRUSHES: std::sync::OnceLock<[usize; 2]> = std::sync::OnceLock::new();
+                static CARD_BRUSHES: std::sync::OnceLock<[usize; 2]> = std::sync::OnceLock::new();
+                let brushes = BG_BRUSHES.get_or_init(|| {
+                    [
+                        CreateSolidBrush(rgb(LIGHT.bg)) as usize,
+                        CreateSolidBrush(rgb(DARK.bg)) as usize,
+                    ]
+                });
+                let cards = CARD_BRUSHES.get_or_init(|| {
+                    [
+                        CreateSolidBrush(rgb(LIGHT.card)) as usize,
+                        CreateSolidBrush(rgb(DARK.card)) as usize,
+                    ]
+                });
+                let dark = DARK_MODE.load(Ordering::Relaxed) as usize;
                 if matches!(id, 220..=223) {
-                    *BG_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_BG)) as usize) as LRESULT
+                    brushes[dark] as LRESULT
                 } else {
-                    *CARD_BRUSH.get_or_init(|| CreateSolidBrush(rgb(CLR_CARD)) as usize) as LRESULT
+                    cards[dark] as LRESULT
                 }
             }
         }
@@ -655,28 +1087,32 @@ unsafe extern "system" fn status_wndproc(
                     return 0;
                 }
                 let d = &*dis;
+                let t = theme();
                 let nav = (3000..=3003).contains(&d.ctl_id);
                 let selected =
                     nav && d.ctl_id as usize - 3000 == settings_ui::PAGE.load(Ordering::Relaxed);
                 let primary = matches!(d.ctl_id, MENU_SAVEHOST | MENU_AUDIO);
+                let disabled = d.item_state & 0x4 != 0; // ODS_DISABLED
                 let brush_color = if nav {
                     if selected {
-                        0xE2E6FA
+                        t.nav_sel
                     } else {
-                        CLR_BG
+                        t.bg
                     }
+                } else if disabled {
+                    t.btn_idle
                 } else if d.item_state & 1 != 0 {
                     if primary {
-                        0x3C49AE
+                        t.btn_primary_pressed
                     } else {
-                        0xDFE3EF
+                        t.btn_pressed
                     }
                 } else if primary {
-                    CLR_ACCENT
+                    t.accent
                 } else {
-                    0xEEF0F7
+                    t.btn_idle
                 };
-                let base = CreateSolidBrush(rgb(if nav { CLR_BG } else { CLR_CARD }));
+                let base = CreateSolidBrush(rgb(if nav { t.bg } else { t.card }));
                 FillRect(d.hdc, &d.rc_item, base);
                 DeleteObject(base);
                 let brush = CreateSolidBrush(rgb(brush_color));
@@ -699,11 +1135,13 @@ unsafe extern "system" fn status_wndproc(
                 SetTextColor(
                     d.hdc,
                     if nav {
-                        rgb(if selected { CLR_ACCENT } else { CLR_TEXT })
+                        rgb(if selected { t.accent } else { t.text })
+                    } else if disabled {
+                        rgb(t.sub)
                     } else if primary {
-                        0xFFFFFF
+                        0x00FFFFFF
                     } else {
-                        rgb(CLR_HEAD)
+                        rgb(t.head)
                     },
                 );
                 if d.item_state & 0x10 != 0 {
@@ -775,7 +1213,7 @@ unsafe fn paint_status(hwnd: HWND) {
         let mut rc = std::mem::zeroed::<Rect>();
         GetClientRect(hwnd, &mut rc);
         // 背景
-        let bg = CreateSolidBrush(rgb(CLR_BG));
+        let bg = CreateSolidBrush(rgb(theme().bg));
         FillRect(hdc, &rc, bg);
         DeleteObject(bg);
         settings_ui::paint_groups(hdc);
@@ -785,9 +1223,7 @@ unsafe fn paint_status(hwnd: HWND) {
 }
 
 /// モダンな見た目のための Segoe UI フォント生成(通常/太字)。
-/// 既定の DEFAULT_GUI_FONT は古いシステムフォントになるため使わない
-/// 近未来ロゴ用の等幅フォント(Consolas)
-
+/// 既定の DEFAULT_GUI_FONT は古いシステムフォントになるため使わない。
 unsafe fn segoe_font(bold: bool, height: i32) -> *mut core::ffi::c_void {
     unsafe {
         let mut name: Vec<u16> = "Meiryo UI".encode_utf16().collect();
@@ -884,7 +1320,7 @@ unsafe fn open_menu(hwnd: HWND) {
             .unwrap_or_default();
         if !entries.is_empty() {
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            let head = wide(&format!("クリップボード履歴 {count}件(クリックで貼り付け)"));
+            let head = wide(&format!("クリップボード履歴 {count}件(クリックでクリップボードへ戻します)"));
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, head.as_ptr());
             let mut ids = Vec::new();
             for (i, (entry_id, label)) in entries.iter().enumerate() {
@@ -897,6 +1333,9 @@ unsafe fn open_menu(hwnd: HWND) {
                 );
                 ids.push(*entry_id);
             }
+            // 平文保存の常時通知(利用者が気づけるように履歴がある間は常に表示する)
+            let note = wide("※履歴は平文で保存されています(残したくない場合は「履歴を消す」)");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, note.as_ptr());
             let clear = wide("履歴を消す");
             AppendMenuW(menu, MF_STRING, MENU_HISTORY_CLEAR as usize, clear.as_ptr());
             if let Ok(mut g) = MENU_HISTORY_IDS.lock() {
@@ -904,18 +1343,35 @@ unsafe fn open_menu(hwnd: HWND) {
             }
         } else {
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-            let head = wide("クリップボード履歴(まだありません。画面を越えると記録されます)");
+            let head = wide("クリップボード履歴(まだありません。コピーすると記録されます)");
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, head.as_ptr());
         }
     }
     let audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
-    let bm = wide("Mac へ戻る");
-    AppendMenuW(menu, MF_STRING, MENU_BACKMAC as usize, bm.as_ptr());
+    let bm = wide("Macへ戻る");
+    AppendMenuW(
+        menu,
+        MF_STRING | if crate::CONNECTED.load(Ordering::Relaxed) {
+            0
+        } else {
+            MF_GRAYED
+        },
+        MENU_BACKMAC as usize,
+        bm.as_ptr(),
+    );
     let fo = wide("受信フォルダを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
     let log_w = wide("ログを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
+    let up = wide(&crate::updater::menu_title());
+    AppendMenuW(menu, MF_STRING, MENU_UPDATE as usize, up.as_ptr());
+    let ih = wide(if crate::helper::is_connected() {
+        "UAC・管理者アプリの操作補助を更新…"
+    } else {
+        "UAC・管理者アプリの操作を有効にする…"
+    });
+    AppendMenuW(menu, MF_STRING, MENU_INPUT_HELPER as usize, ih.as_ptr());
     let rs = wide("再起動");
     AppendMenuW(menu, MF_STRING, MENU_RESTART as usize, rs.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
@@ -959,9 +1415,12 @@ unsafe fn load_tray_icon_size(size: i32) -> *mut core::ffi::c_void {
                 }
             }
         }
+        // 埋め込みアイコン(build.rs が `1 ICON "app.ico"` でリソース ID 1 を
+        // 埋める)。dangling ポインタはアラインメント(=2)を指すため ID 2 を要求する
+        // ことになり、常に失敗していた。ID 1 を明示する
         let embedded = LoadImageW(
             GetModuleHandleW(std::ptr::null()),
-            1usize as *const u16,
+            1usize as *const u16, /*MAKEINTRESOURCEW(1)*/
             IMAGE_ICON,
             size,
             size,
@@ -985,9 +1444,9 @@ unsafe fn tray_loop() {
     let mut class: Vec<u16> = "SDWinTray".encode_utf16().collect();
     class.push(0);
     let hinst = GetModuleHandleW(std::ptr::null());
-    let _ = TRAY_HINST.store(hinst as usize, Ordering::Relaxed);
+    TRAY_HINST.store(hinst as usize, Ordering::Relaxed);
     let icon = load_tray_icon();
-    let _ = TRAY_HICON.store(icon as usize, Ordering::Relaxed);
+    TRAY_HICON.store(icon as usize, Ordering::Relaxed);
     let wc = WNDCLASSW {
         style: 0,
         lpfnWndProc: Some(tray_wndproc),
@@ -1025,7 +1484,18 @@ unsafe fn tray_loop() {
         eprintln!("[tray] CreateWindowExW 失敗(トレイなしで継続)");
         return;
     }
-    let _ = TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
+    TRAY_HWND.store(hwnd as usize, Ordering::Relaxed);
+
+    // 画面ロック連動(Windows→Mac 方向): このセッションのロック(Win+L 等)を
+    // 受け取り、Mac へ既存の Msg::Lock(ワイヤ変更なし)を送る。KNIT_LOCK_SYNC=0 で無効
+    #[link(name = "wtsapi32")]
+    unsafe extern "system" {
+        fn WTSRegisterSessionNotification(hwnd: HWND, flags: u32) -> i32;
+    }
+    const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+    if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } == 0 {
+        eprintln!("[tray] セッション通知の登録に失敗(ロック連動は無効)");
+    }
 
     let mut nid = std::mem::zeroed::<NotifyIconData>();
     nid.cb_size = std::mem::size_of::<NotifyIconData>() as u32;

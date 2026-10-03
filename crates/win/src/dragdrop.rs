@@ -21,21 +21,25 @@ pub static DRAG_THREAD: AtomicU32 = AtomicU32::new(0);
 static CARRIED: std::sync::Mutex<knit_common::drag::Carried> =
     std::sync::Mutex::new(knit_common::drag::Carried::new());
 
-pub fn expect(id: u64) {
+pub fn expect(id: u64, count: usize) {
     CARRIED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .announce(id);
+        .announce(id, count);
 }
 
 fn release_expected() {
     CARRIED.lock().unwrap_or_else(|e| e.into_inner()).release();
 }
 
-/// 届いた転送が、いま掴んでいる操作のものか(一度だけ真)。押下は別接続の
-/// 本線で届くため、到着の前後は start が待って吸収する
-pub fn claim(id: u64) -> bool {
-    CARRIED.lock().unwrap_or_else(|e| e.into_inner()).claim(id)
+/// 届いた転送が、いま掴んでいる操作のものか(一度だけ判定)。押下は別接続の
+/// 本線で届くため、到着の前後は start が待って吸収する。件数は予告(DragOffer)
+/// と照合し、一致しない転送はドラッグにしない
+pub fn claim(id: u64, received: usize) -> knit_common::drag::Claim {
+    CARRIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .claim(id, received)
 }
 #[cfg(test)]
 static TEST_DRAG_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -56,6 +60,10 @@ const OLE_E_ADVISENOTSUPPORTED: HRESULT = 0x8004_0003u32 as i32;
 const DRAGDROP_S_DROP: HRESULT = 0x0004_0100;
 const DRAGDROP_S_CANCEL: HRESULT = 0x0004_0101;
 const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = 0x0004_0102;
+
+/// 予告逆転・押下遅着を吸収する待ち窓(両者で同じ長さが意図)。
+/// start の押下待ちと win_on_bulk の await_claim がこの窓で対になる
+pub(crate) const CLAIM_WAIT_MS: u64 = 500;
 
 const CF_HDROP: u16 = 15;
 const TYMED_HGLOBAL: u32 = 1;
@@ -543,7 +551,7 @@ pub fn start(paths: Vec<String>) {
             return;
         }
         // 転送(別接続)が本線の押下より先に届いた場合に備えて少し待つ
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(CLAIM_WAIT_MS);
         while (host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed))
             && std::time::Instant::now() < deadline
         {
@@ -583,9 +591,31 @@ pub fn start(paths: Vec<String>) {
         src_release(src);
         drop(host);
         if effect == DROPEFFECT_COPY {
+            // ドロップできた files も「Macからの受信」なので、⌘C・fallback
+            // 経路と同じく履歴に載せる(経路で履歴の残り方が変わらないようにする)
+            crate::history_push_files(
+                &paths
+                    .iter()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
+                "Mac",
+            );
             println!("[drag] ドロップ完了(コピー。元は Downloads\\Knit に残ります)");
         } else if hr == DRAGDROP_S_CANCEL {
-            println!("[drag] ドロップを取り消しました");
+            // この時点で転送は完了済みのため、取消で受信済みファイルが消えることは
+            // ない。残ることを通知で言い切る(消えたと思って探させるトラブルの防止)
+            println!(
+                "[drag] ドロップを取り消しました(受信済みの {} 件は Downloads\\Knit に残っています)",
+                paths.len()
+            );
+            #[cfg(not(test))]
+            crate::tray::notify(
+                "Knit",
+                &format!(
+                    "ドロップを取り消しました。受信済みの {} 件は Downloads\\Knit に残っています",
+                    paths.len()
+                ),
+            );
         } else {
             println!("[drag] ドロップ不成立(hr=0x{hr:08x})");
             fallback(&paths);
@@ -594,7 +624,44 @@ pub fn start(paths: Vec<String>) {
     });
 }
 
-fn fallback(_paths: &[String]) {
+/// 掴みドラッグを開始・完了できなかったときの受け皿。win_on_bulk の
+/// フォールスルー(Ctrl+V 形式)と同じ扱いに保つ: 経路が違うだけで
+/// 同じ「Macからの受信」なので、片方だけ履歴に残らない状態を作らない
+fn fallback(paths: &[String]) {
+    if crate::clipboard_write_files(paths) {
+        crate::LAST_SYNC_SEQ.store(crate::clipboard_seq(), Ordering::Relaxed);
+        // テスト環境にはクリップボードが無く書き込みは失敗するため、履歴記録も
+        // 実機ビルドに限定する(下の通知の cfg ガードと同じ扱い)
+        #[cfg(not(test))]
+        crate::history_push_files(
+            &paths
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>(),
+            "Mac",
+        );
+        println!(
+            "[drag] ドロップとして渡せなかったため、{} 件をクリップボードに載せました(Ctrl+V で貼り付け可。Downloads\\Knit にも保存済み)",
+            paths.len()
+        );
+        #[cfg(not(test))]
+        {
+            let dir = std::env::var_os("USERPROFILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join("Downloads")
+                .join("Knit");
+            crate::tray::notify(
+                "Knit",
+                &format!(
+                    "ドロップとして渡せなかったため、{} 件をクリップボードに載せました(次の Ctrl+V で貼り付けできます)。実体は {} にも保存済み",
+                    paths.len(),
+                    dir.display()
+                ),
+            );
+        }
+        return;
+    }
     println!("[drag] 受信ファイルは Downloads\\Knit に保持しています");
     #[cfg(not(test))]
     crate::tray::notify("Knit", "ドロップを開始・完了できませんでした。受信ファイルはDownloads\\Knitに保存されています。掴んだまま境界を越えて、相手の画面上で離すとその場に置けます");
@@ -619,16 +686,26 @@ mod tests {
 
     #[test]
     fn transfer_from_mac_starts_a_drag_only_while_the_carried_press_continues() {
+        use knit_common::drag::Claim;
         crate::BTN_W[0].store(true, Ordering::Relaxed);
-        expect(9);
+        expect(9, 1);
         relay_up();
-        assert!(!claim(9), "離した後に届いた転送は通常の受信へ");
-        expect(10);
+        assert_eq!(claim(9, 1), Claim::Released, "離した後に届いた転送は通常の受信へ");
+        expect(10, 1);
         relay_cancel();
-        assert!(!claim(10), "Macへ戻った後の転送をドラッグにしない");
-        expect(11);
-        assert!(claim(11));
-        assert!(!claim(11), "同じ転送で二度開始しない");
+        assert_eq!(claim(10, 1), Claim::Released, "Macへ戻った後の転送をドラッグにしない");
+        expect(11, 1);
+        assert_eq!(claim(11, 1), Claim::Carried);
+        assert_eq!(claim(11, 1), Claim::Unknown, "同じ転送で二度開始しない");
+        // 予告より少ない受信はドラッグにしない(M1)
+        expect(12, 3);
+        assert_eq!(
+            claim(12, 2),
+            Claim::Mismatch {
+                expected: 3,
+                received: 2
+            }
+        );
         crate::BTN_W[0].store(false, Ordering::Relaxed);
     }
 

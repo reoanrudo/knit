@@ -1,1798 +1,67 @@
 pub mod credentials;
-pub mod desksearch;
+pub mod diagnose;
+pub mod doctor;
 pub mod drag;
 pub mod history;
 pub mod pairing;
+pub mod spkstate;
+pub mod retry;
+pub mod share;
 pub mod smartguard;
+pub mod update;
+pub mod xfer;
 // 共通プロトコル定義(JSON Lines over TCP)
-pub mod envutil {
-    //! 設定値の参照: 環境変数 > 実行ファイル同階層の .env > ~/.config/knit/env。
-    //! 配布形態(.app バンドル埋め込み / exe 同梱 .env / ホーム設定)のどれでも
-    //! 同一コードで動かすための仕組み。KEY=VALUE 形式(1行1エントリ、# はコメント)。
-    //! 旧名称(v0.25 までの Tsunagu、v0.7 以前の seamless-desk)の環境変数・設定パスも
-    //! フォールバックで読むため、既存環境を書き換えずにそのまま移行できる。
-
-    use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
-
-    /// 旧名称へのキー変換(新しい順)。
-    /// KNIT_X ← TSUNAGU_X ← SEAMLESS_X(トークンだけは SEAMLESS_DESK_TOKEN)
-    fn legacy_keys(key: &str) -> Vec<String> {
-        let Some(rest) = key.strip_prefix("KNIT_") else {
-            return Vec::new();
-        };
-        let oldest = if rest == "TOKEN" {
-            "SEAMLESS_DESK_TOKEN".to_string()
-        } else {
-            format!("SEAMLESS_{rest}")
-        };
-        vec![format!("TSUNAGU_{rest}"), oldest]
-    }
-
-    /// 旧名称の設定フォルダを、新しいフォルダが無い時だけ丸ごと複製する。
-    /// 旧版へ戻しても設定が残るよう、移動ではなく複製にする
-    pub fn migrate_dir(old: &Path, new: &Path) {
-        fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
-            std::fs::create_dir_all(to)?;
-            for entry in std::fs::read_dir(from)? {
-                let entry = entry?;
-                let kind = entry.file_type()?;
-                let target = to.join(entry.file_name());
-                if kind.is_dir() {
-                    copy(&entry.path(), &target)?;
-                } else if kind.is_file() {
-                    std::fs::copy(entry.path(), target)?;
-                }
-            }
-            Ok(())
-        }
-        if new.exists() || !old.is_dir() {
-            return;
-        }
-        if let Err(e) = copy(old, new) {
-            eprintln!("[config] 旧設定 {} の移行に失敗: {e}", old.display());
-        }
-    }
-
-    /// 設定フォルダ(~/.config/knit)。初回は旧名称のフォルダから移行する
-    pub fn config_dir() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-        let cfg = Path::new(&home).join(".config");
-        let dir = cfg.join("knit");
-        migrate_dir(&cfg.join("tsunagu"), &dir);
-        Some(dir)
-    }
-
-    /// 端末固有データの置き場(Windows は %LOCALAPPDATA%\Knit、Mac は
-    /// ~/Library/Application Support/Knit)。初回は旧名称のフォルダから移行する
-    pub fn data_dir() -> Option<PathBuf> {
-        #[cfg(target_os = "windows")]
-        let root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
-        #[cfg(not(target_os = "windows"))]
-        let root = PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support");
-        let dir = root.join("Knit");
-        migrate_dir(&root.join("Tsunagu"), &dir);
-        Some(dir)
-    }
-
-    fn entries() -> &'static Vec<(String, String)> {
-        static E: OnceLock<Vec<(String, String)>> = OnceLock::new();
-        E.get_or_init(|| {
-            let mut v = Vec::new();
-            let mut paths = Vec::new();
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(d) = exe.parent() {
-                    paths.push(d.join(".env"));
-                    // .app バンドル配布用: Contents/Resources/.env。
-                    // 注意: どちらの場所も署名済み .app へ後から足すとコード署名の
-                    // 検証が壊れる(sealed resource)。.app 内へ置く場合は再署名が必要
-                    if let Some(res) = d.parent().map(|p| p.join("Resources/.env")) {
-                        paths.push(res);
-                    }
-                }
-            }
-            for key in ["HOME", "USERPROFILE"] {
-                if let Some(home) = std::env::var_os(key) {
-                    let cfg = Path::new(&home).join(".config");
-                    paths.push(cfg.join("knit/env"));
-                    // 旧名称時代の設定パス(移行措置)
-                    paths.push(cfg.join("tsunagu/env"));
-                    paths.push(cfg.join("seamless-desk/env"));
-                }
-            }
-            for p in paths {
-                let Ok(s) = std::fs::read_to_string(&p) else {
-                    continue;
-                };
-                for line in s.lines() {
-                    let line = line.trim();
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    if let Some((k, val)) = line.split_once('=') {
-                        v.push((
-                            k.trim().to_string(),
-                            val.trim().trim_matches('"').to_string(),
-                        ));
-                    }
-                }
-            }
-            v
-        })
-    }
-
-    fn env_var(key: &str) -> Option<String> {
-        std::env::var(key).ok().filter(|v| !v.is_empty())
-    }
-
-    /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する。
-    /// 旧名称のキー(TSUNAGU_*・SEAMLESS_*)も新しい順に確認する
-    pub fn get(key: &str) -> Option<String> {
-        if let Some(v) = env_var(key) {
-            return Some(v);
-        }
-        let legacy = legacy_keys(key);
-        let find = |k: &str| {
-            entries()
-                .iter()
-                .find(|(name, _)| name == k)
-                .map(|(_, v)| v.clone())
-        };
-        find(key)
-            .or_else(|| legacy.iter().find_map(|k| find(k)))
-            // 旧名称の環境変数も受け入れる(スクリプト側の書き換え漏れ保険)
-            .or_else(|| legacy.iter().find_map(|k| env_var(k)))
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn new_keys_fall_back_to_both_older_names() {
-            assert_eq!(
-                legacy_keys("KNIT_TOKEN"),
-                ["TSUNAGU_TOKEN", "SEAMLESS_DESK_TOKEN"]
-            );
-            assert_eq!(legacy_keys("KNIT_HOST"), ["TSUNAGU_HOST", "SEAMLESS_HOST"]);
-            assert!(legacy_keys("OTHER").is_empty());
-        }
-
-        #[test]
-        fn migrates_old_config_once_without_touching_it() {
-            let base = std::env::temp_dir().join(format!("knit-migrate-{}", std::process::id()));
-            let (old, new) = (base.join("tsunagu"), base.join("knit"));
-            std::fs::create_dir_all(old.join("images")).unwrap();
-            std::fs::write(old.join("env"), "TSUNAGU_TOKEN=x\n").unwrap();
-            std::fs::write(old.join("images/a.png"), b"png").unwrap();
-            migrate_dir(&old, &new);
-            assert_eq!(std::fs::read(new.join("images/a.png")).unwrap(), b"png");
-            assert!(old.join("env").exists(), "旧版へ戻せるよう元は残す");
-            std::fs::write(new.join("env"), "KNIT_TOKEN=y\n").unwrap();
-            migrate_dir(&old, &new);
-            assert_eq!(
-                std::fs::read_to_string(new.join("env")).unwrap(),
-                "KNIT_TOKEN=y\n",
-                "移行済みの設定を上書きしない"
-            );
-            std::fs::remove_dir_all(base).unwrap();
-        }
-    }
-}
-
-pub mod proto {
-    use serde::{Deserialize, Serialize};
-
-    pub const PORT: u16 = 24900;
-    /// プロトコル版。9: Leave 追加・Focus/Minimize 削除・版交渉(MIN_VERSION)導入。
-    /// 10: ファイル・画像を大容量経路(bulk, 24902)へ移し本線から File*/ClipData を削除。
-    /// 11: 全経路を Noise 暗号化(認証はハンドシェイクで行い hello のトークンは空)
-    /// 12: Windows→Macの操作ID付きファイルドラッグ。
-    /// 13: hello/hello_ok に端末 id と全モニター構成(monitors)を追加(複数台接続の土台)。
-    pub const VERSION: u32 = 13;
-    /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
-    /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
-    /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
-    pub const MIN_VERSION: u32 = 11;
-
-    /// 相手の版を受け入れてよいか
-    pub fn compatible(peer: u32) -> bool {
-        peer >= MIN_VERSION
-    }
-
-    /// 1 枚のモニター(仮想画面座標系での位置とサイズ。Mac は CG 座標系のまま)。
-    /// 版 13 以降の hello/hello_ok で交換し、複数モニターの自動認知に使う。
-    /// 旧版からの受信は空配列(既定)になり、従来どおり w/h の 1 画面扱い
-    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-    pub struct Monitor {
-        #[serde(default)]
-        pub x: i32,
-        #[serde(default)]
-        pub y: i32,
-        pub w: i32,
-        pub h: i32,
-    }
-
-    impl Monitor {
-        /// モニター群の合計面積を本文として表す(ログ・表示用の 1 行)
-        pub fn summary(monitors: &[Monitor]) -> String {
-            if monitors.is_empty() {
-                return "不明".to_string();
-            }
-            monitors
-                .iter()
-                .map(|m| format!("{}x{}@{},{}", m.w, m.h, m.x, m.y))
-                .collect::<Vec<_>>()
-                .join(" + ")
-        }
-    }
-
-    /// 端末識別子(プロセスの起動ごとに生成)。暗号用途ではなく、同じ Mac へ
-    /// 接続した複数端末と、同一端末の再接続を区別するためだけの値
-    pub fn device_id() -> String {
-        static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        ID.get_or_init(|| {
-            let mut seed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-                ^ ((std::process::id() as u64) << 32);
-            let mut next = move || {
-                // splitmix64: 識別子生成には十分な拡散
-                seed = seed.wrapping_add(0x9e3779b97f4a7c15);
-                let mut z = seed;
-                z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-                z ^ (z >> 31)
-            };
-            format!("{:016x}", next())
-        })
-        .clone()
-    }
-
-    /// 通信で受け取った表示名を UI・ログへ載せられる形にする: 制御文字と
-    /// 文字の並びを偽装する Bidi オーバーライドを除去し、長さを切る。
-    /// 登録(pairing)の safe_name と同一規則を hello の name にも適用する
-    pub fn safe_peer_name(name: &str) -> String {
-        name.chars()
-            .filter(|c| {
-                !c.is_control() && !matches!(*c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-            })
-            .take(48)
-            .collect()
-    }
-
-    #[derive(Serialize, Deserialize, Debug, Clone)]
-    #[serde(tag = "t")]
-    pub enum Msg {
-        #[serde(rename = "hello")]
-        Hello {
-            ver: u32,
-            name: String,
-            /// 版 11 以降は空(認証は暗号化ハンドシェイクで済んでいる)
-            #[serde(default)]
-            token: String,
-            /// 送信側の画面幅/高さ(px)。スケール自動算出と絶対座標送信に使う
-            #[serde(default)]
-            w: i32,
-            #[serde(default)]
-            h: i32,
-            /// 端末識別子(版 13 以降)。複数台の区別と再接続の紐付けに使う
-            #[serde(default)]
-            id: String,
-            /// 送信側の全モニター(版 13 以降)。旧版からの受信は空
-            #[serde(default)]
-            monitors: Vec<Monitor>,
-        },
-        #[serde(rename = "hello_ok")]
-        HelloOk {
-            name: String,
-            w: i32,
-            h: i32,
-            #[serde(default)]
-            ver: u32,
-            /// 端末識別子(版 13 以降)
-            #[serde(default)]
-            id: String,
-            /// 受け側の全モニター(版 13 以降)
-            #[serde(default)]
-            monitors: Vec<Monitor>,
-        },
-        #[serde(rename = "drag_offer")]
-        DragOffer {
-            id: u64,
-            count: usize,
-            total: u64,
-            position: f64,
-        },
-        #[serde(rename = "drag_accept")]
-        DragAccept { id: u64 },
-        #[serde(rename = "drag_ready")]
-        DragReady { id: u64 },
-        #[serde(rename = "drag_commit")]
-        DragCommit { id: u64 },
-        #[serde(rename = "drag_cancel")]
-        DragCancel { id: u64 },
-        #[serde(rename = "drag_done")]
-        DragDone { id: u64, copied: bool },
-        /// 画面構成の変化(Windows→Mac)。解像度変更・モニター抜き差しで送る
-        #[serde(rename = "screen")]
-        Screen { w: i32, h: i32 },
-        /// ゲームモード(Windows→Mac)。カーソルが閉じ込められた/全画面で隠れた間は
-        /// 相対移動で送ってほしい(絶対座標では視点回転が効かない)
-        #[serde(rename = "rel")]
-        Rel { on: bool },
-        /// 画面ロックの連動(Mac→Windows)。Mac がロックされたら Windows もロックする
-        #[serde(rename = "lock")]
-        Lock,
-        #[serde(rename = "key")]
-        Key {
-            kc: u16,
-            down: bool,
-            ctrl: bool,
-            opt: bool,
-            cmd: bool,
-            shift: bool,
-            /// 翻訳済みキー(⌘]→Tab 等)。Win 側の ⌘Tab→Alt+Tab 変換など
-            /// 「生の Mac 入力」前提の特殊処理を適用しない
-            #[serde(default)]
-            tr: bool,
-            /// 右⌘を右 Ctrl として扱う(Mac 側で cmd から分離して載せる)。
-            /// 旧側は未知フィールドを無視するため版 11 のまま
-            #[serde(default)]
-            rcmd: bool,
-        },
-        #[serde(rename = "mouse_move")]
-        MouseMove { dx: f64, dy: f64 },
-        /// カーソル絶対位置(0..1 正規化)。Windows 側は MOUSEEVENTF_ABSOLUTE で注入し、
-        /// ポインタ加速曲線を通さず Mac の速度感をそのまま再現する
-        #[serde(rename = "mouse_abs")]
-        MouseAbs { nx: f64, ny: f64 },
-        #[serde(rename = "mouse_btn")]
-        MouseButton { btn: u8, down: bool },
-        #[serde(rename = "scroll")]
-        Scroll { dx: f64, dy: f64 },
-        /// Windows 左端到達による復帰通知。ny = 復帰時のカーソル高さ(0..1、Mac 側復帰位置へ反映)
-        #[serde(rename = "return")]
-        Return {
-            #[serde(default)]
-            ny: f64,
-        },
-        /// クリップボード同期(プレーンテキスト)
-        #[serde(rename = "clip")]
-        Clip { text: String },
-        /// Mac が制御を取り戻した(Windows を離れた)。Windows は押下中の全キー・
-        /// ボタン・Alt+Tab を解放する。ホットキー/Mac 内完結の左端復帰/切断など
-        /// Windows が自力で検知できない離脱経路のための後片付け合図
-        #[serde(rename = "leave")]
-        Leave,
-        /// カーソル絶対ワープ(0..1 正規化。切替時に相手画面の対応位置へ飛ばす)
-        #[serde(rename = "warp")]
-        Warp { nx: f64, ny: f64 },
-        #[serde(rename = "ping")]
-        Ping {
-            /// 送信時刻(unix ms)。Pong にエコーバックされ RTT 測定に使う
-            #[serde(default)]
-            ts: u64,
-        },
-        #[serde(rename = "pong")]
-        Pong {
-            #[serde(default)]
-            ts: u64,
-        },
-        /// 設定同期: ⌘キーのマップ先(false=Ctrl 既定 / true=Alt)と
-        /// Windows スピーカーのミュート(true=接続中ミュート=Mac のみ発音)。
-        /// 接続確立時とメニュー切替時に Mac→Windows へ送る
-        #[serde(rename = "cfg")]
-        Cfg {
-            cmd_alt: bool,
-            #[serde(default)]
-            spk_mute: bool,
-            /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下。Deskflow の links 相当)
-            #[serde(default)]
-            side: u8,
-            /// クリップボード共有。false の間は Windows 側も送らない(相手任せにしない)
-            #[serde(default = "default_true")]
-            clip: bool,
-        },
-        /// Windows の音量制御(0=up / 1=down / 2=ミュート)。Mac メニューから送る
-        #[serde(rename = "vol")]
-        Vol { op: u8 },
-        /// 接続品質通知: Mac が測定した RTT(ms)を Windows 側の表示へ回す
-        #[serde(rename = "stat")]
-        Stat { rtt: u64 },
-        /// IME 状態同期(Mac→Windows、画面を移る時に送る)。Mac のかな/英数を
-        /// Windows 側 IME の開閉へ反映する(ビジョン§7 IME Follow Cursor)
-        #[serde(rename = "ime")]
-        Ime { kana: bool },
-        /// Continue Here(ビジョン§11): 相手側の既定ブラウザで開く URL。
-        /// スキーム・長さの検査は urlx::transferable で両側で行う
-        #[serde(rename = "open_url")]
-        OpenUrl { url: String },
-        /// Search My Desk の横断化(ビジョン§14): 相手 PC のアプリ一覧を要求する。
-        /// 旧側は未知行として無視する拡張(版 12 のまま)
-        #[serde(rename = "apps_query")]
-        AppsQuery,
-        /// アプリ一覧の応答((表示名, 起動パス)。起動は RunApp で、受け側が
-        /// この列挙結果と突き合わせてから行う)
-        #[serde(rename = "apps_reply")]
-        AppsReply { apps: Vec<(String, String)> },
-        /// 相手 PC でアプリを起動する。受け側は直前に列挙したパスと
-        /// 完全一致するものだけ実行する(任意パスの実行を防ぐ)
-        #[serde(rename = "run_app")]
-        RunApp { path: String },
-        #[serde(rename = "bye")]
-        Bye,
-    }
-
-    fn default_true() -> bool {
-        true
-    }
-
-    pub fn encode(msg: &Msg) -> String {
-        let mut s = serde_json::to_string(msg).unwrap_or_default();
-        s.push('\n');
-        s
-    }
-
-    /// Vol の op のうちメディア制御(3=前へ/4=再生・一時停止/5=次へ)に対応する
-    /// Windows のメディア VK。op 0-2(音量)は None。両側で意味の対応を
-    /// 1 箇所で保証するためにここへ置く
-    pub fn media_vk(op: u8) -> Option<u16> {
-        Some(match op {
-            3 => 0xB1, // VK_MEDIA_PREV_TRACK
-            4 => 0xB3, // VK_MEDIA_PLAY_PAUSE
-            5 => 0xB0, // VK_MEDIA_NEXT_TRACK
-            _ => return None,
-        })
-    }
-
-    pub fn decode(line: &str) -> Option<Msg> {
-        serde_json::from_str(line.trim()).ok()
-    }
-}
-
-pub mod urlx {
-    //! Continue Here(ビジョン§11)で相手に開かせてよい URL の検査。
-    //! 送信側・受信側の両方で同じ規則を適用する(片側だけの検査に頼らない)
-
-    /// 相手に転送してよい URL か。http/https のみ・上限 2048 文字
-    ///(file: 等のローカルスキームや過大なクエリを流さない)。
-    /// 制御文字・空白の混入も拒否する(受信側の文字列がそのまま
-    /// ShellExecuteW へ渡るため、改行入り等の偽装を塞ぐ)
-    pub fn transferable(url: &str) -> bool {
-        url.len() <= 2048
-            && (url.starts_with("http://") || url.starts_with("https://"))
-            && !url.chars().any(|c| c.is_control() || c.is_whitespace())
-    }
-}
-
-pub mod files {
-    //! 受信ファイルの保存(Mac/Windows 共通)。名前の無害化と同名回避を一箇所に置き、
-    //! 両側で規則が食い違う(Windows だけ上書きしていた)事故を防ぐ
-    use std::path::{Path, PathBuf};
-
-    /// 1 ファイルの受信上限(送信側の合計上限と同じ)
-    pub const MAX_FILE: u64 = 10 * 1024 * 1024 * 1024;
-
-    /// 相手から届いたファイル名を、どちらの OS でも安全な単一の名前へ変換する。
-    /// パス区切り・予約文字・制御文字は '_'、先頭末尾の '.' と空白は除去、
-    /// Windows の予約デバイス名(CON/NUL/COM1 等)は先頭に '_' を付ける
-    pub fn sanitize(name: &str) -> String {
-        let mut s: String = name
-            .chars()
-            .map(|c| match c {
-                '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-                c if c.is_control() => '_',
-                c => c,
-            })
-            .collect();
-        s = s
-            .trim_matches(|c: char| c == '.' || c.is_whitespace())
-            .to_string();
-        if s.chars().count() > 200 {
-            s = s.chars().take(200).collect();
-        }
-        if s.is_empty() {
-            return "file".into();
-        }
-        let stem = s.split('.').next().unwrap_or("").to_ascii_uppercase();
-        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-            || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-                && stem.len() == 4
-                && stem.as_bytes()[3].is_ascii_digit());
-        if reserved {
-            s.insert(0, '_');
-        }
-        s
-    }
-
-    /// ファイル群の指紋(パス+合計サイズ)。同一コピーの再検出・エコーバック判定に
-    /// 使う。両 OS で同じ形式にするためここへ置く
-    pub fn key(paths: &[String]) -> String {
-        let sizes: u64 = paths
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok().map(|m| m.len()))
-            .sum();
-        format!("{}|{sizes}", paths.join("\u{1}"))
-    }
-
-    /// 相手 PC から来たファイルに「外部から入手した」印を付ける。これが無いと、
-    /// 受信した実行ファイルや .app が OS の警告(SmartScreen / Gatekeeper)なしで開ける。
-    /// 付与できなくても受信自体は続ける(NTFS 以外のドライブ等)
-    pub fn mark_untrusted(path: &Path) {
-        #[cfg(windows)]
-        {
-            let mut ads = path.as_os_str().to_owned();
-            ads.push(":Zone.Identifier");
-            let _ = std::fs::write(ads, "[ZoneTransfer]\r\nZoneId=3\r\n");
-        }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::ffi::OsStrExt;
-            unsafe extern "C" {
-                fn setxattr(
-                    path: *const core::ffi::c_char,
-                    name: *const core::ffi::c_char,
-                    value: *const core::ffi::c_void,
-                    size: usize,
-                    position: u32,
-                    options: i32,
-                ) -> i32;
-            }
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            // 形式: フラグ;時刻(16進);取得元アプリ;UUID(省略可)
-            let value = format!("0081;{secs:x};Knit;");
-            let Ok(p) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-                return;
-            };
-            unsafe {
-                setxattr(
-                    p.as_ptr(),
-                    c"com.apple.quarantine".as_ptr(),
-                    value.as_ptr() as *const core::ffi::c_void,
-                    value.len(),
-                    0,
-                    0,
-                );
-            }
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let _ = path;
-    }
-
-    /// dir 内に新規ファイルを作る。同名があれば「名前 (n).拡張子」で回避する
-    pub fn create_unique(dir: &Path, name: &str) -> Option<(std::fs::File, PathBuf)> {
-        std::fs::create_dir_all(dir).ok()?;
-        let base = sanitize(name);
-        let p = Path::new(&base);
-        let stem = p
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "file".into());
-        let ext = p
-            .extension()
-            .map(|e| format!(".{}", e.to_string_lossy()))
-            .unwrap_or_default();
-        for i in 0..1000u32 {
-            let cand = if i == 0 {
-                dir.join(&base)
-            } else {
-                dir.join(format!("{stem} ({i}){ext}"))
-            };
-            if let Ok(f) = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&cand)
-            {
-                mark_untrusted(&cand);
-                return Some((f, cand));
-            }
-        }
-        None
-    }
-}
-
-pub mod secure {
-    //! 全経路(本線・音声・大容量)の暗号化と相互認証。
-    //! Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s: 両者が同じトークンを知っている時だけ
-    //! ハンドシェイクが成立し(トークン自体は回線に流れない)、接続ごとの使い捨て鍵で
-    //! 暗号化する(前方秘匿性)。旧方式は平文 TCP にトークンを平文で載せ、
-    //! 盗聴・改ざん耐性を Tailscale に全面依存していた
-    use std::io::{self, Read, Write};
-    use std::net::TcpStream;
-    use std::sync::Arc;
-
-    const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
-    const MAX_MSG: usize = 65535;
-    const TAG: usize = 16;
-    const MAX_PLAIN: usize = MAX_MSG - TAG;
-
-    fn psk(token: &str) -> [u8; 32] {
-        use blake2::Digest;
-        let mut h = blake2::Blake2s256::new();
-        h.update(b"knit-psk-v1\0");
-        h.update(token.as_bytes());
-        h.finalize().into()
-    }
-
-    fn invalid(e: impl std::fmt::Display) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-    }
-
-    fn write_rec(w: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-        let mut out = Vec::with_capacity(2 + data.len());
-        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        out.extend_from_slice(data);
-        w.write_all(&out)
-    }
-
-    fn read_rec(r: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<()> {
-        let mut len = [0u8; 2];
-        r.read_exact(&mut len)?;
-        buf.resize(u16::from_be_bytes(len) as usize, 0);
-        r.read_exact(buf)
-    }
-
-    /// 復号側(Read)。1 レコードずつ復号して返す
-    pub struct Reader {
-        s: TcpStream,
-        st: Arc<snow::StatelessTransportState>,
-        nonce: u64,
-        cipher: Vec<u8>,
-        plain: Vec<u8>,
-        pos: usize,
-    }
-
-    impl Read for Reader {
-        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-            while self.pos >= self.plain.len() {
-                read_rec(&mut self.s, &mut self.cipher)?;
-                // 復号出力は暗号文長−タグ分に収まるため cipher 長だけで足りる。
-                // MAX_MSG(64KB)のゼロフィルは毎レコードの無駄なメモリ書き込みになる
-                self.plain.resize(self.cipher.len(), 0);
-                let n = self
-                    .st
-                    .read_message(self.nonce, &self.cipher, &mut self.plain)
-                    .map_err(invalid)?;
-                self.nonce += 1;
-                self.plain.truncate(n);
-                self.pos = 0;
-            }
-            let n = out.len().min(self.plain.len() - self.pos);
-            out[..n].copy_from_slice(&self.plain[self.pos..self.pos + n]);
-            self.pos += n;
-            Ok(n)
-        }
-    }
-
-    /// 暗号化側(Write)。flush で溜めた平文をレコードにして送る(送り手は必ず flush する)
-    pub struct Writer {
-        s: TcpStream,
-        st: Arc<snow::StatelessTransportState>,
-        nonce: u64,
-        buf: Vec<u8>,
-        cipher: Vec<u8>,
-    }
-
-    impl Writer {
-        fn emit(&mut self, n: usize) -> io::Result<()> {
-            self.cipher.resize(n + TAG, 0);
-            let len = self
-                .st
-                .write_message(self.nonce, &self.buf[..n], &mut self.cipher)
-                .map_err(invalid)?;
-            self.nonce += 1;
-            write_rec(&mut self.s, &self.cipher[..len])?;
-            self.buf.drain(..n);
-            Ok(())
-        }
-        pub fn shutdown(&self) {
-            let _ = self.s.shutdown(std::net::Shutdown::Both);
-        }
-    }
-
-    impl Reader {
-        /// 受信タイムアウトの設定(相手の生存確認の周期に合わせる)
-        pub fn set_read_timeout(&self, d: Option<std::time::Duration>) {
-            let _ = self.s.set_read_timeout(d);
-        }
-    }
-
-    impl Write for Writer {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.buf.extend_from_slice(data);
-            while self.buf.len() >= MAX_PLAIN {
-                self.emit(MAX_PLAIN)?;
-            }
-            Ok(data.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            if !self.buf.is_empty() {
-                let n = self.buf.len();
-                self.emit(n)?;
-            }
-            self.s.flush()
-        }
-    }
-
-    fn split(s: TcpStream, hs: snow::HandshakeState) -> io::Result<(Reader, Writer)> {
-        let st = Arc::new(hs.into_stateless_transport_mode().map_err(invalid)?);
-        let w = s.try_clone()?;
-        Ok((
-            Reader {
-                s,
-                st: st.clone(),
-                nonce: 0,
-                cipher: Vec::new(),
-                plain: Vec::new(),
-                pos: 0,
-            },
-            Writer {
-                s: w,
-                st,
-                nonce: 0,
-                buf: Vec::new(),
-                cipher: Vec::new(),
-            },
-        ))
-    }
-
-    fn builder<'a>(label: &'a [u8], key: &'a [u8; 32]) -> io::Result<snow::Builder<'a>> {
-        snow::Builder::new(PATTERN.parse().map_err(invalid)?)
-            .prologue(label)
-            .map_err(invalid)?
-            .psk(0, key)
-            .map_err(invalid)
-    }
-
-    /// 接続した側(TCP クライアント)のハンドシェイク。label は経路ごとの識別子
-    /// (本線の通信を音声経路へ差し込む等の取り違えを防ぐ)
-    pub fn connect(mut s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
-        let key = psk(token);
-        let mut hs = builder(label, &key)?.build_initiator().map_err(invalid)?;
-        let mut buf = vec![0u8; MAX_MSG];
-        let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
-        write_rec(&mut s, &buf[..n])?;
-        let mut rec = Vec::new();
-        read_rec(&mut s, &mut rec)?;
-        hs.read_message(&rec, &mut buf).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "handshake failed (token mismatch?)",
-            )
-        })?;
-        split(s, hs)
-    }
-
-    /// 待ち受けた側(TCP サーバ)のハンドシェイク。トークンが違えばここで失敗する
-    pub fn accept(mut s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
-        let key = psk(token);
-        let mut hs = builder(label, &key)?.build_responder().map_err(invalid)?;
-        let mut buf = vec![0u8; MAX_MSG];
-        let mut rec = Vec::new();
-        read_rec(&mut s, &mut rec)?;
-        hs.read_message(&rec, &mut buf).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "handshake failed (token mismatch?)",
-            )
-        })?;
-        let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
-        write_rec(&mut s, &buf[..n])?;
-        split(s, hs)
-    }
-
-    /// 待受ループの連続失敗スロットル。認証に失敗し続ける接続が高頻度で
-    /// 来た時だけ受け付けを鈍らせ、正規の接続が成功すれば直ちに回復する
-    /// (登録ポートの MAX_ATTEMPTS=3 と違い、確立済みの運用を締め出さない)
-    pub struct FailThrottle {
-        fails: u32,
-    }
-    impl FailThrottle {
-        pub const fn new() -> Self {
-            Self { fails: 0 }
-        }
-        /// 失敗を 1 つ数え、5 回目以降は失敗 1 回あたり 250ms ずつ
-        /// (上限 5 秒)伸びる待ち時間を返す。呼び出し側で sleep する
-        pub fn fail(&mut self) -> std::time::Duration {
-            self.fails += 1;
-            if self.fails < 5 {
-                std::time::Duration::ZERO
-            } else {
-                std::time::Duration::from_millis(250 * (self.fails - 4).min(20) as u64)
-            }
-        }
-        /// 成功で待ち時間を解除する
-        pub fn success(&mut self) {
-            self.fails = 0;
-        }
-    }
-}
-
-pub mod net {
-    //! 接続元の判定など、両 OS の待受処理で共通の小物
-    use std::net::IpAddr;
-
-    /// 接続を受け入れてよい相手か。通信は暗号化と相互認証(secure)で守られるため、
-    /// 家庭・社内の LAN、有線直結(リンクローカル)、Tailscale を許可する。
-    /// インターネット側のアドレスは KNIT_ALLOW_ANY=1 の時だけ許可する
-    /// (旧: Tailscale のみ許可で、usage.md が勧める有線直結 169.254.x.x が繋がらなかった)
-    pub fn is_allowed(ip: IpAddr) -> bool {
-        if crate::envutil::get("KNIT_ALLOW_ANY").as_deref() == Some("1") {
-            return true;
-        }
-        match ip {
-            IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_link_local() || v4.is_loopback() || is_tailscale(ip)
-            }
-            IpAddr::V6(v6) => {
-                v6.is_loopback()
-                    || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA
-                    || (v6.segments()[0] & 0xffc0) == 0xfe80 // リンクローカル
-                    || v6.to_ipv4_mapped().is_some_and(|v4| is_allowed(IpAddr::V4(v4)))
-            }
-        }
-    }
-
-    /// Tailscale の CGNAT 範囲(100.64.0.0/10)か
-    pub fn is_tailscale(ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                o[0] == 100 && (64..=127).contains(&o[1])
-            }
-            IpAddr::V6(_) => false,
-        }
-    }
-}
-
-pub mod discover {
-    //! 同じ LAN にいる相手の自動発見(接続先の IP を手で入れずに済むように)。
-    //! 問い合わせと応答には、トークンから導いた「部屋 ID」だけを載せる(トークンそのもの
-    //! は含まない)。同じトークンを持つ相手だけが応答するため、他人の Knit とは混ざらない。
-    //! Tailscale や AP 隔離の環境ではブロードキャストが届かないため KNIT_HOST を併用する
-    use std::net::{IpAddr, SocketAddr, UdpSocket};
-    use std::time::{Duration, Instant};
-
-    /// 本線ポートからの差分(24900 → 24903/UDP)
-    pub const PORT_OFFSET: u16 = 3;
-
-    pub fn room_id(token: &str) -> String {
-        use blake2::Digest;
-        let mut h = blake2::Blake2s256::new();
-        h.update(b"knit-room-v1\0");
-        h.update(token.as_bytes());
-        h.finalize()[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    }
-
-    /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える。
-    /// 戻り値は bind 失敗のみ(待受に入ったら戻らない)。呼び出し側でログに出す
-    pub fn respond(
-        bind: &str,
-        port: u16,
-        token: &str,
-        allow: fn(IpAddr) -> bool,
-    ) -> std::io::Result<()> {
-        let sock = UdpSocket::bind((bind, port))?;
-        let ask = format!("KNIT?{}", room_id(token));
-        let ans = format!("KNIT!{}", room_id(token));
-        let mut buf = [0u8; 128];
-        while let Ok((n, from)) = sock.recv_from(&mut buf) {
-            if allow(from.ip()) && &buf[..n] == ask.as_bytes() {
-                let _ = sock.send_to(ans.as_bytes(), from);
-            }
-        }
-        Ok(())
-    }
-
-    /// 問い合わせ側(早期終了版)。最初の応答が届いた時点で返る。
-    /// 再接続のたびに呼ばれるため、LAN 内の実質レイテンシは応答 1 往復分で済む
-    pub fn seek_first(target: SocketAddr, token: &str, wait: Duration) -> Option<IpAddr> {
-        let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else {
-            return None;
-        };
-        let _ = sock.set_broadcast(true);
-        let ask = format!("KNIT?{}", room_id(token));
-        let ans = format!("KNIT!{}", room_id(token));
-        sock.send_to(ask.as_bytes(), target).ok()?;
-        let until = Instant::now() + wait;
-        let mut buf = [0u8; 128];
-        // 不正な応答を受け取るたびにタイムアウトが延びないよう、残り時間を都度計算し直す
-        while let Some(left) = until
-            .checked_duration_since(Instant::now())
-            .filter(|d| !d.is_zero())
-        {
-            let _ = sock.set_read_timeout(Some(left));
-            match sock.recv_from(&mut buf) {
-                Ok((n, from)) if &buf[..n] == ans.as_bytes() => return Some(from.ip()),
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-        }
-        None
-    }
-
-    /// LAN 全体へ問い合わせ、最初に応答した相手を 1 つ返す。
-    /// LAN 内なら応答は数 ms、誰もいなくても 600ms で諦める(再接続 1 回あたりの上乗せがこれ以下)
-    pub fn seek_first_lan(port: u16, token: &str) -> Option<IpAddr> {
-        seek_first(
-            SocketAddr::from(([255, 255, 255, 255], port + PORT_OFFSET)),
-            token,
-            Duration::from_millis(600),
-        )
-    }
-}
-
-pub mod connect {
-    //! 複数の接続候補(有線直結・LAN・Tailscale 等)へ同時に接続を試み、最初に
-    //! 繋がったものを使う。遅延の小さい経路ほど早く繋がるため、自然に最速経路が選ばれ、
-    //! 一つが使えなくなっても次回の接続で別経路へ切り替わる
-    use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-    use std::time::Duration;
-
-    /// "host1,host2:port" のようなカンマ区切りを解決する(ポート省略時は既定ポート)
-    pub fn parse_hosts(list: &str, port: u16) -> Vec<SocketAddr> {
-        list.split(',')
-            .map(str::trim)
-            .filter(|h| !h.is_empty())
-            .flat_map(|h| {
-                let with_port =
-                    if h.contains(':') && !h.starts_with('[') && h.matches(':').count() == 1 {
-                        h.to_string()
-                    } else {
-                        format!("{h}:{port}")
-                    };
-                with_port
-                    .to_socket_addrs()
-                    .ok()
-                    .and_then(|mut it| it.next())
-            })
-            .collect()
-    }
-
-    /// 発見結果と手動指定を併合する(発見を先頭・IP+ポート単位で重複排除)。
-    /// LAN 直と Tailscale を両方候補へ並べるため、first_reachable が自然に最速経路を採用する
-    pub(crate) fn merge_candidates(
-        found: Vec<std::net::IpAddr>,
-        hosts: Option<&str>,
-        port: u16,
-    ) -> Vec<SocketAddr> {
-        let mut addrs: Vec<SocketAddr> = found
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, port))
-            .collect();
-        if let Some(h) = hosts {
-            for a in parse_hosts(h, port) {
-                if !addrs.contains(&a) {
-                    addrs.push(a);
-                }
-            }
-        }
-        addrs
-    }
-
-    /// 接続候補: LAN 自動発見の結果を先頭に、指定(KNIT_HOST)を併せて返す。
-    /// 同じ LAN にいれば発見=LAN 直が最速で、いなければ指定(Tailscale 等)へフォールバックする
-    pub fn resolve(hosts: Option<&str>, port: u16, token: &str) -> Vec<SocketAddr> {
-        let found = crate::discover::seek_first_lan(port, token)
-            .into_iter()
-            .collect::<Vec<_>>();
-        let mut candidates = merge_candidates(found, hosts, port);
-        if hosts.is_none() {
-            if let Some(peer) = crate::credentials::load_peer() {
-                if !candidates.contains(&peer) {
-                    candidates.push(peer);
-                }
-            }
-        }
-        candidates
-    }
-
-    pub fn first_reachable(
-        addrs: &[SocketAddr],
-        timeout: Duration,
-    ) -> Option<(TcpStream, SocketAddr)> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        for a in addrs.iter().copied() {
-            let tx = tx.clone();
-            std::thread::spawn(move || {
-                if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
-                    let _ = tx.send((s, a));
-                }
-            });
-        }
-        drop(tx);
-        rx.recv_timeout(timeout + Duration::from_millis(500)).ok()
-    }
-}
-
-pub mod bulk {
-    //! 大容量データ(ファイル・画像)専用の経路。本線(入力・制御の JSON Lines)と
-    //! 別の TCP 接続に分けることで、転送中もマウス・キー・ping が詰まらない
-    //! (旧方式は 3MB チャンクが入力と同じキューとソケットに並び、転送中は入力が止まり、
-    //! 転送が 10 秒を超えると pong 遅延で切断と誤判定された)。
-    //! フレーム: [種別 u8][長さ u32 LE][本体]。base64 を使わない(33% 増と変換 CPU の削減)
-    use std::io::{Read, Write};
-    use std::path::{Path, PathBuf};
-
-    /// 本線ポートからの差分(24900 → 24902。24901 は音声)
-    pub const PORT_OFFSET: u16 = 2;
-    /// ファイル指紋の再公開(利用側は bulk 経由で呼ぶことが多いため)
-    pub use crate::files::key as files_key;
-    /// 暗号化ハンドシェイクで経路を識別するラベル
-    const LABEL: &[u8] = b"knit-bulk";
-    /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
-    pub const MAX_FRAME: usize = 1024 * 1024;
-    /// ファイル・画像データを分割する単位
-    pub const CHUNK: usize = 256 * 1024;
-    /// 1 回の一括送信の合計上限
-    pub const MAX_TOTAL: u64 = crate::files::MAX_FILE;
-    /// UI の表示も実際の制限値から作る(バイト数は 2 進単位)
-    pub fn file_limit_label() -> String {
-        format!("{}GiB", MAX_TOTAL / (1024 * 1024 * 1024))
-    }
-    /// クリップボード画像の上限(生 DIB)
-    pub const MAX_IMAGE: usize = 64 * 1024 * 1024;
-
-    pub const KEEPALIVE: u8 = 0;
-    pub const FILE_BEGIN: u8 = 1;
-    pub const DATA: u8 = 2;
-    pub const FILE_END: u8 = 3;
-    pub const BATCH_END: u8 = 4;
-    pub const DROP_BEGIN: u8 = 5;
-    pub const DROP_END: u8 = 6;
-    pub const IMAGE_BEGIN: u8 = 7;
-    pub const IMAGE_END: u8 = 8;
-    pub const DROP_ID_BEGIN: u8 = 9;
-
-    pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
-        let mut head = [0u8; 5];
-        head[0] = kind;
-        head[1..].copy_from_slice(&(body.len() as u32).to_le_bytes());
-        w.write_all(&head)?;
-        w.write_all(body)
-    }
-
-    /// 1 フレーム読む(本体は buf に入れ直す)。上限超過は不正として切断させる
-    pub fn read_frame(r: &mut impl Read, buf: &mut Vec<u8>) -> std::io::Result<u8> {
-        let mut head = [0u8; 5];
-        r.read_exact(&mut head)?;
-        let len = u32::from_le_bytes([head[1], head[2], head[3], head[4]]) as usize;
-        if len > MAX_FRAME {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "frame too large",
-            ));
-        }
-        buf.resize(len, 0);
-        r.read_exact(buf)?;
-        Ok(head[0])
-    }
-
-    pub fn total_size(paths: &[PathBuf]) -> u64 {
-        paths
-            .iter()
-            .filter_map(|p| {
-                std::fs::metadata(p)
-                    .ok()
-                    .filter(|m| m.is_file())
-                    .map(|m| m.len())
-            })
-            .fold(0, u64::saturating_add)
-    }
-
-    /// ファイル群を送る。drop=true は「掴んだまま境界越え」(受信側は OLE ドラッグで渡す)。
-    /// 戻り値は送った件数。on_progress は (送信済みバイト, 宣言済み合計) がチャンク毎に呼ばれる
-    pub fn send_files_with_progress(
-        w: &mut impl Write,
-        paths: &[PathBuf],
-        drop: bool,
-        mut on_progress: impl FnMut(u64, u64),
-    ) -> std::io::Result<usize> {
-        let declared = total_size(paths);
-        let n = send_files_inner(w, paths, drop, None, &mut |sent| {
-            on_progress(sent, declared);
-            Ok(())
-        })?;
-        Ok(n)
-    }
-
-    /// ファイル群を送る(進捗不要版)
-    pub fn send_files(w: &mut impl Write, paths: &[PathBuf], drop: bool) -> std::io::Result<usize> {
-        send_files_inner(w, paths, drop, None, &mut |_| Ok(()))
-    }
-
-    pub fn send_drag_files(
-        w: &mut impl Write,
-        paths: &[PathBuf],
-        id: u64,
-        cancelled: impl Fn() -> bool,
-    ) -> std::io::Result<usize> {
-        if id == 0
-            || paths.is_empty()
-            || paths.len() > crate::drag::MAX_FILES
-            || paths.iter().any(|p| !p.is_file())
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unsupported drag files",
-            ));
-        }
-        send_files_inner(w, paths, true, Some(id), &mut |_| {
-            if cancelled() {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "drag cancelled",
-                ))
-            } else {
-                Ok(())
-            }
-        })
-    }
-
-    fn send_files_inner(
-        w: &mut impl Write,
-        paths: &[PathBuf],
-        drop: bool,
-        drag_id: Option<u64>,
-        on_progress: &mut dyn FnMut(u64) -> std::io::Result<()>,
-    ) -> std::io::Result<usize> {
-        if total_size(paths) > MAX_TOTAL {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file batch exceeds size limit",
-            ));
-        }
-        if drag_id.is_some() {
-            on_progress(0)?;
-        }
-        if let Some(id) = drag_id {
-            write_frame(w, DROP_ID_BEGIN, &id.to_le_bytes())?;
-        } else if drop {
-            write_frame(w, DROP_BEGIN, &[])?;
-        }
-        let mut buf = vec![0u8; CHUNK];
-        let mut sent = 0;
-        let mut sent_bytes = 0u64;
-        for p in paths {
-            if drag_id.is_some() {
-                on_progress(sent_bytes)?;
-            }
-            let meta = match std::fs::metadata(p) {
-                Ok(meta) => meta,
-                Err(error) if drag_id.is_some() => return Err(error),
-                Err(_) => continue,
-            };
-            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                continue;
-            };
-            if !meta.is_file() {
-                if drag_id.is_some() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "drag source is not a file",
-                    ));
-                }
-                continue;
-            }
-            let mut f = match std::fs::File::open(p) {
-                Ok(file) => file,
-                Err(error) if drag_id.is_some() => return Err(error),
-                Err(_) => continue,
-            };
-            let size = f.metadata()?.len();
-            // 事前検査の後にファイルが増大していても、受信上限を超える宣言を送らない。
-            if size > crate::files::MAX_FILE || size > MAX_TOTAL - sent_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "file batch exceeds size limit",
-                ));
-            }
-            let head = serde_json::json!({ "name": name, "size": size }).to_string();
-            write_frame(w, FILE_BEGIN, head.as_bytes())?;
-            let mut remain = size;
-            while remain > 0 {
-                let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
-                if n == 0 {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "file shortened during transfer",
-                    ));
-                }
-                write_frame(w, DATA, &buf[..n])?;
-                remain -= n as u64;
-                sent_bytes += n as u64;
-                on_progress(sent_bytes)?;
-            }
-            write_frame(w, FILE_END, &[])?;
-            sent += 1;
-        }
-        write_frame(w, BATCH_END, &[])?;
-        if drop {
-            write_frame(w, DROP_END, &[])?;
-        }
-        w.flush()?;
-        Ok(sent)
-    }
-
-    /// クリップボード画像(DIB)を送る
-    pub fn send_image(w: &mut impl Write, dib: &[u8]) -> std::io::Result<()> {
-        write_frame(w, IMAGE_BEGIN, &(dib.len() as u64).to_le_bytes())?;
-        for c in dib.chunks(CHUNK) {
-            write_frame(w, DATA, c)?;
-        }
-        write_frame(w, IMAGE_END, &[])?;
-        w.flush()
-    }
-
-    /// 受信完了の単位
-    #[derive(Debug)]
-    pub enum Event {
-        /// 一括送信が完了した(drop=true は掴みドラッグ)
-        Files {
-            paths: Vec<PathBuf>,
-            drop: bool,
-            drag_id: Option<u64>,
-        },
-        Image(Vec<u8>),
-    }
-
-    enum Sink {
-        None,
-        File { f: std::fs::File, remain: u64 },
-        Image { data: Vec<u8>, remain: usize },
-    }
-
-    /// 受信側の状態機械。フレームを順に与えると完了時に Event を返す
-    pub struct Receiver {
-        dir: PathBuf,
-        sink: Sink,
-        paths: Vec<PathBuf>,
-        drop: bool,
-        drag_id: Option<u64>,
-        /// 一括転送内の累積書き込みバイト。正常な BATCH_END でリセットする。
-        /// 接続の寿命で累積すると、正当な連続転送も過去の転送量で拒否されてしまう。
-        written: u64,
-        limit: u64,
-        /// 上限超過後はバッチを問わず受け付けない(FILE_BEGIN の連打で上限を
-        /// 回避できないようにする)
-        tainted: bool,
-    }
-
-    impl Receiver {
-        pub fn new(dir: &Path) -> Self {
-            Self {
-                dir: dir.to_path_buf(),
-                sink: Sink::None,
-                paths: Vec::new(),
-                drop: false,
-                drag_id: None,
-                written: 0,
-                limit: MAX_TOTAL,
-                tainted: false,
-            }
-        }
-
-        /// テスト用: 上限を縮小する
-        #[cfg(test)]
-        pub fn set_limit_for_test(&mut self, v: u64) {
-            self.limit = v;
-        }
-
-        /// 書き込み途中のファイルを破棄する(Drop から呼ぶ。完了済みは残す)
-        fn discard_open_file(&mut self) {
-            if let Sink::File { f, .. } = std::mem::replace(&mut self.sink, Sink::None) {
-                drop(f); // Windows でも削除できるよう、ハンドルを先に閉じる
-                if let Some(p) = self.paths.pop() {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-
-        pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
-            match kind {
-                DROP_ID_BEGIN => {
-                    let id = u64::from_le_bytes(body.try_into().ok()?);
-                    if id == 0
-                        || !self.paths.is_empty()
-                        || !matches!(self.sink, Sink::None)
-                        || self.drag_id.is_some()
-                    {
-                        self.tainted = true;
-                        return None;
-                    }
-                    self.drop = true;
-                    self.drag_id = Some(id);
-                }
-                DROP_BEGIN => self.drop = true,
-                FILE_BEGIN => {
-                    self.discard_open_file();
-                    if self.tainted {
-                        return None;
-                    }
-                    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
-                    let name = v["name"].as_str().unwrap_or("file");
-                    let size = v["size"].as_u64().unwrap_or(0);
-                    // 書いてから超過分を消す方式では、一時的に上限を超えてしまう。
-                    if size > crate::files::MAX_FILE
-                        || size > self.limit.saturating_sub(self.written)
-                    {
-                        self.tainted = true;
-                        return None;
-                    }
-                    let (f, path) = crate::files::create_unique(&self.dir, name)?;
-                    self.paths.push(path);
-                    self.sink = Sink::File { f, remain: size };
-                }
-                DATA => match &mut self.sink {
-                    Sink::File { f, remain } => {
-                        // 宣言サイズを超える・書けないデータは、そのファイルごと破棄する
-                        if body.len() as u64 > self.limit.saturating_sub(self.written) {
-                            self.tainted = true;
-                            self.discard_open_file();
-                        } else if body.len() as u64 > *remain || f.write_all(body).is_err() {
-                            self.discard_open_file();
-                        } else {
-                            *remain -= body.len() as u64;
-                            self.written += body.len() as u64;
-                        }
-                    }
-                    Sink::Image { data, remain } => {
-                        if body.len() > *remain {
-                            self.sink = Sink::None;
-                        } else {
-                            data.extend_from_slice(body);
-                            *remain -= body.len();
-                        }
-                    }
-                    Sink::None => {}
-                },
-                FILE_END => {
-                    // 途中で切れた(宣言サイズに満たない)ファイルは残さない
-                    if let Sink::File { remain, .. } = &self.sink {
-                        if *remain > 0 {
-                            self.discard_open_file();
-                        }
-                    }
-                    self.sink = Sink::None;
-                }
-                BATCH_END => {
-                    // FILE_END が無いファイルは完了として公開しない。
-                    self.discard_open_file();
-                    if !self.tainted {
-                        self.written = 0;
-                    }
-                    let paths = std::mem::take(&mut self.paths);
-                    let drop = std::mem::replace(&mut self.drop, false);
-                    let drag_id = self.drag_id.take();
-                    // 受信失敗で0件でも、操作IDを返して準備待ちを取り消せるようにする。
-                    if !paths.is_empty() || drag_id.is_some() {
-                        return Some(Event::Files {
-                            paths,
-                            drop,
-                            drag_id,
-                        });
-                    }
-                }
-                IMAGE_BEGIN => {
-                    self.discard_open_file();
-                    let n = u64::from_le_bytes(body.try_into().ok()?) as usize;
-                    if n == 0 || n > MAX_IMAGE {
-                        return None;
-                    }
-                    self.sink = Sink::Image {
-                        data: Vec::with_capacity(n),
-                        remain: n,
-                    };
-                }
-                IMAGE_END => {
-                    if let Sink::Image { data, remain: 0 } =
-                        std::mem::replace(&mut self.sink, Sink::None)
-                    {
-                        return Some(Event::Image(data));
-                    }
-                }
-                _ => {}
-            }
-            None
-        }
-    }
-
-    impl Drop for Receiver {
-        /// 切断(接続断)時に書き込み途中のファイルが受信フォルダへ残留するのを防ぐ。
-        /// 完了済み(BATCH_END を迎えた)ファイルは保持する
-        fn drop(&mut self) {
-            if !matches!(self.sink, Sink::None) {
-                self.discard_open_file();
-            }
-            if self.drag_id.is_some() {
-                for p in self.paths.drain(..) {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-    }
-
-    /// 大容量経路の送信口。接続が張り替わるたびに差し替える。
-    /// 送信中はロックを保持するため、複数の転送のフレームが混ざらない
-    pub struct Link {
-        /// (世代, 書き込み口)。世代は張り替えのたびに増え、古い受信スレッドが
-        /// 新しい接続を誤って外さないための照合に使う
-        w: std::sync::Mutex<Option<(u64, crate::secure::Writer)>>,
-        gen: std::sync::atomic::AtomicU64,
-    }
-
-    impl Default for Link {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl Link {
-        pub const fn new() -> Self {
-            Self {
-                w: std::sync::Mutex::new(None),
-                gen: std::sync::atomic::AtomicU64::new(0),
-            }
-        }
-        fn slot(&self) -> std::sync::MutexGuard<'_, Option<(u64, crate::secure::Writer)>> {
-            self.w.lock().unwrap_or_else(|e| e.into_inner())
-        }
-        /// 新しい接続を据える。戻り値は世代(受信スレッドの終了時に clear_if へ渡す)
-        pub fn set(&self, s: crate::secure::Writer) -> u64 {
-            let g = self.gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            if let Some((_, old)) = self.slot().replace((g, s)) {
-                old.shutdown();
-            }
-            g
-        }
-        /// 接続を捨てる(本線の切断時など)。受信スレッドも読み出しエラーで終わる
-        pub fn clear(&self) {
-            if let Some((_, old)) = self.slot().take() {
-                old.shutdown();
-            }
-        }
-        /// 指定世代の接続がまだ据わっている時だけ捨てる
-        pub fn clear_if(&self, gen: u64) {
-            let mut g = self.slot();
-            if g.as_ref().is_some_and(|(n, _)| *n == gen) {
-                if let Some((_, old)) = g.take() {
-                    old.shutdown();
-                }
-            }
-        }
-        pub fn is_up(&self) -> bool {
-            self.slot().is_some()
-        }
-        /// 送信する。未接続ならエラー、書き込み失敗なら接続を捨ててエラー
-        pub fn send<T>(
-            &self,
-            f: impl FnOnce(&mut crate::secure::Writer) -> std::io::Result<T>,
-        ) -> std::io::Result<T> {
-            let mut g = self.slot();
-            let Some((_, s)) = g.as_mut() else {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotConnected,
-                    "bulk link down",
-                ));
-            };
-            let r = f(s);
-            if r.is_err() {
-                if let Some((_, old)) = g.take() {
-                    old.shutdown();
-                }
-            }
-            r
-        }
-    }
-
-    /// 経路ごとの設定(受信先・完了時の処理・ログ出力先)
-    pub struct Endpoint {
-        pub link: &'static Link,
-        pub token: String,
-        pub dir: PathBuf,
-        pub on_event: fn(Event),
-        pub log: fn(&str),
-    }
-
-    fn spawn_reader(ep: &'static Endpoint, s: crate::secure::Reader, gen: u64) {
-        std::thread::spawn(move || {
-            let mut r = std::io::BufReader::with_capacity(CHUNK + 16, s);
-            let mut rx = Receiver::new(&ep.dir);
-            let mut buf = Vec::new();
-            while let Ok(kind) = read_frame(&mut r, &mut buf) {
-                if let Some(e) = rx.feed(kind, &buf) {
-                    (ep.on_event)(e);
-                }
-            }
-            ep.link.clear_if(gen);
-            (ep.log)("[bulk] 受信経路が切れました");
-        });
-    }
-
-    /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす
-    pub fn serve(
-        ep: &'static Endpoint,
-        bind: &str,
-        port: u16,
-        allow: fn(std::net::IpAddr) -> bool,
-    ) {
-        let listener = match std::net::TcpListener::bind((bind, port)) {
-            Ok(l) => l,
-            Err(e) => {
-                (ep.log)(&format!(
-                    "[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可)"
-                ));
-                return;
-            }
-        };
-        (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
-        let mut throttle = crate::secure::FailThrottle::new();
-        for s in listener.incoming() {
-            let Ok(s) = s else { continue };
-            let Ok(peer) = s.peer_addr() else { continue };
-            if !allow(peer.ip()) {
-                (ep.log)(&format!("[bulk] rejected: {peer}"));
-                std::thread::sleep(throttle.fail());
-                continue;
-            }
-            let Ok(ctl) = s.try_clone() else { continue };
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            let (r, w) = match crate::secure::accept(s, &ep.token, LABEL) {
-                Ok(x) => x,
-                Err(e) => {
-                    (ep.log)(&format!("[bulk] handshake 失敗 ({peer}): {e}"));
-                    std::thread::sleep(throttle.fail());
-                    continue;
-                }
-            };
-            // 接続側は 10 秒毎にキープアライブを送る。3 回分届かなければ死んだ経路
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(35)))
-                .ok();
-            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20)))
-                .ok();
-            let gen = ep.link.set(w);
-            throttle.success();
-            (ep.log)(&format!("[bulk] established ({peer})"));
-            spawn_reader(ep, r, gen);
-        }
-    }
-
-    /// 接続側: 本線が繋がっている間、大容量経路が無ければ張り直し、キープアライブを送る。
-    /// 接続先は本線がいま使っている相手(複数経路のどれで繋がったか)に追従する
-    pub fn connect_loop(
-        ep: &'static Endpoint,
-        addr: impl Fn() -> Option<std::net::SocketAddr>,
-        main_up: fn() -> bool,
-    ) {
-        let mut last_keepalive = std::time::Instant::now();
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            if !main_up() {
-                ep.link.clear();
-                continue;
-            }
-            if ep.link.is_up() {
-                if last_keepalive.elapsed() >= std::time::Duration::from_secs(10) {
-                    last_keepalive = std::time::Instant::now();
-                    let _ = ep
-                        .link
-                        .send(|w| write_frame(w, KEEPALIVE, &[]).and_then(|_| w.flush()));
-                }
-                continue;
-            }
-            let Some(addr) = addr() else { continue };
-            let Ok(s) =
-                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
-            else {
-                continue;
-            };
-            let Ok(ctl) = s.try_clone() else { continue };
-            ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .ok();
-            let (r, w) = match crate::secure::connect(s, &ep.token, LABEL) {
-                Ok(x) => x,
-                Err(e) => {
-                    (ep.log)(&format!("[bulk] handshake 失敗: {e}"));
-                    continue;
-                }
-            };
-            ctl.set_read_timeout(None).ok();
-            ctl.set_write_timeout(Some(std::time::Duration::from_secs(20)))
-                .ok();
-            let gen = ep.link.set(w);
-            (ep.log)(&format!("[bulk] established (→{addr})"));
-            spawn_reader(ep, r, gen);
-        }
-    }
-}
-
-pub mod keymap {
-    /// Mac keycode(HIToolbox)→ Windows 仮想キーコード(VK)
-    pub fn mac_kc_to_win_vk(kc: u16) -> Option<u16> {
-        let vk = match kc {
-            // アルファベット(Mac keycode はレイアウト依存しない物理キー)
-            0 => 0x41,  // A
-            11 => 0x42, // B
-            8 => 0x43,  // C
-            2 => 0x44,  // D
-            14 => 0x45, // E
-            3 => 0x46,  // F
-            5 => 0x47,  // G
-            4 => 0x48,  // H
-            34 => 0x49, // I
-            38 => 0x4A, // J
-            40 => 0x4B, // K
-            37 => 0x4C, // L
-            46 => 0x4D, // M
-            45 => 0x4E, // N
-            31 => 0x4F, // O
-            35 => 0x50, // P
-            12 => 0x51, // Q
-            15 => 0x52, // R
-            1 => 0x53,  // S
-            17 => 0x54, // T
-            32 => 0x55, // U
-            9 => 0x56,  // V
-            13 => 0x57, // W
-            7 => 0x58,  // X
-            16 => 0x59, // Y
-            6 => 0x5A,  // Z
-            // 数字row
-            18 => 0x31, // 1
-            19 => 0x32,
-            20 => 0x33,
-            21 => 0x34,
-            23 => 0x35,
-            22 => 0x36,
-            26 => 0x37,
-            28 => 0x38,
-            25 => 0x39,
-            29 => 0x30, // 0
-            // 記号
-            33 => 0xDB, // [
-            30 => 0xDD, // ]
-            39 => 0xBA, // ;
-            41 => 0xDE, // '
-            42 => 0xDC, // \
-            43 => 0xBC, // ,
-            47 => 0xBE, // .
-            44 => 0xBF, // /
-            50 => 0xC0, // `
-            93 => 0xDC, // ¥(Mac JIS)→ Win バックスラッシュ/円記号
-            27 => 0xBD, // -(US)/ー(JIS 長音)→ Win -[OEM_MINUS]
-            94 => 0xBD, // _(Mac JIS)→ Win -
-            // 制御・編集
-            36 => 0x0D,  // Return
-            48 => 0x09,  // Tab
-            49 => 0x20,  // Space
-            51 => 0x08,  // Delete(Backspace)
-            53 => 0x1B,  // Escape
-            117 => 0x2E, // Forward Delete
-            115 => 0x24, // Home
-            119 => 0x23, // End
-            116 => 0x21, // PageUp
-            121 => 0x22, // PageDown
-            123 => 0x25, // Left
-            124 => 0x27, // Right
-            125 => 0x28, // Down
-            126 => 0x26, // Up
-            // Fキー
-            122 => 0x70, // F1
-            120 => 0x71, // F2
-            99 => 0x72,  // F3
-            118 => 0x73, // F4
-            96 => 0x74,  // F5
-            97 => 0x75,  // F6
-            98 => 0x76,  // F7
-            100 => 0x77, // F8
-            101 => 0x78, // F9
-            109 => 0x79, // F10
-            103 => 0x7A, // F11
-            111 => 0x7B, // F12
-            // テンキー
-            82 => 0x60, // Num0
-            83 => 0x61,
-            84 => 0x62,
-            85 => 0x63,
-            86 => 0x64,
-            87 => 0x65,
-            88 => 0x66,
-            89 => 0x67,
-            91 => 0x68,
-            92 => 0x69,  // Num9
-            65 => 0x6E,  // Num .
-            67 => 0x6A,  // Num *
-            69 => 0x6B,  // Num +
-            78 => 0x6D,  // Num -
-            75 => 0x6F,  // Num /
-            71 => 0x0C,  // Clear
-            76 => 0x0D,  // テンキー Enter(Win 側で拡張キーフラグを付けて区別する)
-            57 => 0x14,  // Caps Lock(Mac 側は押下ごとに down+up の組で送る)
-            114 => 0x2D, // Help(Mac の Ins 位置)→ Insert
-            // かな(104)/英数(102)はここを通らない: win 側の受信ループが先に
-            // 傍受して ime_set_open(IME 開閉)へ変換する
-            // F13〜F20(F13 は既定ホットキーのため通常は Mac 側で握られる)
-            105 => 0x7C,
-            107 => 0x7D,
-            113 => 0x7E,
-            106 => 0x7F,
-            64 => 0x80,
-            79 => 0x81,
-            80 => 0x82,
-            90 => 0x83,
-            _ => return None,
-        };
-        Some(vk)
-    }
-}
-
-pub mod charmap {
-    /// 送信テスト用: Mac keycode → 表示文字(英数字・記号のみ)
-    pub fn mac_kc_to_char(kc: u16) -> Option<char> {
-        let c = match kc {
-            0 => 'A',
-            11 => 'B',
-            8 => 'C',
-            2 => 'D',
-            14 => 'E',
-            3 => 'F',
-            5 => 'G',
-            4 => 'H',
-            34 => 'I',
-            38 => 'J',
-            40 => 'K',
-            37 => 'L',
-            46 => 'M',
-            45 => 'N',
-            31 => 'O',
-            35 => 'P',
-            12 => 'Q',
-            15 => 'R',
-            1 => 'S',
-            17 => 'T',
-            32 => 'U',
-            9 => 'V',
-            13 => 'W',
-            7 => 'X',
-            16 => 'Y',
-            6 => 'Z',
-            18 => '1',
-            19 => '2',
-            20 => '3',
-            21 => '4',
-            23 => '5',
-            22 => '6',
-            26 => '7',
-            28 => '8',
-            25 => '9',
-            29 => '0',
-            39 => ';',
-            41 => '\'',
-            43 => ',',
-            47 => '.',
-            44 => '/',
-            33 => '[',
-            30 => ']',
-            49 => ' ',
-            36 => '\n',
-            48 => '\t',
-            _ => return None,
-        };
-        Some(c)
-    }
-}
+pub mod envutil;
+pub mod proto;
+pub mod urlx;
+pub mod files;
+pub mod secure;
+pub mod net;
+pub mod discover;
+pub mod connect;
+pub mod bulk;
+pub mod keymap;
+pub mod charmap;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tablet_japanese_capability_keeps_old_android_apps_compatible() {
+        use crate::proto::Msg;
+        let legacy: Msg = serde_json::from_str(r#"{"t":"tablet_info","width_mm":285.0,"height_mm":190.0,"control":true,"keyboard":true}"#).unwrap();
+        assert!(matches!(legacy, Msg::TabletInfo { japanese: false, .. }));
+        let new = Msg::TabletInfo { width_mm: 285.0, height_mm: 190.0, control: true, keyboard: true, japanese: true };
+        let json = serde_json::to_string(&new).unwrap();
+        assert!(matches!(serde_json::from_str::<Msg>(&json).unwrap(), Msg::TabletInfo { japanese: true, .. }));
+    }
+    #[test]
+    fn peer_names_drop_invisible_and_direction_characters() {
+        assert_eq!(crate::proto::safe_peer_name("Re\u{200b}o\u{200e}'s\u{feff} PC\u{202e}"), "Reo's PC");
+        assert_eq!(crate::proto::safe_peer_name("普通の名前"), "普通の名前");
+    }
+
+    #[test]
+    fn bulk_frames_follow_the_local_share_scope() {
+        use crate::share::Scope;
+        use crate::bulk::*;
+        let clip_only = Scope { clip: true, files: false, audio: false };
+        let files_only = Scope { clip: false, files: true, audio: false };
+        // 画像はクリップボード、ファイル・ドラッグはファイルの範囲。KEEPALIVE は常に通す
+        assert!(frame_allowed(KEEPALIVE, false, Scope::INPUT_ONLY));
+        for k in [IMAGE_BEGIN, IMAGE_END] {
+            assert!(frame_allowed(k, true, clip_only));
+            assert!(!frame_allowed(k, true, files_only));
+        }
+        assert!(frame_allowed(DATA, true, clip_only) && !frame_allowed(DATA, true, files_only));
+        assert!(frame_allowed(DATA, false, files_only) && !frame_allowed(DATA, false, clip_only));
+        for k in [FILE_BEGIN, FILE_END, BATCH_END, DROP_BEGIN, DROP_END, DROP_ID_BEGIN] {
+            assert!(frame_allowed(k, false, files_only));
+            assert!(!frame_allowed(k, false, clip_only));
+            assert!(!frame_allowed(k, false, Scope::INPUT_ONLY));
+        }
+        assert!(frame_allowed(FILE_BEGIN, false, Scope::ALL));
+    }
+
     use super::keymap::mac_kc_to_win_vk;
     use super::proto::*;
 
@@ -1817,6 +86,7 @@ mod tests {
             y: 0,
             w: 1080,
             h: 1920,
+            name: String::new(),
         };
         let wire = encode(&Msg::Hello {
             ver: 13,
@@ -1871,7 +141,8 @@ mod tests {
             x: 0,
             y: 0,
             w: 1920,
-            h: 1080
+            h: 1080,
+            name: String::new()
         }])
         .contains("1920x1080"));
     }
@@ -1913,9 +184,12 @@ mod tests {
     #[test]
     fn received_file_names_are_neutralized() {
         use super::files::sanitize;
-        assert_eq!(sanitize("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize("../../etc/passwd"), ".._.._etc_passwd");
         assert_eq!(sanitize("a\\b:c.txt"), "a_b_c.txt");
-        assert_eq!(sanitize("  .hidden  "), "hidden");
+        // 先頭の '.' は隠しファイルに意味があるため残し、末尾の '.'・空白だけ整える
+        assert_eq!(sanitize("  .hidden  "), ".hidden");
+        assert_eq!(sanitize(".gitignore"), ".gitignore");
+        assert_eq!(sanitize("report.. "), "report");
         assert_eq!(sanitize("CON.txt"), "_CON.txt");
         assert_eq!(sanitize("com1"), "_com1");
         assert_eq!(sanitize("console.txt"), "console.txt");
@@ -1930,11 +204,11 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         std::fs::write(base.join("a.txt"), b"hello").unwrap();
         let a = base.join("a.txt").to_string_lossy().into_owned();
-        let k1 = key(&[a.clone()]);
-        let k2 = key(&[a.clone()]);
+        let k1 = key(std::slice::from_ref(&a));
+        let k2 = key(std::slice::from_ref(&a));
         assert_eq!(k1, k2, "同じ選択は同じ指紋");
-        std::fs::write(&base.join("a.txt"), b"hello world").unwrap();
-        assert_ne!(k1, key(&[a.clone()]), "内容が変われば指紋も変わる");
+        std::fs::write(base.join("a.txt"), b"hello world").unwrap();
+        assert_ne!(k1, key(std::slice::from_ref(&a)), "内容が変われば指紋も変わる");
         assert_eq!(
             key(&[a.clone(), a.clone()]).split('|').next(),
             key(&[a.clone(), a.clone()]).split('|').next(),
@@ -1946,8 +220,17 @@ mod tests {
     #[test]
     fn same_name_is_never_overwritten() {
         let dir = std::env::temp_dir().join(format!("knit-files-{}", std::process::id()));
-        let (_, a) = super::files::create_unique(&dir, "x.txt").unwrap();
-        let (_, b) = super::files::create_unique(&dir, "x.txt").unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        // 受信の流れと同じ形で: 一時ファイルに書き → 検疫属性 → 最終名へ公開
+        let (fa, ta) = super::files::create_temp(&dir).unwrap();
+        drop(fa);
+        std::fs::write(&ta, b"a").unwrap();
+        super::files::mark_untrusted(&ta);
+        let a = super::files::publish(&ta, &dir.join("x.txt")).unwrap();
+        let (fb, tb) = super::files::create_temp(&dir).unwrap();
+        drop(fb);
+        std::fs::write(&tb, b"b").unwrap();
+        let b = super::files::publish(&tb, &dir.join("x.txt")).unwrap();
         assert_ne!(a, b);
         assert!(b.to_string_lossy().ends_with("x (1).txt"));
         #[cfg(target_os = "macos")]
@@ -1977,7 +260,7 @@ mod tests {
         std::fs::write(src.join("a.txt"), b"hello").unwrap();
         let mut wire = Vec::new();
         let paths = vec![src.join("big.bin"), src.join("a.txt")];
-        assert_eq!(send_files(&mut wire, &paths, true).unwrap(), 2);
+        assert_eq!(send_files(&mut wire, &paths, true).unwrap().sent, 2);
         let dib: Vec<u8> = (0..(CHUNK + 7)).map(|i| (i % 13) as u8).collect();
         send_image(&mut wire, &dib).unwrap();
 
@@ -2011,13 +294,19 @@ mod tests {
         wire.extend_from_slice(&((MAX_FRAME as u32) + 1).to_le_bytes());
         assert!(read_frame(&mut std::io::Cursor::new(wire), &mut Vec::new()).is_err());
 
-        // 宣言サイズより多いデータを送られたらファイルごと破棄する
+        // 宣言サイズより多いデータを送られたらファイルごと破棄する(失敗として報告)
         let base = std::env::temp_dir().join(format!("knit-bulk-bad-{}", std::process::id()));
         let mut rx = Receiver::new(&base);
         rx.feed(FILE_BEGIN, br#"{"name":"x.bin","size":3}"#);
         rx.feed(DATA, b"toolong");
         rx.feed(FILE_END, &[]);
-        assert!(rx.feed(BATCH_END, &[]).is_none());
+        match rx.feed(BATCH_END, &[]) {
+            Some(Event::Files { paths, failed, .. }) => {
+                assert!(paths.is_empty());
+                assert_eq!(failed.len(), 1, "破棄したファイルを失敗として報告: {failed:?}");
+            }
+            _ => panic!("失敗の報告イベントが出るべき"),
+        }
         assert!(!base.join("x.bin").exists());
         let _ = std::fs::remove_dir_all(base);
     }
@@ -2067,7 +356,7 @@ mod tests {
         let src = base.join("source.bin");
         std::fs::write(&src, vec![5u8; CHUNK * 2]).unwrap();
         let mut wire = Vec::new();
-        let err = send_files_with_progress(&mut wire, &[src.clone()], false, |_, _| {
+        let err = send_files_with_progress(&mut wire, std::slice::from_ref(&src), false, |_, _| {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&src)
@@ -2228,7 +517,16 @@ mod tests {
             FILE_BEGIN,
             format!("{{\"name\":\"large.bin\",\"size\":{size}}}").as_bytes(),
         );
-        assert!(base.join("large.bin").exists());
+        assert!(
+            !base.join("large.bin").exists(),
+            "転送中は最終名を実体化しない(原子的配置)"
+        );
+        assert!(
+            std::fs::read_dir(&base)
+                .unwrap()
+                .any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".knit-")),
+            "一時ファイルへ書き込み中"
+        );
         rx.feed(DATA, b"partial");
         assert!(
             rx.feed(BATCH_END, &[]).is_none(),
@@ -2332,6 +630,43 @@ mod tests {
 
     /// 実ソケットでの結合確認: 待受・接続・認証・送信・受信・誤トークン拒否
     #[test]
+    fn bulk_keepalive_confirms_server_liveness_over_noise() {
+        use super::bulk::*;
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+        static LINK: Link = Link::new();
+        static ENDPOINT: std::sync::OnceLock<Endpoint> = std::sync::OnceLock::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = ENDPOINT.get_or_init(|| Endpoint {
+            link: &LINK, token: "bulk-heartbeat-test-key".into(),
+            dir: std::env::temp_dir().join(format!("knit-heartbeat-{}", std::process::id())),
+            on_event: |_| panic!("keepalive must not produce a file event"), log: |_| {},
+            on_rx_bytes: |_| {},
+        });
+        std::thread::spawn(move || serve(endpoint, "127.0.0.1", address.port(), |_| true));
+        let until = Instant::now() + Duration::from_secs(2);
+        let socket = loop {
+            match std::net::TcpStream::connect(address) {
+                Ok(socket) => break socket,
+                Err(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("server did not start: {error}"),
+            }
+        };
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let (mut reader, mut writer) = crate::secure::connect(socket, &endpoint.token, b"knit-bulk").unwrap();
+        for _ in 0..2 {
+            write_frame(&mut writer, KEEPALIVE, &[]).unwrap();
+            writer.flush().unwrap();
+            let mut payload = Vec::new();
+            assert_eq!(read_frame(&mut reader, &mut payload).unwrap(), KEEPALIVE);
+            assert!(payload.is_empty());
+        }
+        LINK.clear();
+    }
+
+    #[test]
     fn bulk_link_over_real_tcp() {
         use super::bulk::*;
         use std::sync::{Mutex, OnceLock};
@@ -2355,6 +690,7 @@ mod tests {
                 }
             },
             log: |_| {},
+            on_rx_bytes: |_| {},
         });
         let client = CLIENT.get_or_init(|| Endpoint {
             link: &CLIENT_LINK,
@@ -2362,6 +698,7 @@ mod tests {
             dir: base.join("cli"),
             on_event: |_| {},
             log: |_| {},
+            on_rx_bytes: |_| {},
         });
         std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true));
         static ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
@@ -2376,7 +713,7 @@ mod tests {
         let src = base.join("payload.bin");
         std::fs::write(&src, b"over-the-wire").unwrap();
         CLIENT_LINK
-            .send(|w| send_files(w, &[src.clone()], false))
+            .send(|w| send_files(w, std::slice::from_ref(&src), false))
             .unwrap();
         while GOT.lock().unwrap().is_empty() && t0.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2392,6 +729,63 @@ mod tests {
             .unwrap();
         assert!(crate::secure::connect(bad, "wrong", b"knit-bulk").is_err());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    /// 送信が slot のロックを握ったまま書き込みに詰まっていても、clear は
+    /// ロックを待たずに即座に戻り、切断が書き込み側へ伝わること(H5 の回帰)
+    #[test]
+    fn link_clear_cuts_a_blocked_send_without_waiting_for_the_slot_lock() {
+        use super::bulk::Link;
+        use crate::secure;
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        static LINK: Link = Link::new();
+        assert!(!LINK.is_up_fast(), "未接続の is_up_fast は偽");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // ハンドシェイクだけ完了させ、その後は読まない(書き込み側の
+        // ソケットバッファを溢れさせて書き込みを詰まらせる)
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let (_r, _w) = secure::accept(sock, "h5-test", b"knit-bulk").unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let socket = std::net::TcpStream::connect(addr).unwrap();
+        socket.set_write_timeout(None).unwrap();
+        let (_reader, writer) = secure::connect(socket, "h5-test", b"knit-bulk").unwrap();
+        LINK.set(writer);
+        assert!(LINK.is_up_fast(), "接続済みの is_up_fast は真");
+
+        let sender = {
+            // join に期限が無いと、shutdown がブロック中の書き込みを即座に失敗させない
+            // 環境でテストが固まり得るため、channel + recv_timeout で待つ
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(LINK.send(|w| {
+                    let chunk = vec![0u8; 64 * 1024];
+                    for _ in 0..4096 {
+                        w.write_all(&chunk)?;
+                        w.flush()?;
+                    }
+                    Ok(())
+                }));
+            });
+            rx
+        };
+        // 書き込みがバッファ上限に達して詰まるのを待つ
+        std::thread::sleep(Duration::from_millis(300));
+        let t0 = Instant::now();
+        LINK.clear();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "clear が送信のロック待ちで止まった: {elapsed:?}"
+        );
+        let result = sender
+            .recv_timeout(Duration::from_secs(10))
+            .expect("切断後も送信スレッドが終わらない");
+        assert!(result.is_err(), "切断後も書き込みが成功扱いになった");
     }
 
     #[test]
@@ -2475,17 +869,30 @@ mod tests {
 
     #[test]
     fn tailscale_range() {
-        use super::net::is_tailscale;
+        use super::net::{allowed, is_allowed, is_tailscale};
         assert!(is_tailscale("100.64.0.1".parse().unwrap()));
         assert!(is_tailscale("100.127.255.254".parse().unwrap()));
         assert!(!is_tailscale("100.128.0.1".parse().unwrap()));
         assert!(!is_tailscale("192.168.0.2".parse().unwrap()));
-        use super::net::is_allowed;
         assert!(is_allowed("169.254.10.2".parse().unwrap())); // 有線直結
         assert!(is_allowed("192.168.0.2".parse().unwrap()));
-        assert!(is_allowed("100.84.0.2".parse().unwrap()));
         assert!(is_allowed("fe80::1".parse().unwrap()));
         assert!(!is_allowed("8.8.8.8".parse().unwrap()));
+        // Tailscale は既定で拒否・許可時(KNIT_ALLOW_TS=1)のみ通す。
+        // 常時許可だと遠隔の Windows が勝手に再接続して境界に現れ、
+        // マウスが消えたように見える事故の原因になる
+        assert!(
+            !allowed("100.84.0.2".parse().unwrap(), false),
+            "既定では Tailscale を拒否"
+        );
+        assert!(
+            allowed("100.84.0.2".parse().unwrap(), true),
+            "許可時は通す"
+        );
+        // v4 mapped v6 も同じ判定に従う
+        let mapped: std::net::IpAddr = "::ffff:100.84.0.2".parse().unwrap();
+        assert!(!allowed(mapped, false));
+        assert!(allowed(mapped, true));
     }
 
     #[test]
@@ -2506,7 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn search_desk_messages_round_trip_for_cross_pc_apps() {
+    fn apps_messages_round_trip_for_cross_pc_apps() {
         assert!(matches!(
             decode(&encode(&Msg::AppsQuery)),
             Some(Msg::AppsQuery)

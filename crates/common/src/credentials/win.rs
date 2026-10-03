@@ -137,6 +137,15 @@ fn load_at(path: &std::path::Path) -> io::Result<Option<String>> {
 pub(super) fn save(token: &str) -> io::Result<()> {
     save_at(&path()?, token)
 }
+/// 登録の全初期化: 保護した接続キーのファイルを削除する。
+/// すでに無い(NotFound)は成功として扱う(冪等)
+pub(super) fn delete() -> io::Result<()> {
+    match std::fs::remove_file(path()?) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 fn save_at(destination: &std::path::Path, token: &str) -> io::Result<()> {
     if destination.exists() {
         return Err(io::Error::new(

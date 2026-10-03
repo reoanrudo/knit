@@ -21,7 +21,9 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
 struct Pending {
     id: u64,
-    files: Vec<PathBuf>,
+    /// 展開後の送信内容(フォルダは相対パス付きの中のファイルへ展開済み)。
+    /// 予告(DragOffer)と同じ内容を送るため、ここで確定させる
+    entries: Vec<bulk::OutFile>,
     sending: bool,
     ready: bool,
     committing: bool,
@@ -65,31 +67,52 @@ pub fn committed() -> bool {
 }
 
 pub fn accept(id: u64) {
-    let files = {
+    let entries = {
         let mut state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         let Some(p) = state.as_mut().filter(|p| p.id == id && !p.sending) else {
             return;
         };
         p.sending = true;
-        p.files.clone()
+        p.entries.clone()
     };
+    let total = bulk::entries_total(&entries);
+    let label = entries.first().map(|e| e.name.clone()).unwrap_or_default();
+    crate::begin_tx(id, total, &label);
     std::thread::spawn(move || {
-        let cancelled = || {
-            !PENDING
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .is_some_and(|p| p.id == id)
+        let mut cancelled = || {
+            // 予告の取り消し(ボタン解放・30秒経過・切断)または Esc での中止
+            knit_common::xfer::take(id)
+                || !PENDING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .is_some_and(|p| p.id == id)
         };
-        let result = crate::BULK_LINK.send(|w| bulk::send_drag_files(w, &files, id, cancelled));
+        let result = crate::BULK_LINK.send(|w| {
+            bulk::send_entries(
+                w,
+                &entries,
+                true,
+                Some(id),
+                &mut cancelled,
+                &mut |sent, total, name| crate::update_tx(id, sent, total, name),
+            )
+        });
+        crate::end_tx(id);
+        knit_common::xfer::discard(id);
         if let Err(error) = result {
             cancel(id);
             send(Msg::DragCancel { id });
             println!("[drag] win->mac transfer {id} failed: {error}");
-            if error.kind() != std::io::ErrorKind::Interrupted {
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                crate::tray::notify("Knit", "ファイル転送を中止しました");
+            } else {
                 crate::tray::notify(
                     "Knit",
-                    "Macへファイルを渡せませんでした。接続を確認してもう一度掴んでください",
+                    &format!(
+                        "Macへファイルを渡せませんでした({}。接続を確認してもう一度掴んでください)",
+                        bulk::send_error_label(&error)
+                    ),
                 );
             }
         }
@@ -146,6 +169,11 @@ unsafe fn data_files(data: *mut c_void) -> Option<Vec<PathBuf>> {
                     &name[..len as usize],
                 )));
             }
+        } else if n > knit_common::drag::MAX_FILES as u32 {
+            crate::tray::notify(
+                "Knit",
+                "掴んだまま渡せるのは 64 件までです(先にフォルダへまとめてから掴んでください)",
+            );
         }
     }
     ReleaseStgMedium((&mut medium as *mut StgMedium).cast());
@@ -221,22 +249,45 @@ unsafe extern "system" fn enter(
     if !allowed || keys & MK_LBUTTON == 0 || !enabled() {
         return S_OK;
     }
+    // 自分が回している DoDragDrop を自分の辺で受けると Mac へ DragOffer を
+    // 送り返す往復が起きるため、進行中の受けドラッグは他人のものだけにする
+    if DRAG_THREAD.load(Ordering::Relaxed) != 0 {
+        return S_OK;
+    }
+    // 保険: 渡されたデータが自前 DataSource(vtbl が同一)なら本物の
+    // Explorer 由来ではないので弾く
+    if !data.is_null() && std::ptr::eq(*(data as *const *const IDataObjectVtbl), &DATA_VTBL) {
+        return S_OK;
+    }
     if PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return S_OK;
     }
     let Some(files) = data_files(data) else {
         return S_OK;
     };
-    if files
-        .iter()
-        .any(|p| !p.is_file() || std::fs::File::open(p).is_err())
-        || bulk::total_size(&files) > bulk::MAX_TOTAL
-    {
-        crate::tray::notify("Knit", "通常のファイルを選んでください。フォルダ・読み取れない項目・転送上限を超える選択は渡せません");
-        return S_OK;
-    }
-    let total = bulk::total_size(&files);
-    let count = files.len();
+    // 相手の版が持つ機能(フォルダ=版 14 以降・空フォルダ=版 15 以降)は
+    // proto::peer_features に集約した判定を使う
+    let f = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
+    let entries = match bulk::collect(&files, true, f.dirs, f.empty_dirs) {
+        Ok(e) if !e.is_empty() => e,
+        Ok(_) => {
+            crate::tray::notify("Knit", "掴んだ項目の中に送れるものがありません");
+            return S_OK;
+        }
+        Err(e) => {
+            crate::tray::notify(
+                "Knit",
+                &format!(
+                    "渡せません({e})。1回は最大 {} 件・合計 {} まで、読み取れる項目のみです",
+                    knit_common::drag::MAX_BATCH_FILES,
+                    bulk::file_limit_label()
+                ),
+            );
+            return S_OK;
+        }
+    };
+    let total = bulk::entries_total(&entries);
+    let count = entries.len();
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let (x, y, w, h) = crate::vscreen();
     let position = if matches!(crate::SIDE_W.load(Ordering::Relaxed), 2 | 3) {
@@ -246,7 +297,7 @@ unsafe extern "system" fn enter(
     };
     *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending {
         id,
-        files,
+        entries,
         sending: false,
         ready: false,
         committing: false,
@@ -267,7 +318,7 @@ unsafe extern "system" fn enter(
         crate::tray::notify(
             "Knit",
             &format!(
-                "Macへ転送中です({})。境界で押したまま待つと、準備後にMacへ移ります",
+                "Macへ転送中です({})。境界で押したまま待つと、準備後にMacへ移ります(サイズによって数十秒以上かかることがあります)",
                 crate::human_bytes(total)
             ),
         );
@@ -275,6 +326,7 @@ unsafe extern "system" fn enter(
     *effect = DROPEFFECT_COPY;
     S_OK
 }
+
 unsafe extern "system" fn over(
     _this: *mut c_void,
     _keys: u32,
@@ -346,6 +398,9 @@ fn enabled() -> bool {
     PEER_VERSION.load(Ordering::Relaxed) >= 12
         && crate::CONNECTED.load(Ordering::Relaxed)
         && CONTROLLED.load(Ordering::Relaxed)
+        // ファイル共有が閉じているときは境界バンドの受信オファーを通さない
+        // (転送本体が共有範囲の検査で全フレーム捨てられ、押下の間ずっと無音になるため)
+        && knit_common::share::allow_files()
 }
 
 fn rect(side: u8, x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
@@ -361,7 +416,9 @@ fn rect(side: u8, x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if message == WM_TIMER {
         let down = crate::BTN_W[0].load(Ordering::Relaxed);
-        let show = enabled() && down && !committed();
+        // 自分のドラッグ中に帯を出すと自前 DataSource が自分の辺へ入る
+        // ため、進行中(DRAG_THREAD != 0)は表示しない
+        let show = enabled() && down && !committed() && DRAG_THREAD.load(Ordering::Relaxed) == 0;
         if show {
             let (x, y, w, h) = crate::vscreen();
             let (x, y, w, h) = rect(crate::SIDE_W.load(Ordering::Relaxed), x, y, w, h);
@@ -527,5 +584,48 @@ mod tests {
             OleUninitialize();
             assert_eq!(result, S_OK);
         }
+    }
+    #[test]
+    fn ignores_the_drag_we_are_carrying_ourselves() {
+        PEER_VERSION.store(12, Ordering::Relaxed);
+        crate::CONNECTED.store(true, Ordering::Relaxed);
+        CONTROLLED.store(true, Ordering::Relaxed);
+        unsafe {
+            let point = POINTL { x: 0, y: 0 };
+            let no_pending = || PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+            DRAG_THREAD.store(1, Ordering::Relaxed);
+            let mut effect = DROPEFFECT_COPY;
+            assert_eq!(
+                enter(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    MK_LBUTTON,
+                    point,
+                    &mut effect
+                ),
+                S_OK
+            );
+            assert_eq!(effect, DROPEFFECT_NONE);
+            assert!(no_pending(), "自分のドラッグをDragOfferへ繋がない");
+            DRAG_THREAD.store(0, Ordering::Relaxed);
+            // 保険: データが自前 DataSource でも DRAG_THREAD に関係なく弾く
+            let paths = vec![String::from(r"C:\test\自己ドラッグ.txt")];
+            let source = Box::into_raw(Box::new(DataSource {
+                vtbl: &DATA_VTBL,
+                paths,
+                refs: AtomicU32::new(1),
+            })) as *mut c_void;
+            let mut effect = DROPEFFECT_COPY;
+            assert_eq!(
+                enter(std::ptr::null_mut(), source, MK_LBUTTON, point, &mut effect),
+                S_OK
+            );
+            assert_eq!(effect, DROPEFFECT_NONE);
+            assert!(no_pending());
+            ds_release(source);
+        }
+        crate::CONNECTED.store(false, Ordering::Relaxed);
+        CONTROLLED.store(false, Ordering::Relaxed);
+        PEER_VERSION.store(0, Ordering::Relaxed);
     }
 }

@@ -23,6 +23,7 @@ unsafe extern "C" {
     fn SecRandomCopyBytes(random: CF, count: usize, bytes: *mut u8) -> i32;
     fn SecItemCopyMatching(query: CF, result: *mut CF) -> i32;
     fn SecItemAdd(query: CF, result: *mut CF) -> i32;
+    fn SecItemDelete(query: CF) -> i32;
     static kSecClass: CF;
     static kSecClassGenericPassword: CF;
     static kSecAttrService: CF;
@@ -115,6 +116,19 @@ fn load_at(service: &str) -> io::Result<Option<String>> {
 pub(super) fn save(token: &str) -> io::Result<()> {
     save_at(SERVICE, token)
 }
+/// 登録の全初期化: キーチェーンから接続キーを削除する。
+/// すでに無い(-25300 errSecItemNotFound)は成功として扱う(冪等)
+pub(super) fn delete() -> io::Result<()> {
+    unsafe {
+        let query = query(SERVICE)?;
+        let status = SecItemDelete(query.0);
+        if status == 0 || status == -25300 {
+            Ok(())
+        } else {
+            Err(error(status))
+        }
+    }
+}
 fn save_at(service: &str, token: &str) -> io::Result<()> {
     unsafe {
         let query = query(service)?;
@@ -139,10 +153,6 @@ fn save_at(service: &str, token: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[link(name = "Security", kind = "framework")]
-    unsafe extern "C" {
-        fn SecItemDelete(query: CF) -> i32;
-    }
     struct Cleanup(String);
     impl Drop for Cleanup {
         fn drop(&mut self) {
