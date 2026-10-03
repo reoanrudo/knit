@@ -1,0 +1,11 @@
+<resources>
+    <style name="KnitTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item><item name="android:colorAccent">#405FC6</item>
+        <item name="android:windowLightStatusBar">true</item><item name="android:statusBarColor">#F5F6FA</item>
+        <item name="android:navigationBarColor">#F5F6FA</item><item name="android:windowLightNavigationBar">true</item>
+    </style>
+    <string name="accessibility_description">登録したMacから、この端末のタップ・ドラッグ・スクロール・ピンチとホームなどの操作を行います。入力を中止するにはKnitの通知から停止してください。画面の文字を収集しません。</string>
+    <string name="ime_help">Macから入力 · Spaceで変換 · Enterで確定</string>
+    <string name="ime_paste">Macのコピーを貼り付け</string>
+    <string name="ime_switch">通常のキーボードに戻す</string>
+</resources>

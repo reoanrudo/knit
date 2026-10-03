@@ -1,0 +1,15 @@
+[package]
+name = "knit-android-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+knit-common = { path = "../common" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+sha2 = "0.10"

@@ -6,6 +6,7 @@
 // デザイン: インディゴの面に、二つの連続するリボン。
 // メニューバーのテンプレートアイコンは gui.rs が実行時に同モチーフで描画する
 #![allow(non_camel_case_types)]
+#![allow(clippy::duplicated_attributes)] // 複数フレームワークの #[link] 並記(実害なし)
 
 type CGContextRef = *mut core::ffi::c_void;
 type CGColorSpaceRef = *mut core::ffi::c_void;
@@ -196,7 +197,7 @@ fn rgba_to_png(data: &mut [u8], width: usize, height: usize) -> CGImageRef {
     unsafe {
         let space = CGColorSpaceCreateDeviceRGB();
         let ctx = CGBitmapContextCreate(
-            data.as_mut_ptr() as *mut u8,
+            data.as_mut_ptr(),
             width,
             height,
             8,

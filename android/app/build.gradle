@@ -1,0 +1,57 @@
+plugins { id 'com.android.application'; id 'com.google.protobuf' }
+android {
+    namespace 'app.knit'
+    compileSdk 36
+    ndkVersion '28.2.13676358'
+    defaultConfig {
+        applicationId 'app.knit'
+        minSdk 29
+        targetSdk 36
+        versionCode 2
+        versionName '0.1.1'
+        testInstrumentationRunner 'app.knit.SmokeTest'
+        ndk { abiFilters 'arm64-v8a' }
+
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    // 配布用の署名鍵は環境変数で渡す(リポジトリに置かない)。更新は同じ鍵で署名された APK にしか入らない
+    signingConfigs {
+        release {
+            def keystore = System.getenv('KNIT_ANDROID_KEYSTORE')
+            if (keystore) {
+                storeFile file(keystore)
+                storePassword System.getenv('KNIT_ANDROID_STORE_PASSWORD')
+                keyAlias System.getenv('KNIT_ANDROID_KEY_ALIAS') ?: 'knit'
+                keyPassword System.getenv('KNIT_ANDROID_KEY_PASSWORD') ?: System.getenv('KNIT_ANDROID_STORE_PASSWORD')
+            }
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (System.getenv('KNIT_ANDROID_KEYSTORE')) signingConfig signingConfigs.release
+        }
+    }
+    lint { abortOnError true }
+}
+protobuf {
+    protoc { artifact = 'com.google.protobuf:protoc:4.34.1' }
+    generateProtoTasks { all().configureEach { builtins { java { option 'lite' } } } }
+}
+dependencies {
+    implementation 'com.google.protobuf:protobuf-javalite:4.34.1'
+    testImplementation 'junit:junit:4.13.2'
+}
+// Prevent an apparently successful APK that cannot load its offline dictionary.
+def verifyJapaneseAssets = tasks.register('verifyJapaneseAssets') {
+    doLast {
+        def dictionary = file('src/main/assets/mozc.data')
+        def library = file('src/main/jniLibs/arm64-v8a/libmozc.so')
+        def revision = file('src/main/assets/mozc-revision.txt')
+        if (!dictionary.isFile() || dictionary.length() < 1024 * 1024 || !library.isFile() ||
+            !revision.isFile() || revision.text.trim() != 'a069a88d4cb5c011de0f9aebb6c149a1c808d904') {
+            throw new GradleException('日本語エンジンと辞書が未準備です。リポジトリの scripts/build-mozc-android.sh を実行してください。')
+        }
+    }
+}
+tasks.matching { it.name.startsWith('merge') && it.name.endsWith('Assets') }.configureEach { dependsOn verifyJapaneseAssets }

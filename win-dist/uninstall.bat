@@ -4,6 +4,7 @@ REM (トークン(.env)も含め %USERPROFILE%\knit 配下をすべて削除す�
 set DIR=%USERPROFILE%\knit
 
 echo [uninstall] 停止中...
+if exist "%DIR%\knit-win.exe" "%DIR%\knit-win.exe" --uninstall-input-helper
 for %%T in (knit knit_run knit_watch tsunagu tsunagu_run tsunagu_watch seamless_desk seamless_desk_run seamless_desk_watch) do (
   schtasks /End /TN %%T >nul 2>&1
   schtasks /Delete /TN %%T /F >nul 2>&1

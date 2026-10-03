@@ -44,10 +44,30 @@ jobs:
     needs: [macos, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
           path: dist-all
+      - name: 署名付き更新情報(update.json)を作る
+        # 署名鍵(Ed25519 の秘密鍵を16進で)はこのステップにだけ渡す。未登録なら update.json は作らない
+        env:
+          KNIT_UPDATE_SIGNING_KEY: ${{ secrets.KNIT_UPDATE_SIGNING_KEY }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KNIT_UPDATE_SIGNING_KEY}" ]; then echo '署名鍵が未登録のため update.json は作りません'; exit 0; fi
+          trap 'rm -f "$RUNNER_TEMP/update.key"' EXIT
+          VER="${TAG#v}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+          (umask 077; printf '%s' "$KNIT_UPDATE_SIGNING_KEY" > "$RUNNER_TEMP/update.key")
+          cargo run -q --locked -p knit-common --bin knit-sign -- manifest "$VER" stable \
+            "macos-arm64=dist-all/Knit-${VER}.zip=${BASE}/Knit-${VER}.zip" \
+            "windows-x64=dist-all/Knit-win-${VER}.zip=${BASE}/Knit-win-${VER}.zip" \
+            > dist-all/update.json
+          cargo run -q --locked -p knit-common --bin knit-sign -- sign "$RUNNER_TEMP/update.key" dist-all/update.json \
+            > dist-all/update.json.sig
       - uses: softprops/action-gh-release@v2
         with:
           files: dist-all/*

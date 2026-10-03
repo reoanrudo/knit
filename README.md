@@ -1,134 +1,89 @@
 # Knit
 
-**2台のPCを、1つのキーボードで。**
+**One keyboard and trackpad for your Mac and Windows PC.**
+**Macのキーボードとトラックパッドのまま、Windowsも操作。**
 
-> **Status: early stage (v0.26.0).** Core features work day-to-day on the
-> developer's machines, but this has not yet gone through the release
-> quality bar (first-time-user trials, long-run stability, high-DPI,
-> signed/verified installers). Binaries are unsigned — see
-> [the distribution guide](docs/distribution.md) for first-launch steps.
-> Feedback and issue reports are very welcome.
+Knit lets you move the cursor off the edge of your Mac screen and keep working on your Windows PC.
+Copy on one machine, paste on the other. Drag a file across the border. Hear Windows audio on your Mac.
+All traffic between your PCs stays on your local network, encrypted end to end. The only outbound
+connection is the optional update check against GitHub Releases (see the usage guide to disable it).
 
-**English summary** — Knit is an open-source input-sharing tool that lets
-you drive a Windows PC from your MacBook's keyboard and trackpad. Move the
-cursor to a screen edge to hop between machines; clipboard (text/images/
-files), file drag-over-border, clipboard history, and Windows audio
-follow automatically. All traffic is encrypted with the Noise protocol
-(mutual authentication via a shared secret that never crosses the wire);
-only LAN, direct-link, or Tailscale peers are accepted. Multiple Windows
-machines can be connected at once and switched from the menu-bar, and each
-machine's monitor layout is exchanged automatically. Rust, MIT license.
+Macの画面の端までカーソルを動かすと、そのままWindowsの画面へ移ります。コピーしたテキスト・画像・ファイルは
+もう1台でも貼り付けられ、Windowsの音はMacから出ます。PC間の通信はすべて暗号化され、家やオフィスのネットワークの外へは出ません
+(例外はアプリの更新確認だけで、GitHub Releases へ接続します。設定で止めることもできます)。
 
-MacBook のキーボード/トラックパッドで Windows デスクトップを操作する入力共有ツール。
-カーソルを画面の端へ動かすだけで相手の画面へ移り、Windows の音声まで Mac に集約される。
-2 台のコンピューターを 1 つの作業環境として「編み合わせる(knit)」ことから命名。
-v0.25 までの旧名は Knit（旧名 Tsunagu）。旧版とは接続できないため、両方の PC を入れ替えて登録し直す
-(Deskflow 等の既存ソフトとは無関係の独立開発。方式は画面端での切り替え式)。
+> **Status: early preview (v0.26.0).** Unsigned builds; some setups are not yet verified.
+> 開発中のプレビュー版です。署名なしの配布で、未検証の環境があります。
+> 不具合の報告を歓迎します: [Issues](https://github.com/reoanrudo/knit/issues)
 
-主な機能: 画面端での切替・Mac 流ショートカットの翻訳・クリップボード(テキスト/画像/ファイル、
-画面を移る時に同期)・クリップボード履歴(両 PC のコピーから選んで復元)・ファイルを掴んだまま
-境界越え・Windows の音を Mac で再生・複数台の同時接続と切替・モニター構成の自動交換・
-ターミナル/ゲーム向けの自動切替・画面ロック連動・全通信の暗号化。変更点は CHANGELOG を参照
+## できること / Features
 
-設計: [docs/design.md](docs/design.md) / 配布手順: [docs/distribution.md](docs/distribution.md) /
-変更履歴: [CHANGELOG.md](CHANGELOG.md) / セキュリティ: [SECURITY.md](SECURITY.md) /
-ライセンス: [LICENSE](LICENSE)(MIT)
+| | |
+|---|---|
+| 画面の端で切替 | Mac の位置に合わせて、Windows の置き場所(右・左・上・下)を選べる。複数台も切替可能 |
+| Mac のショートカットのまま | ⌘C / ⌘V などを Windows の Ctrl 操作へ自動で翻訳。かな/英数キーと入力言語も追従 |
+| コピー&ペースト | テキスト・画像・ファイルが両方向で通る。履歴から選んで復元もできる |
+| ファイルのドラッグ | 掴んだまま画面の境界を越えられる。**フォルダごと**も渡せる(展開後512ファイル・合計10GiBまで)。進捗表示・Escでの中止・内容ハッシュ検証つき |
+| 音声 | Windows の音を Mac で再生(音量は Mac の設定画面で調整)。接続中は Windows 側を自動でミュートし、切断で元に戻す(異常終了時も Windows 側の次回起動時に自動で戻す) |
+| 安全 | 相互認証 + Noise プロトコルで全通信を暗号化。受け付けるのは LAN・有線直結・Tailscale のみ |
+| 接続の安定 | スリープ復帰後も自動で再接続。断が 60 秒を超えたときだけ通知。安定性はログで実測できる([集計方法](scripts/stability-report.sh)) |
+| Android タブレット | 別の操作先として接続可能([案内](docs/android.md)) |
 
-## 構成
+## はじめる / Get started
 
-- **Mac = サーバ**(`knit-mac`): CGEventTap で入力をフックし TCP で転送。画面右端で切替。
-  **メニューバー常駐 GUI**(アイコン+状態・遅延ms表示・手動切替・切替方式/境界回数/音声/⌘キー/
-  スクロール方向トグル・Windowsへのファイル送信・Windows音量制御・ログ/再起動/終了)付き
-- **Windows = クライアント**(`knit-win`): 受信イベントを SendInput で注入。カーソル左端で復帰通知。
-  **タスクトレイ常駐+ステータスウィンドウ**(左クリックで状態/遅延/音声/ログ/終了)+
-  **毎分の自動復帰ウォッチ**付き。**Windowsの音をMacで再生**(WASAPIループバック→24901→AudioQueue)。
-  **ターミナル/コンソールから起動しても自動で独立プロセスに置き換わり、閉じても切れない**
-- 経路: TCP 24900(入力・制御)/ 24901(音声)/ 24902(ファイル・画像)、UDP 24903(LAN 自動発見)、TCP/UDP 24904(登録画面を開いている間だけ)。
-  **全経路を Noise プロトコルで暗号化**し、共有トークンから導いた鍵で相互認証する(トークンは回線に
-  流れない)。受け入れるのは LAN・有線直結・Tailscale のアドレスのみ
-- 接続方向は .env で選択可(既定: Mac=サーバ/Win=クライアント。逆方向も実機検証済み)
+1. **Mac と Windows の両方に Knit を入れる。** [Releases](https://github.com/reoanrudo/knit/releases) から
+   Mac 用と Windows 用の zip をダウンロードして展開。署名がないため初回だけ開き方に注意
+   ([配布手順](docs/distribution.md))。
+2. **Mac で Knit を起動する。** 初回は画面に6桁のコードが出ます(あとから出すには、設定「接続」の「端末を登録…」)。
+3. **Windows で Knit を起動する。** 同じネットワークの Mac を自動で見つけ、1台だけなら自動で確認を求めます。Mac に出る4桁の番号を、Windows の4つの候補から選び、Mac で「許可」を押します(打つ必要はありません。見つからないときは Mac の IP を入力。従来の6桁コードも使えます)。
+4. **Mac の案内に従い、アクセシビリティで Knit をオンにする。** オンにすると自動で次へ進みます。以上です。
 
-## アプリから初回接続する
+コードは5分で失効し、試行は3回までです。登録に成功すると両 PC のキーチェーン/保護領域に鍵が保存され、
+次からは自動で再接続します。詳細は [初回登録](docs/first-connection.md)。
 
-1. MacでKnitを起動し、「Windowsを登録」を選びます。
-2. WindowsでKnitを起動し、見つかったMacを選びます。見つからない場合はMacのIPを入力できます。
-3. Macの画面にある6桁コードをWindowsへ入力し、「登録する」を選びます。
-4. Macの登録画面を閉じ、案内に従ってアクセシビリティ権限を許可します。
+## 毎日の使い方
 
-コードは5分・最大3接続試行・成功1回まで有効です。短いコードでの認証にはSPAKE2を使い、暗号化した経路で長期キーを交換します。長いキーの手動受け渡しは不要です。
-長期キーはMacのキーチェーンとWindowsユーザー単位の保護ファイルに保存します。既存env設定を優先し、上書きしません。
-詳しい仕様・保存先・検証範囲は [初回登録](docs/first-connection.md) を参照してください。
+- **Mac → Windows:** カーソルを設定した端へ(既定は右端をダブルタップ)
+- **Windows → Mac:** Windows のカーソルを対向する端へ、または F13
+- **設定:** メニューバーの Knit から設定ウィンドウ(⌘,)。切替方式・スクロール・音声・共有を調整
 
-## 開発用セットアップ（既存env方式）
+全操作は [使い方ガイド](docs/usage.md)、困ったときは同ガイドの「うまく動かない時」を参照してください。
+つながらない・切れたときは、まずアプリ内の診断(Mac は「接続を診断…」、Windows は「接続診断」)が原因と対処を教えます。
 
-```bash
-# 1. 共有トークン生成(Mac で 1 回。~/.config/knit/env に保存される)
-./scripts/gen-token.sh
+## Barrier / Synergy から乗り換える
 
-# 2. Windows 側へ配布(.env に同じトークンが入り、スタートアップ登録+起動まで行う)
-./scripts/deploy-win.sh
+Barrier・Synergy・Input Leap のスリープ復帰・切断系の不満は Reddit や GitHub Issues で
+繰り返し報告されており、Knit は「登録は一度きり・以降は自動再接続」を設計の中心に置いています。
 
-# 3. Mac 側を起動(開発運用: ビルド→再起動。メニューバーに常駐する)
-./scripts/restart-mac.sh
+| よくある不満 | Knit の動き |
+|---|---|
+| スリープ復帰後に手動で再読込・再接続が必要 | 自動で再接続。断が 60 秒を超えたときだけ通知する |
+| 設定ファイルの手動編集(接続先・画面配置) | 登録は GUI で完結(自動発見 + 4桁確認 + 許可)。設定ファイル編集は不要 |
+| 接続先の IP 手入力 | 同じネットワークの相手を自動発見。見つからないときだけ IP 入力 |
+| 通信の暗号化が任意・不透明 | 相互認証 + Noise 暗号化が常時 |
+| macOS 更新で登録が消える・壊れる | 登録鍵はキーチェーンに保存され、更新後も再登録なしで動く |
 
-# 4. 自動検証
-./scripts/verify.sh
-```
+「より安定しています」という比較は、まだあなたの環境での実測を持っていません。
+断・再接続はログで実測できるため、あなたの環境での実測データの提供を歓迎します
+([集計方法](scripts/stability-report.sh))。
 
-初回のみ Mac 側でアクセシビリティ権限の許可が必要(システム設定 > プライバシーとセキュリティ > アクセシビリティ)。
-v0.7(旧 seamless-desk)からの乗り換えは上記をそのまま実行するだけでよく、
-旧タスク・旧自動起動は自動的に掃除され、トークン設定も引き継がれる。
+## 動作環境
 
-## 日常の操作
+- Mac: macOS(Apple Silicon)
+- Windows: 対話セッションのデスクトップ環境
+- 両 PC が同じ LAN、有線直結、または同じ Tailscale ネットワーク上にあること
 
-- **Mac→Windows**: カーソルを境界へ(既定は右端ダブルタップ。Windows の位置は変更可)
-- **Windows→Mac**: Windows のカーソルを対向する端へ、または F13 キー
-- **コピー&ペースト**: テキスト/画像/ファイルがそのまま双方向で通る。画面を移る瞬間に同期する
-  (Mac ⌘C → 切替 → Windows Ctrl+V、およびその逆。受信は各 PC の Downloads\Knit)
-- **音**: Windows の音は Mac から出る(接続中は Windows 側を自動ミュート)
-- **調整**: ほぼすべて設定ウィンドウ(⌘,)で完結 — Windows の位置・切替の条件
-  (ダブルタップ/滞在時間)・スクロールの速度と方向・⌘キーの割当・音声・
-  クリップボード共有。メニューからも主要トグルと Windows の音量操作が可能
+## 開発・貢献
 
-設定項目と env の全一覧は [docs/usage.md](docs/usage.md) へ。
+ビルド、テスト、配布物の作り方は [開発者向けガイド](docs/development.md)。
+変更履歴は [CHANGELOG](CHANGELOG.md)、セキュリティ報告は [SECURITY](SECURITY.md)、
+ライセンスは [MIT](LICENSE)。Rust 製。Deskflow など既存ソフトとは無関係の独立開発です。
 
-## アプリとしてのインストールと配布
+*旧名 Tsunagu(v0.25 まで)とは互換がありません。*
 
-公開用ZIPには開発者の設定・認証トークンを含めません。現状は6桁コードによる初回登録を備えた開発候補版です。商品化の品質基準と未達項目は [商品化計画](docs/product-readiness.md) を参照してください。
-
-
-```bash
-./scripts/package-mac.sh   # dist/Knit.app + zip を作成(設定・トークン非同梱)
-./scripts/install-mac.sh   # このMacへインストール(ログイン時自動起動の LaunchAgent 登録)
-./scripts/package-win.sh   # dist/Knit-win-<ver>.zip(設定・トークン非同梱)
-```
-
-Windows への新規配布は `win-dist/`(knit-win.exe・install.bat・run_knit.vbs/bat・.env)一式を
-コピーして install.bat を実行。詳細は [docs/distribution.md](docs/distribution.md)。
-
-## アンインストール
-
-- **Windows**: `win-dist/uninstall.bat` を実行(常駐・タスク登録を解除しファイルを削除)
-- **Mac**: `./scripts/uninstall-mac.sh` を実行(LaunchAgent を解除しアプリを削除)
-
-## ビルド
-
-```bash
-cargo build --release                                            # Mac 側
-cargo build --release -p knit-win --target x86_64-pc-windows-gnu   # Windows 側(クロス)
-cargo test                                                       # テスト(default-members)
-```
-
-## Windows 側の更新手順(開発時)
-
-```bash
-./scripts/deploy-win.sh   # ビルド→停止→配布(exe+起動資材+.env)→起動まで一括
-# ログ: ssh home "type C:\Users\<user>\knit\knit-win.log"
-```
-
-## 開発ノート
-
-- **AI/自動化で扱う場合**の必読事項(環境固有の罠・ワンコマンド): [docs/agent-guide.md](docs/agent-guide.md)
-
-- 第三者レビュー(Wave1 6視点 + Wave2 統合): [docs/reviews/](docs/reviews/wave2-integration.md)
-- 改善履歴: [docs/improvement-log.md](docs/improvement-log.md)
+- **両方の PC を同じ版の Knit へ。** 片側だけ入れ替えても接続できません(プロトコルが非互換です)。
+  もう1台の zip は [Releases](https://github.com/reoanrudo/knit/releases) から
+  (Mac 用 `Knit-<版>.zip` / Windows 用 `Knit-win-<版>.zip`)。アプリ内の
+  「アップデートを確認」は今後の版で有効になるため、それまでの更新は手動です
+- **設定とクリップボード履歴は初回起動時に自動で引き継がれます**(旧データも残ります)。
+  やり直しになるのは「端末の登録」と Mac のアクセシビリティ許可だけです

@@ -56,7 +56,7 @@ fn main() {
     std::fs::create_dir_all(&folder).unwrap();
     std::fs::write(folder.join("nested.txt"), b"inside folder").unwrap();
     let mut wire = Vec::new();
-    let count = bulk::send_files(&mut wire, &[folder], true).unwrap();
+    let count = bulk::send_files(&mut wire, &[folder], true).unwrap().sent;
     assert_eq!(count, 0);
     let mut reader = Cursor::new(wire);
     let mut buf = Vec::new();

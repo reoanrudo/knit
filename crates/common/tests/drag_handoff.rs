@@ -38,7 +38,7 @@ fn transfer_keeps_operation_id_separate_from_the_next_clipboard_batch() {
     let source = temp.0.join("資料.txt");
     std::fs::write(&source, b"drag content").unwrap();
     let mut wire = Vec::new();
-    bulk::send_drag_files(&mut wire, &[source.clone()], 42, || false).unwrap();
+    bulk::send_drag_files(&mut wire, std::slice::from_ref(&source), 42, || false).unwrap();
     bulk::send_files(&mut wire, &[source], false).unwrap();
     let mut receiver = bulk::Receiver::new(&temp.0.join("received"));
     let mut reader = Cursor::new(wire);
@@ -55,6 +55,7 @@ fn transfer_keeps_operation_id_separate_from_the_next_clipboard_batch() {
             paths,
             drop,
             drag_id,
+            ..
         } = event
         else {
             panic!("expected files")
@@ -100,7 +101,7 @@ fn disappearing_drag_file_fails_instead_of_waiting_forever_for_zero_files() {
     let source = temp.0.join("gone.txt");
     std::fs::write(&source, b"remove after preflight").unwrap();
     let calls = AtomicUsize::new(0);
-    let result = bulk::send_drag_files(&mut Vec::new(), &[source.clone()], 8, || {
+    let result = bulk::send_drag_files(&mut Vec::new(), std::slice::from_ref(&source), 8, || {
         if calls.fetch_add(1, Ordering::Relaxed) == 0 {
             std::fs::remove_file(&source).unwrap();
         }
