@@ -6,9 +6,11 @@ dist/
 win-dist/.env
 # 開発環境の私物(検証記録・エージェント状態。公開リポジトリには含めない)
 output/
+.agent/
 .omc/
 .zcode/
 __pycache__/
+.pytest_cache/
 # 開発者の2台運用専用スクリプト(公開リポジトリ外。ローカルにのみ置く)
 scripts/deploy-win.sh
 scripts/verify.sh
@@ -16,3 +18,11 @@ scripts/snap-win.bat
 scripts/check-mouse.sh
 scripts/restart-mac.sh
 scripts/dev.sh
+
+# Android build products and local SDK configuration
+android/.gradle/
+android/local.properties
+android/**/build/
+android/app/src/main/jniLibs/
+android/app/src/main/assets/mozc.data
+android/.mozc-cache/

@@ -108,11 +108,12 @@ fn encrypted_transfer_at_limit_then_another_batch() {
                 last_step = step;
             }
         })
-        .unwrap(),
+        .unwrap()
+        .sent,
         1
     );
     assert_eq!(last_step, 10);
-    assert_eq!(bulk::send_files(&mut writer, &[small], false).unwrap(), 1);
+    assert_eq!(bulk::send_files(&mut writer, &[small], false).unwrap().sent, 1);
     let mut ack = [0; 2];
     reader.read_exact(&mut ack).unwrap();
     assert_eq!(&ack, b"ok");

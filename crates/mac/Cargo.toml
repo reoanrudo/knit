@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 knit-common = { path = "../common" }
 serde_json = { workspace = true }
+png = { workspace = true }

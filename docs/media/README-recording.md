@@ -1,5 +1,19 @@
 # Knit 紹介動画の収録手順（開発者用メモ）
 
+## モーショングラフィックス版(実写なしで作れる紹介動画)
+
+`scripts/media/pr_video.py` が、実装済みの機能だけを描いた 42 秒の紹介動画
+(`docs/media/knit-pr.mp4`、1920x1080・30fps・無音・英語+日本語の字幕)を生成する。
+台本(場面・字幕・カーソルの動き)はスクリプト内の CAPTIONS と CUR にある。
+機能が増えたらここを直して作り直す。Android は「プレビュー」と明記している。
+
+```bash
+python3 scripts/media/pr_video.py                       # 動画を生成
+python3 scripts/media/pr_video.py /tmp/x.mp4 --stills   # 各場面の静止画だけ書き出して確認
+```
+
+以下は実写版の収録手順。
+
 ## 設計方針
 
 - 長さ: 約 25 秒（SNS は最初の 3 秒で掴む。GIF は無音前提）

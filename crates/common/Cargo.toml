@@ -10,3 +10,13 @@ serde_json = { workspace = true }
 snow = { version = "0.10", default-features = false, features = ["std", "default-resolver", "use-chacha20poly1305", "use-blake2", "use-curve25519", "use-getrandom"] }
 blake2 = "0.10"
 spake2 = "0.4.0"
+# 更新情報の署名検証(Ed25519)と成果物のハッシュ検査。curve25519-dalek は snow 経由で既に依存済み
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+sha2 = "0.10"
+# 承認方式の登録で使う鍵交換(X25519)。snow/ed25519-dalek 経由で既に依存済みの版
+curve25519-dalek = { version = "4", default-features = false }
+# 承認方式の一時鍵の乱数(Android を含む全 OS の OS 乱数)。snow 経由で既に依存済みの版
+getrandom = "0.2"
+# OS の TCP keepalive の設定(接続の安定化。NAT/ルータ越えのフロー維持)。
+# std には keepalive API が無いため socket2 を使う(軽量・tokio/mio と同系の土台)
+socket2 = { version = "0.5", default-features = false }

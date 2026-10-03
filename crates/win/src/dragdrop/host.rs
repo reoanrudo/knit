@@ -53,7 +53,7 @@ pub fn relay_up() {
 /// 操作モード離脱・切断。Esc を捕まえたOLEがキャンセル経路で終わる
 pub fn relay_cancel() {
     super::release_expected();
-    if unsafe { post_to_capture(WM_KEYDOWN, 0x1B as usize) } {
+    if unsafe { post_to_capture(WM_KEYDOWN, 0x1B_usize) } {
         println!("[drag] キャンセル(Esc)を OLE の捕捉窓へ中継");
     }
 }

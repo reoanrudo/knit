@@ -16,8 +16,10 @@
   ファイル・画像 TCP 24902(`common::bulk` のバイナリフレーム)/ LAN 自動発見 UDP 24903(`common::discover`)
 - **全 TCP 経路は `common::secure`(Noise NNpsk0)で包む**。平文で読み書きしない。
   `secure::Writer` は flush で送信されるため、書いたら必ず flush する
-- プロトコル: `crates/common/src/lib.rs` の `Msg`。`MIN_VERSION` 以上なら接続を受け入れ、
-  未知のメッセージは無視される。互換を壊す変更は MIN_VERSION も上げる(両側同時更新)
+- プロトコル: `crates/common/src/proto.rs` の `Msg`。`MIN_VERSION` 以上なら接続を受け入れ、
+  未知のメッセージは無視される。互換を壊す変更は MIN_VERSION も上げる(両側同時更新)。
+  `Msg` を追加するときは mac/win 両方の `session.rs` の受信 match に対称して処理を足す。
+  版ごとの機能差(フォルダ=14・空フォルダ=15 等)の判定は `proto::peer_features` に集約する
 - クリップボードは「画面を移る時」だけ同期する(Mac: enter_win_mode、Win: Leave 受信)。
   コピー毎に送る実装へ戻さない(大容量ファイルの無駄な転送・秘匿データ流出の原因)
 - 実機: ssh ホスト名 `home`(Windows)/ Tailscale(Mac 100.100.10.9, Win 100.84.0.2)
@@ -136,3 +138,23 @@
 - 配布手順: docs/distribution.md
 - 履歴: CHANGELOG.md / docs/improvement-log.md
 - 設計詳細: docs/design.md / レビュー: docs/reviews/
+
+## 開発・検証用の環境変数
+
+利用者向けの説明([usage.md](usage.md))から外した内部値。挙動の切り分けや検証にだけ使う。
+Mac は knit-mac の起動時、Windows は `.env` で指定する。
+
+| 変数 | 既定 | 説明 |
+|------|------|------|
+| `KNIT_TOKEN` | (必須) | 両側共通の秘密。暗号化の鍵の元になる。未設定だと起動しない(通常は初回登録が保存する) |
+| `KNIT_BIND` | 0.0.0.0 | Mac 側の待受アドレス。既定は全インターフェース(LAN 直を受け入れる) |
+| `KNIT_HOST` | (未設定) | Windows 側の接続先(フォールバック候補)。LAN 自動発見とは併用で、見つかった LAN IP が優先される |
+| `KNIT_ALLOW_TS` | 0 | Tailscale(100.x)での受け入れ・接続を許可。既定は LAN・有線直結のみ(外出先からの遠隔操作は行わない運用) |
+| `KNIT_ALLOW_ANY` | 0 | 全アドレスでの受け入れを許可(信頼できるネットワークでのみ) |
+| `KNIT_MOUSE_MODE` | abs | マウス転送方式。`abs`=絶対位置(Macの速度感をそのまま再現、画面比率も自動補正)/`rel`=従来の相対移動 |
+| `KNIT_EDGE_TAPS` | 2 | 境界到達回数。2=`KNIT_DOUBLE_TAP_MS` 以内に続けて 2 回当てた時だけ切替(誤爆防止)。1=1 回で切替。切替は境界そのもの(距離 0)でのみ発火するため判定幅の env は存在しない(旧 `KNIT_EDGE_PX` は廃止) |
+| `KNIT_CORNER_PX` | 0 | 四隅 N px 内では切替しない |
+| `KNIT_CTRL_APPS` | ターミナル系 | Windows 側。Mac の Control を Win キーではなく Ctrl として送るアプリ(実行ファイル名のカンマ区切り) |
+| `KNIT_GAME_MODE` | 1 | Windows 側。0 でゲームモード(カーソル閉じ込め時の相対移動への自動切替)を無効化 |
+| `KNIT_AUTO_UPDATE` | 1 | 0 で自動アップデート確認を止める |
+| `KNIT_UPDATE_URL` / `KNIT_UPDATE_PUBKEY` / `KNIT_UPDATE_START_MODE` | - | 自動更新の試験用。**デバッグビルドでのみ有効**([update-design.md](update-design.md)、`scripts/tests/update-e2e.sh`) |

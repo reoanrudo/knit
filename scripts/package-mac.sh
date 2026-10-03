@@ -25,17 +25,26 @@ app = pathlib.Path(sys.argv[1]); version = sys.argv[2]
 with (app / 'Contents/Info.plist').open('wb') as f:
     plistlib.dump(dict(CFBundleName='Knit', CFBundleDisplayName='Knit', CFBundleIdentifier='local.knit', CFBundleExecutable='Knit', CFBundlePackageType='APPL', CFBundleShortVersionString=version, CFBundleVersion=version, CFBundleIconFile='AppIcon', LSUIElement=True, NSHighResolutionCapable=True, NSSupportsAutomaticTermination=False, NSSupportsSuddenTermination=False), f)
 PY
-# 署名: 開発者証明書(KNIT_SIGN_IDENTITY)があれば Developer ID 署名
-# (hardened runtime)。無ければ従来どおりアドホック署名。
-# 公証(KNIT_NOTARY_PROFILE: 事前に xcrun notarytool store-credentials で
-# 登録したプロファイル)は Developer ID 署名時にだけ提出し、承認でステープルする。
-# 証明書が無い環境では両方スキップされ、このスクリプトは変わらず動く。
+# 署名: KNIT_SIGN_IDENTITY(または KNIT_SIGN_IDENTITY 未設定でも、
+# キーチェーンに Apple Development / Developer ID 証明書があれば自動で使う)。
+# 安定した署名者で署名すると、アプリを更新しても macOS のアクセシビリティ
+# 許可が維持される(アドホック署名は毎回別物扱いになり再許可が必要だった)。
+# 公証(KNIT_NOTARY_PROFILE)は Developer ID 署名時にだけ提出する
 SIGN_IDENTITY="${KNIT_SIGN_IDENTITY:-}"
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -1)
+fi
+if [ -z "$SIGN_IDENTITY" ]; then
+    SIGN_IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)
+fi
 NOTARY_PROFILE="${KNIT_NOTARY_PROFILE:-}"
 if [ -n "$SIGN_IDENTITY" ]; then
-    echo "[package-mac] Developer ID 署名(hardened runtime)..."
-    codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+    echo "[package-mac] コード署名: $SIGN_IDENTITY"
+    codesign --force --options runtime --sign "$SIGN_IDENTITY" "$APP"
 else
+    echo "[package-mac] 署名証明書がありません(アドホック署名。更新のたびに権限の再許可が必要)"
     codesign --force --sign - "$APP"
 fi
 codesign --verify --deep --strict "$APP"
