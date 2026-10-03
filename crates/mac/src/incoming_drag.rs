@@ -1,14 +1,16 @@
 //! Windowsで準備されたファイルを、Macの標準ドラッグとして引き継ぐ。
 use crate::*;
 use knit_common::drag::Incoming;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 static INCOMING: Mutex<Incoming> = Mutex::new(Incoming::new());
 static COMMIT: Mutex<Option<u64>> = Mutex::new(None);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static SOURCE_CLASS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
-static FINISHED: Mutex<Option<Active>> = Mutex::new(None);
+static FINISHED: Mutex<Vec<Active>> = Mutex::new(Vec::new());
+// 終了を要求してもAppKitの終了通知まではsourceを生かす。
+static RETIRED: Mutex<Vec<(Active, bool)>> = Mutex::new(Vec::new());
 struct Active {
     id: u64,
     window: usize,
@@ -35,15 +37,22 @@ unsafe extern "C" {
 
 fn delete_received(files: Vec<std::path::PathBuf>) {
     for path in files {
-        let _ = std::fs::remove_file(path);
+        // 受信した空フォルダ(版 15)はディレクトリとして届くため、ファイルの
+        // 削除に失敗したらフォルダ削除で保険する(bulk 切断時の片付けと同じ扱い)
+        if std::fs::remove_file(&path).is_err() {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 }
 
 pub fn offer(id: u64, count: usize, total: u64, position: f64) {
+    // 共有範囲(ファイル)が閉じているときは受信を即拒否する。オファーだけを通すと
+    // 転送本体が共有範囲のフレーム検査で全て捨てられ、押下の間ずっと無音の待ちになる
     let accepted = AVAILABLE.load(Ordering::Relaxed)
         && WIN_MODE.load(Ordering::Relaxed)
         && BTN_DOWN[0].load(Ordering::Relaxed)
         && !HOTKEY_ONLY.load(Ordering::Relaxed)
+        && knit_common::share::allow_files()
         && total <= bulk::MAX_TOTAL
         && INCOMING
             .lock()
@@ -98,14 +107,15 @@ pub fn reset() {
     *COMMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     delete_received(INCOMING.lock().unwrap_or_else(|e| e.into_inner()).reset());
     // 接続が切れたら進行中のセッションも終わらせ、境界切替の抑制を解く。
-    // (AppKitが ended を呼んでくる可能性も残るが、ACTIVE が空なら何もしない)
+    // AppKit操作はmainスレッドへ渡し、遅れる終了通知までsourceを保持する。
     if let Some(active) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        unsafe { hide_window(active.window) };
+        let id = active.id;
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((active, false));
         send_msg(&Msg::DragDone {
-            id: active.id,
+            id,
             copied: false,
         });
-        eprintln!("[drag] Mac drag {} ended(disconnect): recovered", active.id);
+        eprintln!("[drag] Mac drag {id} ended(disconnect): cleanup queued");
     }
 }
 
@@ -125,7 +135,11 @@ unsafe extern "C" fn ignore_modifiers(_this: ID, _sel: SEL, _session: ID) -> u8 
     1
 }
 unsafe extern "C" fn ended(_this: ID, _sel: SEL, _session: ID, _point: CGPoint, result: usize) {
-    if let Some(active) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    let active = {
+        let mut active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        if active.as_ref().is_some_and(|a| a.source == _this as usize) { active.take() } else { None }
+    };
+    if let Some(active) = active {
         unsafe { hide_window(active.window) };
         INCOMING
             .lock()
@@ -141,7 +155,14 @@ unsafe extern "C" fn ended(_this: ID, _sel: SEL, _session: ID, _point: CGPoint, 
             result & 1 != 0
         );
         // このコールバックを呼んでいるAppKitが戻ってからsourceを解放する。
-        *FINISHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(active);
+        FINISHED.lock().unwrap_or_else(|e| e.into_inner()).push(active);
+    } else {
+        // 古いセッションの通知は、新しいACTIVEを終了させない。
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(index) = retired.iter().position(|(a, _)| a.source == _this as usize) {
+            let (active, _) = retired.remove(index);
+            FINISHED.lock().unwrap_or_else(|e| e.into_inner()).push(active);
+        }
     }
 }
 
@@ -354,7 +375,22 @@ unsafe fn begin(id: u64, paths: &[std::path::PathBuf], probe: bool) -> bool {
 
 pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
     AVAILABLE.store(true, Ordering::Relaxed);
-    if let Some(finished) = FINISHED.lock().unwrap_or_else(|e| e.into_inner()).take() {
+    let hide = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut windows = Vec::new();
+        for (active, hidden) in retired.iter_mut() {
+            if !*hidden {
+                windows.push(active.window);
+                *hidden = true;
+            }
+        }
+        windows
+    };
+    // orderOutが終了通知を同期的に呼んでも、RETIREDを二重ロックしない。
+    for window in hide { hide_window(window); }
+    let finished = std::mem::take(&mut *FINISHED.lock().unwrap_or_else(|e| e.into_inner()));
+    for finished in finished {
+        hide_window(finished.window);
         msg0(finished.source as ID, sel_registerName(c"release".as_ptr()));
         msg0(finished.window as ID, sel_registerName(c"release".as_ptr()));
     }
@@ -370,19 +406,22 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
         })
     };
     if stale {
-        if let Some(active) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            unsafe { hide_window(active.window) };
+        let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(active) = active {
+            let (id, window) = (active.id, active.window);
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((active, true));
+            hide_window(window);
             INCOMING
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .cancel(active.id);
+                .cancel(id);
             send_msg(&Msg::DragDone {
-                id: active.id,
+                id,
                 copied: false,
             });
             eprintln!(
                 "[drag] Mac drag {} ended(stale): AppKitの終了通知が来ないため回収",
-                active.id
+                id
             );
         }
     }
@@ -398,6 +437,7 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
         .unwrap_or_else(|e| e.into_inner())
         .commit(id);
     let Some((paths, position)) = prepared else {
+        cancel(id);
         send_msg(&Msg::DragCancel { id });
         return;
     };
@@ -426,7 +466,29 @@ pub fn probe() {
             objc_getClass(c"NSApplication".as_ptr()),
             sel_registerName(c"sharedApplication".as_ptr()),
         );
-        assert!(begin(0, &[path.clone()], true));
+        assert!(begin(0, std::slice::from_ref(&path), true));
     });
     std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_keeps_native_resources_for_main_thread_cleanup() {
+        *ACTIVE.lock().unwrap() = Some(Active { id: 77, window: 0, source: 0, began_ms: 0 });
+        reset();
+        assert!(ACTIVE.lock().unwrap().is_none());
+        assert_eq!(RETIRED.lock().unwrap().len(), 1);
+        assert!(FINISHED.lock().unwrap().is_empty());
+        *ACTIVE.lock().unwrap() = Some(Active { id: 78, window: 0, source: 99, began_ms: 0 });
+        unsafe { ended(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), CGPoint { x: 0.0, y: 0.0 }, 0); }
+        assert_eq!(ACTIVE.lock().unwrap().as_ref().unwrap().id, 78);
+        assert!(RETIRED.lock().unwrap().is_empty());
+        let finished = std::mem::take(&mut *FINISHED.lock().unwrap());
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].id, 77);
+        ACTIVE.lock().unwrap().take();
+    }
 }

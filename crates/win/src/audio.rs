@@ -146,6 +146,9 @@ struct IAudioEndpointVolumeVtbl {
 
 /// トレイ/設定から ON/OFF できる(既定 ON)
 pub static AUDIO_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// 相手(Mac)が音声を再生する意思(Cfg.listen の鏡像。版 15 以降)。
+/// Mac 側で再生ミュート中は誰も聞いていないため、キャプチャ・送信を止める
+pub static LISTEN_MAC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[link(name = "winmm")]
 unsafe extern "system" {
@@ -304,6 +307,12 @@ unsafe fn capture_open() -> Result<Capture, String> {
         } else {
             2 // 不明: 整数側とみなす
         };
+        if bits != 16 && bits != 32 {
+            (cvt.base.Release)(client as *mut _);
+            (dvt.base.Release)(device);
+            (evt.base.Release)(enumerator);
+            return Err(format!("対応外のミックス形式({bits}bit)。16/32bit のみ対応"));
+        }
         let bytes_per_frame = channels * (bits / 8);
         // ループバック(再生音を取り込む)で初期化。バッファ指定は共有モードの
         // エンジン周期に近い 50ms を指定(低遅延: 大きいと取得側の滞留が増える)
@@ -518,6 +527,8 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
             "[audio] ストリーミング開始({}Hz s16/stereo)",
             cap.sample_rate
         );
+        // 音声線の生存をここから示す(本線切断時もミュートを維持する条件)
+        AUDIO_LINK_UP.store(true, Ordering::Relaxed);
         let dev_id = default_render_id();
         let mut last_dev_check = std::time::Instant::now();
         let mut sent_bytes: u64 = 0;
@@ -527,7 +538,8 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
             // 無効中もループは回し続ける: keepalive(下の None 分岐)だけは送る。
             // ここで continue すると keepalive も止まり、Mac 側の受信タイムアウト
             // (12 秒)で接続が切れて、トグルを戻した時に再接続待ちが発生する
-            let enabled = AUDIO_ENABLED.load(Ordering::Relaxed);
+            let enabled = AUDIO_ENABLED.load(Ordering::Relaxed)
+                && LISTEN_MAC.load(Ordering::Relaxed);
             // 8ms 間隔でポーリング(低遅延: WASAPI のエンジン周期 10ms に対し
             // 取得側の追加滞留を平均 4ms 程に抑える)
             std::thread::sleep(std::time::Duration::from_millis(8));
@@ -576,6 +588,9 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
                 println!("[audio] sent={}KB", sent_bytes / 1024);
             }
         }
+        // ストリーミング終了(切断・デバイス切替)。音声線はここで死んだことに
+        // なり、本線切断時のミュート解除(スピーカー復元)が有効になる
+        AUDIO_LINK_UP.store(false, Ordering::Relaxed);
         unsafe {
             ((*(*cap.client).lpVtbl).Stop)(cap.client as *mut _);
             // 開き直すたびに漏れないよう解放する
@@ -599,6 +614,10 @@ pub fn start(host: Option<String>, token: String, port: u16) {
 
 /// 音声転送が稼働している(=ミュート制御が意味を持つ)か
 pub static AUDIO_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 音声ストリーム(24901)が現在確立しているか。本線切断時のミュート判断に使う:
+/// 音声線が生きているのにミュートを解除すると、Mac から鳴っている音と
+/// 二重に発音するため(conn.rs の切断処理を参照)
+pub static AUDIO_LINK_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// ミュート適用前のユーザー設定と適用時のデバイス ID(切断時にその ID へ戻すため)。
 /// None=まだ記録していない
 static SPK_WAS_MUTED: std::sync::Mutex<Option<(bool, String)>> = std::sync::Mutex::new(None);
@@ -668,7 +687,25 @@ unsafe fn open_endpoint_volume(
 /// 接続確立時: ミュートモードが ON なら現在のミュート状態を記録してからミュートする。
 /// 音声転送が無効(AUDIO_ACTIVE=false)のときは何もしない(音がどこにも行かなくなるため)
 pub fn speaker_connect_mute(mode_on: bool) {
-    if !mode_on || !AUDIO_ACTIVE.load(Ordering::Relaxed) {
+    // 音声を共有しない端末では、相手の設定にかかわらず自分のスピーカーに触れない。
+    // 音声転送を OFF にしている場合も同様(OFF なのにミュートされると音がどこからも出ない)
+    if !mode_on
+        || !AUDIO_ACTIVE.load(Ordering::Relaxed)
+        || !AUDIO_ENABLED.load(Ordering::Relaxed)
+        || !knit_common::share::allow_audio()
+    {
+        return;
+    }
+    // 既に適用済みの場合は元状態を上書きしない: 本線切断でも音声線が生きて
+    // いる間はミュートを維持するため、その後の本線再接続でここを通る。
+    // 現在のミュート(true)を「元の状態」と記録し直すと、最終復元で
+    // ミュートされたままになる
+    if SPK_WAS_MUTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        println!("[spk] ミュート適用済みのため、退避記録をそのまま保持します");
         return;
     }
     unsafe {
@@ -683,13 +720,22 @@ pub fn speaker_connect_mute(mode_on: bool) {
         let mut now: i32 = 0;
         let got = (vt.GetMute)(vol as *mut core::ffi::c_void, &mut now);
         if got >= 0 {
-            let _ = SPK_WAS_MUTED
-                .lock()
-                .map(|mut g| *g = Some((now != 0, dev_id.unwrap_or_default())));
+            // ポイズン時も諦めない(リポジトリ標準の回復パターン。ミュートの
+            // 復元漏れは「切断しても音が出ない」形で残るため)
+            *SPK_WAS_MUTED.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((now != 0, dev_id.clone().unwrap_or_default()));
             let hr = (vt.SetMute)(vol as *mut core::ffi::c_void, 1, std::ptr::null());
             println!("[spk] 接続中ミュートを適用 (was_muted={})", now != 0);
-            if hr < 0 {
-                println!("[spk] SetMute 失敗 hr={hr:08x}");
+            // 異常終了(強制終了・電源断)に備えて、元状態をディスクへも退避する。
+            // 次回起動時に残留ミュートとして検知・復元する(main の起動処理)
+            if hr >= 0 {
+                if let Err(e) =
+                    knit_common::spkstate::save(now != 0, dev_id.as_deref().unwrap_or(""))
+                {
+                    println!("[spk] 退避記録の書き込みに失敗: {e}(異常終了時は復元できません)");
+                }
+            } else {
+                println!("[spk] SetMute 失敗 hr={hr:08x}(退避記録は書きません)");
             }
         } else {
             println!("[spk] GetMute 失敗 hr={got:08x}");
@@ -700,11 +746,14 @@ pub fn speaker_connect_mute(mode_on: bool) {
 
 /// 切断時: ミュートを適用した際の元状態へ戻す(元がミュートでなければ鳴らす)
 pub fn speaker_disconnect() {
-    let was = SPK_WAS_MUTED.lock().ok().and_then(|g| g.clone());
+    let was = SPK_WAS_MUTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let Some((was_muted, dev_id)) = was else {
         return;
     }; // ミュートを適用していない
-    let _ = SPK_WAS_MUTED.lock().map(|mut g| *g = None);
+    *SPK_WAS_MUTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     unsafe {
         // まずミュートしたデバイスそのものへ戻す。デバイスが消えていれば既定へ
         // フォールバックする(その場合の復元先は変わるが、触らないより良い)
@@ -733,7 +782,56 @@ pub fn speaker_disconnect() {
         );
         println!("[spk] 切断。ミュートを元へ戻しました (muted={was_muted})");
         if hr < 0 {
-            println!("[spk] SetMute(復元) 失敗 hr={hr:08x}");
+            // 復元に失敗したときは退避記録を残す: 次回起動時の復元処理で再試行する
+            println!("[spk] SetMute(復元) 失敗 hr={hr:08x}(次回起動時に再試行します)");
+        } else {
+            knit_common::spkstate::clear();
+        }
+        (vt.base.Release)(vol as *mut core::ffi::c_void);
+    }
+}
+
+/// 起動時: 前回異常終了(強制終了・電源断)で残ったミュートを検知して復元する。
+/// 退避記録が無ければ何もしない。main の起動シーケンスから接続開始前に呼ぶ
+pub fn speaker_restore_leftover() {
+    let Some(rec) = knit_common::spkstate::load() else {
+        return;
+    };
+    println!(
+        "[spk] 前回の異常終了時にミュートが残っています(元の状態: {})。復元します",
+        if rec.was_muted { "ミュート" } else { "鳴る" }
+    );
+    unsafe {
+        // ミュートしたデバイスそのものへ戻す。消えていれば既定へフォールバック
+        let vol = match open_endpoint_volume(if rec.dev_id.is_empty() {
+            None
+        } else {
+            Some(&rec.dev_id)
+        }) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[spk] 復元先デバイスが取れません({e})。既定デバイスで試みます");
+                match open_endpoint_volume(None) {
+                    Ok(v) => v,
+                    Err(e2) => {
+                        // 記録は残す: デバイスが戻れば次回起動で再試行できる
+                        println!("[spk] 起動時のミュート復元に失敗: {e2}(次回起動で再試行)");
+                        return;
+                    }
+                }
+            }
+        };
+        let vt = &*(*vol).lpVtbl;
+        let hr = (vt.SetMute)(
+            vol as *mut core::ffi::c_void,
+            rec.was_muted as i32,
+            std::ptr::null(),
+        );
+        if hr >= 0 {
+            println!("[spk] 残留ミュートを復元しました (muted={})", rec.was_muted);
+            knit_common::spkstate::clear();
+        } else {
+            println!("[spk] 起動時復元の SetMute 失敗 hr={hr:08x}(次回起動で再試行)");
         }
         (vt.base.Release)(vol as *mut core::ffi::c_void);
     }

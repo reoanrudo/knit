@@ -36,6 +36,7 @@ REM (誤設定の受信許可は上の移行ブロックで削除済み)
 
 REM startup on logon (interactive session = required for SendInput)
 schtasks /Create /TN knit /TR "wscript.exe \"%DIR%\run_knit.vbs\"" /SC ONLOGON /F >nul 2>&1
+set TASK_KNIT=%errorlevel%
 
 REM one-shot task for immediate/restart (run via: schtasks /Run /TN knit_run)
 schtasks /Create /TN knit_run /TR "wscript.exe \"%DIR%\run_knit.vbs\"" /SC ONCE /ST 23:59 /F >nul 2>&1
@@ -45,6 +46,11 @@ REM 二重起動防止(名前付きミューテックス)が即終了する=落�
 REM コンソール付きで起動してしまった場合も exe 自身が DETACHED プロセスへ
 REM 置き換わるため、ターミナルを閉じても接続は維持される
 schtasks /Create /TN knit_watch /TR "wscript.exe \"%DIR%\run_knit.vbs\"" /SC MINUTE /MO 1 /F >nul 2>&1
+set TASK_WATCH=%errorlevel%
+
+REM 操作補助(UAC の確認画面・管理者権限のアプリを Mac から操作するための SYSTEM 常駐)。
+REM 管理者として実行した時だけ導入する(失敗しても本体の導入は止めない)
+"%DIR%\knit-win.exe" --install-input-helper
 
 REM kill old instance and start fresh
 taskkill /IM knit-win.exe /F >nul 2>&1
@@ -53,7 +59,13 @@ schtasks /Run /TN knit_run
 REM 初回導入だけは登録画面を開く。自動復帰からは繰り返し表示しない。
 start "" "%DIR%\knit-win.exe" --retry-setup
 if not exist %DIR%\.env (
-  echo SETUP: KnitでMacを選び、表示された6桁コードを入力してください
+  echo SETUP: Open Knit, select your Mac, choose the 4-digit number shown on the Mac, then approve it.
 ) else (
   echo INSTALL_DONE
 )
+REM Startup/auto-recovery task registration must not fail silently: show how to fix it.
+if "%TASK_KNIT%"=="0" if "%TASK_WATCH%"=="0" goto tasks_ok
+echo SETUP_WARNING: Startup task registration failed ^(knit / knit_watch^).
+echo Right-click install.bat and choose "Run as administrator", then run it again.
+pause
+:tasks_ok

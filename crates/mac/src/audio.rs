@@ -4,11 +4,28 @@
 // 止まる問題を音声で再現しないため(レビュー Wave1 H3 と同じ設計判断)
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// メニューからのミュート(受信は続くが再生しない)
 pub static MUTED: AtomicBool = AtomicBool::new(false);
+/// Windows 音声の再生ゲイン(受信サンプルへ掛ける倍率。1.0=等倍)。
+/// f32 を atomic で保持するためビット列で持つ(0x3F800000 = 1.0f32)。
+/// Mac の音量キーは Windows 操作中は Windows 側へ転送され、エンドポイント音量は
+/// Windows のループバック取り出し点に効かない環境があるため、Knit 内で完結する
+/// 音量調整として設定画面のスライダから変更する
+static GAIN_BITS: AtomicU32 = AtomicU32::new(0x3F80_0000);
+
+/// 現在の再生ゲイン
+pub fn gain() -> f32 {
+    f32::from_bits(GAIN_BITS.load(Ordering::Relaxed))
+}
+
+/// 再生ゲインを設定する(0.0..=2.0 の範囲に丸める)
+pub fn set_gain(v: f64) {
+    let g = if v.is_finite() { (v as f32).clamp(0.0, 2.0) } else { 1.0 };
+    GAIN_BITS.store(g.to_bits(), Ordering::Relaxed);
+}
 /// 診断カウンタ(受信/再生バイト数)。10秒毎にログへ出す
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -16,22 +33,30 @@ static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
 /// 溢れたら古い方を捨てる。実効的な滞留は aq_callback の 2 段階クリップで
 /// 「目標 ≈83ms・上限 333ms」に保つ(下記定数参照)
 static RING: Mutex<std::collections::VecDeque<u8>> = Mutex::new(std::collections::VecDeque::new());
-const RING_CAP: usize = 192 * 1024;
-/// プリロール量(48kHz f32/stereo で ≈83ms)。ストリーム開始/ミュート明けに
+/// 第2レーン(Android タブレットの中継)。Windows 経路(ネットワーク)と
+/// 同時に届くため、再生コールバックでサンプル単位に加算して「全部の音を重ねる」。
+/// プリロールとドレインのみ持ち、高品質な位相追い込みは第1レーン側に任せる
+static RING_B: Mutex<std::collections::VecDeque<u8>> = Mutex::new(std::collections::VecDeque::new());
+static PRIMED_B: AtomicBool = AtomicBool::new(false);
+/// 滞留の上限(≈125ms)。溢れたら古い方を捨てる(遅延をこれ以上溜めない)
+const RING_CAP: usize = 48 * 1024;
+/// プリロール量(48kHz f32/stereo で ≈42ms)。ストリーム開始/ミュート明けに
 /// これだけ溜まるまで再生を始めない。ネットワークの到着むら(バースト)を
-/// このクッションで吸収し、RING 空による断続音(モールス音)を防ぐ
-/// = 全ストリーミング再生の定番構成(遅延はこの分だけ一定に乗る)
-const RING_PRE_ROLL: usize = 32 * 1024;
+/// このクッションで吸収し、RING 空による断続音(モールス音)を防ぐ。
+/// 低遅延を優先して 42ms とする(旧 83ms は体感の遅延が大きかった)
+const RING_PRE_ROLL: usize = 16 * 1024;
+/// プリロール量(再生開始までの溜め)。接続先の種別によらず同じ値を使う
+static PRE_ROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(RING_PRE_ROLL);
 /// プリロール完了状態(開始/ミュート明けごとにやり直す)
 static PRIMED: AtomicBool = AtomicBool::new(false);
-/// ソフト追い込みの目標滞留(≈83ms=プリロール量と同値)。これを超えたら
+/// ソフト追い込みの目標滞留(≈42ms=プリロール量と同値)。これを超えたら
 /// 毎回「超過分の 1/32」だけ捨て、指数的に目標へ戻す。
 /// 1 回あたりのドロップが数サンプル〜数ms 程度に収まるため、
 /// まとめ捨て(位相ジャンプ=プツプツ音)にならない
-const RING_SOFT_TARGET: usize = 32 * 1024;
-/// 緊急クリップの上限(≈333ms)。大バースト(再接続直後等)で一気に溜まった
+const RING_SOFT_TARGET: usize = 16 * 1024;
+/// 緊急クリップの上限(≈166ms)。大バースト(再接続直後等)で一気に溜まった
 /// 場合だけ目標値まで一括で捨てる(恒常的には発動しない)
-const RING_HARD_CLIP: usize = 128 * 1024;
+const RING_HARD_CLIP: usize = 64 * 1024;
 
 type AudioQueueRef = *mut core::ffi::c_void;
 type AudioQueueBufferRef = *mut AudioQueueBuffer;
@@ -110,6 +135,10 @@ static AQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(
 static AQ_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn ensure_playback(rate: u32) {
+    // 生成経路を直列化する(2 スレッドが同時に通ると片方の AudioQueue が漏えいし
+    // リングを二重消費する)。レート変更での作り直しは従来どおり許す
+    static AQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = AQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if AQ.load(Ordering::Relaxed) != 0 && AQ_RATE.load(Ordering::Relaxed) == rate {
         return;
     }
@@ -168,15 +197,20 @@ unsafe extern "C" fn aq_callback(
             // 溜まりきる前に鳴らし始めると供給の到着むらがそのまま音切れに
             // なる(断続音=モールス音の原因)
             if !PRIMED.load(Ordering::Relaxed) {
-                if ring.len() < RING_PRE_ROLL {
+                let pre_roll = PRE_ROLL.load(Ordering::Relaxed);
+                // 第1レーン(ネットワーク)にまだデータが無い場合は素通りする:
+                // ここで return すると第2レーン(タブレット)の音まで止まってしまう
+                if !ring.is_empty() && ring.len() < pre_roll {
                     std::ptr::write_bytes(dst, 0, cap);
                     (*buffer).mAudioDataByteSize = cap as u32;
                     PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);
                     AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
                     return;
                 }
-                PRIMED.store(true, Ordering::Relaxed);
-                phase_store(0.0); // 在庫が新鮮なため位相もリセット
+                if !ring.is_empty() {
+                    PRIMED.store(true, Ordering::Relaxed);
+                    phase_store(0.0); // 在庫が新鮮なため位相もリセット
+                }
             }
             // 緊急クリップ(大バーストのみ): 8 バイト(f32×2ch=1フレーム)境界で
             // 一括間引き。超過は通常この経路を通らず、通った量は diag で見える
@@ -283,6 +317,59 @@ unsafe extern "C" fn aq_callback(
                 filled = take;
             }
         }
+        // 第2レーン(Android タブレット)を加算して「全部の音を重ねる」。
+        // 同じ 48kHz のためサンプル位置は 1:1 で足せる。加算はソフト飽和付き。
+        // 重要: 加算の前に未書き込み領域をゼロクリアする。バッファには前回の
+        // 内容が残っており、そのまま足すと「前回の音+今回の音」が混ざって
+        // 不連続な波形(音割れ)になる
+        if !MUTED.load(Ordering::Relaxed) {
+            let mut rb = RING_B.lock().unwrap_or_else(|e| e.into_inner());
+            if filled < cap {
+                std::ptr::write_bytes(dst.add(filled), 0, cap - filled);
+            }
+            if !rb.is_empty() {
+                if !PRIMED_B.load(Ordering::Relaxed)
+                    && rb.len() >= RING_PRE_ROLL {
+                        PRIMED_B.store(true, Ordering::Relaxed);
+                    }
+                if PRIMED_B.load(Ordering::Relaxed) {
+                    // 超過分を 1/32 ずつ捨てて目標滞留へ戻す(荒いが第2レーン限定)
+                    const SOFT_B: usize = RING_PRE_ROLL + 2048;
+                    if rb.len() > SOFT_B {
+                        let excess = ((rb.len() - RING_PRE_ROLL) / 32) & !7usize;
+                        let n = excess.min(rb.len());
+                        DROP_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                        rb.drain(..n);
+                    }
+                    let take = (rb.len().min(cap)) & !3usize;
+                    let dst_f = dst as *mut f32;
+                    for i in 0..take / 4 {
+                        let s = f32::from_le_bytes([
+                            rb[i * 4],
+                            rb[i * 4 + 1],
+                            rb[i * 4 + 2],
+                            rb[i * 4 + 3],
+                        ]);
+                        let cur = dst_f.add(i).read();
+                        // ソフト飽和: 0.7 までは素通し、超えた分は滑らかに抑える。
+                        // 単純な clamp は波形を平らに切って強い歪み(音割れ)になる
+                        let sum = cur + s;
+                        let out = if sum > 0.7 {
+                            0.7 + (sum - 0.7) / (1.0 + (sum - 0.7) * 4.0) * 0.3
+                        } else if sum < -0.7 {
+                            -0.7 - (-sum - 0.7) / (1.0 + (-sum - 0.7) * 4.0) * 0.3
+                        } else {
+                            sum
+                        };
+                        dst_f.add(i).write(out);
+                    }
+                    rb.drain(..take);
+                    if take > filled {
+                        filled = take;
+                    }
+                }
+            }
+        }
         // 残りは無音のまま(バッファは前回の内容が残るため明示的にゼロクリア)
         if filled < cap {
             std::ptr::write_bytes(dst.add(filled), 0, cap - filled);
@@ -359,6 +446,12 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
 pub fn start(token: String, port: u16) {
     std::thread::spawn(move || {
         use std::io::{BufRead, Read, Write};
+        // 再生音量の初期値(.env で指定可。設定画面のスライダと同じ範囲)
+        if let Some(v) = crate::envutil::get("KNIT_AUDIO_GAIN").and_then(|v| v.parse::<f64>().ok())
+        {
+            set_gain(v);
+            eprintln!("[audio] KNIT_AUDIO_GAIN={} を適用しました", gain());
+        }
         let bind_ip = crate::envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
         let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
             Ok(l) => l,
@@ -407,7 +500,7 @@ pub fn start(token: String, port: u16) {
                 std::thread::sleep(throttle.fail());
                 continue;
             }
-            let parts: Vec<&str> = line.trim().split_whitespace().collect();
+            let parts: Vec<&str> = line.split_whitespace().collect();
             let s16 = parts.len() == 3 && parts[0] == "SDAUDIO3" && parts[2] == "s16";
             if !s16 {
                 eprintln!("[audio] invalid handshake");
@@ -428,6 +521,8 @@ pub fn start(token: String, port: u16) {
                 continue;
             }
             throttle.success();
+            // ネットワーク経路も低遅延優先(全経路で ≈42ms のプリロール)
+            PRE_ROLL.store(16 * 1024, Ordering::Relaxed);
             ensure_playback(rate);
             RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
             PRIMED.store(false, Ordering::Relaxed);
@@ -456,11 +551,16 @@ pub fn start(token: String, port: u16) {
                     break;
                 }
                 if s16 {
-                    // 再生リングは f32 のまま(補間・追い込み処理を共通にする)
+                    // 再生リングは f32 のまま(補間・追い込み処理を共通にする)。
+                    // 受信スレッドでゲインを掛ける(設定スライダの音量反映)。
+                    // 振り切れは clamp で防ぐ(第2レーンの加算と同じ保護)
+                    let g = gain();
                     frame = frame
-                        .chunks_exact(2)
+                        .as_chunks::<2>().0.iter()
                         .flat_map(|b| {
-                            (i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0).to_le_bytes()
+                            let v = ((i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0) * g)
+                                .clamp(-1.0, 1.0);
+                            v.to_le_bytes()
                         })
                         .collect();
                 }
@@ -497,11 +597,55 @@ pub fn start(token: String, port: u16) {
     });
 }
 
+/// 同一プロセス内(Android タブレットの中継)からの音声供給。ネットワーク経路と
+/// 同じ再生リングへ流す。ポート待受(24901)は accept が直列のため、外部からの
+/// 接続失敗が続くと中継の接続が accept までタイムアウトする。これを避ける専用口
+pub fn feed_s16(rate: u32, pcm_s16: &[u8]) {
+    ensure_playback(rate);
+    // Android 中継は USB 経由の安定供給のため低遅延優先(プリロールは全経路共通)。
+    // 音量: 実機では小さめに届くため持ち上げる。Windows 経路と加算ミックスするため
+    // ×1.5 に抑える(合計の振り切れは加算後のソフト飽和で保護)
+    const GAIN: f32 = 1.5;
+    let mut frame: Vec<u8> = pcm_s16
+        .as_chunks::<2>().0.iter()
+        .flat_map(|b| {
+            let v = ((i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0) * GAIN).clamp(-1.0, 1.0);
+            v.to_le_bytes()
+        })
+        .collect();
+    frame.truncate(frame.len() & !7usize);
+    if frame.is_empty() {
+        return;
+    }
+    RX_BYTES.fetch_add(pcm_s16.len() as u64, Ordering::Relaxed);
+    if !MUTED.load(Ordering::Relaxed) {
+        let mut ring = RING_B.lock().unwrap_or_else(|e| e.into_inner());
+        // 滞留の上限は約 80ms。超過分は一度に全部ではなく 1/8 ずつ捨てる
+        // (一括で捨てると波形が周期的に途切れて「プツプツ/割れ」に聞こえる)
+        // 48kHz f32 stereo で 80ms ≒ 30KB(旧値は実質 800ms で、映像とのずれを溜めていた)
+        const ANDROID_MAX_BACKLOG: usize = 48_000 * 2 * 4 * 80 / 1000;
+        while ring.len() > ANDROID_MAX_BACKLOG {
+            let excess = ((ring.len() - ANDROID_MAX_BACKLOG) / 8) & !7usize;
+            let n = excess.max(8).min(ring.len());
+            DROP_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            ring.drain(..n);
+        }
+        ring.extend(frame.iter().copied());
+    } else {
+        PRIMED_B.store(false, Ordering::Relaxed);
+    }
+}
+
+/// 第2レーン(Android 中継)の在庫を捨てる(セッション終了時に呼ぶ)
+pub fn clear_lane_b() {
+    RING_B.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    PRIMED_B.store(false, Ordering::Relaxed);
+}
+
 /// 10 秒毎の診断ログ(受信量/再生量/滞留 lag/間引き drop)。
 /// 無音期間はキープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる。
 /// drop が増え続けていれば波形を切っている=音割れの原因として疑う
-fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {
-    if last_diag.elapsed() < std::time::Duration::from_secs(10) {
+fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {    if last_diag.elapsed() < std::time::Duration::from_secs(10) {
         return;
     }
     *last_diag = std::time::Instant::now();

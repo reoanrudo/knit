@@ -27,6 +27,12 @@ mod platform {
             "未対応のOSです。",
         ))
     }
+    pub fn delete() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "未対応のOSです。",
+        ))
+    }
 }
 
 /// 入力の前後空白だけを許す。短いPIN、行の混入、URLなどを鍵として受け入れない。
@@ -41,6 +47,15 @@ pub fn parse_key(text: &str) -> io::Result<String> {
     }
     Ok(text.to_ascii_lowercase())
 }
+/// Validate an existing transport key without trimming or changing its case.
+/// This is for authenticated enrollment into stores that support legacy keys;
+/// manual imports and the desktop credential store remain canonical-only.
+pub fn validate_transport_key(token: &str) -> io::Result<()> {
+    if !(32..=512).contains(&token.len()) || token.chars().any(char::is_control) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported transport credential"));
+    }
+    Ok(())
+}
 pub fn display_key(token: &str) -> String {
     format!("knit1:{token}")
 }
@@ -54,6 +69,11 @@ pub fn load() -> io::Result<Option<String>> {
 }
 pub fn save(token: &str) -> io::Result<()> {
     platform::save(&parse_key(token)?)
+}
+/// 保存した接続キーを OS の資格情報保護から削除する(登録の全初期化で使う)。
+/// 削除して保存し直すまで、既存の相手は再接続できなくなる
+pub fn delete() -> io::Result<()> {
+    platform::delete()
 }
 
 #[cfg(all(test, any(target_os = "macos", target_os = "windows")))]
