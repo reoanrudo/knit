@@ -40,7 +40,7 @@ pub(crate) use tap::*;
 use knit_common::proto::{encode, Msg, PORT};
 use knit_common::{bulk, envutil, secure};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 更新の適用のために終了する。Windows 操作中ならカーソルを戻してから終える
@@ -94,8 +94,19 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
-/// この Mac のホスト名(kern.hostname、ドメイン部は除く)。hello で相手へ出す
+/// この Mac の名前(設定「接続」で上書きした場合のみ。空=ホスト名既定)。
+/// hello/hello_ok の name として相手へ送り、設定画面・配置エディタの表示にも
+/// 使う(hostname_label 経由)。保存時に safe_peer_name 済み
+pub static OWN_NAME: Mutex<String> = Mutex::new(String::new());
+
+/// この Mac のホスト名(kern.hostname、ドメイン部は除く)。hello で相手へ出す。
+/// 設定で名前を上書きしている場合はそちらを優先する
 pub fn hostname_label() -> String {
+    // 上書き名は保存時に safe_peer_name 済みのためそのまま出す
+    let own = OWN_NAME.lock().unwrap_or_else(|e| e.into_inner());
+    if !own.is_empty() {
+        return own.clone();
+    }
     unsafe extern "C" {
         fn sysctlbyname(
             name: *const std::ffi::c_char,
@@ -154,13 +165,22 @@ pub fn send_cfg() {
 }
 /// 単調時計の ms。壁時計(SystemTime)は NTP 補正やスリープ復帰で飛び、
 /// ダブルタップ判定・復帰ガード・pong 監視を誤動作させるため使わない。
-/// 0 を「未設定」の意味で使う箇所があるため 1 秒のオフセットを足す
+/// 実体は knit_common::clock(mac/win で同じ値域・テスト済み)
 fn now_ms() -> u64 {
-    static T0: OnceLock<std::time::Instant> = OnceLock::new();
-    T0.get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-        + 1_000
+    knit_common::clock::mono_now_ms()
+}
+
+/// スリープ検知の判定(純関数): 壁時計と単調時計の前回からの進みから、
+/// 眠っていた時間を返す。単調の進みがほぼ無い(<100ms)時だけスリープとみなす。
+/// NTP の前方ステップ(壁だけが飛ぶ)では単調も普段どおり進むため弾け、
+/// 壁の巻き戻り(進み 0)も 0 になるため誤検知しない
+fn slept_duration(wall_adv: Duration, mono_adv: Duration) -> Duration {
+    const MONO_ADV_MIN: Duration = Duration::from_millis(100);
+    if mono_adv < MONO_ADV_MIN {
+        wall_adv.saturating_sub(mono_adv)
+    } else {
+        Duration::ZERO
+    }
 }
 pub(crate) fn send_msg(msg: &Msg) {
     let _ = send_msg_reported(msg);
@@ -169,6 +189,28 @@ pub(crate) fn send_msg(msg: &Msg) {
 /// 設定(GUI)で選んだ「Windows をホストにする」。KNIT_ROLE=client の GUI 版。
 /// 接続方向は起動時に決まるため、再起動後に反映される
 pub(crate) static CLIENT_ROLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 役割の表示決定(純粋関数・単体テスト対象)。環境変数 KNIT_ROLE=client が
+/// GUI 設定に優先する(mac が env で固定できるのは client のみ。
+/// server 等の他の値は Windows 側の固定で、Mac では GUI 設定に従う)
+pub(crate) fn display_client_role(env: Option<&str>, gui_client: bool) -> bool {
+    env == Some("client") || gui_client
+}
+
+/// 画面・診断で示す実効的な役割(この Mac が接続しに行く側か)。
+/// 環境変数 KNIT_ROLE=client が GUI 設定に優先する(main の起動判定・diag の診断と
+/// 同じ条件を一元化し、表示と実役割が食い違わないようにする)
+pub(crate) fn effective_client_role() -> bool {
+    display_client_role(
+        envutil::get("KNIT_ROLE").as_deref(),
+        CLIENT_ROLE.load(Ordering::Relaxed),
+    )
+}
+
+/// 環境変数 KNIT_ROLE=client で役割が固定されているか(固定中は GUI から切り替えられない)
+pub(crate) fn role_env_fixed() -> bool {
+    envutil::get("KNIT_ROLE").as_deref() == Some("client")
+}
 
 /// Mac 自身をロックする(Win+L に相当する ⌘Ctrl+Q を System Events 経由で発生させる。
 /// Knit はアクセシビリティ権限を持つためこの経路が使える)
@@ -197,7 +239,7 @@ pub fn send_msg_reported(msg: &Msg) -> bool {
 }
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20261004-003043-8e80c6b";
+const BUILD_ID: &str = "build-20261004-090802-e3a2973";
 
 /// 起動中はロックファイルを保持する(プロセスの終了で自動的に解放される)
 fn acquire_instance_lock() -> bool {
@@ -224,7 +266,46 @@ fn acquire_instance_lock() -> bool {
     true
 }
 
+/// /tmp/knit-mac.log のローテーション(起動時+実行中の定期チェック)。
+/// LaunchAgent はこのファイルを追記(O_APPEND)で開いたままのため、削除
+/// (unlink)ではリンク切れの inode へ書き続けて容量が解放されない。切り詰めなら
+/// 追記の書き込みオフセットが毎回ファイル末尾へ置き直されるため、0 から追記が
+/// 始まる(win 側 helper.log の「256KB 超えたら作り直す」と同じ発想の Mac 版。
+/// 常駐運用では起動時だけの切り詰めでは頭打ちにならないため、ping 送信ループが
+/// 1 分に 1 回この関数を呼ぶ。チェックは metadata の stat だけで軽い)。
+/// 切り詰めの前には 1 世代(.old)へ退避する(Windows の run_knit.bat と同じ
+/// 「1 世代残す」運用。障害直前のログが 5MB 到達で消えるのを防ぐ)
+fn rotate_tmp_log() {
+    /// 5MB。diag 行が約 1MB/日のため、数日分でも次のチェックで収まるサイズ
+    const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+    rotate_log_at(
+        std::path::Path::new("/tmp/knit-mac.log"),
+        std::path::Path::new("/tmp/knit-mac.log.old"),
+        MAX_LOG_BYTES,
+    );
+}
+
+/// ログが `max_bytes` を超えていたら、`backup` へ退避してから切り詰める。
+/// 退避は fs::copy(新しいファイルを作る)で行うため、元のファイルの inode は
+/// 変わらず O_APPEND で開いたままの fd(LaunchAgent 由来)と共存できる。
+/// 戻り値は切り詰めたかどうか(テストと、失敗時の静かな継続に使う)
+fn rotate_log_at(path: &std::path::Path, backup: &std::path::Path, max_bytes: u64) -> bool {
+    let Ok(m) = std::fs::metadata(path) else {
+        return false;
+    };
+    if m.len() <= max_bytes {
+        return false;
+    }
+    // 退避が失敗しても切り詰めは実行する(容量の頭打ちは放置できず、退避は
+    // 補助的なため。その場合 .old は前回の内容のまま残る)
+    if std::fs::copy(path, backup).is_err() {
+        eprintln!("[log] ローテーションの退避に失敗しました({})", backup.display());
+    }
+    std::fs::write(path, b"").is_ok()
+}
+
 fn main() {
+    rotate_tmp_log();
     eprintln!("[info] knit-mac {BUILD_ID}");
     crate::state::init_boot_wall();
     if let Some(note) = knit_common::share::startup_note() {
@@ -280,14 +361,23 @@ fn main() {
     }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
+        // プレビューでも「操作する端末」が複数台のときの見た目を確認できるように、
+        // ダミーの Windows を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
+        PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
+            id: "windows-preview".into(), name: "Windows（プレビュー）".into(),
+            ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
+            writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
+            alias: None,
+        });
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
             PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
                 id: "android-preview".into(), name: "タブレット（プレビュー）".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
+                alias: None,
             });
-            *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 0;
+            *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 1; // タブレットを見ている想定
         }
         if gui::start() {
             gui::SHOW_AT_START.store(true, Ordering::Relaxed);
@@ -341,11 +431,33 @@ fn main() {
                 return;
             }
             Err(_) => {
-                if !no_gui {
-                    gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");
+                // 読み取れない登録が残っている限り再起動しても同じ場所で止まる。
+                // 確認のうえ初期化して初回登録へ導く(キャンセル時は従来どおり終了)
+                if no_gui || !gui::setup::confirm_broken_registration_reset() {
+                    if !no_gui {
+                        gui::setup::error("保存した接続キーを読み取れません。キーチェーンのアクセス許可を確認してください。");
+                    }
+                    eprintln!("[setup] credential store unavailable");
+                    return;
                 }
-                eprintln!("[setup] credential store unavailable");
-                return;
+                if let Err(e) = knit_common::credentials::delete() {
+                    gui::setup::error(&format!(
+                        "保存した接続キーを削除できませんでした。\n{e}"
+                    ));
+                    eprintln!("[setup] credential delete failed: {e}");
+                    return;
+                }
+                eprintln!("[setup] 読み取れない登録を初期化しました。初回登録をやり直します");
+                match gui::setup::first_run(false) {
+                    Some((t, registered)) => {
+                        registered_now = true;
+                        if registered {
+                            PAIRED.store(true, Ordering::Relaxed);
+                        }
+                        t
+                    }
+                    None => return,
+                }
             }
         }
     };
@@ -492,6 +604,9 @@ fn main() {
             .unwrap_or_default(),
     );
     history_load();
+    // 画像履歴の実体を件数(60)と総量(512MiB)の両上限へ刈り込む(起動時に 1 回)。
+    // 保存時の刈り込みは画像が届いた時しか走らないため、ここで残った超過を掃く
+    prune_image_store_now();
     start_local_history();
     eprintln!("[info] 操作ガイド: カーソルを画面端へ動かすと Windows へ移ります。メニューバーにクリップボード履歴があります");
 
@@ -505,6 +620,9 @@ fn main() {
     std::thread::spawn(move || {
         use std::io::Write;
         let mut ping_at = std::time::Instant::now();
+        // /tmp/knit-mac.log のサイズチェックは 1 分に 1 回で十分(stat は軽量)。
+        // 起動時のみの切り詰めだと常駐運用で際限なく成長するため、ここで定期化する
+        let mut log_check_at = std::time::Instant::now();
         let mut pending = None;
         // スリープ復帰の検知: 単調時計はスリープ中に進まないため、壁時計との差が
         // 開いたら眠っていたと分かる。眠っている間に相手側の接続は切れているのが
@@ -513,10 +631,10 @@ fn main() {
         let mut mono = std::time::Instant::now();
         loop {
             let (wall_now, mono_now) = (std::time::SystemTime::now(), std::time::Instant::now());
-            let slept = wall_now
-                .duration_since(wall)
-                .unwrap_or_default()
-                .saturating_sub(mono_now.duration_since(mono));
+            let slept = slept_duration(
+                wall_now.duration_since(wall).unwrap_or_default(),
+                mono_now.duration_since(mono),
+            );
             (wall, mono) = (wall_now, mono_now);
             if slept > Duration::from_secs(3) {
                 // stability-report.sh が「復帰検知→再接続確立」の所要時間を集計できるよう
@@ -554,6 +672,12 @@ fn main() {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(_) => break,
+            }
+            // 常駐運用のログ頭打ち(5MB 超えたら切り詰め)。受信タイムアウト
+            //(200ms)の合間で回すため、チェック周期だけ 1 分に緩める
+            if log_check_at.elapsed() >= Duration::from_secs(60) {
+                log_check_at = std::time::Instant::now();
+                rotate_tmp_log();
             }
             if ping_at.elapsed() >= Duration::from_secs(1) {
                 ping_at = std::time::Instant::now();
@@ -676,8 +800,7 @@ fn main() {
     // その場合は Windows 側を KNIT_ROLE=server で待ち受ける)
     // GUI 設定(Windows をホストにする)か環境変数 KNIT_ROLE=client で接続側になる。
     // 環境変数が優先(GUI は配布時の既定、env は開発者の上書き)
-    let client_role = envutil::get("KNIT_ROLE").as_deref() == Some("client")
-        || crate::CLIENT_ROLE.load(Ordering::Relaxed);
+    let client_role = crate::effective_client_role();
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
         token: token.clone(),
@@ -693,7 +816,20 @@ fn main() {
         on_event: mac_on_bulk,
         log: |s| eprintln!("{s}"),
         on_rx_bytes: |_| {},
+        // 受信バッチの開始時点のアクティブ端末を履歴ラベルとして固定する
+        //(通知時点で読むと、受信中の端末切替でラベルがすり替わる)
+        on_batch_begin: note_bulk_rx_device,
+        // 待受 bind の初回失敗だけ通知センターへも出す(接続は生きているのに
+        // ファイル・画像だけが届かない状態をログだけで終わらせない)
+        on_bind_error: |s: &str| notify("Knit", s),
     });
+    // 前回終了時に残った受信中ファイルの一時実体(.knit-*.part)を掃除する。
+    // exit(0) は Receiver の Drop を飛ばすため、再起動・初期化経路の保険として
+    // 起動時(まだ受信が始まっていない=安全な時期)に消す
+    let swept = knit_common::files::sweep_temp_files(&bulk_ep.dir);
+    if swept > 0 {
+        eprintln!("[bulk] 前回の受信中ファイルの残骸を {swept} 件掃除しました");
+    }
     if client_role {
         let host = args
             .iter()
@@ -744,7 +880,9 @@ fn main() {
         std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
     }
 
-    // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録
+    // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録。
+    // --diag 起動時の有効化に加え、設定「その他」の「詳しく記録」でも runtime で
+    // 切り替えられる(出力スレッドは常駐させて、DIAG_ENABLED の間だけ書き出す)
     if args.iter().any(|a| a == "--diag") {
         DIAG_ENABLED.store(true, Ordering::Relaxed);
         // 検証用の切替指示(--diag 起動時のみ): 一時ディレクトリへ "toggle" と書くと
@@ -761,38 +899,42 @@ fn main() {
                 }
             }
         });
-        std::thread::spawn(|| {
-            let mut last_cursor = (0.0f64, 0.0f64);
-            loop {
-                std::thread::sleep(Duration::from_secs(1));
-                let (mode, mv, kd, sd, wp, mc, sc, ab, heal) = (
-                    WIN_MODE.load(Ordering::Relaxed),
-                    DIAG_MOVE_COUNT.load(Ordering::Relaxed),
-                    DIAG_KEY_COUNT.load(Ordering::Relaxed),
-                    DIAG_SEND_COUNT.load(Ordering::Relaxed),
-                    DIAG_WARP_COUNT.load(Ordering::Relaxed),
-                    DIAG_MODE_COUNT.load(Ordering::Relaxed),
-                    DIAG_SCROLL_COUNT.load(Ordering::Relaxed),
-                    DIAG_ABS_COUNT.load(Ordering::Relaxed),
-                    DIAG_SELF_HEAL.load(Ordering::Relaxed),
-                );
-                unsafe {
-                    let ev = CGEventCreate(std::ptr::null_mut());
-                    let p = if ev.is_null() {
-                        CGPoint { x: 0.0, y: 0.0 }
-                    } else {
-                        CGEventGetLocation(ev)
-                    };
-                    let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
-                    eprintln!(
-                        "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} self_heal={heal} cursor=({:.0},{:.0}) moving={}",
-                        if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
-                    );
-                    last_cursor = (p.x, p.y);
-                }
-            }
-        });
     }
+    std::thread::spawn(|| {
+        let mut last_cursor = (0.0f64, 0.0f64);
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            // 設定での切替は即時に効かせる(1 秒の確認は軽いため常駐で問題ない)
+            if !DIAG_ENABLED.load(Ordering::Relaxed) {
+                continue;
+            }
+            let (mode, mv, kd, sd, wp, mc, sc, ab, heal) = (
+                WIN_MODE.load(Ordering::Relaxed),
+                DIAG_MOVE_COUNT.load(Ordering::Relaxed),
+                DIAG_KEY_COUNT.load(Ordering::Relaxed),
+                DIAG_SEND_COUNT.load(Ordering::Relaxed),
+                DIAG_WARP_COUNT.load(Ordering::Relaxed),
+                DIAG_MODE_COUNT.load(Ordering::Relaxed),
+                DIAG_SCROLL_COUNT.load(Ordering::Relaxed),
+                DIAG_ABS_COUNT.load(Ordering::Relaxed),
+                DIAG_SELF_HEAL.load(Ordering::Relaxed),
+            );
+            unsafe {
+                let ev = CGEventCreate(std::ptr::null_mut());
+                let p = if ev.is_null() {
+                    CGPoint { x: 0.0, y: 0.0 }
+                } else {
+                    CGEventGetLocation(ev)
+                };
+                let moved = (p.x - last_cursor.0).abs() + (p.y - last_cursor.1).abs() > 1.0;
+                eprintln!(
+                    "[diag] mode={} moves={mv} keys={kd} sent={sd} scrolls={sc} abs={ab} warp_fixed={wp} switches={mc} self_heal={heal} cursor=({:.0},{:.0}) moving={}",
+                    if mode { "WIN" } else { "MAC" }, p.x, p.y, moved
+                );
+                last_cursor = (p.x, p.y);
+            }
+        }
+    });
 
     // 起動時点のクリップボードは送らない(以後の変化だけを切替時に同期する)
     LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
@@ -1044,6 +1186,63 @@ mod file_tx_tests {
 }
 
 #[cfg(test)]
+mod log_rotation_tests {
+    use super::*;
+
+    /// 退避→切り詰めの一連(5MB 超えで .old へ残して空になる)。O_APPEND の fd との
+    /// 共存は fs::copy(inode を変えない)による設計のため、ここでは退避の中身と
+    /// 切り詰め結果・しきい未満では何もしないことを確認する
+    #[test]
+    fn rotate_backs_up_then_truncates_only_over_the_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "knit-rotate-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("test.log");
+        let backup = dir.join("test.log.old");
+
+        // しきい未満: 触らない(前回の .old も上書きしない)
+        std::fs::write(&log, "small").unwrap();
+        std::fs::write(&backup, "previous backup").unwrap();
+        assert!(!rotate_log_at(&log, &backup, 100));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "small");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            "previous backup",
+            "しきい未満では退避先を書き換えない"
+        );
+
+        // しきい超え: 退避して切り詰める
+        let big = "x".repeat(101);
+        std::fs::write(&log, &big).unwrap();
+        assert!(rotate_log_at(&log, &backup, 100));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "", "切り詰められる");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            big,
+            "退避先に切り詰め前の中身が残る"
+        );
+
+        // 2 回目の超え: 退避先は新しい中身で上書きされる(1 世代のみ)
+        let big2 = "y".repeat(150);
+        std::fs::write(&log, &big2).unwrap();
+        assert!(rotate_log_at(&log, &backup, 100));
+        assert_eq!(std::fs::read_to_string(&backup).unwrap(), big2, "1 世代だけ残す");
+
+        // ログが無い初回起動: false のまま落ちない
+        let missing = dir.join("missing.log");
+        assert!(!rotate_log_at(&missing, &dir.join("missing.log.old"), 100));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod drag_end_tests {
     use super::*;
 
@@ -1174,6 +1373,7 @@ mod boundary_tests {
             ver: knit_common::proto::VERSION,
             side,
             edge_monitor,
+            alias: None,
         }
     }
 
@@ -1606,6 +1806,44 @@ mod dib_tests {
         let bmp = dib_to_bmp(&v5);
         let off = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
         assert_eq!(off, 14 + 124, "V5 ヘッダは二重に足さない");
+    }
+}
+
+#[cfg(test)]
+mod sleep_detect_tests {
+    use super::slept_duration;
+    use std::time::Duration;
+
+    const S: fn(u64) -> Duration = Duration::from_secs;
+
+    #[test]
+    fn detects_an_actual_sleep_where_only_the_wall_clock_moves() {
+        // 実スリープ: 壁は 30 秒進み、単調(200ms 周期の監視ループ)はほぼ進まない
+        let slept = slept_duration(S(30) + Duration::from_millis(20), Duration::from_millis(20));
+        assert!(
+            slept >= S(29) && slept <= S(30),
+            "眠っていた時間を概ね返す: {slept:?}"
+        );
+    }
+
+    #[test]
+    fn ntp_forward_step_is_not_a_sleep() {
+        // NTP の前方ステップ: 壁だけ 5 秒飛ぶ。単調は普段どおり進むためスリープではない
+        assert_eq!(
+            slept_duration(S(5) + Duration::from_millis(200), Duration::from_millis(200)),
+            Duration::ZERO
+        );
+        // 差が 3 秒を超えていても(旧判定なら誤検知した量でも)単調が進んでいれば切らない
+        assert_eq!(slept_duration(S(10), Duration::from_millis(150)), Duration::ZERO);
+    }
+
+    #[test]
+    fn wall_clock_going_backwards_is_not_a_sleep() {
+        // 壁の巻き戻り(NTP 補正の負方向)は進み 0 → slept も 0(切断しない)
+        assert_eq!(
+            slept_duration(Duration::ZERO, Duration::from_millis(50)),
+            Duration::ZERO
+        );
     }
 }
 

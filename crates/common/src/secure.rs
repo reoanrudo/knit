@@ -20,6 +20,29 @@
         h.finalize().into()
     }
 
+    /// 接続キーのフィンガープリント(短い略号・SHA-256 の先頭8桁)。設定画面に
+    /// 「両端末が同じ鍵で認証中か」を確認するための表示専用で、トークン本体や
+    /// 派生鍵(psk)を復元できる情報は含まない。psk とは別の固定プレフィックスで
+    /// ドメイン分離する(表示用ハッシュを鍵導出に影響させない)
+    pub fn fingerprint(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(b"knit-fingerprint-v1\0");
+        h.update(token.as_bytes());
+        let digest = h.finalize();
+        digest.iter().take(4).map(|b| format!("{b:02X}")).collect()
+    }
+
+    /// 設定画面の暗号化の行の文言。暗号化は常時ONのためトグルは無く、状態を
+    /// 読み取れる1行として出す(フィンガープリント付きなら「鍵: XXXXXXXX」を併記)。
+    /// 両OSで同じ文言にするため common 側で組立てる
+    pub fn encryption_line(fingerprint: Option<&str>) -> String {
+        match fingerprint {
+            Some(fp) => format!("通信は常時暗号化・相互認証されています(設定不要)· 鍵: {fp}"),
+            None => "通信は常時暗号化・相互認証されています(設定不要)".into(),
+        }
+    }
+
     fn invalid(e: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     }
@@ -221,5 +244,43 @@
         /// 成功で待ち時間を解除する
         pub fn success(&mut self) {
             self.fails = 0;
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// フィンガープリントは同じ鍵で同じ値・異なる鍵で異なる値。トークンの
+        /// 本文を含まない(鍵を画面に出さない前提の確認手段だから)
+        #[test]
+        fn fingerprint_is_stable_distinct_and_hides_the_token() {
+            let token = "7f".repeat(32);
+            let a = fingerprint(&token);
+            assert_eq!(a.len(), 8);
+            assert!(a.chars().all(|c| c.is_ascii_uppercase_hexdigit()), "{a}");
+            assert_eq!(a, fingerprint(&token), "同じ鍵は同じ値");
+            assert_ne!(a, fingerprint(&"3a".repeat(32)), "異なる鍵は異なる値");
+            assert!(!a.contains(token.as_str()), "トークン本文を含まない");
+            // 大文字小文字は別の鍵として扱う(psk と同じ・正規化は保存時に済んでいる)
+            assert_ne!(a, fingerprint(&token.to_ascii_uppercase()));
+        }
+
+        /// 暗号化の行の文言: フィンガープリントの有無で「鍵:」の併記が変わるだけ
+        #[test]
+        fn encryption_line_appends_fingerprint_only_when_present() {
+            let base = "通信は常時暗号化・相互認証されています(設定不要)";
+            assert_eq!(encryption_line(None), base);
+            assert_eq!(encryption_line(Some("AB12CD34")), format!("{base}· 鍵: AB12CD34"));
+        }
+    }
+
+    /// 大文字の16進桁だけか(テスト用の小ヘルパー)
+    trait AsciiUppercaseHexdigit {
+        fn is_ascii_uppercase_hexdigit(&self) -> bool;
+    }
+    impl AsciiUppercaseHexdigit for char {
+        fn is_ascii_uppercase_hexdigit(&self) -> bool {
+            self.is_ascii_digit() || ('A'..='F').contains(self)
         }
     }

@@ -21,8 +21,12 @@
         vec![format!("TSUNAGU_{rest}"), oldest]
     }
 
-    /// 旧名称の設定フォルダを、新しいフォルダが無い時だけ丸ごと複製する。
-    /// 旧版へ戻しても設定が残るよう、移動ではなく複製にする
+    /// 旧名称の設定フォルダを、新しいフォルダへ丸ごと複製する。
+    /// 旧版へ戻しても設定が残るよう、移動ではなく複製にする。
+    /// 「最後まで通った」証として new 内へ完了マーカー(migrated-from-旧名)を
+    /// 置き、マーカーが無ければ(初回またはコピー途中のプロセス死亡)最初から
+    /// やり直す。コピーは上書きのため冪数で、部分コピーが中途半端に残った
+    /// 状態からでも再試行で完全な状態に収束する
     pub fn migrate_dir(old: &Path, new: &Path) {
         fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
             std::fs::create_dir_all(to)?;
@@ -38,15 +42,27 @@
             }
             Ok(())
         }
-        if new.exists() || !old.is_dir() {
+        // 完了マーカーのパス。old の名前ごとに固有にする
+        let marker = old.file_name().and_then(|n| n.to_str()).map(|n| {
+            new.join(format!("migrated-from-{n}"))
+        });
+        let Some(marker) = marker else { return };
+        if marker.exists() || !old.is_dir() {
             return;
         }
         if let Err(e) = copy(old, new) {
-            // 部分コピーのまま残すと new.exists() で次回以降も補完されない
-            //(トークンが転写されないまま起動し続ける)。消して次回に委ねる
-            let _ = std::fs::remove_dir_all(new);
+            // 失敗しても部分コピーは消さない: 失敗の原因がディスク容量等なら
+            // 削除も失敗しやすく、またマーカーが無いため次回は最初から上書きで
+            // やり直される(途中のファイルも完全なコピーで置き換わる)
             eprintln!("[config] 旧設定 {} の移行に失敗: {e}(次回の起動でやり直します)", old.display());
+            return;
         }
+        // 全ファイルのコピーが通ってから初めてマーカーを置く(ここで初回確定)
+        let stamped = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        let _ = std::fs::write(&marker, stamped);
     }
 
     /// 設定フォルダ(~/.config/knit)。初回は旧名称のフォルダから移行する
@@ -120,6 +136,67 @@
         std::env::var(key).ok().filter(|v| !v.is_empty())
     }
 
+    /// 設定ファイルの KEY=VALUE 行を書き換える(無ければ追記)。
+    /// Windows 側の .env 書き換え(tray の save_host_to_env)と同じ挙動を共通化した
+    /// もので、同じキーと旧名称のキー(TSUNAGU_*・SEAMLESS_*)の行は新しい 1 行に
+    /// まとめる(get の解決順序に古い指定が残らないようにする)。
+    /// value が空のときは行を書かない=未指定の既定へ戻す。
+    /// 書き込みは一時ファイル+リネームのため、失敗しても元の内容が残る
+    pub fn set_env_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+        let mut removes = vec![format!("{key}=")];
+        removes.extend(legacy_keys(key).iter().map(|k| format!("{k}=")));
+        let mut lines: Vec<String> = std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !removes.iter().any(|r| t.starts_with(r.as_str()))
+            })
+            .map(|l| l.to_string())
+            .collect();
+        if !value.is_empty() {
+            lines.push(format!("{key}={value}"));
+        }
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| std::io::Error::other("保存先のフォルダがありません"))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, lines.join("\n") + "\n")?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// env ファイルから Knit の設定行(KNIT_* と旧名称の TSUNAGU_*・SEAMLESS_*)を
+    /// すべて取り除く(設定の初期化用)。コメント行など Knit 以外の行が混ざって
+    /// いても保持する。ファイルが無ければ何もしない(=既に指定が無い状態のため
+    /// 素通り)。書き込みは set_env_value と同じ一時ファイル+リネームのため、
+    /// 失敗しても元の内容が残る
+    pub fn clear_knit_lines(path: &Path) -> std::io::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let is_knit_line = |l: &str| {
+            let t = l.trim_start();
+            ["KNIT_", "TSUNAGU_", "SEAMLESS_"]
+                .iter()
+                .any(|prefix| t.starts_with(prefix))
+        };
+        let lines: Vec<String> = std::fs::read_to_string(path)?
+            .lines()
+            .filter(|l| !is_knit_line(l))
+            .map(|l| l.to_string())
+            .collect();
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| std::io::Error::other("保存先のフォルダがありません"))?;
+        std::fs::create_dir_all(parent)?;
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&tmp, lines.join("\n") + "\n")?;
+        std::fs::rename(&tmp, path)
+    }
+
     /// 環境変数を第一優先とし、未設定なら設定ファイル群から検索する。
     /// 旧名称のキー(TSUNAGU_*・SEAMLESS_*)も新しい順に確認する
     pub fn get(key: &str) -> Option<String> {
@@ -153,6 +230,95 @@
             assert!(legacy_keys("OTHER").is_empty());
         }
 
+        /// set_env_value の一連の動作(追記・書き換え・旧キーの統合・削除)。
+        /// ファイルは都度新しく作る(テスト間で共有しない)
+        #[test]
+        fn set_env_value_rewrites_appends_and_clears() {
+            let path = std::env::temp_dir().join(format!(
+                "knit-setenv-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            // 既存ファイルが無ければ追記する(コメント行も書ける)
+            set_env_value(&path, "KNIT_HOST", "192.168.1.23").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "KNIT_HOST=192.168.1.23\n"
+            );
+            // 既存行は置き換え、関係ない行(コメント・他キー)はそのまま残る
+            std::fs::write(
+                &path,
+                "# 接続先\nKNIT_TOKEN=abc\nKNIT_HOST=10.0.0.1\nTSUNAGU_HOST=10.0.0.2\n",
+            )
+            .unwrap();
+            set_env_value(&path, "KNIT_HOST", "192.168.1.99,100.100.10.9").unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains("# 接続先"), "コメント行は保持: {after}");
+            assert!(after.contains("KNIT_TOKEN=abc"), "他キーは保持: {after}");
+            assert!(after.contains("KNIT_HOST=192.168.1.99,100.100.10.9"));
+            assert!(
+                !after.contains("10.0.0.1") && !after.contains("10.0.0.2"),
+                "新旧の KNIT_HOST 行は新しい 1 行にまとまる: {after}"
+            );
+            assert!(
+                after.lines().count() == 3,
+                "旧名称行も削除されて 3 行になる: {after}"
+            );
+            // 空値は行ごと削除(未指定=既定の挙動へ戻す)
+            set_env_value(&path, "KNIT_HOST", "").unwrap();
+            let cleared = std::fs::read_to_string(&path).unwrap();
+            assert!(!cleared.contains("KNIT_HOST"));
+            assert!(cleared.contains("KNIT_TOKEN=abc"));
+            // 末尾に改行が無い既存ファイルでも失われる行が出ない
+            std::fs::write(&path, "KNIT_TOKEN=abc").unwrap();
+            set_env_value(&path, "KNIT_HOST", "1.2.3.4").unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "KNIT_TOKEN=abc\nKNIT_HOST=1.2.3.4\n"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        /// clear_knit_lines: KNIT_*(新旧名称)の行だけが消え、コメントと他ツールの
+        /// 行は残る。ファイルが無い場合は作らない(初期化の冪等性)
+        #[test]
+        fn clear_knit_lines_removes_only_knit_entries() {
+            let path = std::env::temp_dir().join(format!(
+                "knit-clearenv-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            // ファイルが無いとき: 素通り(空ファイルを作らない)
+            clear_knit_lines(&path).unwrap();
+            assert!(!path.exists(), "存在しないファイルは作らない");
+            std::fs::write(
+                &path,
+                "# Knit 設定\nKNIT_HOST=10.0.0.1\nTSUNAGU_HOST=10.0.0.2\nSEAMLESS_DESK_TOKEN=x\nOTHER_TOOL=1\n",
+            )
+            .unwrap();
+            clear_knit_lines(&path).unwrap();
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.contains("# Knit 設定"), "コメント行は保持: {after}");
+            assert!(after.contains("OTHER_TOOL=1"), "他ツールの行は保持: {after}");
+            assert!(!after.contains("KNIT_HOST"), "新名称の行は消える: {after}");
+            assert!(!after.contains("TSUNAGU_"), "旧名称の行も消える: {after}");
+            assert!(!after.contains("SEAMLESS_"), "最旧名称の行も消える: {after}");
+            // 再実行しても冪等(全て消えた状態で変化しない)
+            clear_knit_lines(&path).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                after,
+                "初期化済みの再実行は変化させない"
+            );
+            std::fs::remove_file(&path).unwrap();
+        }
+
         #[test]
         fn migrates_old_config_once_without_touching_it() {
             let base = std::env::temp_dir().join(format!("knit-migrate-{}", std::process::id()));
@@ -163,12 +329,51 @@
             migrate_dir(&old, &new);
             assert_eq!(std::fs::read(new.join("images/a.png")).unwrap(), b"png");
             assert!(old.join("env").exists(), "旧版へ戻せるよう元は残す");
+            assert!(
+                new.join("migrated-from-tsunagu").exists(),
+                "完了後にマーカーが置かれる"
+            );
             std::fs::write(new.join("env"), "KNIT_TOKEN=y\n").unwrap();
             migrate_dir(&old, &new);
             assert_eq!(
                 std::fs::read_to_string(new.join("env")).unwrap(),
                 "KNIT_TOKEN=y\n",
                 "移行済みの設定を上書きしない"
+            );
+            std::fs::remove_dir_all(base).unwrap();
+        }
+
+        /// コピー途中でプロセスが死んだ状態(一部ファイルだけ転写済み・マーカー無し)
+        /// から再試行すると、全ファイルが完全なコピーで揃う
+        #[test]
+        fn partial_migration_is_retried_until_complete() {
+            let base =
+                std::env::temp_dir().join(format!("knit-migrate-partial-{}", std::process::id()));
+            let (old, new) = (base.join("tsunagu"), base.join("knit"));
+            std::fs::create_dir_all(old.join("images")).unwrap();
+            std::fs::write(old.join("env"), "TSUNAGU_TOKEN=x\n").unwrap();
+            std::fs::write(old.join("images/a.png"), b"png").unwrap();
+            std::fs::write(old.join("images/b.png"), b"png2").unwrap();
+            // 途中で死んだ状況の再現: env だけが中途半端に転写済み
+            std::fs::create_dir_all(&new).unwrap();
+            std::fs::write(new.join("env"), "TSUNAGU_TOKEN=x\nTRUNCAT").unwrap();
+            migrate_dir(&old, &new);
+            // 再試行で全ファイルが揃い、部分コピーは完全なコピーへ置き換わる
+            assert_eq!(
+                std::fs::read_to_string(new.join("env")).unwrap(),
+                "TSUNAGU_TOKEN=x\n",
+                "部分コピーは本の内容で上書きされる"
+            );
+            assert_eq!(std::fs::read(new.join("images/a.png")).unwrap(), b"png");
+            assert_eq!(std::fs::read(new.join("images/b.png")).unwrap(), b"png2");
+            assert!(new.join("migrated-from-tsunagu").exists());
+            // マーカーが有る状態での再呼び出しは何もしない(new 側の変更が保たれる)
+            std::fs::write(new.join("images/a.png"), b"edited").unwrap();
+            migrate_dir(&old, &new);
+            assert_eq!(
+                std::fs::read(new.join("images/a.png")).unwrap(),
+                b"edited",
+                "完了済みの再移行は上書きしない"
             );
             std::fs::remove_dir_all(base).unwrap();
         }

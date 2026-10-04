@@ -4,6 +4,24 @@
     use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
+    /// 接続先手動指定(KNIT_HOST)の入力検証。カンマ区切りの各要素が IP アドレス
+    /// (IPv4/IPv6)として書けているかを確かめ、最初の不正要素を Err で返す
+    /// (通知の文言に使う)。空欄=自動発見へ戻す指定のため空文字は Ok。
+    /// Mac 設定の imp_save_host と Windows トレイの MENU_SAVEHOST が同じ基準で
+    /// 検証するための共有関数(ホスト名は接続先指定で使わないため入力ミスを止める)
+    pub fn validate_host_input(text: &str) -> Result<(), String> {
+        if let Some(bad) = text
+            .split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .find(|h| h.parse::<std::net::IpAddr>().is_err())
+        {
+            Err(bad.to_string())
+        } else {
+            Ok(())
+        }
+    }
+
     /// "host1,host2:port" のようなカンマ区切りを解決する(ポート省略時は既定ポート)
     pub fn parse_hosts(list: &str, port: u16) -> Vec<SocketAddr> {
         list.split(',')
@@ -118,5 +136,24 @@ mod tests {
             vec![SocketAddr::from(([127, 0, 0, 1], 1234))]
         );
         assert!(parse_hosts("", 1234).is_empty());
+    }
+
+    /// 接続先入力の検証は Mac・Windows で同じ基準(IP のみ・カンマ区切り・空欄=解除)
+    #[test]
+    fn validate_host_input_reports_first_bad_element() {
+        // 空欄・IP 単独・カンマ区切り・前後の空白は OK
+        assert!(validate_host_input("").is_ok());
+        assert!(validate_host_input("192.168.1.23").is_ok());
+        assert!(validate_host_input(" 192.168.1.23 , ::1 ").is_ok());
+        // ホスト名・ポート付き・空要素混じりは NG(最初の不正要素を返す)
+        assert_eq!(
+            validate_host_input("my-mac.local").unwrap_err(),
+            "my-mac.local"
+        );
+        assert_eq!(validate_host_input("192.168.1.23:24900").unwrap_err(), "192.168.1.23:24900");
+        assert_eq!(
+            validate_host_input("::1, bad! , 10.0.0.5").unwrap_err(),
+            "bad!"
+        );
     }
 }

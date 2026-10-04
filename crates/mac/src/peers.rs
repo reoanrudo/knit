@@ -12,6 +12,10 @@ pub(crate) fn insert(peers: &mut Vec<PeerEntry>, active: usize, peer: PeerEntry)
         let mut peer = peer;
         peer.side = peers[i].side;
         peer.edge_monitor = peers[i].edge_monitor;
+        // エイリアス(表示名)も配置と同じく既存エントリの値を優先して引き継ぐ。
+        // 呼び出し側が peer-sides.json から積み直すため通常は同じ値だが、保存の
+        // 一時的な読み失敗で利用者が付けた名前が再接続で消えるのを防ぐ保険
+        peer.alias = peers[i].alias.clone();
         if let Some(old) = peers[i].writer.take() {
             old.shutdown();
         }
@@ -50,6 +54,16 @@ pub(crate) fn detach(
     }
 }
 
+/// detach の後で端末の配置(peer-sides)を保存し直すべきか(純関数)。
+/// 全端末がいなくなった時だけ: 1 台の切断のたびに保存すると、一時的な
+/// ネット断の detach で「戻ってくるはずの端末の設定」を消してしまう。
+/// 一方で detach が一切保存へ反映されないと、登録解除した端末の設定が
+/// dead entry として残り続ける。全端末いなくなった時点=運用の区切りだけ
+/// 保存すれば、次に現れた端末から整った一覧で始まる
+pub(crate) fn should_save_sides_after_detach(peers_after: &[PeerEntry], departure: &Departure) -> bool {
+    peers_after.is_empty() && !matches!(departure, Departure::Unchanged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -66,6 +80,7 @@ mod tests {
             side: 0,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
+            alias: None,
         }
     }
 
@@ -118,6 +133,18 @@ mod tests {
         assert_eq!(peers.len(), 2);
     }
 
+    /// 再接続(同じ id への insert 置換)では、利用者が付けたエイリアス(表示名)も
+    /// 配置(side/edge_monitor)と同じく既存エントリから引き継がれる。
+    /// 新しいエントリ側が alias 無しで積まれても名前が消えない(保存の読み失敗保険)
+    #[test]
+    fn reconnection_keeps_the_user_given_alias() {
+        let mut peers = vec![peer("working", 1)];
+        peers[0].alias = Some("事務室のPC".into());
+        // 選択中の端末の再接続のため insert は選択を返す(既存テストと同じ意味)
+        assert!(insert(&mut peers, 0, peer("working", 2)));
+        assert_eq!(peers[0].alias.as_deref(), Some("事務室のPC"));
+    }
+
     #[test]
     fn the_first_device_is_selected_and_the_last_disconnect_has_no_fallback() {
         let mut peers = Vec::new();
@@ -129,5 +156,32 @@ mod tests {
         );
         assert_eq!(active, usize::MAX);
         assert!(peers.is_empty());
+    }
+
+    /// detach 後の配置保存は「全端末がいなくなった時」だけ。1 台残りの切断で
+    /// 保存すると一時的なネット断で戻る端末の設定が消えるため
+    #[test]
+    fn sides_are_saved_only_when_the_last_peer_departed() {
+        // 最後の 1 台が detach(対象がいた)→ PEERS 空 → 保存
+        let mut peers = vec![peer("last", 1)];
+        let mut active = 0;
+        let departure = detach(&mut peers, &mut active, "last", 1);
+        assert!(should_save_sides_after_detach(&peers, &departure));
+
+        // 2 台のうち 1 台が detach → 残り 1 台 → 保存しない
+        let mut peers = vec![peer("a", 1), peer("b", 2)];
+        let mut active = 1;
+        let departure = detach(&mut peers, &mut active, "a", 1);
+        assert!(
+            !should_save_sides_after_detach(&peers, &departure),
+            "残り 1 台いるのに保存してはいけない"
+        );
+
+        // detach 対象が一覧に無い(Unchanged)→ PEERS 空でも保存しない
+        let peers = Vec::new();
+        assert!(!should_save_sides_after_detach(
+            &peers,
+            &Departure::Unchanged
+        ));
     }
 }

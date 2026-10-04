@@ -118,3 +118,61 @@
         };
         Some(vk)
     }
+
+    /// Caps Lock の越境同期: Windows 側の現在のトグル状態と Mac 側の
+    /// alphaShift を比べ、合わせるためのトグル注入(1 回)が要るか。
+    /// Windows の Caps Lock は「押すたびに反転」のため、状態が既に一致して
+    /// いる時に注入すると逆にズレる。Vk 57→VK_CAPITAL(0x14) と同じく
+    /// 両 OS の対応を 1 箇所で保証するためにここへ置く
+    pub fn caps_toggle_needed(win_caps_on: bool, mac_caps_on: bool) -> bool {
+        win_caps_on != mac_caps_on
+    }
+
+    /// 切替キー(Mac keycode)の表示名。設定画面の「切替キー（…）のみ」の項目名など
+    /// 両 OS の設定 UI で同じ名前を出すための変換。候補に無いキーは「コードN」
+    /// (Mac 側の「現在のキー（コードN）」表示と同じ規則)
+    pub fn mac_key_label(kc: i64) -> String {
+        match kc {
+            97 => "F6".into(),
+            100 => "F8".into(),
+            105 => "F13".into(),
+            54 => "右⌘".into(),
+            other => format!("コード{other}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod caps_sync_tests {
+        use super::caps_toggle_needed;
+
+        #[test]
+        fn injects_only_when_the_states_differ() {
+            // 状態が異なる時だけ 1 回トグル注入が必要
+            assert!(caps_toggle_needed(true, false), "Win ON / Mac OFF は注入要");
+            assert!(caps_toggle_needed(false, true), "Win OFF / Mac ON は注入要");
+        }
+
+        #[test]
+        fn skips_injection_when_already_aligned() {
+            // 既に一致している時に注入すると逆にズレるため注入しない
+            assert!(!caps_toggle_needed(true, true), "両方 ON はそのまま");
+            assert!(!caps_toggle_needed(false, false), "両方 OFF はそのまま");
+        }
+    }
+
+    #[cfg(test)]
+    mod key_label_tests {
+        use super::mac_key_label;
+
+        /// 設定 UI の候補(F6/F8/F13/右⌘)はキー名、それ以外は「コードN」。
+        /// 両 OS で同じ文言になることをここで固定する
+        #[test]
+        fn candidates_have_names_and_others_use_code_form() {
+            assert_eq!(mac_key_label(97), "F6");
+            assert_eq!(mac_key_label(100), "F8");
+            assert_eq!(mac_key_label(105), "F13");
+            assert_eq!(mac_key_label(54), "右⌘");
+            assert_eq!(mac_key_label(63), "コード63");
+            assert_eq!(mac_key_label(0), "コード0");
+        }
+    }

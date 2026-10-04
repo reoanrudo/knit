@@ -45,6 +45,8 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 ```
 
 - ログイン時に自動起動(LaunchAgent `local.knit`)。ログは /tmp/knit-mac.log
+  (起動時と実行中の定期チェックで 5MB を超えていたら 1 世代退避(knit-mac.log.old)
+  して切り詰め。実行中は追記)
 - 初回起動時、アクセシビリティ権限の許可を求められたら許可する
   (許可がないと `[fatal] CGEventTapCreate failed` で終了する)
 - メニューバーに Knit のアイコンが出れば起動完了(未接続の間は「未接続」と
@@ -69,7 +71,8 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
   しても動く。**ターミナル/cmd/Windows Terminal から起動した場合も、exe は起動直後に
   コンソールから独立したプロセスへ自動置換されるため、ターミナルを閉じても接続は維持される**
 - 接続/切断はバルーン通知で可視化される
-- ログ: `C:\Users\<user>\knit\knit-win.log`(1世代ローテーション)
+- ログ: `C:\Users\<user>\knit\knit-win.log`(起動ごとに 1 世代ローテーションして
+  knit-win.log.old へ移し、実行中は追記)
 - 新規環境では登録画面が開きます。自動復帰・ログオン用の `--background` 起動では、未登録なら静かに終了します。初回はアプリを直接起動してください。
 
 ## 4.5 旧版(Tsunagu v0.25 まで)からの移行と戻し

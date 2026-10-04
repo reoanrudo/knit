@@ -245,6 +245,22 @@ fn wait_xfer_ack(timeout: Duration) -> Option<(usize, usize, bool)> {
     }
 }
 
+/// 掴みドラッグの offer に必要な bulk 経路の猶予窓(ms)。端末切替で経路を clear
+/// した直後は、接続側(2 秒毎の張り直し)がまもなく新ピアへ張り替えるため、
+/// この窓の内の未接続は offer を通して送信側の再試行に委ねる
+pub(crate) const DRAG_LINK_REBUILD_WINDOW_MS: u64 = 10_000;
+
+/// 掴みドラッグの offer を通してよいか。経路が張れていれば通す。張れていなくても
+/// 端末切替で張り替えた直後(切替の時刻から猶予窓の内)なら通す: ここで拒否すると
+/// 切替直後の掴み渡しが構造的に 100% 失敗し、入力先だけ切り替わった不一致が残る。
+/// 送信側(send_drag_files_to_win)には未接続を待って再試行する既存の仕組みがある
+pub(crate) fn drag_offer_link_ok(link_up: bool, ms_since_switch: Option<u64>) -> bool {
+    if link_up {
+        return true;
+    }
+    matches!(ms_since_switch, Some(ms) if ms < DRAG_LINK_REBUILD_WINDOW_MS)
+}
+
 /// 掴んだまま境界を越えたファイルを Windows へ渡す準備。本線の予告(DragOffer)と
 /// ファイル転送に同じ受け渡しIDを付け、Windows は越えてきた押下が続いている間に
 /// 届いた場合だけ OLE ドラッグを始める(離した後の転送を別の操作に混ぜない)。
@@ -264,14 +280,23 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // 越境を確定する前にファイル経路が張れていることを確かめる(M7)。
     // 張り直し中に越えると元のドラッグは合成 Up で終わるのに転送が届かず、
     // 「どこにも渡らない」結果になるため、拒んで Mac 側のドラッグを続けさせる。
-    // is_up_fast はロックを待たない(転送中の slot ロック待ちで tap が止まらない)
+    // is_up_fast はロックを待たない(転送中の slot ロック待ちで tap が止まらない)。
+    // ただし端末切替(activate_peer)で経路を張り替えた直後は必然的に未接続に
+    // なるため、接続側の張り直しが間に合う猶予窓の内だけ通す(切替直後の掴み
+    // 渡しが構造的に失敗するのを防ぐ。実際の送信は送信スレッドの再試行に委ねる)
     if !BULK_LINK.is_up_fast() {
-        eprintln!("[drag] mac->win 対象外: ファイル経路が未接続");
-        notify(
-            "Knit",
-            "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください",
-        );
-        return None;
+        let switched_at = BULK_SWITCHED_AT_MS.load(Ordering::Relaxed);
+        let ms_since_switch = (switched_at > 0).then(|| now_ms().saturating_sub(switched_at));
+        if !drag_offer_link_ok(false, ms_since_switch) {
+            eprintln!("[drag] mac->win 対象外: ファイル経路が未接続");
+            notify(
+                "Knit",
+                "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください",
+            );
+            return None;
+        }
+        eprintln!("[drag] 経路張替直後のため、再接続を待って転送します(切替から約{}ms)",
+            ms_since_switch.unwrap_or(0));
     }
     // 相手の版が持つ機能(フォルダ=版 14 以降・空フォルダ=版 15 以降)
     let f = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
@@ -523,7 +548,8 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             let rename_note = rename_note(renamed);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
-                history_push_files(&paths, history_device_for_active());
+                // 履歴ラベルはバッチ開始時点の端末で固定(受信中の切替で替えない)
+                history_push_files(&paths, &bulk_rx_device());
                 let total = knit_common::bulk::total_size(&paths);
                 notify(
                     "Knit",
@@ -536,7 +562,7 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
                 // 実体は保存済みだが ⌘V に載らなかった。黙っていると
                 // 「受信したのに貼り付けられない」というトラブルに見えるため伝える
                 eprintln!("[file] win->mac 受信: {n} 件(クリップボード載せ失敗)");
-                history_push_files(&paths, history_device_for_active());
+                history_push_files(&paths, &bulk_rx_device());
                 notify(
                     "Knit",
                     &format!(
@@ -734,6 +760,50 @@ pub fn xfer_line() -> Option<String> {
 }
 /// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
 pub(crate) static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
+
+/// 掴みドラッグ offer の経路猶予判定(切替直後の未接続で構造的に失敗する回帰の防止)
+#[cfg(test)]
+mod drag_offer_link_tests {
+    use super::{drag_offer_link_ok, DRAG_LINK_REBUILD_WINDOW_MS};
+
+    #[test]
+    fn connected_link_is_always_accepted() {
+        assert!(drag_offer_link_ok(true, None), "接続済みは即 accept");
+        assert!(drag_offer_link_ok(true, Some(999_999)));
+    }
+
+    #[test]
+    fn freshly_switched_link_is_given_a_grace_window() {
+        // 端末切替(activate_peer の clear)の直後は必然的に未接続になる。
+        // 猶予窓の内なら通して送信側の再試行に委ねる
+        assert!(
+            drag_offer_link_ok(false, Some(0)),
+            "切替直後(0ms)は通す"
+        );
+        assert!(
+            drag_offer_link_ok(false, Some(DRAG_LINK_REBUILD_WINDOW_MS - 1)),
+            "窓の内は通す"
+        );
+    }
+
+    #[test]
+    fn stale_disconnection_is_still_refused() {
+        // 窓の外(接続側の張り直しが間に合わない異常)と、一度も切替していない
+        // 未接続は従来どおり拒否して掴み直してもらう
+        assert!(
+            !drag_offer_link_ok(false, Some(DRAG_LINK_REBUILD_WINDOW_MS)),
+            "猶予窓の境界の外は拒否"
+        );
+        assert!(
+            !drag_offer_link_ok(false, Some(60_000)),
+            "窓の外の未接続は拒否"
+        );
+        assert!(
+            !drag_offer_link_ok(false, None),
+            "切替を挟まない未接続は拒否(従来動作)"
+        );
+    }
+}
 
 #[cfg(test)]
 mod xfer_ack_tests {
