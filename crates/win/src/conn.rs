@@ -5,8 +5,8 @@ use crate::input::list_monitors;
 use crate::registration_authenticated;
 use crate::session::session;
 use crate::state::{
-    log_safe, now_ms, CONNECTED, MAIN_SHUTDOWN, METRIC_CONNECTS, METRIC_DROPS, METRIC_MAX_GAP_MS,
-    METRIC_TOTAL_GAP_MS, RTT_MS, SPK_MUTE_MODE, WAKE, WTX,
+    log_safe, now_ms, wall_ms, CONNECTED, MAIN_SHUTDOWN, METRIC_CONNECTS, METRIC_DROPS,
+    METRIC_MAX_GAP_MS, METRIC_TOTAL_GAP_MS, RTT_MS, SPK_MUTE_MODE, WAKE, WTX,
 };
 use crate::xfer::{BULK_LINK, RX_BYTES, RX_DRAG};
 use knit_common::proto::{compatible, decode, encode, safe_peer_name, Msg, VERSION};
@@ -17,7 +17,8 @@ use std::process::exit;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// 最終接続時刻と断の検知時刻(unix ms)、次の再試行時刻(0=待ちなし)
+/// 最終接続時刻と断の検知時刻(単調時計の ms。「N分前」表示や断の長さの判定に使う。
+/// 壁時計は NTP 補正で飛ぶため内部比較には使わない)、次の再試行時刻(0=待ちなし)
 static LAST_CONNECTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DISCONNECTED_SINCE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -30,9 +31,10 @@ fn mark_connected() {
     let now = now_ms();
     let since = DISCONNECTED_SINCE_MS.swap(0, Ordering::Relaxed);
     LAST_CONNECTED_MS.store(now, Ordering::Relaxed);
-    // 接続安定性の実測(scripts/stability-report.sh の集計源)。since=0 は断なしの接続
+    // 接続安定性の実測(scripts/stability-report.sh の集計源)。since=0 は断なしの接続。
+    // 時刻は壁時計(プロセス再起動を跨ぐ集計のため)。gap の内部比較は単調時計
     let gap = if since == 0 { 0 } else { now.saturating_sub(since) };
-    println!("[conn-metric] connected unix_ms={now} gap_ms={gap}");
+    println!("[conn-metric] connected unix_ms={} gap_ms={gap}", wall_ms());
     // 稼働計測(診断の安定性表示の源)。断=再接続が成功した回数のみ数える
     if gap > 0 {
         METRIC_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -48,7 +50,8 @@ fn mark_connected() {
 /// 切断を記録する(次の再接続までの表示と、長い断の判定に使う)
 fn note_disconnected() {
     CONNECTED.store(false, Ordering::Relaxed);
-    println!("[conn-metric] lost unix_ms={}", now_ms());
+    // ログの時刻は壁時計、以後の継続時間の計測は単調時計(DISCONNECTED_SINCE_MS)
+    println!("[conn-metric] lost unix_ms={}", wall_ms());
     DISCONNECTED_SINCE_MS
         .compare_exchange(0, now_ms(), Ordering::Relaxed, Ordering::Relaxed)
         .ok();
@@ -123,14 +126,60 @@ pub(crate) static PEER: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::
 /// 接続相手の名前(hello で受け取る)。通知・ログへ出す
 pub static PEER_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
+/// LAN 昇格監視の世代(Tailscale 接続のたびに発行)。単一の常駐スレッド
+///(lan_promotion_watch_loop)がこの世代を見て監視対象のセッションを切り替える
+static LAN_WATCH: knit_common::net::LanPromotionWatch = knit_common::net::LanPromotionWatch::new();
+
+/// Tailscale 接続中の LAN 昇格監視(単一の常駐スレッド・client_loop の最初に
+/// 1 回だけ起こす)。起動一発目は LAN 発見が間に合わず Tailscale へ落ちる
+/// ことがある(発見は 600ms で諦めるため)ため、Tailscale 接続の間は 30 秒毎に
+/// LAN を探し直し、見つかれば本線を張り直して次の再接続で LAN 直へ昇格する。
+/// 旧実装は Tailscale 接続のたびに監視スレッドを spawn して並走し、30 秒毎の
+/// 探索ブロードキャストが重なっていた。判定(確立待ち・終了条件)は
+/// knit_common::net::LanWatch の状態機械(単体テスト済み)へ委ねる
+fn lan_promotion_watch_loop(port: u16, token: String) {
+    let mut state = knit_common::net::LanWatch::new();
+    let mut next_seek = Instant::now() + Duration::from_secs(30);
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let seek = state.step(
+            LAN_WATCH.current(),
+            CONNECTED.load(Ordering::Relaxed),
+            LAST_CONNECTED_MS.load(Ordering::Relaxed),
+            peer_ip(),
+            Instant::now() >= next_seek,
+            500,
+        );
+        if !seek {
+            continue;
+        }
+        next_seek = Instant::now() + Duration::from_secs(30);
+        if let Some(ip) = knit_common::discover::seek_first_lan(port, &token) {
+            println!("[conn] LAN 直の相手を発見({ip})。経路昇格のため張り替えます");
+            if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                let _ = tx.send(MAIN_SHUTDOWN.to_string());
+            }
+        }
+    }
+}
+
 /// 相手(Mac)に表示するこの端末の名前。登録(pairing)で名乗る COMPUTERNAME と
-/// 同じ値を hello/hello_ok にも載せる(複数台接続の区別のため)
-fn device_name() -> String {
-    std::env::var("COMPUTERNAME")
+/// 同じ値を hello/hello_ok にも載せる(複数台接続の区別のため)。
+/// KNIT_COMPUTERNAME が設定されていれば優先する(同名の PC を識別したいときの
+/// 上書き口。hello の name と同じ safe_peer_name 規則で不正文字を除く)
+pub(crate) fn device_name() -> String {
+    let raw = std::env::var("KNIT_COMPUTERNAME")
         .ok()
         .map(|n| n.trim().to_string())
         .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "Windows".into())
+        .or_else(|| {
+            std::env::var("COMPUTERNAME")
+                .ok()
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty())
+        })
+        .unwrap_or_else(|| "Windows".into());
+    knit_common::proto::safe_peer_name(&raw)
 }
 
 pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
@@ -141,6 +190,13 @@ pub(crate) fn peer_ip() -> Option<std::net::IpAddr> {
 /// 最初に繋がった経路を使う。切断は指数バックオフ+フルジッターで再接続し、
 /// 電源イベント(WAKE)で待機を飛ばしてすぐ再試行する
 pub(crate) fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32, h: i32) {
+    // LAN 昇格監視(単一の常駐スレッド)。Tailscale 接続のたびに下で世代を発行
+    // し、このスレッドが世代を見て監視対象のセッションを切り替える(旧実装は
+    // 接続のたびに spawn して並走した)
+    {
+        let token = token.to_string();
+        std::thread::spawn(move || lan_promotion_watch_loop(port, token));
+    }
     let mut backoff = knit_common::retry::Backoff::new(
         Duration::from_millis(500),
         Duration::from_secs(10),
@@ -170,50 +226,11 @@ pub(crate) fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32,
                 //(発見は 600ms で諦めるため)。Tailscale 接続の間は 30 秒毎に LAN を
                 // 探し直し、見つかれば本線を張り直して次の再接続で LAN 直へ昇格する
                 if knit_common::net::is_tailscale(a.ip()) {
-                    let tk = token.to_string();
-                    // 起動一発目は LAN 発見が間に合わず Tailscale へ落ちることがある。
-                    // Tailscale 接続の間は 30 秒毎に LAN を探し直し、見つかれば本線を
-                    // 張り直して次の再接続で LAN 直へ昇格する。
-                    // この時点の LAST_CONNECTED_MS は前回セッションの値のため、開始時に
-                    // 読んで比較すると 30 秒後の判定が常に「別セッション」となり監視が
-                    // 自滅していた。今回の確立(mark_connected による更新)を待ってから
-                    // 監視に入る
-                    let prev_connected_ms = LAST_CONNECTED_MS.load(Ordering::Relaxed);
-                    std::thread::spawn(move || {
-                        let mut waited_ms = 0u64;
-                        let established = loop {
-                            std::thread::sleep(Duration::from_millis(500));
-                            let cur = LAST_CONNECTED_MS.load(Ordering::Relaxed);
-                            if cur != prev_connected_ms && CONNECTED.load(Ordering::Relaxed) {
-                                break cur;
-                            }
-                            waited_ms += 500;
-                            if waited_ms >= 15_000 {
-                                return; // この接続は確立しなかった(監視しない)
-                            }
-                        };
-                        loop {
-                            std::thread::sleep(Duration::from_secs(30));
-                            if !CONNECTED.load(Ordering::Relaxed)
-                                || LAST_CONNECTED_MS.load(Ordering::Relaxed) != established
-                            {
-                                return; // セッション終了済み/別セッションに切り替わった
-                            }
-                            match peer_ip() {
-                                Some(p) if !knit_common::net::is_tailscale(p) => return, // 昇格済み
-                                None => return,
-                                _ => {}
-                            }
-                            if let Some(ip) = knit_common::discover::seek_first_lan(port, &tk) {
-                                println!("[conn] LAN 直の相手を発見({ip})。経路昇格のため張り直します");
-                                if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
-                                {
-                                    let _ = tx.send(MAIN_SHUTDOWN.to_string());
-                                }
-                                return;
-                            }
-                        }
-                    });
+                    // 監視は lan_promotion_watch_loop(単一の常駐スレッド)が担い、
+                    // ここでは世代の発行だけ行う。旧実装は接続のたびにスレッドを
+                    // spawn するため、Tailscale 経路の再接続を重ねるほど監視が
+                    // 並走した(世代が変わると古い監視は自然終了する)
+                    LAN_WATCH.begin();
                 }
                 // TCP だけ繋がる相手(LAN 発見で拾った旧版・別トークンの応答者)はハンドシェイクで
                 // 失敗する。セッション失敗まで backoff をリセットすると高頻度の無限再試行に
@@ -321,6 +338,14 @@ pub(crate) fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
+            // ポート占有での起動失敗をトレイのバルーンへも出す(exit するとログしか
+            // 残らないため)。tray::start は main の中で先に走っているため通知窓はある
+            tray::notify(
+                "Knit を起動できません",
+                &format!(
+                    "ポート {port} が他のアプリに使用中です。他の Knit(旧 Tsunagu 等)が動いていないか確認してください"
+                ),
+            );
             exit(1);
         }
     };

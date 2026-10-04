@@ -51,6 +51,12 @@ fn platform() -> &'static str {
     }
 }
 
+/// 更新が見つかった時の通知文言。署名検証(ed25519)を通った更新だけが
+/// ここへ来るため、成功時に検証が見えるように検証済みであることを書く
+fn available_text(version: &str) -> String {
+    format!("Knit {version} が利用できます(署名を確認した更新です・ed25519 検証済み)。メニューから更新できます")
+}
+
 /// 試験用の差し替えはデバッグビルドに限る(配布版では常に組み込みの置き場と鍵だけを使う)
 fn manifest_url() -> String {
     if cfg!(debug_assertions) {
@@ -282,7 +288,7 @@ pub fn on_click() {
             std::thread::spawn(|| {
                 match check() {
                     Ok(Some(a)) => {
-                        crate::notify("Knit", &format!("Knit {} が利用できます。メニューから更新できます", a.version));
+                        crate::notify("Knit", &available_text(&a.version));
                         set_state(State::Available { version: a.version, artifact: a.artifact });
                     }
                     Ok(None) => {
@@ -414,7 +420,7 @@ pub fn start_background() {
                     let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
                     if *n != a.version {
                         *n = a.version.clone();
-                        crate::notify("Knit", &format!("Knit {} が利用できます。メニューから更新できます", a.version));
+                        crate::notify("Knit", &available_text(&a.version));
                     }
                     if matches!(state(), State::Idle) {
                         set_state(State::Available { version: a.version, artifact: a.artifact });

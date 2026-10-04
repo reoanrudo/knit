@@ -224,6 +224,10 @@ const MENU_BACKMAC: u32 = 1007;
 const MENU_OPENFOLDER: u32 = 1008;
 const MENU_REGISTER: u32 = 1012;
 const MENU_DIAGNOSE: u32 = 1017;
+/// 設定の置き場を開く(.env と %LOCALAPPDATA%\Knit)
+const MENU_OPENSETDIR: u32 = 1018;
+/// 設定を初期化(.env の KNIT_* 行削除+配置の既定化のみ)
+const MENU_RESETSETTINGS: u32 = 1019;
 const MENU_SHARE_CLIP: u32 = 1014;
 const MENU_SHARE_FILES: u32 = 1015;
 const MENU_UPDATE: u32 = 1013;
@@ -354,21 +358,19 @@ fn rtt_line() -> String {
         format!("遅延: {ms}ms{route}")
     }
 }
-/// exe と同じフォルダの .env の KNIT_HOST 行を書き換える(無ければ追記)
+/// exe と同じフォルダの .env の KNIT_HOST 行を書き換える(無ければ追記)。
+/// host が空のときは行を書かない=LAN 自動発見へ戻す(Mac 側 imp_save_host の
+/// 「空欄で KNIT_HOST 行を消す」と同じ挙動)。
+/// 共通の envutil::set_env_value へ統一した: Mac 側と同じ一時ファイル+リネームの
+/// 安全な書き込み(直書きは書込み途中の失敗で .env が壊れるため)と、旧名称
+/// (TSUNAGU_HOST/SEAMLESS_HOST)行の新しい 1 行への統合を併せ持つ。改行は
+/// CRLF から LF へ変わるが、読み込み側(lines())はどちらも同じ扱い
 fn save_host_to_env(host: &str) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let dir = exe
         .parent()
         .ok_or_else(|| std::io::Error::other("exe directory is unavailable"))?;
-    let path = dir.join(".env");
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim_start().starts_with("KNIT_HOST"))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(format!("KNIT_HOST={host}"));
-    std::fs::write(&path, lines.join("\r\n") + "\r\n")
+    knit_common::envutil::set_env_value(&dir.join(".env"), "KNIT_HOST", host)
 }
 
 /// Mac 側の設定(画面位置・⌘キー割当)の表示。Mac から Cfg で同期された値
@@ -394,6 +396,17 @@ fn maccfg_line() -> String {
 /// フッター: 接続先サーバー・最終接続・次の再試行・稼働時間(1 秒タイマーで更新)
 fn footer_line() -> String {
     let host = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // 相手の名前(hello/hello_ok で受け取った物)が分かるときは併記する。
+    // IP だけでは同じ LAN の複数台(切り替え先)を区別できないため
+    let peer = crate::conn::PEER_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let target = if peer.is_empty() {
+        host.clone()
+    } else {
+        format!("{peer}({host})")
+    };
     let up = START_AT
         .get_or_init(std::time::Instant::now)
         .elapsed()
@@ -414,7 +427,7 @@ fn footer_line() -> String {
         .join("Downloads")
         .join("Knit");
     format!(
-        "接続先: {host} ・ 稼働 {h}時間{m:02}分{extra}\n受信フォルダ: {}",
+        "接続先: {target} ・ 稼働 {h}時間{m:02}分{extra}\n受信フォルダ: {}",
         recv.display()
     )
 }
@@ -638,11 +651,33 @@ fn wait_role_ack(timeout: std::time::Duration) -> bool {
     false
 }
 
+/// 実効的な役割(このPCがホストか)。環境変数 KNIT_ROLE=server が GUI 設定に優先する
+///(main の起動判定と同じ条件。表示と実役割が食い違わないように一元化する)
+pub(crate) fn effective_host_mode() -> bool {
+    role_env_fixed() || preferences::host_mode_pref()
+}
+
+/// 環境変数 KNIT_ROLE=server で役割が固定されているか(GUI からの切替が効かない)
+pub(crate) fn role_env_fixed() -> bool {
+    knit_common::envutil::get("KNIT_ROLE").as_deref() == Some("server")
+}
+
 /// 相手から接続の方向の切替を知らされたときの対応。相手がホストになるなら自分は接続側へ、
 /// 相手が接続側へ戻るなら自分がホストへ。すでに合っていれば何もしない
 pub(crate) fn apply_peer_role(peer_is_host: bool) {
     let want_host = !peer_is_host;
-    if preferences::host_mode_pref() == want_host {
+    // 実効役割(GUI 設定+環境変数)が既に相手の指示と一致していれば何も要らない
+    if effective_host_mode() == want_host {
+        return;
+    }
+    // 環境変数で役割を固定しているときは追従できない(再起動しても env が優先する)。
+    // 黙って再起動すると役割が変わらないまま切れるだけのため、案内で留める
+    if role_env_fixed() {
+        notify(
+            "Knit",
+            "環境変数 KNIT_ROLE=server で役割を固定しているため、相手の切り替えには追従しません",
+        );
+        println!("[role] KNIT_ROLE 固定中のため相手の切替指示を無視しました");
         return;
     }
     preferences::set_host_mode(want_host);
@@ -748,6 +783,75 @@ unsafe fn handle_command(id: u32) {
                 }
             });
         }
+        MENU_OPENSETDIR => {
+            // 設定の置き場を開く: .env(exe と同じフォルダ)と端末固有データ
+            // (%LOCALAPPDATA%\Knit)の両方。無いフォルダは作ってから開く
+            //(MENU_OPENFOLDER と同じ ShellExecuteW の導線)
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(d) = exe.parent() {
+                    dirs.push(d.to_path_buf());
+                }
+            }
+            if let Some(d) = knit_common::envutil::data_dir() {
+                let _ = std::fs::create_dir_all(&d);
+                dirs.push(d);
+            }
+            for dir in dirs {
+                let mut path: Vec<u16> = dir.to_string_lossy().encode_utf16().collect();
+                path.push(0);
+                let verb = wide("open");
+                let target = wide("explorer.exe");
+                ShellExecuteW(
+                    std::ptr::null_mut(),
+                    verb.as_ptr(),
+                    target.as_ptr(),
+                    path.as_ptr(),
+                    std::ptr::null(),
+                    5, /*SW_SHOW*/
+                );
+            }
+        }
+        MENU_RESETSETTINGS => {
+            // 設定を初期化(Mac の「すべての設定を初期化…」と対になる操作)。
+            // .env の KNIT_* 行を消し、配置を既定へ戻す。履歴と端末の登録は
+            // 消さない。環境変数として設定された KNIT_* はここからは消えない
+            let text = wide(
+                "このPCの Knit の設定を初期化しますか?\n対象: .env の KNIT_* 行・画面配置\n履歴と端末の登録は消えません。\n\n環境変数として設定されている KNIT_* は消えません。\nこの操作は取り消せません。",
+            );
+            let caption = wide("設定の初期化");
+            let choice = MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                0x0004_0030 /*MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND*/,
+            );
+            if choice != 6 {
+                /*IDYES 以外 = キャンセル*/
+                return;
+            }
+            let env_path = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join(".env")));
+            if let Some(path) = env_path {
+                if let Err(e) = knit_common::envutil::clear_knit_lines(&path) {
+                    eprintln!("[tray] 設定の初期化に失敗(.env): {e}");
+                    notify(
+                        "設定を初期化できませんでした",
+                        "アプリのフォルダへの書込み権限を確認してください。",
+                    );
+                    return;
+                }
+            }
+            // 配置の既定化(MENU_SIDE_RESET と同じ効果)
+            crate::state::set_mac_pref("side", serde_json::json!(0));
+            crate::state::set_mac_pref("peer_layout_reset", serde_json::json!(true));
+            eprintln!("[tray] 設定を初期化しました(.env の KNIT_* 行を削除し配置を既定化)");
+            notify(
+                "設定を初期化しました",
+                "Knit を再起動すると、最初の状態で起動します。",
+            );
+        }
         MENU_OPENLOG => {
             // ログは exe と同じフォルダ(run_knit.bat が書き出す)
             let path = std::env::current_exe()
@@ -803,7 +907,8 @@ unsafe fn handle_command(id: u32) {
             );
         }
         MENU_SAVEHOST => {
-            // サーバー(Mac)アドレスを .env へ保存して再起動(自動復帰が起こす)
+            // サーバー(Mac)アドレスを .env へ保存して再起動(自動復帰が起こす)。
+            // 空欄は KNIT_HOST 行を消して LAN 自動発見へ戻す(Mac 側と同じ挙動)
             let hwnd = EDIT_HOST.load(Ordering::Relaxed) as HWND;
             if !hwnd.is_null() {
                 extern "system" {
@@ -815,26 +920,39 @@ unsafe fn handle_command(id: u32) {
                 GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
                 let text = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
                 let host = text.trim().to_string();
-                if !host.is_empty() {
-                    if UI_PREVIEW.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    if let Err(e) = save_host_to_env(&host) {
-                        eprintln!("[prefs] host save failed: {e}");
-                        notify(
-                            "接続先を保存できません",
-                            "アプリのフォルダへの書込み権限を確認してください。",
-                        );
-                        return;
-                    }
-                    eprintln!("[tray] サーバーを {host} へ変更し再起動します");
-                    // 接続中ミュートの状態を復帰させてから終わる(ミュート恒久化の防止)。
-                    // 終了だけだと毎分の自動復帰タスクが起こすまで最長 1 分消えたままに
-                    // なるため、restart_self で即座に起こし直す(MENU_RESTART と同じ)
-                    crate::audio::speaker_disconnect();
-                    crate::release_all_input();
-                    restart_self();
+                if UI_PREVIEW.load(Ordering::Relaxed) {
+                    return;
                 }
+                // 形式の確認(Mac 側 imp_save_host と同じ基準の共通関数):
+                // 各要素が IP アドレスとして書けているか。不正なら通知して保存しない
+                if let Err(bad) = knit_common::connect::validate_host_input(&host) {
+                    eprintln!("[prefs] host save rejected: {bad}");
+                    notify(
+                        "接続先を保存できません",
+                        &format!(
+                            "「{bad}」が IP アドレスとして読めません。192.168.1.23 の形式で入力してください(カンマ区切りで複数可)"
+                        ),
+                    );
+                    return;
+                }
+                if let Err(e) = save_host_to_env(&host) {
+                    eprintln!("[prefs] host save failed: {e}");
+                    notify(
+                        "接続先を保存できません",
+                        "アプリのフォルダへの書込み権限を確認してください。",
+                    );
+                    return;
+                }
+                eprintln!(
+                    "[tray] サーバーを {} へ変更し再起動します",
+                    if host.is_empty() { "(自動発見)" } else { host.as_str() }
+                );
+                // 接続中ミュートの状態を復帰させてから終わる(ミュート恒久化の防止)。
+                // 終了だけだと毎分の自動復帰タスクが起こすまで最長 1 分消えたままに
+                // なるため、restart_self で即座に起こし直す(MENU_RESTART と同じ)
+                crate::audio::speaker_disconnect();
+                crate::release_all_input();
+                restart_self();
             }
         }
         MENU_SIDE_RESET => {
@@ -894,6 +1012,15 @@ unsafe fn handle_command(id: u32) {
             if UI_PREVIEW.load(Ordering::Relaxed) {
                 return;
             }
+            // 環境変数 KNIT_ROLE=server で固定中は GUI から切り替えられない
+            if role_env_fixed() {
+                notify(
+                    "Knit",
+                    "環境変数 KNIT_ROLE=server で役割を固定しています。切り替えるには .env の KNIT_ROLE の指定を外して再起動してください",
+                );
+                update_labels();
+                return;
+            }
             let want = match id {
                 MENU_ROLE_HOST => true,
                 MENU_ROLE_CLIENT => false,
@@ -923,14 +1050,19 @@ unsafe fn handle_command(id: u32) {
             // この処理はウィンドウプロシージャ(メッセージループ)から呼ばれるため、
             // 最大2秒の待ちをここで行うと描画・トレイ操作が固まる。別スレッドで待つ
             ROLE_ACK.store(false, Ordering::Relaxed);
+            // 切替の進行を設定画面の注記行へ出す(確認待ち→確認済み/タイムアウト。
+            // sync() がこの状態を文言へ反映する。Mac 側と同じ仕組み)
+            settings_ui::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
             crate::state::send_main_msg(&knit_common::proto::Msg::Role { host: next });
             crate::audio::speaker_disconnect();
             crate::release_all_input();
             std::thread::spawn(|| {
                 if wait_role_ack(std::time::Duration::from_millis(2000)) {
                     println!("[role] 相手の適用を確認しました");
+                    settings_ui::ROLE_NOTE_KIND.store(3, Ordering::Relaxed);
                 } else {
                     println!("[role] 相手の適用確認が取れないため時間経過で再起動します");
+                    settings_ui::ROLE_NOTE_KIND.store(4, Ordering::Relaxed);
                 }
                 restart_self();
             });
@@ -1362,8 +1494,12 @@ unsafe fn open_menu(hwnd: HWND) {
     );
     let fo = wide("受信フォルダを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
+    let sd = wide("設定フォルダを開く");
+    AppendMenuW(menu, MF_STRING, MENU_OPENSETDIR as usize, sd.as_ptr());
     let log_w = wide("ログを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENLOG as usize, log_w.as_ptr());
+    let rs_set = wide("設定を初期化…");
+    AppendMenuW(menu, MF_STRING, MENU_RESETSETTINGS as usize, rs_set.as_ptr());
     let up = wide(&crate::updater::menu_title());
     AppendMenuW(menu, MF_STRING, MENU_UPDATE as usize, up.as_ptr());
     let ih = wide(if crate::helper::is_connected() {

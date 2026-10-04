@@ -13,6 +13,11 @@ const MAX_LINE: u64 = 8 * 1024 * 1024;
 /// 最後に案内通知を出した時刻)
 static RTT_DEGRADE: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
 
+/// [rtt] ログ行を最後に出した時刻(単調 ms・0=未発生)。pong は毎秒来るため、
+/// 80ms 超が続く間の毎秒出力は常駐運用のログ成長の主力になる。劣化通知
+/// (rtt_degraded_check)と同じ 10 分スロットルに載せる
+static RTT_LOG_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
 /// RTT 悪化の継続判定( pong 受信ごとに呼ぶ純関数。単体テストで境界を守る)。
 /// 80ms 超が 10 秒以上続き、前回の案内から 10 分以上空いていれば案内する。
 /// 戻り値は (案内するか, 更新後の状態)。rtt が閾値未満なら継続をリセットする
@@ -34,14 +39,33 @@ pub(crate) fn rtt_degraded_check(state: (u64, u64), rtt: u64, now: u64) -> (bool
     (false, (since, last_notify))
 }
 
+/// [rtt] ログ行の出力判定(pong 受信ごとに呼ぶ純関数。単体テストで境界を守る)。
+/// rtt_degraded_check と同じ閾値・同じ 10 分スロットルで、RTT が 80ms 超の間
+/// ログは 10 分に 1 回だけ出す。戻り値は (出力するか, 更新後の last 時刻)
+pub(crate) fn rtt_log_check(last: u64, rtt: u64, now: u64) -> (bool, u64) {
+    const THRESH_MS: u64 = 80;
+    const THROTTLE_MS: u64 = 600_000;
+    if rtt < THRESH_MS {
+        return (false, last);
+    }
+    // last=0 は「一度も出力していない」なのでスロットルには掛からない
+    if last == 0 || now.saturating_sub(last) >= THROTTLE_MS {
+        return (true, now);
+    }
+    (false, last)
+}
+
 /// 認証済み接続の受信ループ(Return / Pong / Clip / Bye)。
 /// 戻り値は true=相手の Bye による正常終了、false=切断・読み取りエラー
 pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reader>, my_id: &str, generation: u64) -> bool {
-    use std::io::BufRead;
+    use std::io::{BufRead, Read};
     let mut line = String::new();
     loop {
         line.clear();
-        match reader.read_line(&mut line) {
+        // take(MAX_LINE+1) で読み込み自体を打ち切る(改行なしの巨大行で
+        // read_line が際限なくメモリを確保するのを防ぐ。hello 読み取りと
+        // Windows 側と同じ規則: 打ち切られた行は長さ MAX_LINE 超として切る)
+        match (&mut *reader).take(MAX_LINE + 1).read_line(&mut line) {
             Ok(0) => break,
             // 切断理由(EOF 以外)を残す: pong 途絶の張替えか read エラーかの区別が
             // 「なぜ切れたか」の追跡に必要。不正行(decode 失敗)は既存どおり無視
@@ -162,7 +186,7 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                     Some(text.clone());
                                 with_pool(|| unsafe { mac_set_clipboard(&text) });
                                 LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-                                history_push(&text, history_device_for_peer(my_id));
+                                history_push(&text, &history_device_for_peer(my_id));
                                 eprintln!("[clip] win->mac {} bytes", text.len());
                             }
                         }
@@ -176,7 +200,13 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 // ステータス窓表示にも回す(接続品質の見える化)
                                 let rtt = now.saturating_sub(ts).min(60_000);
                                 RTT_MS.store(rtt, Ordering::Relaxed);
-                                if rtt >= 80 {
+                                // [rtt] 行は 80ms 超の間も 10 分に 1 回まで
+                                //(劣化通知と同じスロットル。毎秒出すと常駐運用の
+                                // ログが際限なく増えるため)
+                                let log_last = RTT_LOG_LAST_MS.load(Ordering::Relaxed);
+                                let (log_rtt, log_next) = rtt_log_check(log_last, rtt, now);
+                                RTT_LOG_LAST_MS.store(log_next, Ordering::Relaxed);
+                                if log_rtt {
                                     eprintln!("[rtt] {rtt}ms(相手 {my_id}。カクつきが Wi-Fi の遅れによるかの確認用)");
                                 }
                                 // RTT 悪化が続いたら一度だけ有線直結を案内する
@@ -418,7 +448,18 @@ fn handshake_and_hello(
             } else {
                 id
             };
-            Ok((reader, hw, disp, dev, monitors, w.max(1) as f64, h.max(1) as f64, ver))
+            // monitors と w/h は Screen の受信ガードと同じ値域へ丸める
+            //(そのまま GUI のレイアウトへ入るため。外れた Monitor は除外)
+            Ok((
+                reader,
+                hw,
+                disp,
+                dev,
+                knit_common::proto::sanitize_monitors(&monitors),
+                w.clamp(1, 32768) as f64,
+                h.clamp(1, 32768) as f64,
+                ver,
+            ))
         }
         _ => Err("invalid hello".into()),
     }
@@ -432,6 +473,16 @@ pub(crate) fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f
         Ok(l) => l,
         Err(e) => {
             eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
+            // ポート占有での起動失敗を通知センターへも出す(exit するとログしか
+            // 残らないため)。通知は非同期発火のため、表示される時間だけ待つ
+            //(request_quit_for_update と同じ待ち方)
+            crate::notify(
+                "Knit",
+                &format!(
+                    "ポート {port} が他のアプリに使用中のため Knit を起動できません。他の Knit(旧 Tsunagu 等)が動いていないか確認してください"
+                ),
+            );
+            std::thread::sleep(Duration::from_millis(1500));
             std::process::exit(1);
         }
     };
@@ -538,6 +589,8 @@ pub(crate) fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f
                     id: dev.clone(), name: disp.clone(), ip: peer.ip(),
                     screen: (win_w, win_h), monitors: mons, writer: Some(w),
                     gen: my_gen, side, edge_monitor, ver: peer_ver,
+                    // 保存済みのエイリアス(表示名)があれば接続時点で載せる
+                    alias: tap::saved_peer_alias(&dev),
                 });
                 if replacing {
                     if let Some(old) = slot.take() { old.shutdown(); }
@@ -563,6 +616,17 @@ pub(crate) fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f
                 }
                 departure
             };
+            // 全端末がいなくなったら配置(peer-sides)を整理して保存する。
+            // 1 台の切断ごとに保存すると一時的なネット断で残り端末の設定を消す
+            // ため、PEERS が空になった時点だけ(detach が PEERS を触るため
+            // ロックの外で呼ぶ。save_peer_sides が内部で PEERS を掴み直す)
+            if peers::should_save_sides_after_detach(
+                &PEERS.lock().unwrap_or_else(|e| e.into_inner()),
+                &departure,
+            ) {
+                crate::tap::save_peer_sides();
+                eprintln!("[conn] 全ての端末がいなくなったため配置設定を整理しました");
+            }
             if let peers::Departure::Active { next } = departure {
                 // 待機端末へ自動で切り替わる場合は切断通知を出さない(二重になる)
                 on_disconnect(next.is_some());
@@ -615,7 +679,7 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
             ver,
             monitors,
             ..
-        }) if mw > 0 && mh > 0 && compatible(ver) => {
+        }) if (1..=32768).contains(&mw) && (1..=32768).contains(&mh) && compatible(ver) => {
             PEER_VERSION.store(ver, Ordering::Relaxed);
             *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner()) = (mw as f64, mh as f64);
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
@@ -628,7 +692,9 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
             };
             eprintln!(
                 "[info] win screen {mw}x{mh} モニター: {}",
-                knit_common::proto::Monitor::summary(&monitors)
+                knit_common::proto::Monitor::summary(&knit_common::proto::sanitize_monitors(
+                    &monitors
+                ))
             );
         }
         _ => return Err("invalid hello_ok".into()),
@@ -712,6 +778,43 @@ pub(crate) fn client_thread(host: Option<String>, port: u16, token: String, scre
     }
 }
 
+/// 受信ループの行長上限: take(MAX_LINE+1) が巨大行の読み込みを切ることの境界
+#[cfg(test)]
+mod line_cap_tests {
+    use super::MAX_LINE;
+    use std::io::{BufRead, Read};
+
+    /// 改行なしの巨大行は MAX_LINE+1 バイトで打ち切られ、長さ超として検出できる
+    ///(take 無しの read_line は行末まで際限なく読み込み続ける)
+    #[test]
+    fn unbounded_line_without_newline_is_truncated_at_max_line() {
+        let data = vec![b'a'; MAX_LINE as usize + 100];
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let n = (&mut reader)
+            .take(MAX_LINE + 1)
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(n as u64, MAX_LINE + 1, "読み込みは上限+1 バイトで止まる");
+        assert!(line.len() as u64 > MAX_LINE, "上限超として検出される");
+    }
+
+    /// ちょうど MAX_LINE バイト(改行込み)の行は切られずに読める
+    #[test]
+    fn exactly_max_line_bytes_pass_through() {
+        let mut data = vec![b'a'; MAX_LINE as usize - 1];
+        data.push(b'\n');
+        let mut reader = std::io::BufReader::new(&data[..]);
+        let mut line = String::new();
+        let n = (&mut reader)
+            .take(MAX_LINE + 1)
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(n as u64, MAX_LINE);
+        assert_eq!(line.len() as u64, MAX_LINE, "ちょうど上限は検出対象にしない");
+    }
+}
+
 #[cfg(test)]
 mod rtt_degrade_tests {
     use super::rtt_degraded_check;
@@ -763,5 +866,51 @@ mod rtt_degrade_tests {
         assert!(guide);
         let (_, st) = rtt_degraded_check((0, 0), 79, 1_000);
         assert_eq!(st.0, 0, "79ms は正常扱いで開始もしない");
+    }
+}
+
+/// [rtt] ログ行のスロットル(rtt_log_check): 毎秒の pong で出し続けると
+/// 常駐運用のログ成長の主力になるため、劣化通知と同じ 10 分に 1 回まで絞る
+#[cfg(test)]
+mod rtt_log_tests {
+    use super::rtt_log_check;
+
+    #[test]
+    fn 超過の初回は出力し以降は10分に1回() {
+        // 未出力(last=0)なら 80ms 超の初回 pong ですぐ出す
+        let (log, last) = rtt_log_check(0, 120, 1_000);
+        assert!(log);
+        assert_eq!(last, 1_000);
+        // 以降の毎秒 pong(80ms 超が続く)ではスロットル内なので出さない
+        for t in [2_000, 3_000, 60_000, 500_000] {
+            let (log, next) = rtt_log_check(last, 120, t);
+            assert!(!log, "10 分以内の {t}ms 時点では出力しない");
+            assert_eq!(next, last, "不出力の間は last を更新しない");
+        }
+        // 10 分経てば再び出す(超過がまだ続いている想定)
+        let (log, next) = rtt_log_check(last, 120, 601_000);
+        assert!(log);
+        assert_eq!(next, 601_000);
+    }
+
+    #[test]
+    fn 閾値未満では出力も更新もしない() {
+        // 79ms の pong では何も起こさない(継続リセットは rtt_degraded_check 側の役割)
+        let (log, last) = rtt_log_check(1_000, 79, 2_000);
+        assert!(!log);
+        assert_eq!(last, 1_000, "last は更新しない");
+        // 80ms ちょうどは「80ms 超」のログと同じ条件(>= 80)で対象
+        let (log, _) = rtt_log_check(0, 80, 1_000);
+        assert!(log);
+    }
+
+    #[test]
+    fn 前回出力が遠い過去なら即出す() {
+        // last が 10 分以上前なら継続の長さに関係なく出す
+        let (log, _) = rtt_log_check(1_000, 95, 601_000);
+        assert!(log);
+        // 9 分 59 秒ならまだ出さない(境界)
+        let (log, _) = rtt_log_check(1_000, 95, 600_999);
+        assert!(!log);
     }
 }

@@ -457,7 +457,10 @@ pub(crate) fn peer_at_side(d: u8) -> Option<usize> {
 
 /// 端末の対象の辺までの距離。モニター指定(edge_monitor)ならその矩形の辺で
 /// 測り、辺の延長線上にいなければ到達扱いにしない(f64::MAX)。
-/// 全画面(None)は全体領域の端
+/// 全画面(None)は全体領域の端。
+/// モニター番号が現在の displays に無い(取り外された等)場合は到達不能
+///(f64::MAX)を返す=境界は壁になる。旧実装は全体領域の端へ黙ってフォール
+/// バックしていたため、境界が知らないうちに「全画面の端」へ移動していた
 pub(crate) fn peer_gap(g: &Geo, edge_monitor: Option<usize>, side: u8, x: f64, y: f64) -> f64 {
     // 斜め配置(4-7)の端末も、基の辺(右/左)までの距離で測る。接続できる
     // 範囲(上半分・下半分)は LAY_RANGE が担う
@@ -466,7 +469,7 @@ pub(crate) fn peer_gap(g: &Geo, edge_monitor: Option<usize>, side: u8, x: f64, y
         return g.gap(side, x, y);
     };
     let Some(d) = g.displays.get(mi) else {
-        return g.gap(side, x, y);
+        return f64::MAX;
     };
     let (mx0, my0, mx1, my1) = (d.x, d.y, d.x + d.w, d.y + d.h);
     match side {
@@ -549,36 +552,131 @@ pub(crate) fn set_peer_side(index: usize, side: u8, edge_monitor: Option<usize>)
     );
 }
 
-/// 端末ごとの画面の位置を保存する(端末 id ごと。値は {side, monitor}。
-/// 旧版の数値形式(side + 4*(モニター+1))も読み替える)
-fn save_peer_sides() {
+/// peer-sides.json に併保存するモニターの識別情報。同型(同面積)モニターの
+/// 列挙順が入れ替わっても、保存時の物理的な配置から同じモニターを追跡する
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct MonitorMeta {
+    pub w: i64,
+    pub h: i64,
+    /// メインモニター原点基準の相対配置(displays[0] は常にメイン)
+    pub rel_x: i64,
+    pub rel_y: i64,
+    /// モニターの機種名(取れない環境は空)
+    pub name: String,
+}
+
+/// 現在の displays から mi 番のモニターの識別情報を作る。範囲外・displays 無しは None
+fn monitor_meta(displays: &[MacDisplay], mi: usize) -> Option<MonitorMeta> {
+    let d = displays.get(mi)?;
+    let (mx, my) = displays
+        .first()
+        .map(|m| (m.x as i64, m.y as i64))
+        .unwrap_or((0, 0));
+    Some(MonitorMeta {
+        w: d.w as i64,
+        h: d.h as i64,
+        rel_x: d.x as i64 - mx,
+        rel_y: d.y as i64 - my,
+        name: d.name.clone(),
+    })
+}
+
+/// 保存時のモニター識別情報から、現在の displays 内の同じ物理モニターの番号を
+/// 探す(同型モニターの列挙順入れ替わりに追従するための純粋関数)。
+/// - メタが無い(旧形式の保存)は saved_index をそのまま返す(番号で解釈)
+/// - サイズが一致する候補のうち、名前が一致するものを優先する(名前が
+///   取れない・同型 2 枚で名前も同じ場合はメイン原点基準の相対配置が
+///   最も近いものを選ぶ)
+/// - 候補が無い(取り外された・解像度が変わった)は None(呼び出し側で
+///   通知して再設定へ導く)
+pub(crate) fn remap_monitor_index(
+    saved_index: Option<usize>,
+    saved_meta: Option<&MonitorMeta>,
+    displays: &[MacDisplay],
+) -> Option<usize> {
+    let Some(m) = saved_meta else {
+        return saved_index; // 旧形式(番号のみ)は現状どおり番号で解釈
+    };
+    let size_match: Vec<usize> = displays
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.w as i64 == m.w && d.h as i64 == m.h)
+        .map(|(i, _)| i)
+        .collect();
+    if size_match.is_empty() {
+        return None;
+    }
+    // 名前が取れていて一致する候補が 1 つならそれ(同型 2 枚は名前も同じなので
+    // この段階では絞り切れない。位置で決める)
+    let named: Vec<usize> = size_match
+        .iter()
+        .copied()
+        .filter(|&i| !m.name.is_empty() && displays[i].name == m.name)
+        .collect();
+    let candidates = if named.len() == 1 { named } else { size_match };
+    // 相対配置が最も近い候補を選ぶ(メイン原点基準。メインが displays[0] で
+    // あることは mac_displays の並びが保証する)
+    let (mx, my) = displays
+        .first()
+        .map(|d| (d.x as i64, d.y as i64))
+        .unwrap_or((0, 0));
+    candidates.into_iter().min_by_key(|&i| {
+        let dx = displays[i].x as i64 - mx - m.rel_x;
+        let dy = displays[i].y as i64 - my - m.rel_y;
+        dx * dx + dy * dy
+    })
+}
+
+/// 端末ごとの画面の位置を保存する(端末 id ごと。値は {side, monitor} と
+/// monitor が指す物理モニターの識別情報(幅・高さ・相対配置・名前)、
+/// エイリアス(利用者が付けた表示名・設定があれば))。
+/// 識別情報は再構成時のリマッチ(remap_monitor_index)に使う。
+/// 旧版の数値形式(side + 4*(モニター+1))も読み替える。
+/// 接続中の切替(rematch)と全端末の退出(peers::should_save_sides_after_detach
+/// が真のとき)から呼ばれる
+pub(crate) fn save_peer_sides() {
     let Some(dir) = knit_common::envutil::config_dir() else {
         return;
     };
+    let displays = geo().displays;
     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
     let map: std::collections::BTreeMap<&str, serde_json::Value> = peers
         .iter()
         .map(|p| {
-            let v = serde_json::json!({
+            let mut v = serde_json::json!({
                 "side": p.side,
                 "monitor": p.edge_monitor.map(|m| m as i64).unwrap_or(-1),
             });
+            // エイリアスは設定した端末だけに書く(設定していない端末の
+            // エントリは旧形式の形を保つ=将来の形式変更の影響を広げない)
+            if let Some(a) = p.alias.as_deref().filter(|a| !a.is_empty()) {
+                v["alias"] = a.into();
+            }
+            // モニター指定のときだけ識別情報を併保存する(全画面は不要)。
+            // 保存時点で displays が取れない(起動直前 等)はメタ無しで
+            // 書く=旧形式と同じ扱いになり、次回の保存で埋まる
+            if let Some(m) = p.edge_monitor.and_then(|mi| monitor_meta(&displays, mi)) {
+                v["monitor_w"] = m.w.into();
+                v["monitor_h"] = m.h.into();
+                v["monitor_rel_x"] = m.rel_x.into();
+                v["monitor_rel_y"] = m.rel_y.into();
+                v["monitor_name"] = m.name.into();
+            }
             (p.id.as_str(), v)
         })
         .collect();
     if let Ok(json) = serde_json::to_string_pretty(&map) {
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join("peer-sides.json"), json);
+        // 直書きだと書き込み途中の電源断で全端末の境界設定が壊れるため、
+        // 一時ファイル+rename のアトミック置換で保存する(preferences と同じ手法)
+        if let Err(e) = knit_common::persist::write_atomic(&dir.join("peer-sides.json"), json.as_bytes()) {
+            eprintln!("[tap] peer-sides.json の保存に失敗: {e}");
+        }
     }
 }
 
-/// 端末 id に保存された画面の位置(無ければ None)。戻り値は (side, モニター番号)。
-/// 旧形式(数値)は side 0-3 + モニター付き、新形式({side, monitor})は 0-7
-fn saved_peer_side(id: &str) -> Option<(u8, Option<usize>)> {
-    let dir = knit_common::envutil::config_dir()?;
-    let text = std::fs::read_to_string(dir.join("peer-sides.json")).ok()?;
-    let map: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let v = map.get(id)?;
+/// peer-sides.json の 1 エントリを (side, モニター番号, モニター識別情報) へ
+/// 読み込む。旧形式(数値)・メタ無しの新形式は識別情報 None
+fn parse_saved_side(v: &serde_json::Value) -> Option<(u8, Option<usize>, Option<MonitorMeta>)> {
     // 旧形式(数値): side(0-3) + 4*(モニター+1)
     if let Some(n) = v.as_u64() {
         if n > 35 {
@@ -586,9 +684,9 @@ fn saved_peer_side(id: &str) -> Option<(u8, Option<usize>)> {
         }
         let n = n as u8;
         return Some(if n <= 3 {
-            (n, None)
+            (n, None, None)
         } else {
-            (n & 3, Some((n / 4) as usize - 1))
+            (n & 3, Some((n / 4) as usize - 1), None)
         });
     }
     // 新形式({side, monitor}): side 0-7(斜め含む)。monitor は -1=全画面
@@ -599,10 +697,95 @@ fn saved_peer_side(id: &str) -> Option<(u8, Option<usize>)> {
     // monitor は保存側が常に書くが、手書き修正や版混在で欠けていても
     // side だけ生かす(配置がサイレントに既定へ落ちるのを防ぐ)
     let mon = v.get("monitor").and_then(|m| m.as_i64()).unwrap_or(-1);
+    let meta = v
+        .get("monitor_w")
+        .and_then(|w| w.as_i64())
+        .zip(v.get("monitor_h").and_then(|h| h.as_i64()))
+        .map(|(w, h)| MonitorMeta {
+            w,
+            h,
+            rel_x: v
+                .get("monitor_rel_x")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            rel_y: v
+                .get("monitor_rel_y")
+                .and_then(|y| y.as_i64())
+                .unwrap_or(0),
+            name: v
+                .get("monitor_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
     Some((
         side as u8,
         if mon < 0 { None } else { Some(mon as usize) },
+        meta,
     ))
+}
+
+/// peer-sides.json を全体を読む(読めなければ None)。壊れている場合は
+/// .corrupt へ退避してから None: 無言で空扱いにすると以後の保存で旧設定が
+/// 恒久喪失するため、上書き前に救出材料を残す
+fn load_peer_sides_json() -> Option<serde_json::Value> {
+    let dir = knit_common::envutil::config_dir()?;
+    knit_common::persist::read_json_or_quarantine(&dir.join("peer-sides.json"))
+}
+
+/// 端末 id に保存された画面の位置(無ければ None)。戻り値は (side, モニター番号)。
+/// モニター識別情報が保存されている場合は、現在のモニター構成へリマッチした
+/// 番号を返す(同型モニターの列挙順入れ替わりに追従)。旧形式は番号どおり
+fn saved_peer_side(id: &str) -> Option<(u8, Option<usize>)> {
+    let v = load_peer_sides_json()?.get(id)?.clone();
+    let (side, mon, meta) = parse_saved_side(&v)?;
+    Some((side, remap_monitor_index(mon, meta.as_ref(), &geo().displays)))
+}
+
+/// 保存された 1 エントリからエイリアス(利用者が付けた表示名)を読む。
+/// 無い・空・文字列以外は None。値は hello の name と同じ safe_peer_name
+/// 規則で検査する(手書き修正・壊れたファイルから表示へ不正文字を流さない)
+fn alias_from_entry(v: &serde_json::Value) -> Option<String> {
+    let raw = v.get("alias")?.as_str()?;
+    let a = knit_common::proto::safe_peer_name(raw.trim());
+    (!a.is_empty()).then_some(a)
+}
+
+/// peer-sides.json から端末 id に保存されたエイリアスを読む(無ければ None)。
+/// 旧形式(alias フィールド無し)は None=コンピュータ名を使う従来どおり
+pub(crate) fn saved_peer_alias(id: &str) -> Option<String> {
+    alias_from_entry(load_peer_sides_json()?.get(id)?)
+}
+
+/// 端末のエイリアス(表示名)を設定する(設定「接続」の「選択中の端末の名前」)。
+/// 空文字・空白のみは None=コンピュータ名(hello の name)へ戻す。
+/// peer-sides.json へ保存し、表示(active_peer_label・配置エディタ等)へ反映される
+pub(crate) fn set_peer_alias(index: usize, alias: &str) {
+    let cleaned = knit_common::proto::safe_peer_name(alias.trim());
+    let alias = (!cleaned.is_empty()).then_some(cleaned);
+    let name;
+    {
+        let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(p) = peers.get_mut(index) else {
+            return;
+        };
+        p.alias = alias.clone();
+        name = p.name.clone();
+    }
+    save_peer_sides();
+    match alias {
+        Some(a) => eprintln!("[cfg] {name} の表示名 -> {a}"),
+        None => eprintln!("[cfg] {name} の表示名をコンピュータ名へ戻しました"),
+    }
+}
+
+/// peer-sides.json に保存済みの端末配置が 1 つでもあるか。未接続時に配置
+/// エディタで全体設定を変えた際「次回の接続では保存済み配置が優先される」
+/// 案内を出すかの判定に使う(assign_side_for_new_peer が保存を最優先するため)
+pub(crate) fn has_saved_peer_sides() -> bool {
+    load_peer_sides_json()
+        .and_then(|v| v.as_object().map(|o| !o.is_empty()))
+        .unwrap_or(false)
 }
 
 /// 新しい端末の画面の位置を決める: 保存があればそれ、無ければ全体設定の辺が
@@ -792,6 +975,56 @@ fn compute_geo() -> Geo {
     }
 }
 
+/// displays の範囲外の edge_monitor を持つ端末の名前一覧(取り外し検査の
+/// 純粋関数。境界が壁へ落ちた端末の通知文に使う)
+pub(crate) fn missing_monitor_peer_names(
+    peers: &[PeerEntry],
+    display_count: usize,
+) -> Vec<String> {
+    peers
+        .iter()
+        .filter(|p| p.edge_monitor.is_some_and(|m| m >= display_count))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// モニター構成の再構成後に呼ぶ: 保存済みの識別情報で各端末の境界モニター番号を
+/// 張り直し(1 つでも変われば保存)、張り直し後も範囲外の境界は「壁」扱いのまま
+/// 通知して再設定へ導く
+fn rematch_peer_edge_monitors(displays: &[MacDisplay]) {
+    let Some(map) = load_peer_sides_json() else {
+        return;
+    };
+    let mut changed = false;
+    {
+        let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        for p in peers.iter_mut() {
+            let Some(v) = map.get(&p.id) else {
+                continue;
+            };
+            let Some((_, saved_mon, meta)) = parse_saved_side(v) else {
+                continue;
+            };
+            let new_mon = remap_monitor_index(saved_mon, meta.as_ref(), displays);
+            if new_mon != p.edge_monitor {
+                eprintln!(
+                    "[screen] {} の境界モニターを {} へ張り直しました",
+                    p.name,
+                    match new_mon {
+                        None => "無効(壁)".to_string(),
+                        Some(i) => format!("モニター{}", i + 1),
+                    }
+                );
+                p.edge_monitor = new_mon;
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        save_peer_sides();
+    }
+}
+
 pub(crate) fn refresh_geo() {
     let g = compute_geo();
     *GEO.lock().unwrap_or_else(|e| e.into_inner()) = Some(g.clone());
@@ -799,6 +1032,26 @@ pub(crate) fn refresh_geo() {
         "[screen] main {}x{} / 全体 x={:.0}..{:.0} y={:.0}..{:.0}",
         g.main_w, g.main_h, g.min_x, g.max_x, g.min_y, g.max_y
     );
+    // 同型モニターの列挙順は安定しないため、保存済みの識別情報で番号を張り直す
+    rematch_peer_edge_monitors(&g.displays);
+    // 張り直しても範囲外の境界モニター(取り外された等)は壁として残る。
+    // サイレントに全画面の端へ移すことはしない(旧実装の問題)。
+    // 通知はモニター構成変更の連発で洪水にならないよう 60 秒に間引く
+    let missing = missing_monitor_peer_names(
+        &PEERS.lock().unwrap_or_else(|e| e.into_inner()),
+        g.displays.len(),
+    );
+    if !missing.is_empty() {
+        static LAST_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
+        let now = now_ms();
+        if now.saturating_sub(LAST_NOTIFY_MS.swap(now, Ordering::Relaxed)) > 60_000 {
+            let list = missing.join("、");
+            notify(
+                "Knit",
+                &format!("モニター構成が変わりました。端末「{list}」の境界を確認してください"),
+            );
+        }
+    }
 }
 
 /// ディスプレイ構成の変更通知(メイン RunLoop 上で呼ばれる)。変更完了時だけ作り直す
@@ -846,6 +1099,14 @@ pub(crate) fn enter_win_mode_cursor_lock() {
     }
     trackpad::reset_session();
     sync_clipboard_to_win();
+    // Caps Lock の越境同期: Mac の alphaShift と Windows のトグル状態がズレていると
+    // 越境直後の大文字/小文字が反転する。IME 同期とは独立(IME を同期しない設定でも
+    // 文字の大小が狂うのは困るため常時送る)。Windows 側は Msg::Caps を受け取った時点で
+    // 状態が異なる場合だけ VK_CAPITAL を 1 回トグルする
+    let caps_on = unsafe {
+        CGEventSourceFlagsState(EVENT_SOURCE_STATE_COMBINED) & FLAG_ALPHA_SHIFT != 0
+    };
+    send_msg(&Msg::Caps { on: caps_on });
     // IME Follow Cursor(ビジョン§7): Mac のかな/英数の状態を Windows 側の
     // IME 開閉へ乗せていく。「画面を移る時だけ同期」の原則どおりここでだけ送る。
     // 対象外の入力ソース(サードパーティ IME 等)は同期しない(その旨をログへ出す)
@@ -2100,6 +2361,7 @@ mod side_geometry_tests {
             side,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
+            alias: None,
         }
     }
 
@@ -2146,5 +2408,261 @@ mod side_geometry_tests {
         let peers = [p];
         assert_eq!(boundary_of(&peers, 0, Some(0)), Some((1, Some(2))));
         assert_eq!(boundary_of(&peers, 0, None), None);
+    }
+}
+
+#[cfg(test)]
+mod monitor_rematch_tests {
+    use super::{remap_monitor_index, MacDisplay, MonitorMeta};
+
+    fn display(x: f64, y: f64, w: f64, h: f64, main: bool, name: &str) -> MacDisplay {
+        MacDisplay {
+            x,
+            y,
+            w,
+            h,
+            main,
+            name: name.to_string(),
+        }
+    }
+
+    fn meta(w: i64, h: i64, rel_x: i64, rel_y: i64, name: &str) -> MonitorMeta {
+        MonitorMeta {
+            w,
+            h,
+            rel_x,
+            rel_y,
+            name: name.to_string(),
+        }
+    }
+
+    fn dual_setup() -> (Vec<MacDisplay>, MonitorMeta) {
+        // メイン(0,0 2560x1440)+右にサブ(2560,0 1920x1080)の 2 枚。保存時は
+        // サブが 1 番だった(=rel=(2560,0))
+        (
+            vec![
+                display(0.0, 0.0, 2560.0, 1440.0, true, "内蔵 Retina ディスプレイ"),
+                display(2560.0, 0.0, 1920.0, 1080.0, false, "LG HDR WFHD"),
+            ],
+            meta(1920, 1080, 2560, 0, "LG HDR WFHD"),
+        )
+    }
+
+    #[test]
+    fn follows_the_same_physical_monitor_when_order_swaps() {
+        // 同面積の 2 枚(サブと同じ 1920x1080 がもう 1 枚)で列挙順が入れ替わって
+        // も、相対配置(名前が違えば名前、同じなら位置)で同じ物理を指す
+        let (displays, m) = dual_setup();
+        assert_eq!(remap_monitor_index(Some(1), Some(&m), &displays), Some(1));
+        // サブが 0 番へ入れ替わった場合(メインの面積が小さい等で並びが変わる):
+        // 名前一致で追跡できる
+        let swapped = vec![
+            display(2560.0, 0.0, 1920.0, 1080.0, false, "LG HDR WFHD"),
+            display(0.0, 0.0, 2560.0, 1440.0, true, "内蔵 Retina ディスプレイ"),
+        ];
+        // 名前が取れない環境でも位置で追跡できる(縦に並べた同型 2 枚)
+        let m_upper = meta(1920, 1080, 2560, 0, "");
+        let m_lower = meta(1920, 1080, 2560, 1200, "");
+        let unnamed = vec![
+            display(0.0, 0.0, 2560.0, 1440.0, true, ""),
+            display(2560.0, 0.0, 1920.0, 1080.0, false, ""),
+            display(2560.0, 1200.0, 1920.0, 1080.0, false, ""),
+        ];
+        assert_eq!(remap_monitor_index(Some(1), Some(&m_upper), &unnamed), Some(1));
+        assert_eq!(remap_monitor_index(Some(2), Some(&m_lower), &unnamed), Some(2));
+        assert_eq!(
+            remap_monitor_index(Some(1), Some(&m), &swapped),
+            Some(0),
+            "名前一致で入れ替わり後の番号へ張り直す"
+        );
+    }
+
+    #[test]
+    fn same_model_pair_is_distinguished_by_relative_position() {
+        // 同型 2 枚(名前もサイズも同じ)はメイン原点基準の相対配置で区別する
+        let displays = vec![
+            display(0.0, 0.0, 2560.0, 1440.0, true, "同型"),
+            display(2560.0, 0.0, 1920.0, 1080.0, false, "LG UltraFine"),
+            display(-1920.0, 0.0, 1920.0, 1080.0, false, "LG UltraFine"),
+        ];
+        let right = meta(1920, 1080, 2560, 0, "LG UltraFine");
+        let left = meta(1920, 1080, -1920, 0, "LG UltraFine");
+        assert_eq!(remap_monitor_index(Some(1), Some(&right), &displays), Some(1));
+        assert_eq!(remap_monitor_index(Some(2), Some(&left), &displays), Some(2));
+    }
+
+    #[test]
+    fn returns_none_when_no_display_matches() {
+        // 取り外された・解像度が変わった: サイズ一致が無ければ None(壁扱い)
+        let (displays, m) = dual_setup();
+        let only_main = vec![displays[0].clone()];
+        assert_eq!(remap_monitor_index(Some(1), Some(&m), &only_main), None);
+        let resized = vec![
+            displays[0].clone(),
+            display(2560.0, 0.0, 3840.0, 2160.0, false, "LG HDR WFHD"),
+        ];
+        assert_eq!(remap_monitor_index(Some(1), Some(&m), &resized), None);
+    }
+
+    #[test]
+    fn legacy_entry_without_meta_keeps_the_saved_number() {
+        // 旧形式(番号のみの保存)は現状どおり番号で解釈する
+        let (displays, _) = dual_setup();
+        assert_eq!(remap_monitor_index(Some(1), None, &displays), Some(1));
+        assert_eq!(remap_monitor_index(None, None, &displays), None);
+        // 範囲外の番号もそのまま返す(取り外し検査 missing_monitor_peer_names と
+        // peer_gap の壁化が受け持つ。ここで勝手に直さない)
+        assert_eq!(remap_monitor_index(Some(5), None, &displays), Some(5));
+    }
+}
+
+#[cfg(test)]
+mod missing_monitor_tests {
+    use super::{missing_monitor_peer_names, peer_gap, MacDisplay, Geo, PeerEntry};
+
+    fn peer(side: u8) -> PeerEntry {
+        PeerEntry {
+            id: "w1".into(),
+            name: "w1".into(),
+            ip: "127.0.0.1".parse().unwrap(),
+            screen: (1920.0, 1080.0),
+            monitors: Vec::new(),
+            writer: None,
+            gen: 1,
+            side,
+            ver: knit_common::proto::VERSION,
+            edge_monitor: None,
+            alias: None,
+        }
+    }
+
+    fn geo_with(displays: Vec<MacDisplay>) -> Geo {
+        Geo {
+            main_w: 2560.0,
+            main_h: 1440.0,
+            min_x: 0.0,
+            max_x: 4480.0,
+            min_y: 0.0,
+            max_y: 1440.0,
+            exit: [(0.0, 1440.0), (0.0, 1440.0), (0.0, 4480.0), (0.0, 4480.0)],
+            displays,
+        }
+    }
+
+    fn displays() -> Vec<MacDisplay> {
+        vec![
+            MacDisplay {
+                x: 0.0,
+                y: 0.0,
+                w: 2560.0,
+                h: 1440.0,
+                main: true,
+                name: "内蔵".into(),
+            },
+            MacDisplay {
+                x: 2560.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+                main: false,
+                name: "外付け".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn out_of_range_edge_monitor_is_an_unreachable_wall() {
+        // モニター 3 番(取り外された)への境界は到達不能(f64::MAX)=壁。
+        // 旧実装は全体領域の端へ黙ってフォールバックし、境界が知らないうちに
+        // 「全画面の端」へ移動していた
+        let g = geo_with(displays());
+        assert_eq!(peer_gap(&g, Some(2), 0, 2559.0, 700.0), f64::MAX);
+        // displays そのものが無い(起動直前)も同様に壁
+        let empty = geo_with(Vec::new());
+        assert_eq!(peer_gap(&empty, Some(0), 0, 10.0, 10.0), f64::MAX);
+    }
+
+    #[test]
+    fn in_range_edge_monitor_measures_on_its_own_edge() {
+        let g = geo_with(displays());
+        // モニター 1(外付け)の右辺は x=4480。そこから 10px 内側
+        assert_eq!(peer_gap(&g, Some(1), 0, 4470.0, 500.0), 10.0);
+        // 全画面(None)は全体領域の端(従来どおり)
+        assert_eq!(peer_gap(&g, None, 0, 4470.0, 500.0), 10.0);
+    }
+
+    #[test]
+    fn detects_only_peers_whose_edge_monitor_is_out_of_range() {
+        let mut a = peer(0);
+        a.name = "Surface".into();
+        a.edge_monitor = Some(1); // 範囲内
+        let mut b = peer(1);
+        b.name = "自作 PC".into();
+        b.edge_monitor = Some(2); // 範囲外(取り外し)
+        let mut c = peer(2);
+        c.name = "タブレット".into();
+        c.edge_monitor = None; // 全画面
+        let names = missing_monitor_peer_names(&[a, b, c], 2);
+        assert_eq!(names, vec!["自作 PC".to_string()]);
+        // 全て範囲内なら空
+        let mut a2 = peer(0);
+        a2.edge_monitor = Some(0);
+        assert!(missing_monitor_peer_names(&[a2], 2).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::alias_from_entry;
+
+    /// エイリアスの読み込み: 旧形式(alias 無し)は None=コンピュータ名のまま。
+    /// 空・空白のみも None(「コンピュータ名へ戻す」の扱い)。値は safe_peer_name
+    /// で検査される(手書き修正されたファイルから表示へ不正文字を流さない)
+    #[test]
+    fn alias_reads_are_backward_compatible_and_sanitized() {
+        // 旧形式(数値・{side,monitor} のみ)は None
+        assert_eq!(alias_from_entry(&serde_json::json!(5)), None);
+        assert_eq!(
+            alias_from_entry(&serde_json::json!({"side": 0, "monitor": -1})),
+            None
+        );
+        // 空・空白のみは None
+        assert_eq!(alias_from_entry(&serde_json::json!({"alias": ""})), None);
+        assert_eq!(alias_from_entry(&serde_json::json!({"alias": "  "})), None);
+        // 文字列以外の型も None
+        assert_eq!(alias_from_entry(&serde_json::json!({"alias": 7})), None);
+        // 通常の値は trim 済みで返る
+        assert_eq!(
+            alias_from_entry(&serde_json::json!({"alias": " 事務室のPC "})),
+            Some("事務室のPC".into())
+        );
+        // 偽装文字(Bidi オーバーライド)は hello の name と同じ規則で除去
+        assert_eq!(
+            alias_from_entry(&serde_json::json!({"alias": "A\u{202e}B"})),
+            Some("AB".into())
+        );
+    }
+
+    /// save_peer_sides が書く 1 エントリの形式(設定した端末だけ alias を併記)と
+    /// alias_from_entry の読み込みの対。保存形式を変えたときに対が壊れないよう固定する
+    #[test]
+    fn saved_entry_shape_round_trips_through_alias_read() {
+        // save_peer_sides と同じ構造(side/monitor + 設定時のみ alias)
+        let with_alias = serde_json::json!({
+            "side": 3,
+            "monitor": -1,
+            "alias": "書斎のWindows",
+        });
+        assert_eq!(
+            alias_from_entry(&with_alias),
+            Some("書斎のWindows".into()),
+            "保存形式の alias はそのまま読めること"
+        );
+        // alias 未設定(旧形式互換)のエントリからは None
+        let without_alias = serde_json::json!({
+            "side": 3,
+            "monitor": -1,
+        });
+        assert_eq!(alias_from_entry(&without_alias), None);
     }
 }

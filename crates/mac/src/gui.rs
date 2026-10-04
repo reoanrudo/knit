@@ -4,7 +4,7 @@
 // 呼び出し規約: このモジュールの全関数はメインスレッドから呼ぶこと
 // (start() は main() の末尾、IMP は AppKit のイベント配信=メインRunLoop)。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::{msg0, msg0_cstr, nsstring, objc_getClass};
@@ -134,8 +134,24 @@ static GUI_ROLE_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// Android タブレットのサブメニュー(状態・操作する/しないの切替)。世代が変わった時だけ作り直す
 /// 変化検知の初期値は最大値にして、起動直後の 1 回目で必ず作り直させる
 static GUI_HISTORY_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+/// 履歴サブメニューが開示中(tracking 中)か。開示中の removeAllItems は
+/// AppKit の追跡中メニューを壊す(未定義動作)ため、再構築を閉じるまで保留する
+static GUI_HISTORY_OPEN: AtomicBool = AtomicBool::new(false);
+/// 開示中に履歴の変化を検知した(閉じた時に 1 回だけ再構築する)
+static GUI_HISTORY_PENDING: AtomicBool = AtomicBool::new(false);
 /// 履歴の見出し項目(件数表示を setTitle で更新する)
 static GUI_HISTORY_ITEM: AtomicUsize = AtomicUsize::new(0);
+
+/// 毎秒の再構築判断: 履歴に変化があり、かつメニューが閉じている時にだけ作り直す。
+/// 開示中の保留(未定義動作の回避)と閉じた時の反映を分けて試験で固定する
+fn history_rebuild_now(last_id: u64, seen: u64, menu_open: bool) -> bool {
+    last_id != seen && !menu_open
+}
+
+/// メニューを閉じた時の反映判断: 開示中に届いた変化(pending)を 1 回だけ反映する
+fn history_flush_on_close(pending: bool, last_id: u64, seen: u64) -> bool {
+    pending && last_id != seen
+}
 
 // ---------- 設定ウィンドウ(メニュー「設定…」で開く) ----------
 static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
@@ -217,6 +233,144 @@ unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
         .spawn();
 }
 
+/// 設定「その他」の「設定フォルダを開く」: 設定の保存先(~/.config/knit)を
+/// Finder で開く(imp_open_log と同じ open コマンドの導線)。フォルダがまだ
+/// 無いときは作ってから開く(初回起動で env が無い場合でも導線が死なないように)
+unsafe extern "C" fn imp_open_settings_dir(_s: ID, _c: SEL, _n: ID) {
+    let Some(dir) = knit_common::envutil::config_dir() else {
+        crate::notify("Knit", "ホームが取得できないため設定フォルダを開けません");
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[prefs] 設定フォルダの作成に失敗: {e}");
+    }
+    let status = std::process::Command::new("open").arg(&dir).status();
+    if !matches!(status, Ok(s) if s.success()) {
+        crate::notify(
+            "Knit",
+            &format!("設定フォルダを開けませんでした: {}", dir.display()),
+        );
+    }
+}
+
+/// 設定「その他」の「設定を書き出す…」: 現在の設定一式を JSON ファイルへ保存
+/// する(引っ越し・バックアップ用。NSSavePanel で場所を選ぶ)
+unsafe extern "C" fn imp_export_prefs(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let app = msg0(
+        objc_getClass(c"NSApplication".as_ptr()),
+        sel(c"sharedApplication"),
+    );
+    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    let panel = msg0(
+        objc_getClass(c"NSSavePanel".as_ptr()),
+        sel(c"savePanel"),
+    );
+    if panel.is_null() {
+        eprintln!("[gui] NSSavePanel を生成できません");
+        return;
+    }
+    msg1_void_id(
+        panel,
+        sel(c"setMessage:"),
+        nsstring("Knit の設定を書き出します(接続キー・履歴は含まれません)"),
+    );
+    msg1_void_id(
+        panel,
+        sel(c"setNameFieldStringValue:"),
+        nsstring("knit-settings.json"),
+    );
+    let resp = crate::msg0_isize(panel, sel(c"runModal"));
+    if resp != 1 {
+        return; // NSModalResponseOK 以外 = キャンセル
+    }
+    let url = msg0(panel, sel(c"URL"));
+    if url.is_null() {
+        return;
+    }
+    let path = msg0(url, sel(c"path"));
+    let utf8 = crate::msg0_cstr(path, sel(c"UTF8String"));
+    if utf8.is_null() {
+        return;
+    }
+    let target = std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned();
+    match preferences::export_to(std::path::Path::new(&target)) {
+        Ok(()) => {
+            eprintln!("[prefs] 設定を書き出しました: {target}");
+            crate::notify("Knit", &format!("設定を書き出しました:\n{target}"));
+        }
+        Err(e) => {
+            eprintln!("[prefs] 設定の書き出しに失敗: {e}");
+            crate::notify("Knit", "設定を書き出せませんでした。保存先の権限を確認してください");
+        }
+    }
+}
+
+/// 設定「その他」の「設定を読み込む…」: 書き出した JSON から設定を復元する。
+/// 読み込みは apply(知らないキー無視・範囲検査つき)を通すため、外部で
+/// 編集されたファイルでも安全。反映は保存と同じ経路で、画面の表示は
+/// 毎秒の sync() が追いつける
+unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let app = msg0(
+        objc_getClass(c"NSApplication".as_ptr()),
+        sel(c"sharedApplication"),
+    );
+    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    let panel = msg0(
+        objc_getClass(c"NSOpenPanel".as_ptr()),
+        sel(c"openPanel"),
+    );
+    if panel.is_null() {
+        eprintln!("[gui] NSOpenPanel を生成できません");
+        return;
+    }
+    msg1_void_u8(panel, sel(c"setCanChooseFiles:"), 1);
+    msg1_void_u8(panel, sel(c"setCanChooseDirectories:"), 0);
+    msg1_void_u8(panel, sel(c"setAllowsMultipleSelection:"), 0);
+    msg1_void_id(
+        panel,
+        sel(c"setMessage:"),
+        nsstring("書き出しておいた Knit の設定ファイルを選んでください"),
+    );
+    let resp = crate::msg0_isize(panel, sel(c"runModal"));
+    if resp != 1 {
+        return; // NSModalResponseOK 以外 = キャンセル
+    }
+    let url = msg0(panel, sel(c"URL"));
+    if url.is_null() {
+        return;
+    }
+    let path = msg0(url, sel(c"path"));
+    let utf8 = crate::msg0_cstr(path, sel(c"UTF8String"));
+    if utf8.is_null() {
+        return;
+    }
+    let source = std::ffi::CStr::from_ptr(utf8)
+        .to_string_lossy()
+        .into_owned();
+    match preferences::import_from(std::path::Path::new(&source)) {
+        Ok(()) => {
+            eprintln!("[prefs] 設定を読み込みました: {source}");
+            crate::notify(
+                "Knit",
+                "設定を読み込みました。環境変数・envファイルの指定がある項目は、そちらが優先されます",
+            );
+            refresh_status();
+        }
+        Err(e) => {
+            eprintln!("[prefs] 設定の読み込みに失敗: {e}");
+            crate::notify("Knit", &format!("設定を読み込めませんでした。\n{e}"));
+        }
+    }
+}
+
 /// 履歴メニューの「消す」クリック。本文は不要(メニュー操作で即反映)
 unsafe extern "C" fn imp_history_clear(_s: ID, _c: SEL, _n: ID) {
     crate::history_clear();
@@ -259,6 +413,135 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
     restart_now();
 }
 
+/// 設定「接続」の「保存して再接続」: ~/.config/knit/env の KNIT_HOST 行を書き換えて
+/// 再起動する(接続先は起動時に決まるため。Windows 側の .env 書き換えと同じ流れ)。
+/// 空欄なら行を消して LAN からの自動発見へ戻す
+unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let field = prefs::host_field() as ID;
+    if field.is_null() {
+        return;
+    }
+    let obj = msg0(field, sel(c"stringValue"));
+    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
+    let text = if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8).to_string_lossy().trim().to_string()
+    };
+    // 形式の確認: カンマ区切りの各要素が IP アドレス(IPv4/IPv6)として書けているか。
+    // ホスト名は Knit の接続先指定では使わないため、入力ミスをここで止める。
+    // 判定は Windows 側(MENU_SAVEHOST)と共通の knit_common::connect::validate_host_input
+    if let Err(bad) = knit_common::connect::validate_host_input(&text) {
+        crate::notify(
+            "Knit",
+            &format!("接続先「{bad}」が IP アドレスとして読めません。192.168.1.23 の形式で入力してください(カンマ区切りで複数可)"),
+        );
+        eprintln!("[prefs] 接続先の形式が不正のため保存しません: {bad}");
+        return;
+    }
+    let Some(dir) = knit_common::envutil::config_dir() else {
+        crate::notify("Knit", "ホームが取得できず接続先を保存できませんでした");
+        return;
+    };
+    let path = dir.join("env");
+    // Windows 側(save_host_to_env)と同じ安全策: 失敗したら通知して元のまま続ける
+    if let Err(e) = knit_common::envutil::set_env_value(&path, "KNIT_HOST", &text) {
+        eprintln!("[prefs] 接続先の保存に失敗: {e}");
+        crate::notify("Knit", "接続先を保存できませんでした。ログを確認してください");
+        return;
+    }
+    let message = if text.is_empty() {
+        "接続先の指定を外しました(自動発見へ戻します)。Knit を再起動します".to_string()
+    } else {
+        format!("接続先を {text} に保存しました。Knit を再起動します")
+    };
+    // 保存先(~/.config/knit/env)より優先される指定(起動時の環境変数)があるときは
+    // 保存が効かないため、上書き方法を併せて案内する
+    let message = if std::env::var("KNIT_HOST").map(|v| !v.is_empty()).unwrap_or(false) {
+        format!("{message}。なお環境変数 KNIT_HOST が設定されているため、そちらが優先されます")
+    } else {
+        message
+    };
+    crate::notify("Knit", &message);
+    restart_now();
+}
+
+/// NSTextField の stringValue を読み取る(入力欄の保存ハンドラ共通)
+unsafe fn field_text(field: ID) -> String {
+    if field.is_null() {
+        return String::new();
+    }
+    let obj = msg0(field, sel(c"stringValue"));
+    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
+    if utf8.is_null() {
+        String::new()
+    } else {
+        std::ffi::CStr::from_ptr(utf8).to_string_lossy().trim().to_string()
+    }
+}
+
+/// 設定「接続」の「選択中の端末の名前」: アクティブな端末のエイリアス(表示名)を
+/// peer-sides.json へ保存する。空欄ならコンピュータ名(hello の name)へ戻す。
+/// ポップアップ・配置エディタ・履歴・通知の表示がエイリアス優先へ切り替わる
+unsafe extern "C" fn imp_save_alias(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let text = field_text(prefs::alias_field() as ID);
+    let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+    if act == usize::MAX {
+        crate::notify("Knit", "接続中の端末がありません。つながってから名前を設定してください");
+        return;
+    }
+    crate::tap::set_peer_alias(act, &text);
+    let message = if text.is_empty() {
+        "端末の名前をコンピュータ名に戻しました"
+    } else {
+        "端末の名前を保存しました"
+    };
+    crate::notify("Knit", message);
+    // 配置エディタのラベルも名前を出すため即座に描き直す
+    prefs::redraw_layout();
+    refresh_status();
+}
+
+/// 設定「接続」の「このMacの名前」: 相手へ hello/hello_ok で名乗る名前を上書きする。
+/// 空欄ならホスト名(kern.hostname)既定。再起動不要で次の接続から反映
+unsafe extern "C" fn imp_save_own_name(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let field = prefs::own_name_field() as ID;
+    let text = field_text(field);
+    // hello の name と同じ規則で検査する。不正文字(制御文字・偽装文字)が
+    // 混じんでいたら除去して保存せず弾く(意図しない名前になるのを防ぐ)
+    let cleaned = knit_common::proto::safe_peer_name(&text);
+    if !cleaned.is_empty() && cleaned != text {
+        crate::notify(
+            "Knit",
+            "名前に使えない文字が含まれています。制御文字などを除いてください",
+        );
+        eprintln!("[prefs] このMacの名前は不正な文字を含むため保存しません: {text:?}");
+        return;
+    }
+    *crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()) = cleaned.clone();
+    preferences::save();
+    let message = if cleaned.is_empty() {
+        format!("このMacの名前をホスト名({})に戻しました", crate::hostname_label())
+    } else {
+        format!("このMacの名前を「{cleaned}」に保存しました")
+    };
+    crate::notify("Knit", &message);
+    // クリーン済みの値を見た目へ戻す(trim 済み)
+    if !field.is_null() {
+        msg1_void_id(field, sel(c"setStringValue:"), nsstring(&cleaned));
+    }
+    refresh_status();
+}
+
 /// 再起動のためのシェル文字列。1 秒待って(古いプロセスが終わり二重起動のロックが
 /// 空くのを待って)、同じ実行ファイル・同じ引数で起こし直す。.app の中なら .app ごと開く
 fn restart_command(exe: &std::path::Path, args: &[String]) -> String {
@@ -291,6 +574,18 @@ fn restart_now() {
     if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
         crate::leave_win_mode_cursor_unlock(None);
     }
+    // exit(0) は Rust のクリーンアップ(Drop)を飛ばすため、進行中のファイル転送を
+    // 先に片付ける: 送信は中止要求(切断として伝播)、受信は bulk 経路の切断で
+    // 受信スレッドを終わらせ、Receiver の Drop に一時ファイルの後始末を任せる。
+    // 加えて起動時の掃除(sweep_temp_files)が残骸の保険になる
+    if crate::cancel_active_xfer() {
+        eprintln!("[gui] 再起動前に進行中のファイル送信を中止します");
+    }
+    if knit_common::bulk::rx_active() {
+        eprintln!("[gui] 再起動前に受信中の転送を切断して後始末します");
+        crate::BULK_LINK.clear();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+    }
     let Ok(exe) = std::env::current_exe() else {
         crate::notify("Knit", "実行ファイルの場所が分からず再起動できません");
         return;
@@ -313,7 +608,19 @@ fn restart_now() {
 /// 相手(Windows)から接続の方向の切替を知らされたときの対応(別スレッドから呼ばれる)。
 /// 相手がホストになるならこの Mac は接続側へ、相手が接続側へ戻るなら待ち受けへ
 pub fn apply_peer_role(peer_is_host: bool) {
-    if crate::CLIENT_ROLE.load(Ordering::Relaxed) == peer_is_host {
+    // 実効役割(GUI 設定+環境変数)が既に相手の指示と一致していれば何も要らない
+    if crate::effective_client_role() == peer_is_host {
+        return;
+    }
+    // 環境変数で役割を固定しているときは追従できない(再起動しても env が優先する)。
+    // 黙って再起動すると役割が変わらないまま切れるだけのため、案内で留める
+    if crate::role_env_fixed() {
+        let peer = crate::active_peer_label();
+        crate::notify(
+            "Knit",
+            &format!("環境変数 KNIT_ROLE で役割を固定しているため、{peer} の切り替えには追従しません"),
+        );
+        eprintln!("[role] KNIT_ROLE 固定中のため相手の切替指示を無視しました");
         return;
     }
     let peer = crate::active_peer_label();
@@ -351,23 +658,45 @@ fn wait_role_ack(timeout: std::time::Duration) -> bool {
     }
 }
 
-/// 接続の方向メニュー項目の表示文言(接続先が Android でも成り立つ中性の言葉)
+/// 接続の方向メニュー項目の表示文言(接続先が Android でも成り立つ中性の言葉)。
+/// 実役割は環境変数 KNIT_ROLE=client も反映する(GUI 設定と表示が食い違わないように)
 fn role_menu_title() -> String {
     let peer = crate::active_peer_label();
-    if crate::CLIENT_ROLE.load(Ordering::Relaxed) {
+    if crate::effective_client_role() {
         format!("{peer} をホストにする(解除してこの Mac が待ち受ける)")
     } else {
         format!("{peer} をホストにする")
     }
 }
 
+/// 環境変数 KNIT_ROLE で役割が固定されているときの案内(GUI からは切り替えられない)。
+/// 戻り値 true=固定中のためハンドラはここで終える
+fn role_env_guard() -> bool {
+    if UI_PREVIEW.load(Ordering::Relaxed) || !crate::role_env_fixed() {
+        return false;
+    }
+    crate::notify(
+        "Knit",
+        "環境変数 KNIT_ROLE で役割を固定しています。切り替えるには KNIT_ROLE の指定を外して再起動してください",
+    );
+    eprintln!("[role] KNIT_ROLE 固定中のため GUI からの切替を案内のみにしました");
+    unsafe { prefs::sync_role() };
+    true
+}
+
 /// 「{相手} をホストにする」: この Mac を接続側へ切り替える(起動時に決まるため再起動で反映)
 unsafe extern "C" fn imp_host_role(_s: ID, _c: SEL, _n: ID) {
-    set_role(!crate::CLIENT_ROLE.load(Ordering::Relaxed));
+    if role_env_guard() {
+        return;
+    }
+    set_role(!crate::effective_client_role());
 }
 
 /// 設定画面の「接続の方向」(ラジオ)。tag 0=この Mac がホスト / 1=Windows がホスト
 unsafe extern "C" fn imp_role(_s: ID, _c: SEL, sender: ID) {
+    if role_env_guard() {
+        return;
+    }
     let want_client = crate::msg0_isize(sender, sel(c"tag")) == 1;
     set_role(want_client);
 }
@@ -377,7 +706,7 @@ unsafe fn set_role(next: bool) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
     }
-    if crate::CLIENT_ROLE.load(Ordering::Relaxed) == next {
+    if crate::effective_client_role() == next {
         prefs::sync_role();
         return;
     }
@@ -394,6 +723,9 @@ unsafe fn set_role(next: bool) {
     // 再起動する(行き損ねで双方が同役割のまま沈黙するのを防ぐ)。旧版相手は
     // 応答しないため、従来どおり時間経過で再起動する
     ROLE_ACK.store(false, Ordering::Relaxed);
+    // 切替の進行を設定画面の注記行へ出す(確認待ち→確認済み/タイムアウト。
+    // 毎秒の sync() がこの状態を文言へ反映する)
+    prefs::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
     crate::send_msg(&knit_common::proto::Msg::Role { host: !next });
     let message = if next {
         format!("この Mac を {peer}(ホスト)へ接続する側に切り替えました。Knit を再起動します")
@@ -404,8 +736,10 @@ unsafe fn set_role(next: bool) {
     std::thread::spawn(|| {
         if wait_role_ack(std::time::Duration::from_millis(2000)) {
             eprintln!("[role] 相手の適用を確認しました");
+            prefs::ROLE_NOTE_KIND.store(3, Ordering::Relaxed);
         } else {
             eprintln!("[role] 相手の適用確認が取れないため時間経過で再起動します");
+            prefs::ROLE_NOTE_KIND.store(4, Ordering::Relaxed);
         }
         restart_now();
     });
@@ -919,6 +1253,14 @@ static LAY_GRAB: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0)
 static LAY_DRAG: AtomicBool = AtomicBool::new(false);
 /// ドラッグ中の端末(PEERS の添字。usize::MAX = なし)
 static LAY_DRAG_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
+/// mouseDown の位置(クリック判定=ドラッグ量 4px 未満の mouseUp に使う)。
+/// 端末を掴んでいない時は f64::NAN を入れて判定が常に偽になるようにする
+static LAY_DOWN_POS: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((f64::NAN, f64::NAN));
+/// 占有済みの辺へドロップした時の警告表示の期限(単調時計 ms。0=無効)。
+/// 毎秒の再描画(refresh_status → prefs::sync)で自然に消えるため戻し処理は不要
+static LAY_WARN_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// 警告表示の対象の基の辺(0=右/1=左/2=上/3=下)
+static LAY_WARN_DIR: AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 /// 非アクティブ端末をドラッグ中の中心(アクティブ用の LAY_WIN とは別に持つ)
 static LAY_DRAG_CENTER: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
 
@@ -1020,6 +1362,8 @@ unsafe fn lay_point_in_view(_self: ID, ev: ID) -> CGPoint2 {
 /// 配置エディタに表示する 1 端末分の情報(描画とドラッグ判定の共通ソース)
 struct LayPeer {
     idx: usize,
+    /// 端末識別子(hello の id。クリック選択で使う。未接続プレースホルダは空)
+    id: String,
     name: String,
     rects: Vec<Rect>,
     size: (f64, f64),
@@ -1047,13 +1391,20 @@ fn lay_peers() -> Vec<LayPeer> {
     let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
     let drag_idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
     let drag_center = *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner());
-    let peers: Vec<(String, u8, Option<usize>, (Vec<Rect>, (f64, f64)), Vec<String>)> = {
+    let peers: Vec<(String, String, u8, Option<usize>, (Vec<Rect>, (f64, f64)), Vec<String>)> = {
         let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
         peers
             .iter()
             .map(|p| {
                 (
-                    p.name.clone(),
+                    p.id.clone(),
+                    // 下の名前ラベルは「表示名 (IP)」: エイリアス優先・同じ
+                    // コンピュータ名の複数台を IP で区別できる形式
+                    crate::conn::peer_display_label(
+                        p.alias.as_deref(),
+                        &p.name,
+                        &p.ip.to_string(),
+                    ),
                     p.side,
                     p.edge_monitor,
                     peer_group(p),
@@ -1063,7 +1414,7 @@ fn lay_peers() -> Vec<LayPeer> {
             .collect()
     };
     let mut out = Vec::new();
-    for (i, (name, side, edge_monitor, (rects, size), names)) in peers.into_iter().enumerate() {
+    for (i, (id, name, side, edge_monitor, (rects, size), names)) in peers.into_iter().enumerate() {
         let active = i == act;
         let dragging = i == drag_idx;
         let (w, h) = (size.0 * sc, size.1 * sc);
@@ -1091,6 +1442,7 @@ fn lay_peers() -> Vec<LayPeer> {
         };
         out.push(LayPeer {
             idx: i,
+            id,
             name,
             rects,
             size,
@@ -1105,6 +1457,7 @@ fn lay_peers() -> Vec<LayPeer> {
         let (rects, size) = win_group();
         out.push(LayPeer {
             idx: usize::MAX,
+            id: String::new(),
             name: "接続先".to_string(),
             rects,
             size,
@@ -1258,14 +1611,37 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
             } else {
                 None
             };
+            // 同じ辺(斜めは基の辺へ集約)を 2 台以上が使っているセルは警告色の
+            // 枠で見せる: 重複配置は黙って受け入れられ 2 台が重なって描かれる
+            // ため、どちらかが辺に入れず気づけない
+            let occupied: Vec<u8> = crate::PEERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .map(|p| crate::base_dir(p.side))
+                .collect();
+            // 占有済みの辺へのドロップ直後の告知(約1.5秒の薄赤フラッシュ。
+            // 毎秒の再描画タイマーがあるため期限が切れれば自然に戻る)
+            let warn_dir = LAY_WARN_DIR.load(Ordering::Relaxed);
+            let warn_active = crate::now_ms() < LAY_WARN_UNTIL.load(Ordering::Relaxed);
             for s in 0u8..8 {
                 let r = lay_cell_rect(&m, s);
+                let d = crate::base_dir(s);
+                if warn_active && d == warn_dir {
+                    CGContextSetRGBFillColor(ctx, 0.92, 0.28, 0.24, 0.20);
+                    CGContextFillRect(ctx, r);
+                }
                 if Some(s) == hover {
                     CGContextSetRGBFillColor(ctx, 0.36, 0.47, 0.88, 0.14);
                     CGContextFillRect(ctx, r);
                 }
-                CGContextSetRGBStrokeColor(ctx, 0.80, 0.82, 0.90, 1.0);
-                CGContextSetLineWidth(ctx, 1.0);
+                if occupied.iter().filter(|&&od| od == d).count() >= 2 {
+                    CGContextSetRGBStrokeColor(ctx, 0.88, 0.46, 0.16, 1.0);
+                    CGContextSetLineWidth(ctx, 2.0);
+                } else {
+                    CGContextSetRGBStrokeColor(ctx, 0.80, 0.82, 0.90, 1.0);
+                    CGContextSetLineWidth(ctx, 1.0);
+                }
                 CGContextStrokeRect(ctx, r);
             }
         }
@@ -1300,6 +1676,30 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
                 None => format!("モニター{}", i + 1),
             };
             lay_text(&lay_fit(&label, r.w, 10.0), r.x + r.w / 2.0, r.y + r.h / 2.0 - 6.0, 10.0, is_main);
+        }
+        // ドラッグ中の端末が Mac の外接矩形の上(セルの外)にあるとき: ドロップで
+        // 「全画面の端(モニター指定なし)」へ戻ることを示す薄緑のオーバーレイ。
+        // モニター描画の後へ重ねないと下の fill に隠れるため、この位置で描く。
+        // 未接続プレースホルダ(usize::MAX)は戻す先のモニター指定がそもそも
+        // 無いため対象外(表示だけ出て何も起きないのを避ける)
+        if LAY_DRAG.load(Ordering::Relaxed)
+            && LAY_DRAG_IDX.load(Ordering::Relaxed) != usize::MAX
+        {
+            let m = lay_mac_rect();
+            let idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
+            let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+            let p = if idx == usize::MAX || idx == act {
+                lay_win_center()
+            } else {
+                *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner())
+            };
+            if lay_cell_for_point(&m, p).is_none() {
+                CGContextSetRGBFillColor(ctx, 0.30, 0.65, 0.40, 0.18);
+                CGContextFillRect(ctx, m);
+                CGContextSetRGBStrokeColor(ctx, 0.22, 0.58, 0.34, 1.0);
+                CGContextSetLineWidth(ctx, 2.0);
+                CGContextStrokeRect(ctx, m);
+            }
         }
         // 接続先: 全端末のモニター群を実配置のまま描く。アクティブな端末は青、
         // それ以外は薄い青。どの端末もドラッグで配置を変えられ、名前を下に表示する
@@ -1336,8 +1736,14 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
                     lp.active || lp.dragging,
                 );
             }
-            // 端末名(Deskflow 風に矩形の下へ)
-            lay_text(&lp.name, cx, (oy - 15.0).max(2.0), 11.0, false);
+            // 端末名(Deskflow 風に矩形の下へ)。名前+IP で長くなるため幅に収まるよう切り詰める
+            lay_text(
+                &lay_fit(&lp.name, LAY_VW, 11.0),
+                cx,
+                (oy - 15.0).max(2.0),
+                11.0,
+                false,
+            );
         }
         // Mac 側の名前(実機のホスト名。配置は固定)
         {
@@ -1398,6 +1804,10 @@ unsafe extern "C" fn lay_down(_self: ID, _cmd: SEL, ev: ID) {
             LAY_DRAG_IDX.store(idx, Ordering::Relaxed);
             LAY_DRAG.store(true, Ordering::Relaxed);
             *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner()) = (p.x - cx, p.y - cy);
+            // クリック判定のため押下位置を覚える(移動量が僅かなら選択扱いにする)
+            *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (p.x, p.y);
+        } else {
+            *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (f64::NAN, f64::NAN);
         }
     }
 }
@@ -1436,8 +1846,12 @@ unsafe extern "C" fn lay_dragged(_self: ID, _cmd: SEL, ev: ID) {
 }
 
 /// ドロップ: ドラッグ中の端末について、最も近い Mac モニターとその辺を
-/// 「画面の位置」として設定し、表示を計算位置へスナップし直す
-unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
+/// 「画面の位置」として設定し、表示を計算位置へスナップし直す。
+/// Mac の外接矩形の上(セルの外)へ置いた場合はモニター指定を外して
+/// 「全画面の端」へ戻す(旧JSON・環境変数経由でしか戻せなかった問題の解消)。
+/// ドラッグ量が僅か(4px 未満)の mouseUp はクリックとみなし、その端末を
+/// 操作対象へ選択する(接続ページのポップアップと同じ経路)
+unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, ev: ID) {
     unsafe {
         if !LAY_DRAG.swap(false, Ordering::Relaxed) {
             return;
@@ -1465,6 +1879,34 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
                 sh,
             )
         };
+        // クリック判定: 押下からほぼ動いていなければ配置は変えず、その端末を
+        // 操作対象へ選ぶ。activate_peer_by_id は writer の一時不在を待ち得るが
+        // 接続ページのポップアップ(imp_peer_activate)と同じメインスレッド経路
+        let down = *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner());
+        let up = lay_point_in_view(_self, ev);
+        let clicked = (up.x - down.0).abs() < 4.0
+            && (up.y - down.1).abs() < 4.0
+            && down.0.is_finite()
+            && down.1.is_finite();
+        *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (f64::NAN, f64::NAN);
+        if clicked {
+            let id = lay_peers()
+                .iter()
+                .find(|lp| lp.idx == idx)
+                .map(|lp| lp.id.clone())
+                .unwrap_or_default();
+            if !id.is_empty() && !UI_PREVIEW.load(Ordering::Relaxed) {
+                crate::activate_peer_by_id(&id, "配置エディタ");
+                refresh_status();
+            }
+            // 選択だけなので設定保存は不要。位置リセットと再描画だけ行う
+            *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
+            *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
+            let snd: unsafe extern "C" fn(ID, SEL, u8) =
+                std::mem::transmute(crate::objc_msgSend as *const () as usize);
+            snd(_self, sel(c"setNeedsDisplay:"), 1);
+            return;
+        }
         // ドロップ位置から最寄りの Mac モニター(edge 指定)と、8 方向セルの
         // side(Deskflow 式。斜めも置ける)を決める
         let mac_rect = lay_mac_rect();
@@ -1480,23 +1922,72 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         }
         if let Some((mi, _)) = best {
             let target = if active_drag { act } else { idx };
-            let side = lay_cell_for_point(&mac_rect, wc0).unwrap_or(0);
-            if target != usize::MAX {
-                crate::set_peer_side(target, side, Some(mi));
-                eprintln!(
-                    "[lay] 配置を更新: モニター{} の{}",
-                    mi + 1,
-                    ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
-                );
-            } else {
-                // 未接続(プレースホルダを動かした)。全体設定 SIDE へ反映し、
-                // 次に繋がる端末の位置になる。ここで反映しないとドロップが
-                // 常に捨てられ「動かせない」ように見える
-                crate::set_side(side);
-                eprintln!(
-                    "[lay] 配置を更新(未接続のため全体設定へ): {}",
-                    ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
-                );
+            match lay_cell_for_point(&mac_rect, wc0) {
+                Some(side) => {
+                    // 占有済みの辺(斜めは基の辺)へのドロップは重複配置になる。
+                    // 設定自体は受け入れる(従来どおり)が、セルを一瞬赤く
+                    // フラッシュして重複が起きたことを見せる
+                    let dir = crate::base_dir(side);
+                    let dup = {
+                        let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                        peers
+                            .iter()
+                            .enumerate()
+                            .any(|(i, p)| i != target && crate::base_dir(p.side) == dir)
+                    };
+                    if dup && target != usize::MAX {
+                        LAY_WARN_UNTIL
+                            .store(crate::now_ms() + 1500, Ordering::Relaxed);
+                        LAY_WARN_DIR.store(dir, Ordering::Relaxed);
+                        eprintln!("[lay] 警告: {}の辺は既に他の端末が使っています(重複配置)", crate::side_label(dir));
+                    }
+                    if target != usize::MAX {
+                        crate::set_peer_side(target, side, Some(mi));
+                        eprintln!(
+                            "[lay] 配置を更新: モニター{} の{}",
+                            mi + 1,
+                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
+                        );
+                    } else {
+                        // 未接続(プレースホルダを動かした)。全体設定 SIDE へ反映し、
+                        // 次に繋がる端末の位置になる。ここで反映しないとドロップが
+                        // 常に捨てられ「動かせない」ように見える
+                        crate::set_side(side);
+                        eprintln!(
+                            "[lay] 配置を更新(未接続のため全体設定へ): {}",
+                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
+                        );
+                        // 保存済みの端末は接続時にその配置が優先されるため、この
+                        // 変更が「次に繋がる端末」へ反映されないことがある。
+                        // 気づかないまま設定が捨てられたように見えるのを防ぐ案内
+                        if crate::has_saved_peer_sides() {
+                            crate::notify(
+                                "Knit",
+                                "保存済みの端末は各端末の設定が優先されるため、この位置は次回の接続では使われないことがあります",
+                            );
+                        }
+                    }
+                }
+                None => {
+                    // Mac の外接矩形の上(どのセルにも置かない)へドロップ:
+                    // モニター指定を外して「全画面の端」へ戻す。辺は現在の値を
+                    // 維持する(意図は「モニター指定の解除」のため)
+                    if target != usize::MAX {
+                        let current = crate::PEERS
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(target)
+                            .map(|p| p.side)
+                            .unwrap_or(0);
+                        crate::set_peer_side(target, current, None);
+                        eprintln!(
+                            "[lay] 配置を更新: 全画面の{}(モニター指定なし)",
+                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][current.min(7) as usize]
+                        );
+                    } else {
+                        eprintln!("[lay] 未接続のため、Mac の上へのドロップは無視します(全体設定にモニター指定はありません)");
+                    }
+                }
             }
         }
         // 表示位置は保存せず、設定(side/モニター)から計算し直した位置へスナップする
@@ -1509,6 +2000,8 @@ unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, _ev: ID) {
         // ここで全域へ戻すと斜め配置の「辺の半分だけ接続」が効かなくなるため上書きしない
     }
     preferences::save();
+    // 設定ページの現在値表示(モニター名+辺の一覧)もドロップ結果へ揃える
+    prefs::redraw_layout();
 }
 /// 配置エディタの NSView サブクラスを登録して生成(初回のみ)
 unsafe fn make_layout_view(target_frame_host: ID) -> ID {
@@ -1754,17 +2247,49 @@ fn refresh_status() {
         sync_prefs_state();
 
         // クリップボード履歴メニュー(push があったときだけ作り直す。
-        // 開いているメニューのちらつきを避けるため変化検知する)
+        // 開いているメニューのちらつきを避けるため変化検知する)。
+        // 開示中(tracking 中)は removeAllItems が未定義動作になるため保留し、
+        // 閉じた時(menuDidClose:)に 1 回だけ反映する
         let history_menu = GUI_HISTORY_MENU.load(Ordering::Relaxed) as ID;
         if !history_menu.is_null() {
             let last = crate::HISTORY_LAST_ID.load(Ordering::Relaxed);
-            if last != GUI_HISTORY_SEEN.load(Ordering::Relaxed) {
+            if history_rebuild_now(last, GUI_HISTORY_SEEN.load(Ordering::Relaxed), GUI_HISTORY_OPEN.load(Ordering::Relaxed)) {
                 GUI_HISTORY_SEEN.store(last, Ordering::Relaxed);
                 rebuild_history_menu(history_menu);
+            } else if GUI_HISTORY_OPEN.load(Ordering::Relaxed) && last != GUI_HISTORY_SEEN.load(Ordering::Relaxed) {
+                GUI_HISTORY_PENDING.store(true, Ordering::Relaxed);
             }
         }
 
     }
+}
+
+/// NSMenuDelegate(menuWillOpen:/menuDidClose:)の送り主が履歴サブメニューか。
+/// delegate メソッド名は AppKit 側で固定のため、接続先ピッカーと IMP を共有して
+/// sender で区別する(prefs::peer_menu_open/close から呼ばれる)
+pub(super) unsafe fn history_menu_tracking(menu: ID) -> bool {
+    let h = GUI_HISTORY_MENU.load(Ordering::Relaxed) as ID;
+    !h.is_null() && menu == h
+}
+
+/// 履歴サブメニューの開示開始(再構築の保留を始める)
+pub(super) unsafe fn history_menu_opened() {
+    GUI_HISTORY_OPEN.store(true, Ordering::Relaxed);
+}
+
+/// 履歴サブメニューの閉鎖(保留していた変化を 1 回だけ反映する)
+pub(super) unsafe fn history_menu_closed() {
+    GUI_HISTORY_OPEN.store(false, Ordering::Relaxed);
+    let history_menu = GUI_HISTORY_MENU.load(Ordering::Relaxed) as ID;
+    let pending = GUI_HISTORY_PENDING.swap(false, Ordering::Relaxed);
+    let last = crate::HISTORY_LAST_ID.load(Ordering::Relaxed);
+    if history_menu.is_null()
+        || !history_flush_on_close(pending, last, GUI_HISTORY_SEEN.load(Ordering::Relaxed))
+    {
+        return;
+    }
+    GUI_HISTORY_SEEN.store(last, Ordering::Relaxed);
+    rebuild_history_menu(history_menu);
 }
 
 /// 接続先メニューの選択: representedObject の端末 id でピアを探してアクティブへ
@@ -1924,6 +2449,10 @@ unsafe fn make_target() -> ID {
             c"sdSwitchMethod:",
             prefs::switch_method as *const () as usize,
         ),
+        (
+            c"sdSwitchDelay:",
+            prefs::switch_delay as *const () as usize,
+        ),
         (c"sdReturnMac:", prefs::return_mac as *const () as usize),
         (c"sdEnterPeer:", prefs::enter_peer as *const () as usize),
         (c"sdSelectPeer:", prefs::select_peer as *const () as usize),
@@ -1937,10 +2466,18 @@ unsafe fn make_target() -> ID {
             c"sdResetRegistration:",
             setup::reset_registration as *const () as usize,
         ),
+        (
+            c"sdResetSettings:",
+            setup::reset_all_settings as *const () as usize,
+        ),
+        (c"sdOpenSettingsDir:", imp_open_settings_dir as *const () as usize),
+        (c"sdExportPrefs:", imp_export_prefs as *const () as usize),
+        (c"sdImportPrefs:", imp_import_prefs as *const () as usize),
         (c"sdScrollSpeed:", prefs::scroll_speed as *const () as usize),
         (c"sdSwitchMode:", imp_switch_mode as *const () as usize),
         (c"sdEdgeTaps:", imp_edge_taps as *const () as usize),
         (c"sdOpenLog:", imp_open_log as *const () as usize),
+        (c"sdDiagLog:", prefs::diag_log as *const () as usize),
         (
             c"sdHistoryRestore:",
             imp_history_restore as *const () as usize,
@@ -1949,6 +2486,9 @@ unsafe fn make_target() -> ID {
         (c"sdCancelXfer:", imp_cancel_xfer as *const () as usize),
         (c"sdPeerActivate:", imp_peer_activate as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
+        (c"sdSaveHost:", imp_save_host as *const () as usize),
+        (c"sdSaveAlias:", imp_save_alias as *const () as usize),
+        (c"sdSaveOwnName:", imp_save_own_name as *const () as usize),
         (c"sdCheckUpdate:", imp_check_update as *const () as usize),
         (c"sdDiagnose:", imp_diag as *const () as usize),
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
@@ -2084,11 +2624,23 @@ pub fn start() -> bool {
             add_item(menu, diagm);
         }
 
+        // ログを開く(Windows トレイ・設定画面の同名項目と対称。診断と並べて
+        // 「繋がらない時の困った時」がここで揃う。Console で /tmp/knit-mac.log を開く)
+        let logm = menu_item("ログを開く", Some(c"sdOpenLog:"), "");
+        if !logm.is_null() {
+            msg1_void_id(logm, sel(c"setTarget:"), target);
+            msg1_void_sel(logm, sel(c"setAction:"), sel(c"sdOpenLog:"));
+            add_item(menu, logm);
+        }
+
         // クリップボード履歴(送信・受信したテキストから選んで復元)。
-        // 項目は refresh_status が履歴の変化だけ検知して作り直す
+        // 項目は refresh_status が履歴の変化だけ検知して作り直す。
+        // 開示中の再構築を控えるため、追跡状態(menuWillOpen:/menuDidClose:)を
+        // 受け取る delegate を設定する(IMP は接続先ピッカーと共通・sender で区別)
         let history_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
         if !history_menu.is_null() {
             msg1_void_u8(history_menu, sel(c"setAutoenablesItems:"), 0);
+            msg1_void_id(history_menu, sel(c"setDelegate:"), target);
             let holder = menu_item("クリップボード履歴", None, "");
             if !holder.is_null() {
                 msg1_void_id(holder, sel(c"setSubmenu:"), history_menu);
@@ -2214,6 +2766,31 @@ mod restart_tests {
     fn app_bundle_is_opened_as_a_bundle() {
         let c = restart_command(Path::new("/Applications/Knit.app/Contents/MacOS/knit-mac"), &[]);
         assert_eq!(c, "sleep 1; /usr/bin/open -n '/Applications/Knit.app'");
+    }
+}
+
+/// 履歴メニュー開示中の再構築保留(開示中の removeAllItems は未定義動作になる)
+#[cfg(test)]
+mod history_rebuild_defer_tests {
+    use super::{history_flush_on_close, history_rebuild_now};
+
+    #[test]
+    fn rebuild_is_deferred_while_the_menu_is_tracking() {
+        // 変化がある・閉じている → 作り直す
+        assert!(history_rebuild_now(10, 3, false));
+        // 変化が無ければ作り直さない
+        assert!(!history_rebuild_now(3, 3, false));
+        // 開示中は変化があっても作り直さない(保留)
+        assert!(!history_rebuild_now(10, 3, true));
+    }
+
+    #[test]
+    fn deferred_change_is_flushed_once_on_close() {
+        // 開示中に届いた変化は閉じた時に 1 回だけ反映される
+        assert!(history_flush_on_close(true, 10, 3));
+        // 保留が無い・変化が無い時は何もしない
+        assert!(!history_flush_on_close(false, 10, 3));
+        assert!(!history_flush_on_close(true, 3, 3));
     }
 }
 

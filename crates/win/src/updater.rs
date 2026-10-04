@@ -54,6 +54,13 @@ pub fn menu_title() -> String {
     }
 }
 
+/// 更新が見つかった時の通知文言。署名検証(ed25519)を通った更新だけが
+/// ここへ来るため、成功時に検証が見えるように検証済みであることを書く
+/// (Mac 側 updater::available_text と同じ文言)
+fn available_text(version: &str) -> String {
+    format!("Knit {version} が利用できます(署名を確認した更新です・ed25519 検証済み)。トレイのメニューから更新できます")
+}
+
 fn system_tool(name: &str) -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     format!(r"{root}\System32\{name}")
@@ -171,10 +178,7 @@ pub fn on_click() {
             set_state(State::Checking);
             std::thread::spawn(|| match check() {
                 Ok(Some(a)) => {
-                    crate::tray::notify(
-                        "Knit",
-                        &format!("Knit {} が利用できます。トレイのメニューから更新できます", a.version),
-                    );
+                    crate::tray::notify("Knit", &available_text(&a.version));
                     set_state(State::Available(a.version, a.artifact));
                 }
                 Ok(None) => {
@@ -220,10 +224,7 @@ pub fn start_background() {
                     let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
                     if *n != a.version {
                         *n = a.version.clone();
-                        crate::tray::notify(
-                            "Knit",
-                            &format!("Knit {} が利用できます。トレイのメニューから更新できます", a.version),
-                        );
+                        crate::tray::notify("Knit", &available_text(&a.version));
                     }
                     if matches!(state(), State::Idle) {
                         set_state(State::Available(a.version, a.artifact));
@@ -305,7 +306,15 @@ pub fn run_apply(args: &[String]) -> i32 {
             .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
             .spawn()
     };
+    // 入れ替えと起動確認(HEALTH)の間はシステムを眠らせない(第一の防御は共通側の
+    // 「止まっていた時間ぶん期限を延ばす」方式。これはその補助で、監視自体を
+    // スリープで止めないようにする)
+    use windows_sys::Win32::System::Power::{
+        SetThreadExecutionState, ES_CONTINUOUS, ES_SYSTEM_REQUIRED,
+    };
+    unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) };
     let result = update::swap_and_start(&pkg, &target, &start, HEALTH);
+    unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
     let _ = std::fs::remove_file(&lock);
     if let Some(s) = stage {
         if s.file_name().is_some_and(|n| n.to_string_lossy().starts_with(".knit-update-")) {

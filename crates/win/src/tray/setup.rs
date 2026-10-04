@@ -338,6 +338,10 @@ unsafe fn poll(hwnd: HWND) {
             hint(&message)
         }
         UiEvent::Registered(Ok(token)) => {
+            // 完了が見えるように、少し表示してから閉じる(黙って消えない)。
+            // Sleep 中はこのスレッド(UI)のメッセージ処理も止まるため、閉じ操作との競合も起きない
+            hint("登録が完了しました。Macと自動でつながります。");
+            windows_sys::Win32::System::Threading::Sleep(1500);
             *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             DestroyWindow(hwnd);
         }
@@ -636,16 +640,43 @@ pub fn first_run(preview: bool) -> Option<String> {
         UnregisterClassW(class.as_ptr(), instance);
         DeleteObject(brush);
         EVENTS.lock().unwrap_or_else(|e| e.into_inner()).take();
-        RESULT.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let result = RESULT.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if result.is_none() && !PREVIEW.load(Ordering::Relaxed) {
+            // 「あとで」で閉じた時: Mac の permission_postponed と同じく、黙って
+            // 終わらず再開方法を案内してから終わる(登録はまだ済んでいない)
+            super::MessageBoxW(
+                std::ptr::null_mut(),
+                wide("Knit を終了します。もう一度 Knit を開くと、ここから再開できます。").as_ptr(),
+                wide("Knit — はじめての接続").as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        result
     }
 }
 pub fn error(text: &str) {
     unsafe {
-        MessageBoxW(
+        // use super::* の extern 宣言と windows-sys の glob import が同名で衝突するため、
+        // tray モジュールの extern 宣言側を明示する
+        super::MessageBoxW(
             std::ptr::null_mut(),
             wide(text).as_ptr(),
             wide("Knit — 接続の準備").as_ptr(),
             MB_OK | MB_ICONERROR,
         );
+    }
+}
+/// 保存した接続キーが読み取れない時(DPAPI不通・破損)。読めない登録が残っている
+/// 限り再起動しても同じ場所で止まり、復旧UI(設定の初期化)は起動後でしか選べない
+/// ため、起動を諦める前に初期化と再登録を提案する。
+/// 戻り値: true=「初期化して登録し直す」(OK)が選ばれた
+pub fn confirm_broken_registration_reset() -> bool {
+    unsafe {
+        super::MessageBoxW(
+            std::ptr::null_mut(),
+            wide("保存した接続キーが読み取れないため、Knit を起動できません。\n登録を初期化してもう一度登録し直しますか?\n\n初期化すると、いま登録済みの端末はすべて接続できなくなり、再登録が必要です。\nWindowsのユーザーが変わっているのが原因の場合は「キャンセル」を選び、前のユーザーで起動するか保存先を確認してください。").as_ptr(),
+            wide("Knit — 保存した登録を読み取れません").as_ptr(),
+            MB_OKCANCEL | MB_ICONERROR,
+        ) == IDOK
     }
 }

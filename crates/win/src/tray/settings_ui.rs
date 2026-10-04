@@ -14,6 +14,15 @@ static SHARE_FILES_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static BACK_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static ROLE_CLIENT_RADIO: AtomicUsize = AtomicUsize::new(0);
 static ROLE_HOST_RADIO: AtomicUsize = AtomicUsize::new(0);
+/// 役割カードの注記行(通常の再起動案内・KNIT_ROLE 固定中・切替進行で文言が変わる)
+static ROLE_NOTE: AtomicUsize = AtomicUsize::new(0);
+/// 役割注記のモード(0=通常 1=Env固定 2=確認待ち 3=確認済み 4=タイムアウト)。
+/// 切替ハンドラと Ack 待ちスレッドが書き、sync() が文言へ反映する(Mac と同じ仕組み)
+pub(super) static ROLE_NOTE_KIND: AtomicUsize = AtomicUsize::new(0);
+/// 「接続先のMac」入力欄の説明の右横に出す、このPC自身のアドレス行
+static OWN_IP_LABEL: AtomicUsize = AtomicUsize::new(0);
+/// 接続先の保存ボタン(ホスト役割の間は押せなくする)
+static SAVEHOST_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static HINT: AtomicUsize = AtomicUsize::new(0);
 static DRAW_FONT: AtomicUsize = AtomicUsize::new(0);
 static INPUT_HINT: AtomicUsize = AtomicUsize::new(0);
@@ -22,6 +31,12 @@ pub(super) static SIDE_COMBO: AtomicUsize = AtomicUsize::new(0);
 static SIDE_RESET_BUTTON: AtomicUsize = AtomicUsize::new(0);
 pub(super) static METHOD_COMBO: AtomicUsize = AtomicUsize::new(0);
 pub(super) static HOTKEY_COMBO: AtomicUsize = AtomicUsize::new(0);
+/// 「ショートカットのみ」項目(切替方式コンボの3番目)の前回の文言。同じ間は
+/// コンボへ触れない(開いているドロップダウンが閉じてしまうのを防ぐ)
+static METHOD_ITEM_TITLE: Mutex<String> = Mutex::new(String::new());
+/// 切替キーコンボの「現在のキー（コードN）」項目に入れているキーコード。
+/// 候補外のキーが設定されているときだけ項目を足す(-1 = 無し)
+static HOTKEY_CUSTOM_KC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 static FLIP_BUTTON: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SCROLL_TRACK: AtomicUsize = AtomicUsize::new(0);
 static NAV_BUTTON: AtomicUsize = AtomicUsize::new(0);
@@ -101,12 +116,30 @@ pub(super) unsafe fn sync() {
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
     }
-    // 接続の方向の選択表示
-    let host = crate::tray::HOST_MODE.load(Ordering::Relaxed);
+    // 接続の方向の選択表示。実役割は環境変数 KNIT_ROLE=server が GUI 設定に
+    // 優先するため表示にも反映し、固定中は GUI から切り替えられないように
+    // ラジオを無効化する(Mac 側の設定と同じ対応)
+    let env_fixed = crate::tray::role_env_fixed();
+    let host = env_fixed || crate::tray::HOST_MODE.load(Ordering::Relaxed);
     for (slot, on) in [(&ROLE_CLIENT_RADIO, !host), (&ROLE_HOST_RADIO, host)] {
         let h = slot.load(Ordering::Relaxed) as HWND;
-        if !h.is_null() && (SendMessageW(h, 0xF2 /*BM_GETCHECK*/, 0, 0) != 0) != on {
-            SendMessageW(h, 0xF1 /*BM_SETCHECK*/, on as usize, 0);
+        if !h.is_null() {
+            if (SendMessageW(h, 0xF2 /*BM_GETCHECK*/, 0, 0) != 0) != on {
+                SendMessageW(h, 0xF1 /*BM_SETCHECK*/, on as usize, 0);
+            }
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h, !env_fixed as i32);
+        }
+    }
+    // 役割の注記行は状況で文言が変わる(Env 固定中・切替の進行)
+    set_text(ROLE_NOTE.load(Ordering::Relaxed), &role_note_text());
+    set_text(OWN_IP_LABEL.load(Ordering::Relaxed), &own_ip_text());
+    // 接続先IPと保存は、この PC がホスト(待ち受け側)の間は無効にする(Deskflow の
+    // Server 選択中は Client 入力が要らないのと同じ対応)
+    let client_side = !host;
+    for slot in [&EDIT_HOST, &SAVEHOST_BUTTON] {
+        let h = slot.load(Ordering::Relaxed);
+        if h != 0 {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h as HWND, client_side as i32);
         }
     }
     // 「Macへ戻る」は接続中だけ押せる(未接続では相手に届かない)
@@ -128,6 +161,44 @@ pub(super) unsafe fn sync() {
             }
         ),
     );
+}
+
+/// 役割カードの注記行の文言(ROLE_NOTE_KIND の状態から。Mac 側と同じ文言)
+fn role_note_text() -> String {
+    match ROLE_NOTE_KIND.load(Ordering::Relaxed) {
+        1 => "環境変数 KNIT_ROLE で役割を固定中のため、ここでは切り替えられません".into(),
+        2 => "切り替えを相手へ送りました。相手の適用を確認しています…".into(),
+        3 => "相手の適用を確認しました。再起動します…".into(),
+        4 => "相手の適用確認が取れないため、時間経過で再起動します…".into(),
+        _ => "切り替えると、両方のPCで Knit が自動で再起動します".into(),
+    }
+}
+
+/// このPCの IPv4 一覧の表示文字列(10 秒キャッシュ)。タイマーで呼ばれ続ける
+/// sync() のたびにアドレス列挙を呼ばないためのキャッシュ
+fn own_ip_text() -> String {
+    static CACHE: std::sync::Mutex<Option<(std::time::Instant, String)>> =
+        std::sync::Mutex::new(None);
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((at, text)) = cache.as_ref() {
+        if at.elapsed() < std::time::Duration::from_secs(10) {
+            return text.clone();
+        }
+    }
+    let ips = knit_common::discover::local_ipv4s();
+    let text = if ips.is_empty() {
+        "このWindowsのアドレス: (取得できません)".to_string()
+    } else {
+        format!(
+            "このWindowsのアドレス: {}",
+            ips.iter()
+                .map(|ip| ip.to_string())
+                .collect::<Vec<_>>()
+                .join("、")
+        )
+    };
+    *cache = Some((std::time::Instant::now(), text.clone()));
+    text
 }
 
 /// 最小化を戻して前面へ出す。トレイのメニュー操作直後は前面権限がなく
@@ -297,7 +368,7 @@ pub(super) unsafe fn build() {
     );
     // サブタイトルは Mac 設定画面と共通の文言に揃える(同じページ構成のため)
     let titles = [
-        ("接続", "つながっている端末と、その状態です。"),
+        ("接続", "この PC の役割と、つながっている端末の状態です。"),
         ("画面配置", "接続先の位置を、実際の画面配置に合わせます。"),
         ("操作", "画面を移る方法と、スクロールの感触です。"),
         ("共有", "このPCが渡すものと、受け取るものを選びます。"),
@@ -342,14 +413,23 @@ pub(super) unsafe fn build() {
         }
         h
     };
-    // Connection is a device relationship, followed by a separate editable endpoint.
-    LABEL_STATE.store(
-        label(0, &tray_status_text(), 236, 234, 520, ID_LBL_STATE),
+    // Deskflow 流の構成(Mac 設定と対): 役割の 2 択を最上部カードへ、状態は中段、
+    // 補助的な操作は下段に集める。役割と接続先(IP)は一对なので同じカードに置く。
+    // ラジオは Win32 標準のグループ化(先頭に WS_GROUP、TAB 停止は先頭のみ)
+    label(0, "このPCの役割", 236, 134, 300, ID_HEAD_ACT);
+    ROLE_CLIENT_RADIO.store(
+        make(Some(0), "BUTTON", "Mac がホスト(既定) — この PC が Mac へ接続しに行きます", 0x9 | WS_TABSTOP | 0x0002_0000 /*WS_GROUP*/, 236, 168, 516, 26, MENU_ROLE_CLIENT, font),
         Ordering::Relaxed,
     );
-    HINT.store(note(0, "", 236, 268, 520), Ordering::Relaxed);
-    label(0, "接続先", 236, 350, 200, ID_HEAD_ACT);
-    note(0, "MacのIPアドレス", 236, 380, 200);
+    ROLE_HOST_RADIO.store(
+        make(Some(0), "BUTTON", "この PC がホスト — Mac がこの PC へ接続しに来ます", 0x9, 236, 196, 516, 26, MENU_ROLE_HOST, font),
+        Ordering::Relaxed,
+    );
+    ROLE_NOTE.store(note(0, "", 236, 230, 520), Ordering::Relaxed);
+    label(0, "接続先のMac", 236, 264, 200, ID_HEAD_ACT);
+    note(0, "MacのIPアドレス", 236, 290, 200);
+    // このPC自身のアドレス(相手の Mac 側で IP を指定するときの確認用)
+    OWN_IP_LABEL.store(note(0, "", 440, 290, 312), Ordering::Relaxed);
     let host = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
     EDIT_HOST.store(
         make(
@@ -358,7 +438,7 @@ pub(super) unsafe fn build() {
             &host,
             0x0080 | 0x00800000 | WS_TABSTOP,
             236,
-            426,
+            326,
             310,
             30,
             230,
@@ -366,26 +446,79 @@ pub(super) unsafe fn build() {
         ),
         Ordering::Relaxed,
     );
-    btn(0, "保存して再接続", 562, 424, 190, MENU_SAVEHOST);
-    // 接続の方向: このPCが待ち受ける(ホスト)か、Mac へ接続しに行くか。再起動で反映
-    // 役割は 2 択の選択(ラジオ)。選ぶと相手にも伝えて両方が再起動する
-    let radio = |text: &str, y, id| make(Some(0), "BUTTON", text, 0x9 | WS_TABSTOP, 236, y, 516, 26, id, font);
-    ROLE_CLIENT_RADIO.store(
-        radio("Macがホスト: このPCがMacへ接続しに行く(既定)", 462, MENU_ROLE_CLIENT),
+    SAVEHOST_BUTTON.store(
+        btn(0, "保存して再接続", 562, 320, 190, MENU_SAVEHOST),
         Ordering::Relaxed,
     );
-    ROLE_HOST_RADIO.store(
-        radio("このPCがホスト: Macがこのパソコンへ接続しに来る", 490, MENU_ROLE_HOST),
+    // 中段カード: 端末の状態(図は paint_groups が描く)
+    LABEL_STATE.store(
+        label(0, &tray_status_text(), 236, 476, 540, ID_LBL_STATE),
         Ordering::Relaxed,
     );
+    HINT.store(note(0, "", 236, 506, 520), Ordering::Relaxed);
     LABEL_RTT.store(
-        label(0, &rtt_line(), 236, 561, 150, ID_LBL_RTT),
+        label(0, &rtt_line(), 236, 532, 200, ID_LBL_RTT),
         Ordering::Relaxed,
     );
-    btn(0, "登録情報", 236, 596, 150, MENU_REGISTER);
-    btn(0, "ログ", 392, 596, 130, MENU_OPENLOG);
-    btn(0, "診断", 528, 596, 100, MENU_DIAGNOSE);
-    btn(0, "再起動", 634, 596, 100, MENU_RESTART);
+    // このPCの名前(相手の Mac へ hello/hello_ok で名乗る名前。静的表示)。
+    // 複数台をつなぐときの区別に使う。上書きは環境変数 KNIT_COMPUTERNAME
+    // (usage.md「複数台をつなぐ」参照)。Mac 側の「このMacの名前」と対になる行
+    {
+        let overridden = std::env::var("KNIT_COMPUTERNAME")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        label(
+            0,
+            &format!(
+                "このPCの名前: {}{}",
+                crate::conn::device_name(),
+                if overridden { "(KNIT_COMPUTERNAME で指定)" } else { "" }
+            ),
+            440,
+            532,
+            312,
+            ID_HEAD_ACT,
+        );
+    }
+    // 通信の保護の常時表示(常時暗号化・相互認証)。鍵の略号(フィンガープリント)は
+    // この PC が保存している接続キーから出す。Mac 側の暗号化の行と同じ値なら
+    // 同じ鍵で認証中と確認できる(鍵本体は画面に出さない)
+    {
+        let fp = knit_common::envutil::get("KNIT_TOKEN")
+            .filter(|t| !t.is_empty())
+            .or_else(|| knit_common::credentials::load().ok().flatten())
+            .map(|t| knit_common::secure::fingerprint(&t));
+        note(
+            0,
+            &knit_common::secure::encryption_line(fp.as_deref()),
+            236,
+            558,
+            520,
+        );
+    }
+    // 登録の管理(台数の確認・初期化)は Mac 側の設定にあるため、その案内を出す。
+    // この PC は登録される側で、登録済み台数(接続中の端末の一覧)は持たない
+    label(0, "その他", 236, 602, 100, ID_HEAD_ACT);
+    btn(0, "登録情報", 236, 626, 150, MENU_REGISTER);
+    btn(0, "ログ", 394, 626, 130, MENU_OPENLOG);
+    btn(0, "診断", 532, 626, 110, MENU_DIAGNOSE);
+    btn(0, "再起動", 650, 626, 110, MENU_RESTART);
+    note(
+        0,
+        "登録済みの台数は Mac の設定「接続」の「登録の管理」で確認できます",
+        236,
+        664,
+        520,
+    );
+    // ログの保存場所(Mac 側設定の注記行と対称。「ログ」ボタンが開くのと同じ
+    // ファイル=knit-win.exe と同じフォルダの knit-win.log)
+    note(
+        0,
+        "ログ: knit-win.exe と同じフォルダの knit-win.log に追記されます(ボタンで開けない場合はこのファイルを開いてください)",
+        236,
+        698,
+        520,
+    );
     // 画面配置: Mac の設定を Windows から変える(Mac から見たこのPCの位置)
     label(1, "このPCの位置(Macから見て)", 236, 424, 250, ID_HEAD_ACT);
     SIDE_COMBO.store(
@@ -403,13 +536,18 @@ pub(super) unsafe fn build() {
     label(2, "かな / 英数", 494, 246, 258, ID_HEAD_ACT);
     // Mac の設定を Windows から変える(接続中のみ)
     label(2, "切替方式", 236, 318, 220, ID_HEAD_ACT);
+    // 3番目の項目名は sync_mac_prefs が現在の切替キー名へ書き換える(Mac 側と対称)。
+    // 初期値は既定キー(F13)の文言にしておく
     METHOD_COMBO.store(
-        combo(2, &["端に2回触れる", "端で少し待つ", "ショートカットのみ", "端に1回触れる"], 440, 314, 312, ID_METHOD_COMBO),
+        combo(2, &["端に2回触れる", "端で少し待つ", "切替キー（F13）のみ", "端に1回触れる"], 440, 314, 312, ID_METHOD_COMBO),
         Ordering::Relaxed,
     );
     label(2, "切替キー", 236, 362, 220, ID_HEAD_ACT);
+    // 右⌘(54)は MacBook 内蔵キーボードなど F13 が無い機種での代替(Mac 側と共通の
+    // 候補)。候補外のキーが設定されているときは sync_mac_prefs が末尾へ
+    // 「現在のキー（コードN）」項目を足して空選択を潰す
     HOTKEY_COMBO.store(
-        combo(2, &["F6（必要に応じてfnと併用）", "F8（必要に応じてfnと併用）", "F13"], 440, 358, 312, ID_HOTKEY_COMBO),
+        combo(2, &["F6（必要に応じてfnと併用）", "F8（必要に応じてfnと併用）", "F13", "右⌘"], 440, 358, 312, ID_HOTKEY_COMBO),
         Ordering::Relaxed,
     );
     label(2, "スクロール方向", 236, 406, 220, ID_HEAD_ACT);
@@ -481,7 +619,7 @@ pub(super) unsafe fn build() {
             &footer_line(),
             0,
             208,
-            722,
+            716,
             580,
             23,
             222,
@@ -634,7 +772,7 @@ unsafe fn card(hdc: *mut core::ffi::c_void, top: i32, bottom: i32) {
 pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
     let page = PAGE.load(Ordering::Relaxed);
     let groups: &[(i32, i32)] = match page {
-        0 => &[(120, 318), (330, 524), (536, 622)],
+        0 => &[(120, 360), (372, 590), (600, 700)],
         1 => &[(120, 392), (404, 520)],
         2 => &[(120, 290), (302, 596), (608, 700)],
         _ => &[(120, 290), (302, 530), (534, 708)],
@@ -661,9 +799,9 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
             let mut text = wide(name);
             let mut r = Rect {
                 left: x,
-                top: 196,
+                top: 439,
                 right: x + 150,
-                bottom: 224,
+                bottom: 467,
             };
             DrawTextW(
                 hdc,
@@ -700,9 +838,9 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
             let mut t = [0xE7F4u16, 0];
             let mut r = Rect {
                 left: x,
-                top: 143,
+                top: 386,
                 right: x + 150,
-                bottom: 191,
+                bottom: 434,
             };
             DrawTextW(
                 hdc,
@@ -714,8 +852,8 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
         }
         let pen = CreatePen(0, 1, rgb(theme().diagram_line));
         let op = SelectObject(hdc, pen);
-        MoveToEx(hdc, 418, 170, std::ptr::null_mut());
-        LineTo(hdc, 568, 170);
+        MoveToEx(hdc, 418, 410, std::ptr::null_mut());
+        LineTo(hdc, 568, 410);
         SelectObject(hdc, op);
         DeleteObject(pen);
         SelectObject(hdc, old);
@@ -751,10 +889,21 @@ pub(super) unsafe fn combo_changed(id: u32, sel: usize) {
         ID_METHOD_COMBO => {
             set_mac_pref("hotkey_only", json!(sel == 2));
             set_mac_pref("edge_taps", json!(if sel == 3 { 1 } else { 2 }));
-            set_mac_pref("delay", json!(if sel == 1 { 300 } else { 0 }));
+            // 「端で少し待つ」: 未設定(0)なら既定 300ms、設定済みならその値を保つ
+            //(Mac 側の switch_method と同じ規則。滞在時間スライダの値を
+            // 方式の行き来で失わない)。他の方式は滞在を使わないため 0
+            let current = crate::state::mac_pref("delay").and_then(|v| v.as_u64()).unwrap_or(0);
+            let delay = if sel == 1 {
+                if current == 0 { 300 } else { current }
+            } else {
+                0
+            };
+            set_mac_pref("delay", json!(delay));
         }
         ID_HOTKEY_COMBO => {
-            if let Some(k) = [97, 100, 105].get(sel) {
+            // 候補は Mac 側と共通(F6/F8/F13/右⌘)。末尾の「現在のキー」項目(候補外)は
+            // 選んも変更しない(候補 .get の範囲外のため自然に無視される)
+            if let Some(k) = [97, 100, 105, 54].get(sel) {
                 set_mac_pref("hotkey", json!(k));
             }
         }
@@ -828,10 +977,55 @@ pub(super) unsafe fn sync_mac_prefs() {
     let prefs = |k: &str| crate::state::mac_pref(k);
     select(&SIDE_COMBO, prefs("side").and_then(|v| v.as_u64()).map(|n| n as usize).filter(|n| *n <= 7));
     select(&METHOD_COMBO, method_index());
-    select(
-        &HOTKEY_COMBO,
-        prefs("hotkey").and_then(|v| v.as_i64()).and_then(|k| [97, 100, 105].iter().position(|x| *x == k)),
-    );
+    let kc = prefs("hotkey").and_then(|v| v.as_i64());
+    // 「ショートカットのみ」の項目名を実際の切替キー名へ(Mac 側と対称の文言)。
+    // 文言が変わったときだけ項目を作り直す(ドロップダウン開放中の操作を避ける)
+    {
+        let title = format!(
+            "切替キー（{}）のみ",
+            knit_common::keymap::mac_key_label(kc.unwrap_or(105))
+        );
+        let mut last = METHOD_ITEM_TITLE.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != title {
+            let h = METHOD_COMBO.load(Ordering::Relaxed) as HWND;
+            if !h.is_null() {
+                SendMessageW(h, 0x144 /*CB_DELETESTRING*/, 2, 0);
+                SendMessageW(h, 0x143 /*CB_INSERTSTRING*/, 2, wide(&title).as_ptr() as isize);
+                *last = title;
+            }
+        }
+    }
+    // 切替キー: 既知の候補(F6/F8/F13/右⌘)はその位置を選ぶ。Mac 側で env 等により
+    // 候補外のキーが設定されているときは末尾へ「現在のキー（コードN）」項目を足して
+    // 選ぶ(空選択だと実際のキーと見た目が食い違うため)。候補に戻れば項目を外す
+    {
+        let h = HOTKEY_COMBO.load(Ordering::Relaxed) as HWND;
+        if !h.is_null() {
+            let current = kc.unwrap_or(105);
+            match [97, 100, 105, 54].iter().position(|x| *x == current) {
+                Some(i) => {
+                    if HOTKEY_CUSTOM_KC.load(Ordering::Relaxed) != -1 {
+                        if SendMessageW(h, 0x146 /*CB_GETCOUNT*/, 0, 0) == 5 {
+                            SendMessageW(h, 0x144 /*CB_DELETESTRING*/, 4, 0);
+                        }
+                        HOTKEY_CUSTOM_KC.store(-1, Ordering::Relaxed);
+                    }
+                    select(&HOTKEY_COMBO, Some(i));
+                }
+                None => {
+                    if HOTKEY_CUSTOM_KC.load(Ordering::Relaxed) != current {
+                        if SendMessageW(h, 0x146 /*CB_GETCOUNT*/, 0, 0) == 5 {
+                            SendMessageW(h, 0x144 /*CB_DELETESTRING*/, 4, 0);
+                        }
+                        let text = wide(&format!("現在のキー（コード{current}）"));
+                        SendMessageW(h, 0x143 /*CB_ADDSTRING*/, 0, text.as_ptr() as isize);
+                        HOTKEY_CUSTOM_KC.store(current, Ordering::Relaxed);
+                    }
+                    select(&HOTKEY_COMBO, Some(4));
+                }
+            }
+        }
+    }
     let track = SCROLL_TRACK.load(Ordering::Relaxed) as HWND;
     if !track.is_null() && !TRACK_DRAGGING.load(Ordering::Relaxed) {
         if let Some(div) = prefs("scroll_div").and_then(|v| v.as_f64()) {
