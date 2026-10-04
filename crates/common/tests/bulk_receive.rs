@@ -658,3 +658,82 @@ fn collect_error_message_carries_actual_count_and_limit() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 深い日本語フォルダの rel は UTF-16 units 上限(1000)まで通る。旧判定
+/// (バイト数 480)では日本語 160 文字=480 バイトで以降全ファイルが拒否されて
+/// いたため、それを超える深い階層が collect で列挙されることを確認する
+///(超過分を skipped へ回す分岐は、macOS の PATH_MAX(1024 バイト)では
+/// UTF-16 1000 units 超えの実パスを作れないため、受信側の文言試験で代替する)
+#[test]
+fn collect_accepts_deep_japanese_paths_beyond_the_old_byte_limit() {
+    let temp = Temp::new("longrel");
+    // "あ"*80(240 バイト・80 units)× 3 階層 = rel 728 バイト・242 units。
+    // 旧判定(name.len() > 480)では 2 階層目の時点で拒否されていた深さ
+    let root = temp.0.join("深い日本語フォルダ");
+    let seg = "あ".repeat(80);
+    let deep = root.join(&seg).join(&seg).join(&seg);
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("f.txt"), b"x").unwrap();
+
+    let cr = bulk::collect_with_skips(std::slice::from_ref(&root), false, true, false).unwrap();
+    assert!(
+        cr.skipped.is_empty(),
+        "旧バイト上限超過でも新 units 上限内なら拒否しない: {:?}",
+        cr.skipped
+    );
+    assert_eq!(
+        cr.entries.len(),
+        1,
+        "最深部のファイルが列挙される: {:?}",
+        cr.entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+    );
+    let rel = &cr.entries[0].name;
+    assert!(
+        knit_common::files::utf16_len(rel) > 480 / 3,
+        "旧判定(480 バイト≈日本語 160 文字)を超える rel であること: {rel:?}"
+    );
+    assert!(
+        knit_common::files::utf16_len(rel) <= knit_common::files::MAX_REL_UNITS,
+        "新上限(UTF-16 units)には収まっていること"
+    );
+}
+
+/// 受信側で rel が長すぎる場合の失敗理由は「長すぎる」である(旧: 正当な長い
+/// 名前が一律「無効なファイル名」で案内されていた)。送信側で事前チェック
+/// しているため通常届かないが、旧版送信側との混在で届き得る
+#[test]
+fn receiver_reports_overlong_names_as_too_long() {
+    let temp = Temp::new("longname");
+    let dst = temp.0.join("received");
+    let mut rx = bulk::Receiver::new(&dst);
+    let over = "あ".repeat(knit_common::files::MAX_REL_UNITS + 1);
+    let head = serde_json::json!({ "name": over, "size": 1 }).to_string();
+    rx.feed(bulk::FILE_BEGIN, head.as_bytes());
+    rx.feed(bulk::DATA, b"z");
+    rx.feed(bulk::FILE_END, &[]);
+    let bulk::Event::Files { failed, .. } = rx.feed(bulk::BATCH_END, &[]).expect("event") else {
+        panic!("files event expected");
+    };
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].1.contains("長すぎる"),
+        "理由は長すぎること: {}",
+        failed[0].1
+    );
+    // 不正だが短い名前(空コンポーネント)は従来どおり「無効なファイル名」。
+    // 注記: ".." 遷移は sanitize がコンポーネントを無害化して通す設計のため
+    // ここでは空コンポーネントで「短い不正名」の文言を確認する
+    let mut rx = bulk::Receiver::new(&dst);
+    rx.feed(bulk::FILE_BEGIN, br#"{"name":"a//b.txt","size":1}"#);
+    rx.feed(bulk::DATA, b"z");
+    rx.feed(bulk::FILE_END, &[]);
+    let bulk::Event::Files { failed, .. } = rx.feed(bulk::BATCH_END, &[]).expect("event") else {
+        panic!("files event expected");
+    };
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert!(
+        failed[0].1.contains("無効なファイル名"),
+        "短い不正名は従来文言: {}",
+        failed[0].1
+    );
+}

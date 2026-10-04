@@ -642,10 +642,11 @@ pub fn clear_lane_b() {
     PRIMED_B.store(false, Ordering::Relaxed);
 }
 
-/// 10 秒毎の診断ログ(受信量/再生量/滞留 lag/間引き drop)。
+/// 60 秒毎の診断ログ(受信量/再生量/滞留 lag/間引き drop)。
 /// 無音期間はキープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる。
-/// drop が増え続けていれば波形を切っている=音割れの原因として疑う
-fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {    if last_diag.elapsed() < std::time::Duration::from_secs(10) {
+/// drop が増え続けていれば波形を切っている=音割れの原因として疑う。
+/// 10 秒→60 秒へ緩和: 常時接続で log が約 1MB/日で育ち続けるのを抑えるため
+fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {    if last_diag.elapsed() < std::time::Duration::from_secs(60) {
         return;
     }
     *last_diag = std::time::Instant::now();

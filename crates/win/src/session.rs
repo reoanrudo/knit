@@ -638,6 +638,12 @@ pub(crate) fn session(
                     if kana { "かな(ON)" } else { "英数(OFF)" }
                 );
             }
+            Msg::Caps { on } => {
+                // Mac の Caps Lock(alphaShift)を画面切替時に反映。Windows の
+                // Caps は「押すたびに反転」のため、状態が異なる時だけ 1 回
+                // トグル注入する(一致している時に注入すると逆にズれる)
+                crate::input::sync_caps_state(on);
+            }
             Msg::OpenUrl { url } => {
                 // Continue Here: Mac の前面ブラウザの URL を既定ブラウザで開く。
                 // 相手から来る文字列のため、検査(common urlx)を通るものだけ開く

@@ -10,12 +10,27 @@ static SOURCE_CLASS: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
 static FINISHED: Mutex<Vec<Active>> = Mutex::new(Vec::new());
 // 終了を要求してもAppKitの終了通知まではsourceを生かす。
-static RETIRED: Mutex<Vec<(Active, bool)>> = Mutex::new(Vec::new());
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
 struct Active {
     id: u64,
     window: usize,
     source: usize,
     began_ms: u64,
+}
+/// RETIRED へ退避した1セッション分。retired_ms は退避した時刻(単調 ms)で、
+/// ended が来ないまま残ったエントリの保険回収(poll)の期限判定に使う
+struct Retired {
+    active: Active,
+    /// window を orderOut 済みか(初回の poll で隠す)
+    hidden: bool,
+    retired_ms: u64,
+}
+
+/// RETIRED への退避から回収期限が切れたか(poll の判定用の純関数)。
+/// true を返したエントリは source/window を release して除去する
+fn retired_expired(retired_ms: u64, now: u64) -> bool {
+    const RETIRED_TIMEOUT_MS: u64 = 60_000;
+    now.saturating_sub(retired_ms) > RETIRED_TIMEOUT_MS
 }
 
 /// 受信ドラッグ(NSDraggingSession)が進行中か。進行中は Mac→Win の境界
@@ -110,7 +125,11 @@ pub fn reset() {
     // AppKit操作はmainスレッドへ渡し、遅れる終了通知までsourceを保持する。
     if let Some(active) = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let id = active.id;
-        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((active, false));
+        RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(Retired {
+            active,
+            hidden: false,
+            retired_ms: now_ms(),
+        });
         send_msg(&Msg::DragDone {
             id,
             copied: false,
@@ -159,9 +178,9 @@ unsafe extern "C" fn ended(_this: ID, _sel: SEL, _session: ID, _point: CGPoint, 
     } else {
         // 古いセッションの通知は、新しいACTIVEを終了させない。
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(index) = retired.iter().position(|(a, _)| a.source == _this as usize) {
-            let (active, _) = retired.remove(index);
-            FINISHED.lock().unwrap_or_else(|e| e.into_inner()).push(active);
+        if let Some(index) = retired.iter().position(|r| r.active.source == _this as usize) {
+            let removed = retired.remove(index);
+            FINISHED.lock().unwrap_or_else(|e| e.into_inner()).push(removed.active);
         }
     }
 }
@@ -378,10 +397,10 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
     let hide = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         let mut windows = Vec::new();
-        for (active, hidden) in retired.iter_mut() {
-            if !*hidden {
-                windows.push(active.window);
-                *hidden = true;
+        for r in retired.iter_mut() {
+            if !r.hidden {
+                windows.push(r.active.window);
+                r.hidden = true;
             }
         }
         windows
@@ -393,6 +412,31 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
         hide_window(finished.window);
         msg0(finished.source as ID, sel_registerName(c"release".as_ptr()));
         msg0(finished.window as ID, sel_registerName(c"release".as_ptr()));
+    }
+    // ended が来ないまま RETIRED に残ったセッションの保険回収: 退避から 60 秒
+    // 経っても AppKit の終了通知が来なければ、source/window を release して
+    // 除去する(生ポインタ未解放の恒久残留を防ぐ)。0 はテスト等のダミーのため
+    // release しない。遅れて ended が来ても RETIRED に無いため FINISHED へは
+    // 積まれず、二重 release にはならない(ended は ACTIVE/RETIRED の照合で
+    // 該当が無ければ何もしない)
+    let expired = {
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        let mut expired = Vec::new();
+        retired.retain(|r| {
+            if retired_expired(r.retired_ms, now) {
+                expired.push((r.active.id, r.active.source, r.active.window));
+                false
+            } else {
+                true
+            }
+        });
+        expired
+    };
+    for (id, source, window) in expired {
+        if source != 0 { msg0(source as ID, sel_registerName(c"release".as_ptr())); }
+        if window != 0 { msg0(window as ID, sel_registerName(c"release".as_ptr())); }
+        eprintln!("[drag] Mac drag {id} ended(expired): 終了通知が来ないため退避から60秒で回収");
     }
     // ended が来ない異常残骸の回収。物理ボタンが解放されたのに一定時間
     // 経ってもセッションが終わらなければ、掴み切替を妨げ続けないよう
@@ -409,7 +453,11 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
         let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(active) = active {
             let (id, window) = (active.id, active.window);
-            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push((active, true));
+            RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(Retired {
+                active,
+                hidden: true,
+                retired_ms: now_ms(),
+            });
             hide_window(window);
             INCOMING
                 .lock()
@@ -490,5 +538,24 @@ mod tests {
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].id, 77);
         ACTIVE.lock().unwrap().take();
+    }
+
+    /// RETIRED へ退避してからの期限判定: 60 秒を超えたら回収対象。
+    /// ダミー構造(実ポインタなし)で判定だけを確かめる
+    #[test]
+    fn retired_entries_expire_sixty_seconds_after_retirement() {
+        let now = 10_000_000u64;
+        assert!(!retired_expired(now, now), "退避直後は回収しない");
+        assert!(
+            !retired_expired(now - 60_000, now),
+            "ちょうど 60 秒ではまだ回収しない(境界)"
+        );
+        assert!(
+            retired_expired(now - 60_001, now),
+            "60 秒超で回収対象"
+        );
+        // retired_ms が now より未来(時計の巻き戻り相当)でも飽和して 0 扱いに
+        // なり、誤回収しない
+        assert!(!retired_expired(now + 5_000, now));
     }
 }

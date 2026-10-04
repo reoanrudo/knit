@@ -317,7 +317,16 @@ fn main() {
         .join("Downloads")
         .join("Knit");
     let _ = std::fs::create_dir_all(&recv_dir);
+    // 前回終了時に残った受信中ファイルの一時実体(.knit-*.part)を掃除する
+    //(exit は Receiver の Drop を飛ばすための保険。Mac 側と同じ起動時掃除)
+    let swept = knit_common::files::sweep_temp_files(&recv_dir);
+    if swept > 0 {
+        println!("[file] 前回の受信中ファイルの残骸を {swept} 件掃除しました");
+    }
     history_load();
+    // 画像履歴の実体を件数(60)と総量(512MiB)の両上限へ刈り込む(起動時に 1 回)。
+    // 保存時の刈り込みは画像が届いた時しか走らないため、ここで残った超過を掃く
+    clipboard::prune_image_store_now();
     // 前回異常終了した際のスピーカーミュート残留を、接続を始める前に復元する
     // (退避記録が無ければ何もしない。ここを接続処理より後に置くと、確立時の
     // ミュート適用と競合して復元の意味が無くなる)
@@ -369,11 +378,31 @@ fn main() {
                 None => return,
             },
             Err(_) => {
-                if !args.iter().any(|a| a == "--background") {
-                    tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");
+                let background = args.iter().any(|a| a == "--background");
+                // 読み取れない登録が残っている限り再起動しても同じ場所で止まる。
+                // 確認のうえ初期化して初回登録へ導く(キャンセル時は従来どおり終了)
+                if background || !tray::setup::confirm_broken_registration_reset() {
+                    if !background {
+                        tray::setup::error("保存した接続キーを読み取れません。Windowsのユーザーと保存先を確認してください。");
+                    }
+                    eprintln!("[setup] credential store unavailable");
+                    return;
                 }
-                eprintln!("[setup] credential store unavailable");
-                return;
+                if let Err(e) = knit_common::credentials::delete() {
+                    tray::setup::error(&format!(
+                        "保存した接続キーを削除できませんでした。\n{e}"
+                    ));
+                    eprintln!("[setup] credential delete failed: {e}");
+                    return;
+                }
+                eprintln!("[setup] 読み取れない登録を初期化しました。初回登録をやり直します");
+                match tray::setup::first_run(false) {
+                    Some(t) => {
+                        JUST_REGISTERED.store(true, Ordering::Relaxed);
+                        t
+                    }
+                    None => return,
+                }
             }
         }
     };
@@ -455,6 +484,12 @@ fn main() {
         on_event: win_on_bulk,
         log: |s| println!("{s}"),
         on_rx_bytes: |n| RX_BYTES.store(n, Ordering::Relaxed),
+        // 受信バッチの開始通知。Windows 側は履歴ラベルが接続先(Mac)固定のため
+        // 特に記録しない(共通 Endpoint のフィールドとして必須の no-op)
+        on_batch_begin: || {},
+        // 待受 bind の初回失敗だけトレイのバルーンにも出す(接続は生きて
+        // いるのにファイル・画像だけが届かない状態をログだけで終わらせない)
+        on_bind_error: |s: &str| crate::tray::notify("Knit", s),
     });
     // Esc での転送中止の監視(物理・注入どちらの Esc も拾う)
     spawn_esc_cancel_watcher();

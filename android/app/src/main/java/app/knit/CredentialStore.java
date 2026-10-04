@@ -27,8 +27,26 @@ final class CredentialStore {
     }
     synchronized JSONObject load() throws Exception {
         if(!prefs.contains("sealed")) return null;
-        Cipher c=Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,Base64.decode(prefs.getString("iv",""),Base64.NO_WRAP)));
-        return new JSONObject(new String(c.doFinal(Base64.decode(prefs.getString("sealed",""),Base64.NO_WRAP)),java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            Cipher c=Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.DECRYPT_MODE,key(),new GCMParameterSpec(128,Base64.decode(prefs.getString("iv",""),Base64.NO_WRAP)));
+            return new JSONObject(new String(c.doFinal(Base64.decode(prefs.getString("sealed",""),Base64.NO_WRAP)),java.nio.charset.StandardCharsets.UTF_8));
+        } catch(Exception e) {
+            if(!keyLost(e)) throw e;
+            // Keystore の鍵を失った(端末初期化・鍵の無効化・OS更新など)。復号は
+            // 二度と成功しないため、壊れた登録をここで自壊して「登録が必要」へ
+            // 遷移させる。残したままでは paired() が true を返し続け、
+            // 「登録済み」の表示のまま無限再接続ループになる
+            prefs.edit().remove("iv").remove("sealed").commit();
+            return null;
+        }
+    }
+    /** 復号の失敗が「Keystore の鍵を失って二度と戻らない」種類か。
+     *  AEADBadTagException(タグ不一致=鍵が変わって復号できない)と
+     *  InvalidKeyException(鍵の無効化。KeyPermanentlyInvalidatedException は
+     *  そのサブクラス)を対象とする。SharedPreferences に依存しない純粋な
+     *  判定として切り出し、単体テストで検証する */
+    static boolean keyLost(Throwable e) {
+        return e instanceof AEADBadTagException || e instanceof InvalidKeyException;
     }
     boolean paired() { return prefs.contains("sealed"); }
     void forget() throws Exception {

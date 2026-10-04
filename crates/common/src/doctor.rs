@@ -78,6 +78,9 @@ pub enum Verdict {
 pub struct Governor {
     log: Vec<(Fix, u64)>,
     exhausted_noted: Vec<Fix>,
+    /// 渡された時刻の最後の値。巻き戻った時刻(壁時計の誤使用など)でも
+    /// 判定が破綻しないよう、これより小さい値は張り付けて受け取る
+    last_now: u64,
 }
 
 impl Governor {
@@ -86,6 +89,10 @@ impl Governor {
     }
 
     pub fn check(&mut self, fix: Fix, now_ms: u64) -> Verdict {
+        // 時刻は単調(減らない)を前提とした判定のため、巻き戻りは前回値に張り付く
+        // (= 経過 0 扱い。安全側の TooSoon/窓の縮小は起きない)
+        let now_ms = now_ms.max(self.last_now);
+        self.last_now = now_ms;
         let (gap, max, window) = fix.policy();
         self.log.retain(|&(_, t)| now_ms.saturating_sub(t) < window);
         let mine: Vec<u64> = self.log.iter().filter(|(f, _)| *f == fix).map(|&(_, t)| t).collect();
@@ -119,7 +126,10 @@ pub fn enabled() -> bool {
 }
 
 /// 1 周: 異常な実測のうち修復候補を、重複を除いて Governor の許す範囲で実行する。
-/// 実行した修復の結果は Journal に残る。戻り値は実行した修復の数
+/// 実行した修復の結果は Journal に残る。戻り値は実行した修復の数。
+/// `now_ms` には単調時計の ms(`crate::clock::mono_now_ms()`。各 OS の `now_ms()`)
+/// を渡すこと。壁時計は NTP 補正やスリープ復帰で飛び・巻き戻り、
+/// 連発制限(gap/窓)の判定を誤らせる
 pub fn cycle(
     findings: &[Finding],
     gov: &mut Governor,
@@ -232,6 +242,18 @@ mod tests {
         assert_eq!(g.check(Fix::Reconnect, 1_000), Verdict::Run);
         assert_eq!(g.check(Fix::Reconnect, 10_000), Verdict::TooSoon);
         assert_eq!(g.check(Fix::Reconnect, 31_001), Verdict::Run);
+    }
+
+    #[test]
+    fn governor_does_not_break_when_the_clock_goes_backwards() {
+        // 壁時計を誤って渡した場合などの防御: 時刻が巻き戻っても破綻しない。
+        // 巻き戻りは「経過 0」として扱い、誤って修復を許可しない
+        let mut g = Governor::new();
+        assert_eq!(g.check(Fix::Reconnect, 10_000), Verdict::Run);
+        assert_eq!(g.check(Fix::Reconnect, 4_000), Verdict::TooSoon, "巻き戻りで窓を飛ばさない");
+        assert_eq!(g.check(Fix::Reconnect, 5_000), Verdict::TooSoon);
+        // 巻き戻りを挟んでも、前回実行(10_000)からの実経過で判定が戻る
+        assert_eq!(g.check(Fix::Reconnect, 41_000), Verdict::Run);
     }
 
     #[test]

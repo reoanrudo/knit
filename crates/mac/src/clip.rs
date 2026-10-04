@@ -98,12 +98,25 @@ pub(crate) fn history_push_image(bmp: &[u8], device: &str) {
     knit_common::history::restrict_dir(&dir);
     let path = dir.join(&name);
     if !path.exists() {
-        if knit_common::history::write_private(&path, bmp).is_err() {
+        // 失敗時は部分書き込みの実体を消す(exists チェックで壊れた実体が
+        // 固定化され、復元だけが恒久失敗するのを防ぐ)
+        if knit_common::history::write_private_or_remove(&path, bmp).is_err() {
             eprintln!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
             return;
         }
-        knit_common::history::prune_image_store(&dir, IMAGE_KEEP);
+    } else {
+        // 同じ画像の再コピー: 実体は既に有るため書き直さず mtime だけ現在へ
+        // 更新する。刈り込み(prune)が mtime 順に残すため、更新しないと
+        // 「履歴の最新」として参照中の実体が古い順に消える
+        knit_common::history::touch_mtime(&path);
     }
+    // 刈り込みは if の外: 同じ画像の再コピー(実体の新規保存が無い)の間も
+    // バイト総量上限(512MiB)へ収め続ける。件数とバイトの両方で頭打ちにする
+    knit_common::history::prune_image_store(
+        &dir,
+        IMAGE_KEEP,
+        knit_common::history::MAX_IMAGE_STORE_BYTES,
+    );
     let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_image(&name, bmp.len(), device, ts).is_some() {
@@ -112,6 +125,17 @@ pub(crate) fn history_push_image(bmp: &[u8], device: &str) {
             history_save();
         }
     }
+}
+
+/// 起動時に画像履歴の実体を刈り込む(履歴 load の後に 1 回)。保存時の刈り込みは
+/// 画像が届いた時しか走らないため、起動をまたぐと総量超過が残り続くのを防ぐ
+pub(crate) fn prune_image_store_now() {
+    let Some(dir) = image_store_dir() else { return };
+    knit_common::history::prune_image_store(
+        &dir,
+        IMAGE_KEEP,
+        knit_common::history::MAX_IMAGE_STORE_BYTES,
+    );
 }
 
 /// 履歴から Mac のクリップボードへ復元する。受信ループ防止のため
@@ -225,6 +249,27 @@ pub fn history_restore(text: String) {
 pub static LOCAL_HISTORY: AtomicBool = AtomicBool::new(true);
 static RECORD_DONE_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 static RECORD_SEEN_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+/// ローカルコピー 1 回分(changeCount)の履歴記録権。record_local_copy(常時の
+/// 監視)と sync_clipboard_to_win(越境時の同期)が同じコピーを扱えるため、
+/// 片方が読み出しから history_push までの間に他方の印(LAST_SYNC_COUNT)を
+/// 読み違えると二重に積まれる。CAS で一方のみが積めるようにする
+static HISTORY_CLAIM_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+
+/// changeCount への履歴記録権を取る。true=初めての記録として通す、false=他の
+/// 経路が既に記録済み(またはより新しいコピーを記録済み)のため積まない。
+/// changeCount は単調増加するため、CAS ループで現在値より大きい時だけ書き換える
+fn claim_history(claimed: &std::sync::atomic::AtomicIsize, cnt: isize) -> bool {
+    let mut cur = claimed.load(Ordering::Relaxed);
+    loop {
+        if cur >= cnt {
+            return false;
+        }
+        match claimed.compare_exchange(cur, cnt, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+}
 
 /// ペーストボードの変化を見張る。書き込み直後は読まず、次の確認でも同じ値なら読む(遅延提供の途中を避ける)
 pub(crate) fn start_local_history() {
@@ -281,14 +326,31 @@ unsafe fn record_local_copy() {
         if knit_common::smartguard::looks_secret(&text) == Some(true) {
             return;
         }
-        history_push(&text, "Mac");
+        // 越境同期(sync_clipboard_to_win)が同じ changeCount を記録済みなら
+        // 二重に積まない(⌘C 直後の越境で片方が読み違える競合の窓を塞ぐ)
+        if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+            history_push(&text, "Mac");
+        }
     } else if let Some(files) = mac_clipboard_files() {
-        history_push_files(&files, "Mac");
+        if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+            history_push_files(&files, "Mac");
+        }
     } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) >= 1_000 {
         if let Some(dib) = mac_clipboard_image_dib() {
-            history_push_image(&dib_to_bmp(&dib), "Mac");
+            if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+                history_push_image(&dib_to_bmp(&dib), "Mac");
+            }
         }
     }
+}
+
+/// Busy 等で同期を保留するとき、同期済みの印(LAST_SYNC_COUNT)を自分が書いた
+/// 値のままの時だけ prev へ戻す。間に別の書き込みが入っていれば上書きしない。
+/// 戻さないとこのコピーは二度と同期されない(次の変更検知・切替で再送する)
+fn defer_sync_rollback(prev: isize, cnt: isize) {
+    LAST_SYNC_COUNT
+        .compare_exchange(cnt, prev, Ordering::Relaxed, Ordering::Relaxed)
+        .ok();
 }
 
 pub(crate) fn sync_clipboard_to_win() {
@@ -342,14 +404,7 @@ pub(crate) fn sync_clipboard_to_win() {
                                 // 戻すのは自分が書いた値のままの時だけにする(間に別の
                                 // 書き込みが入っていれば上書きしない)
                                 SendFilesOutcome::Busy => {
-                                    LAST_SYNC_COUNT
-                                        .compare_exchange(
-                                            cnt,
-                                            prev,
-                                            Ordering::Relaxed,
-                                            Ordering::Relaxed,
-                                        )
-                                        .ok();
+                                    defer_sync_rollback(prev, cnt);
                                     eprintln!(
                                         "[file] 他の転送中のためファイル同期を保留します(次の切替で再試行します)"
                                     );
@@ -381,7 +436,9 @@ pub(crate) fn sync_clipboard_to_win() {
                                         "[clip] mac->android image(クリップボード) {}KB",
                                         png.len() / 1024
                                     );
-                                    history_push_image(&dib_to_bmp(&dib), "Mac");
+                                    if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+                                        history_push_image(&dib_to_bmp(&dib), "Mac");
+                                    }
                                 } else {
                                     eprintln!("[clip] タブレットのクリップボードへ画像を載せられませんでした");
                                 }
@@ -418,11 +475,22 @@ pub(crate) fn sync_clipboard_to_win() {
                                 bulk::MAX_IMAGE / 1024 / 1024
                             ),
                         );
+                    } else if FILE_TX_BUSY.load(Ordering::Relaxed) {
+                        // ファイル転送中に画像を送ると、bulk の送信口(転送が終わる
+                        // まで ロックを保持)を待ってこのスレッドが留まり、転送完了後に
+                        // 古い画像が上書いてしまう。ファイル同期と同じ Busy 扱いで
+                        // 今回はスキップし、印を戻して次の切替(変更検知)で再送する
+                        defer_sync_rollback(prev, cnt);
+                        eprintln!(
+                            "[clip] 他の転送中のため画像同期を保留します(次の切替で再試行します)"
+                        );
                     } else {
                         match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
                             Ok(()) => {
                                 eprintln!("[clip] mac->win image {}KB", dib.len() / 1024);
-                                history_push_image(&dib_to_bmp(&dib), "Mac");
+                                if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+                                    history_push_image(&dib_to_bmp(&dib), "Mac");
+                                }
                             }
                             Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
                         }
@@ -461,7 +529,11 @@ pub(crate) fn sync_clipboard_to_win() {
                 return;
             }
             eprintln!("[clip] mac->win {} bytes", text.len());
-            history_push(&text, "Mac");
+            // 履歴記録はローカル監視(record_local_copy)と同じ changeCount の
+            // 記録権を取り合う: どちらが先に通っても一方だけが積む
+            if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
+                history_push(&text, "Mac");
+            }
             send_msg(&Msg::Clip { text });
         })
     });
@@ -501,3 +573,79 @@ pub(crate) static LAST_RECV_CLIP: Mutex<Option<String>> = Mutex::new(None);
 /// 直近の受信では画像送信を 1 回控える(changeCount 保護の二重ガード)
 pub(crate) static LAST_IMG_RX_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) const CLIP_MAX_BYTES: usize = 1024 * 1024; // 1MB(Win側と同じ上限)
+
+/// Busy による画像同期の保留: 同期済みの印が巻き戻ること(次の変更検知で再送される)
+#[cfg(test)]
+mod defer_sync_rollback_tests {
+    use super::{defer_sync_rollback, LAST_SYNC_COUNT};
+    use std::sync::atomic::Ordering;
+
+    /// LAST_SYNC_COUNT はプロセス共有の static。入れ替えて必ず元へ戻す
+    #[test]
+    fn rollback_restores_prev_only_when_untouched() {
+        let saved = LAST_SYNC_COUNT.load(Ordering::Relaxed);
+        // prev=5 → cnt=7 へ進めた状態(同期スレッドが swap で書いた直後を再現)
+        LAST_SYNC_COUNT.store(7, Ordering::Relaxed);
+        defer_sync_rollback(5, 7);
+        assert_eq!(
+            LAST_SYNC_COUNT.load(Ordering::Relaxed),
+            5,
+            "誰も触っていなければ prev へ巻き戻る(次の切替で再送される)"
+        );
+        // 間に別の書き込み(=別のコピーの同期)が入っていれば上書きしない
+        LAST_SYNC_COUNT.store(8, Ordering::Relaxed);
+        defer_sync_rollback(5, 7);
+        assert_eq!(
+            LAST_SYNC_COUNT.load(Ordering::Relaxed),
+            8,
+            "自分の書いた値のまま以外は触らない"
+        );
+        LAST_SYNC_COUNT.store(saved, Ordering::Relaxed);
+    }
+}
+
+/// 履歴記録権の CAS(⌘C 直後の越境で二重記録される回帰の防止)
+#[cfg(test)]
+mod claim_history_tests {
+    use super::claim_history;
+    use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+
+    #[test]
+    fn only_one_side_wins_the_same_count() {
+        let claimed = AtomicIsize::new(-1);
+        assert!(claim_history(&claimed, 7), "最初の要求は通る");
+        assert!(!claim_history(&claimed, 7), "同じ changeCount の 2 回目は通らない");
+    }
+
+    #[test]
+    fn newer_copy_claims_after_older_one() {
+        let claimed = AtomicIsize::new(3);
+        assert!(!claim_history(&claimed, 3));
+        assert!(claim_history(&claimed, 4), "新しいコピーは記録できる");
+        assert!(!claim_history(&claimed, 4));
+    }
+
+    #[test]
+    fn stale_count_never_displaces_a_newer_claim() {
+        let claimed = AtomicIsize::new(9);
+        assert!(!claim_history(&claimed, 5), "古い changeCount は記録しない");
+        assert_eq!(claimed.load(Ordering::Relaxed), 9, "値を巻き戻さない");
+    }
+
+    /// 並走を模して 8 スレッドが同じ changeCount を要求した時、通るのは 1 つだけ
+    #[test]
+    fn concurrent_claims_admit_exactly_one() {
+        let claimed = AtomicIsize::new(-1);
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    if claim_history(&claimed, 42) {
+                        wins.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(Ordering::Relaxed), 1, "記録権を取れるのは 1 スレッドだけ");
+    }
+}

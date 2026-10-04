@@ -26,6 +26,13 @@ static NEXT_TX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// 元のため、2つの送信が並走すると単一スロットの XFER_ACK を取り違ける。
 /// panic でも残らないよう TxGuard で解く
 static TX_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// ファイル送信中か。クリップボード画像の同期を Busy 設計に乗せるために
+/// clipboard.rs から読む(送信中の画像送信は bulk の送信口を待って後から
+/// 古い内容が流れるのを防ぐ)
+pub(crate) fn tx_busy() -> bool {
+    TX_BUSY.load(std::sync::atomic::Ordering::Relaxed)
+}
 struct TxGuard(std::cell::Cell<Option<u64>>);
 impl TxGuard {
     fn new() -> Self {

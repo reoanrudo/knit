@@ -21,6 +21,9 @@ public final class ConnectionService extends Service {
      * ファイル経路が通った時に自動で送る。AtomicReference なのは、保持と
      * 取り出し(bulk確立時のgetAndSet)が別スレッドで競合するため */
     static final java.util.concurrent.atomic.AtomicReference<JSONArray> pendingFiles=new java.util.concurrent.atomic.AtomicReference<>();
+    /** 取り出した保留の送信が失敗した時、1回だけ保留へ戻したか(無限再送の防止)。
+     * 保留へ戻す時に true、bulk 確立での取り出し・新しい共有の積み込みで false へ戻す */
+    static final java.util.concurrent.atomic.AtomicBoolean pendingFilesRetried=new java.util.concurrent.atomic.AtomicBoolean();
     private volatile boolean running;
     private volatile long epoch;
     private volatile long handle,bulkHandle;
@@ -61,7 +64,33 @@ public final class ConnectionService extends Service {
         ConnectionService service=current;
         if(service!=null)service.ui.post(()->{if(service.running)((NotificationManager)service.getSystemService(NOTIFICATION_SERVICE)).notify(1,service.notification());});
     }
-    @Override public void onCreate() { super.onCreate(); current=this; ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(new NotificationChannel(CHANNEL,"Macとの接続",NotificationManager.IMPORTANCE_LOW)); }
+    @Override public void onCreate() { super.onCreate(); current=this; ((NotificationManager)getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(new NotificationChannel(CHANNEL,"Macとの接続",NotificationManager.IMPORTANCE_LOW)); cleanSendCache(); }
+    /** 前回起動の送信キャッシュ(cacheDir/send/ の UUID 隔離ディレクトリ群)を掃除する。
+     *  未送信のまま再起動した保留の実体(1 件最大 256MiB)が cacheDir に居座るのを防ぐ。
+     *  onCreate 時点で pendingFiles は必ず空(プロセス再起動なら null 初期化、
+     *  サービス再生成なら onDestroy で消去済み)のため一律削除で安全だが、万一生きて
+     *  いる保留が指す実体は再送のため残す */
+    private void cleanSendCache() {
+        File[] dirs=new File(getCacheDir(),"send").listFiles();
+        if(dirs==null)return;
+        String[] keep=pendingPaths();
+        for(File dir:dirs)if(!isProtectedFromClean(dir.getAbsolutePath(),keep))deleteTree(dir);
+    }
+    /** 掃除から守るべき保留の実体パス(onCreate 直後は通常空) */
+    private String[] pendingPaths() {
+        JSONArray pending=pendingFiles.get();
+        if(pending==null)return new String[0];
+        String[] out=new String[pending.length()];
+        for(int i=0;i<pending.length();i++)out[i]=pending.optString(i);
+        return out;
+    }
+    /** 送信ディレクトリが保留の指す実体を含むか(再送のため掃除から守る)。
+     *  純粋な文字列比較のみのため、単体テストで状態遷移だけを検証できる */
+    static boolean isProtectedFromClean(String dir,String[] paths) {
+        for(String p:paths)if(p.startsWith(dir+File.separator))return true;
+        return false;
+    }
+    static void deleteTree(File f) { File[] c=f.listFiles(); if(c!=null)for(File x:c)deleteTree(x); f.delete(); }
     @Override public int onStartCommand(Intent intent,int flags,int startId) {
         if(intent!=null && "stop".equals(intent.getAction())) { setStopped(this,true); stopSelf(); return START_NOT_STICKY; }
         startForeground(1,notification());
@@ -171,8 +200,9 @@ public final class ConnectionService extends Service {
                 if(!valid(generation) || handle!=mainId || !selected) {Native.close(id);continue;}
                 bulkHandle=id;final long bulk=id;
                 // つながる前に共有されていたファイルがあれば、ここで自動送信する
+                //(再送として戻した分は、失敗時に再度戻さないよう印を受け取る)
                 JSONArray pending=pendingFiles.getAndSet(null);
-                if(pending!=null)sendFiles(pending);
+                if(pending!=null)sendFiles(pending,pendingFilesRetried.getAndSet(false));
                 ScheduledExecutorService heartbeat=Executors.newSingleThreadScheduledExecutor();
                 heartbeat.scheduleWithFixedDelay(()-> {if(valid(generation)&&handle==mainId&&selected)try{Native.request(8,bulk,Native.obj(),null);}catch(Exception ignored){Native.close(bulk);}},10,10,TimeUnit.SECONDS);
                 try {
@@ -186,12 +216,31 @@ public final class ConnectionService extends Service {
             if(valid(generation)&&handle==mainId)try{Thread.sleep(2000);}catch(InterruptedException e){break;}
         }
     }
-    void sendFiles(JSONArray paths) {
+    void sendFiles(JSONArray paths) { sendFiles(paths,false); }
+    /** retried=保留へ戻した分の再送(失敗してももう戻さない)。新しい共有は
+     *  false で呼ばれ、失敗時に 1 回だけ保留へ戻す */
+    void sendFiles(JSONArray paths,boolean retried) {
         long id=bulkHandle;
-        if(id==0) { pendingFiles.set(paths); report("Macがこのタブレットを選択すると送信されます(Macの画面の端へカーソルを移動してください)。"); return; }
-        files.execute(()-> { try { Native.request(7,id,Native.obj("paths",paths),null); report("Macへファイルを送信しました。"); } catch(Exception e) { report(safe(e)); }
-            finally { for(int i=0;i<paths.length();i++){File f=new File(paths.optString(i));try{if(f.getCanonicalPath().startsWith(new File(getCacheDir(),"send").getCanonicalPath()+File.separator)){f.delete();f.getParentFile().delete();}}catch(Exception ignored){}} }
+        if(id==0) { pendingFiles.set(paths); pendingFilesRetried.set(false); report("Macがこのタブレットを選択すると送信されます(Macの画面の端へカーソルを移動してください)。"); return; }
+        files.execute(()-> {
+            try { Native.request(7,id,Native.obj("paths",paths),null); report("Macへファイルを送信しました。"); }
+            catch(Exception e) { report(safe(e));
+                // bulk 確立の直後に Mac 側の選択解除が重なると id は閉じられ、
+                // 取り出し済みの保留は黙って消えていた。1 回だけ保留へ戻す
+                //(戻すのは保留が空の時だけ=新しい共有を上書きしない)。戻せた
+                // 分は次の確立で再送するため、キャッシュの実体もここでは消さない
+                if(requeueOnFailure(pendingFiles,pendingFilesRetried,paths,retried)) return; }
+            for(int i=0;i<paths.length();i++){File f=new File(paths.optString(i));try{if(f.getCanonicalPath().startsWith(new File(getCacheDir(),"send").getCanonicalPath()+File.separator)){f.delete();f.getParentFile().delete();}}catch(Exception ignored){}}
         });
+    }
+    /** 送信に失敗した取り出し済みの共有を、1 回だけ保留へ戻す。戻せたら true。
+     *  汎型の静的メソッドにしているのは、単体テストで状態遷移だけを
+     *  (android.jar のスタブに阻まれず)検証するため */
+    static <T> boolean requeueOnFailure(java.util.concurrent.atomic.AtomicReference<T> pending,java.util.concurrent.atomic.AtomicBoolean retried,T paths,boolean wasRetry) {
+        if(wasRetry) return false; // 再送分は戻さない(無限再送の防止)
+        if(!pending.compareAndSet(null,paths)) return false; // 新しい共有がある: 上書きしない
+        retried.set(true);
+        return true;
     }
     static void send(JSONObject msg) {
         ConnectionService service=current;
@@ -212,7 +261,7 @@ public final class ConnectionService extends Service {
     @Override public void onConfigurationChanged(android.content.res.Configuration config) { super.onConfigurationChanged(config); if(ControlService.current!=null) ControlService.current.release(); permissions(); }
     @Override public void onDestroy() {
         running=false; lowLatency(false); ui.removeCallbacks(permissionTicker); ++epoch; connected=false; current=null;
-        pendingFiles.set(null);
+        pendingFiles.set(null); pendingFilesRetried.set(false);
         long main=handle,bulk=bulkHandle; handle=0; bulkHandle=0;
         Native.close(main); Native.close(bulk); sender.shutdownNow(); files.shutdownNow();
         if(ControlService.current!=null) ControlService.current.release();

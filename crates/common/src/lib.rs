@@ -1,4 +1,6 @@
+pub mod clock;
 pub mod credentials;
+pub mod persist;
 pub mod diagnose;
 pub mod doctor;
 pub mod drag;
@@ -643,7 +645,7 @@ mod tests {
             link: &LINK, token: "bulk-heartbeat-test-key".into(),
             dir: std::env::temp_dir().join(format!("knit-heartbeat-{}", std::process::id())),
             on_event: |_| panic!("keepalive must not produce a file event"), log: |_| {},
-            on_rx_bytes: |_| {},
+            on_rx_bytes: |_| {}, on_batch_begin: || {}, on_bind_error: |_| {},
         });
         std::thread::spawn(move || serve(endpoint, "127.0.0.1", address.port(), |_| true));
         let until = Instant::now() + Duration::from_secs(2);
@@ -691,6 +693,8 @@ mod tests {
             },
             log: |_| {},
             on_rx_bytes: |_| {},
+            on_batch_begin: || {},
+            on_bind_error: |_| {},
         });
         let client = CLIENT.get_or_init(|| Endpoint {
             link: &CLIENT_LINK,
@@ -699,6 +703,8 @@ mod tests {
             on_event: |_| {},
             log: |_| {},
             on_rx_bytes: |_| {},
+            on_batch_begin: || {},
+            on_bind_error: |_| {},
         });
         std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true));
         static ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
