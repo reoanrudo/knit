@@ -27,7 +27,16 @@ pub(crate) const MAIN_SHUTDOWN: &str = "\u{0}MAIN-SHUTDOWN";
 /// 再接続の待機を外部イベント(スリープ復帰・電源状態変化)で割り込ませる
 pub static WAKE: knit_common::retry::Wakeable = knit_common::retry::Wakeable::new();
 
+/// 単調時計の ms(プロセス起動からの経過)。経過時間・間引き・期限判定(再試行予定・
+/// 通知の間引き・ドクターの連発制限)に使う。壁時計は NTP 補正やスリープ復帰で
+/// 飛び・巻き戻るため、内部の比較には使わない(Mac 側と同じ原則の共通実装)
 pub(crate) fn now_ms() -> u64 {
+    knit_common::clock::mono_now_ms()
+}
+
+/// 壁時計の unix ms。ログのメトリクス行など、絶対時刻を表示する用途だけに使う。
+/// 時間の長さは測らない(Mac 側 state::wall_ms と同じ使い分け)
+pub(crate) fn wall_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -47,9 +56,9 @@ pub(crate) static METRIC_TOTAL_GAP_MS: std::sync::atomic::AtomicU64 =
 pub(crate) static BOOT_WALL_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// 起動時刻の記録(main から 1 回呼ぶ)
+/// 起動時刻の記録(main から 1 回呼ぶ)。壁時計の絶対時刻で記録する
 pub(crate) fn init_boot_wall() {
-    BOOT_WALL_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+    BOOT_WALL_MS.store(wall_ms(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 本線へ 1 行送る(トレイ・電源イベント・Esc 監視から使う)

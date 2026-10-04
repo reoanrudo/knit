@@ -504,6 +504,14 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .ok();
+        // 書き込みタイムアウトも設定する: ネットワーク断では読み出しタイムアウトが
+        // 発火しない(データもエラーも来ない)ため、書き込みが TCP の再送断念
+        // (数十秒〜数分)まで滞って音声線だけ「生きている」扱いが続く。
+        // 10 秒で書き込みを諦めれば切断検知とミュート復元の遅れを縮められる
+        //(ソケットオプションは複製ハンドルと共有される。bulk 経路と同じ方式)
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+            .ok();
         let (r, mut w) = match knit_common::secure::connect(stream, &token, b"knit-audio") {
             Ok(x) => x,
             Err(e) => {
@@ -583,7 +591,9 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
             }
             last_send = std::time::Instant::now();
             sent_bytes += frame.len() as u64;
-            if last_diag.elapsed() >= std::time::Duration::from_secs(10) {
+            // 10 秒→60 秒へ緩和: 常駐中に追記され続ける knit-win.log の定常行
+            // (約1行/10秒)を 1/6 へ抑える(送信の可否・内容には影響しない)
+            if last_diag.elapsed() >= std::time::Duration::from_secs(60) {
                 last_diag = std::time::Instant::now();
                 println!("[audio] sent={}KB", sent_bytes / 1024);
             }
@@ -591,6 +601,11 @@ fn audio_run(fixed_host: Option<String>, token: String, port: u16) {
         // ストリーミング終了(切断・デバイス切替)。音声線はここで死んだことに
         // なり、本線切断時のミュート解除(スピーカー復元)が有効になる
         AUDIO_LINK_UP.store(false, Ordering::Relaxed);
+        // 音声線が死んだ今、本線も切れていればミュートを復元する。ネットワーク断で
+        // は本線の切断処理(conn.rs の session 終端)が走らない・遅れる間にここを
+        // 通ると、conn 側の speaker_disconnect_if_audio_down は音声線がまだ生きて
+        // いると見てミュートを維持してしまい、復元の機会が永久に漏れる
+        restore_speaker_if_main_down("音声ストリーム切断");
         unsafe {
             ((*(*cap.client).lpVtbl).Stop)(cap.client as *mut _);
             // 開き直すたびに漏れないよう解放する
@@ -728,14 +743,32 @@ pub fn speaker_connect_mute(mode_on: bool) {
             println!("[spk] 接続中ミュートを適用 (was_muted={})", now != 0);
             // 異常終了(強制終了・電源断)に備えて、元状態をディスクへも退避する。
             // 次回起動時に残留ミュートとして検知・復元する(main の起動処理)
+            let mut persisted = false;
             if hr >= 0 {
-                if let Err(e) =
-                    knit_common::spkstate::save(now != 0, dev_id.as_deref().unwrap_or(""))
-                {
-                    println!("[spk] 退避記録の書き込みに失敗: {e}(異常終了時は復元できません)");
+                match knit_common::spkstate::save(now != 0, dev_id.as_deref().unwrap_or("")) {
+                    Ok(()) => persisted = true,
+                    Err(e) => println!("[spk] 退避記録の書き込みに失敗: {e}"),
                 }
             } else {
                 println!("[spk] SetMute 失敗 hr={hr:08x}(退避記録は書きません)");
+            }
+            match knit_common::spkstate::apply_decision(hr >= 0, persisted) {
+                knit_common::spkstate::ApplyDecision::Keep => {}
+                knit_common::spkstate::ApplyDecision::NotApplied => {}
+                knit_common::spkstate::ApplyDecision::Rollback => {
+                    // 退避記録を書けないままミュートすると、強制終了時にミュートが
+                    // 残留し復元手段を失う(スピーカーが恒久ミュート)。適用を
+                    // 取りやめて元の状態へ戻す
+                    let back = (vt.SetMute)(vol as *mut core::ffi::c_void, now, std::ptr::null());
+                    if back >= 0 {
+                        // 元に戻った: メモリ退避も破棄する(ミュートしていないため)
+                        *SPK_WAS_MUTED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        println!("[spk] 退避記録が書けないため、ミュート適用を取りやめました(接続中も鳴ります)");
+                    } else {
+                        // 戻しにも失敗: メモリ退避を残し、切断時の復元へ託す
+                        println!("[spk] SetMute(戻し) 失敗 hr={back:08x}(切断時に再度復元します)");
+                    }
+                }
             }
         } else {
             println!("[spk] GetMute 失敗 hr={got:08x}");
@@ -847,4 +880,24 @@ pub fn speaker_set_mode(on: bool, connected: bool) {
     } else {
         speaker_disconnect();
     }
+}
+
+/// 音声線が死んだ時点でのミュート復元(audio_run の終端から呼ぶ)。本線も切れて
+/// おり、なおミュートの退避記録が残っている時だけ戻す(conn.rs の切断処理と同じ
+/// 条件を音声側からも確認する)。本線が生きていればミュートを維持する(本線切断時
+/// に conn 側で復元され、再接続で再適用もされる)。speaker_disconnect は退避記録の
+/// 有無で冪等なため、本線側からの復元との二重呼び出しも安全
+fn restore_speaker_if_main_down(reason: &str) {
+    if crate::state::CONNECTED.load(Ordering::Relaxed) {
+        return; // 本線はまだ生きている: 従来どおり conn 側の切断処理に任せる
+    }
+    if SPK_WAS_MUTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+    {
+        return; // ミュートを適用していない
+    }
+    println!("[spk] {reason}。本線も切断のためミュートを復元します");
+    speaker_disconnect();
 }

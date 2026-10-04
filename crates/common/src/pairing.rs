@@ -12,7 +12,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 pub const PORT: u16 = 24904;
@@ -130,8 +130,14 @@ fn configure(s: &TcpStream, timeout: Duration) -> io::Result<()> {
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))
 }
-fn check_active(stop: &AtomicBool, until: Instant) -> io::Result<()> {
-    if stop.load(Ordering::SeqCst) || Instant::now() >= until {
+/// 招待・承認の残り時間。期限は壁時計(絶対時刻)で持つため、スリープ中も
+/// (単調時計は止まるが壁は進むため)期限は延命されない。戻り値 0=失効
+pub fn remaining(until: SystemTime, now: SystemTime) -> Duration {
+    until.duration_since(now).unwrap_or_default()
+}
+
+fn check_active(stop: &AtomicBool, until: SystemTime) -> io::Result<()> {
+    if stop.load(Ordering::SeqCst) || remaining(until, SystemTime::now()).is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
             "invitation closed",
@@ -177,7 +183,9 @@ impl Invitation {
         let invitation_id = credentials::generate()?;
         let stop = Arc::new(AtomicBool::new(false));
         let active = Arc::new(Mutex::new(None));
-        let until = Instant::now() + lifetime;
+        // 登録コードの有効期限は壁時計の絶対時刻で持つ。単調時計(Instant)は
+        // スリープ中に止まるため、眠っている間に招待が延命されてしまう
+        let until = SystemTime::now() + lifetime;
         let (tx, events) = mpsc::channel();
         // ビーコンは LAN 上の全員から見える。端末名(人名・社名を含むことがある)を
         // 載せず、固定の匿名ラベルで応答する。登録の突合は4桁の確認番号と
@@ -192,7 +200,9 @@ impl Invitation {
         let discovery = thread::spawn(move || {
             let mut data = [0; 128];
             let mut last = Instant::now() - Duration::from_secs(1);
-            while !discovery_stop.load(Ordering::SeqCst) && Instant::now() < until {
+            while !discovery_stop.load(Ordering::SeqCst)
+                && !remaining(until, SystemTime::now()).is_zero()
+            {
                 if let Ok((n, from)) = udp.recv_from(&mut data) {
                     if &data[..n] == ASK
                         && crate::net::is_allowed(from.ip())
@@ -214,9 +224,7 @@ impl Invitation {
                 match tcp.accept() {
                     Ok((s, peer)) if crate::net::is_allowed(peer.ip()) => {
                         attempts += 1;
-                        let timeout = until
-                            .saturating_duration_since(Instant::now())
-                            .min(IO_TIMEOUT);
+                        let timeout = remaining(until, SystemTime::now()).min(IO_TIMEOUT);
                         if timeout.is_zero() {
                             break;
                         }
@@ -235,8 +243,10 @@ impl Invitation {
                             ask_tx
                                 .send(Event::Approval(Approval { name, sas, peer: from, decision }))
                                 .map_err(|_| invalid("no approver"))?;
-                            let wait_until = Instant::now() + APPROVAL_WINDOW;
-                            while Instant::now() < wait_until && !ask_stop.load(Ordering::SeqCst) {
+                            let wait_until = SystemTime::now() + APPROVAL_WINDOW;
+                            while !remaining(wait_until, SystemTime::now()).is_zero()
+                                && !ask_stop.load(Ordering::SeqCst)
+                            {
                                 match answer.recv_timeout(Duration::from_millis(100)) {
                                     Ok(v) => return Ok(v),
                                     Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -275,6 +285,14 @@ impl Invitation {
                         if worker_stop.load(Ordering::SeqCst) {
                             break;
                         }
+                        // 何も送らずに去った接続(候補確認の probe・ポート走査)は
+                        // 試行に数えない: コードを一度も試していなければ総当たり
+                        // の危険が増えないため、試行制限の意味は保たれる
+                        if matches!(&result, Err(e) if e.kind() == io::ErrorKind::ConnectionAborted)
+                        {
+                            attempts -= 1;
+                            continue;
+                        }
                         if attempts >= MAX_ATTEMPTS {
                             let _ = tx.send(Event::Locked);
                             break;
@@ -288,7 +306,7 @@ impl Invitation {
                     Err(_) => break,
                 }
             }
-            if Instant::now() >= until {
+            if remaining(until, SystemTime::now()).is_zero() {
                 let _ = tx.send(Event::Expired);
             }
             worker_stop.store(true, Ordering::SeqCst);
@@ -323,13 +341,25 @@ fn serve_one(
     port: u16,
     stop: &AtomicBool,
     until: Instant,
-    session_until: Instant,
+    session_until: SystemTime,
     server_name: &str,
     ask: &AskFn,
 ) -> io::Result<()> {
     let mut wire = Wire::new(s, stop, until)?;
     wire.send(id.as_bytes())?;
-    let incoming = wire.receive()?;
+    // 最初のフレーム(SPAKE2/SAS の開始)を1つも送らずに切った相手は候補確認の
+    // probe 等。通常の失敗試行(保存失敗で途中切断する正当なクライアント)と
+    // 区別できるよう、専用の種別で返す(呼び出し側は試行に数えない)
+    let incoming = match wire.receive() {
+        Ok(v) => v,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "probe-only connection",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
     if incoming.starts_with(SAS_MARK) {
         return serve_sas(wire, &incoming, peer, id, token, port, stop, session_until, server_name, ask);
     }
@@ -343,7 +373,7 @@ fn serve_one(
         .finish(&incoming)
         .map_err(|_| invalid("invalid PAKE message"))?;
     let mut channel = Channel::handshake(wire, &key, false)?;
-    serve_credential(&mut channel, token, port, stop, until)
+    serve_credential(&mut channel, token, port, stop, session_until)
 }
 
 /// 認証済みの暗号化経路で長期キーを渡す(6桁方式と承認方式で共通)。
@@ -352,7 +382,7 @@ fn serve_credential(
     token: &str,
     port: u16,
     stop: &AtomicBool,
-    until: Instant,
+    until: SystemTime,
 ) -> io::Result<()> {
     // Authenticated transport proves possession of the PAKE key on both sides.
     if channel.receive()? != b"ready" {
@@ -452,7 +482,7 @@ fn serve_sas(
     token: &str,
     port: u16,
     stop: &AtomicBool,
-    session_until: Instant,
+    session_until: SystemTime,
     server_name: &str,
     ask: &AskFn,
 ) -> io::Result<()> {
@@ -482,8 +512,11 @@ fn serve_sas(
     }
     let shared = shared_secret(&secret, &pk_a)?;
     let (sas, key) = sas_and_key(id.as_bytes(), (&pk_a, &nonce_a), (&public, &nonce_b), &shared);
-    // ここから先は、人が判断する時間を見込んで期限を延ばす(登録全体の期限は超えない)
-    wire.until = (Instant::now() + APPROVAL_WINDOW + Duration::from_secs(10)).min(session_until);
+    // ここから先は、人が判断する時間を見込んで期限を延ばす(登録全体の期限は超えない)。
+    // 承認の期限(session_until)は壁時計。ワイヤの IO 期限はその残りを単調時計へ写す
+    let session_left = remaining(session_until, SystemTime::now());
+    wire.until =
+        Instant::now() + (APPROVAL_WINDOW + Duration::from_secs(10)).min(session_left);
     let probe = wire.socket.try_clone()?;
     let alive = move || {
         let mut byte = [0u8; 1];
@@ -525,10 +558,13 @@ impl Pending {
         save: impl FnOnce(&str, SocketAddr) -> io::Result<()>,
     ) -> io::Result<String> {
         let Pending { socket, cancelled, address, key, .. } = self;
-        let until = Instant::now() + APPROVAL_WINDOW + Duration::from_secs(10);
-        let wire = Wire::new(socket, &cancelled, until)?;
+        // 承認の期限は壁時計(スリープ中も進み、眠っている間に延命されない)。
+        // ワイヤの IO 期限は同じ長さを単調時計で測る(ワイヤは Instant の原則)
+        let session_until = SystemTime::now() + APPROVAL_WINDOW + Duration::from_secs(10);
+        let io_until = Instant::now() + APPROVAL_WINDOW + Duration::from_secs(10);
+        let wire = Wire::new(socket, &cancelled, io_until)?;
         let mut channel = Channel::handshake(wire, &key, true)?;
-        client_credential(&mut channel, address, preserve_existing, &cancelled, until, save)
+        client_credential(&mut channel, address, preserve_existing, &cancelled, session_until, save)
     }
 }
 
@@ -538,7 +574,7 @@ pub fn request_approval(
     my_name: &str,
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<Pending> {
-    check_active(&cancelled, Instant::now() + IO_TIMEOUT)?;
+    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)?;
     let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
     let until = Instant::now() + Duration::from_secs(20);
     let mut wire = Wire::new(s, &cancelled, until)?;
@@ -608,10 +644,12 @@ fn enroll_impl(
     save: impl FnOnce(&str, SocketAddr) -> io::Result<()>,
 ) -> io::Result<String> {
     let code = parse_code(code)?;
-    check_active(&cancelled, Instant::now() + IO_TIMEOUT)?;
+    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)?;
     let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
-    let until = Instant::now() + Duration::from_secs(20);
-    let mut wire = Wire::new(s, &cancelled, until)?;
+    // ワイヤの IO 期限(Instant)と、この登録試行の期限(壁時計)を分けて持つ
+    let io_until = Instant::now() + Duration::from_secs(20);
+    let session_until = SystemTime::now() + Duration::from_secs(20);
+    let mut wire = Wire::new(s, &cancelled, io_until)?;
     let id = wire.receive()?;
     if id.len() != 64 || !id.iter().all(u8::is_ascii_hexdigit) {
         return Err(invalid("unknown invitation"));
@@ -626,7 +664,7 @@ fn enroll_impl(
         .finish(&wire.receive()?)
         .map_err(|_| invalid("invalid PAKE message"))?;
     let mut channel = Channel::handshake(wire, &key, true)?;
-    client_credential(&mut channel, address, preserve_existing, &cancelled, until, save)
+    client_credential(&mut channel, address, preserve_existing, &cancelled, session_until, save)
 }
 /// 認証済みの暗号化経路で長期キーを受け取って保存する(6桁方式と承認方式で共通)。
 fn client_credential(
@@ -634,7 +672,7 @@ fn client_credential(
     address: SocketAddr,
     preserve_existing: bool,
     cancelled: &AtomicBool,
-    until: Instant,
+    until: SystemTime,
     save: impl FnOnce(&str, SocketAddr) -> io::Result<()>,
 ) -> io::Result<String> {
     channel.send(b"ready")?;
@@ -674,10 +712,21 @@ impl<'a> Wire<'a> {
             until,
         })
     }
+    /// ワイヤの IO 期限(Instant)とキャンセルの判定。招待・承認の期限(壁時計)とは
+    /// 分離しており、こちらは1レコードの送受信が猶予内かだけを見る
+    fn io_active(&self) -> io::Result<()> {
+        if self.cancelled.load(Ordering::SeqCst) || Instant::now() >= self.until {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "invitation closed",
+            ));
+        }
+        Ok(())
+    }
     fn read_exact(&mut self, data: &mut [u8]) -> io::Result<()> {
         let mut offset = 0;
         while offset < data.len() {
-            check_active(self.cancelled, self.until)?;
+            self.io_active()?;
             match self.socket.read(&mut data[offset..]) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -704,7 +753,7 @@ impl<'a> Wire<'a> {
         bytes.extend_from_slice(data);
         let mut offset = 0;
         while offset < bytes.len() {
-            check_active(self.cancelled, self.until)?;
+            self.io_active()?;
             match self.socket.write(&bytes[offset..]) {
                 Ok(0) => {
                     return Err(io::Error::new(
@@ -828,6 +877,18 @@ fn clamp_name_bytes(s: &str, max: usize) -> &str {
     &s[..cut]
 }
 
+/// ビーコン応答者の本物さを確かめる TCP 接続の上限。LAN 内の RST は即返るため
+/// 300ms で十分(到達不能な応答者はこの上限で打ち切られる)
+const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// アドレスの TCP ポートが開いているか(接続確立のみ・すぐ閉じる)。
+/// ビーコン(ASK への UDP 応答)は平文で誰でも返せるため、応答だけを信じて
+/// 候補へ載せると、6桁コード経路で偽の Mac を一覧へ出される。応答者が
+/// 本物の招待(登録待ち受けの TCP)を持つかを接続で確かめてから載せる
+fn tcp_port_open(addr: SocketAddr, timeout: Duration) -> bool {
+    TcpStream::connect_timeout(&addr, timeout).is_ok()
+}
+
 pub fn discover() -> io::Result<Vec<Candidate>> {
     discover_at(
         SocketAddr::from(([255, 255, 255, 255], PORT)),
@@ -835,6 +896,11 @@ pub fn discover() -> io::Result<Vec<Candidate>> {
     )
 }
 fn discover_at(target: SocketAddr, wait: Duration) -> io::Result<Vec<Candidate>> {
+    discover_probe(target, wait, PORT)
+}
+/// discover_at の実体。probe_port は応答者の登録待ち受け(TCP)の確認先で、
+/// 本番は pairing::PORT 固定。テストは任意ポートの招待と合わせる
+fn discover_probe(target: SocketAddr, wait: Duration, probe_port: u16) -> io::Result<Vec<Candidate>> {
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.set_broadcast(true)?;
     s.send_to(ASK, target)?;
@@ -849,9 +915,15 @@ fn discover_at(target: SocketAddr, wait: Duration) -> io::Result<Vec<Candidate>>
         match s.recv_from(&mut data) {
             Ok((n, from)) if crate::net::is_allowed(from.ip()) => {
                 if let Ok(b) = serde_json::from_slice::<Beacon>(&data[..n]) {
+                    // ペアリング待ち受けポートが開いている応答者だけを候補へ
+                    // 載せる: ビーコンだけ鳴らす偽装を排除する
                     if b.version == 1
                         && !found.iter().any(|p: &Candidate| p.address == from)
                         && found.len() < 32
+                        && tcp_port_open(
+                            SocketAddr::new(from.ip(), probe_port),
+                            PROBE_TIMEOUT.min(left),
+                        )
                     {
                         found.push(Candidate {
                             name: safe_name(&b.name),
@@ -896,6 +968,27 @@ pub fn manual_address(input: &str) -> io::Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn invitation_remaining_runs_on_the_wall_clock_so_sleep_cannot_extend_it() {
+        let created = SystemTime::UNIX_EPOCH;
+        let until = created + LIFETIME;
+        // 通常の経過: 残りは減っていく
+        assert_eq!(
+            remaining(until, created + Duration::from_secs(100)),
+            Duration::from_secs(200)
+        );
+        // スリープ相当: 単調時計が止まっていても壁時計が LIFETIME 進めば失効する
+        assert_eq!(remaining(until, created + LIFETIME), Duration::ZERO);
+        assert_eq!(
+            remaining(until, created + LIFETIME + Duration::from_secs(1)),
+            Duration::ZERO,
+            "眠っていた分だけ確実に失効(延命しない)"
+        );
+        // 承認窓も同じ壁時計の計算に乗る
+        let approved_at = created + Duration::from_secs(299);
+        assert_eq!(remaining(until, approved_at + APPROVAL_WINDOW), Duration::ZERO);
+    }
+
+    #[test]
     fn beacon_name_is_an_anonymous_label_without_the_host_name() {
         let name = beacon_name();
         assert!(name == "Knit (Mac)" || name == "Knit (Windows)" || name == "Knit");
@@ -905,6 +998,58 @@ mod tests {
                 assert!(!name.contains(&host), "beacon に端末名を載せない: {name}");
             }
         }
+    }
+
+    /// ビーコン応答だけの偽装は候補へ出ない: 応答者の登録待ち受け(TCP)が
+    /// 開いている場合だけ候補に載る。6桁コード経路で偽の Mac を一覧へ
+    /// 出される攻撃の排除(偽が本物のポートも開くなら SAS/コードの検証が担う)
+    #[test]
+    fn discovery_requires_an_open_pairing_port_not_just_a_beacon_reply() {
+        // 偽ビーコン: ASK には正しい形式の Beacon(version=1)を返すが、
+        // 登録待ち受けの TCP を持たない。確認ポートは偽の待ち受けと同じに
+        // 向けても、その TCP が閉じていれば候補へ出ない
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let beacon = serde_json::to_vec(&Beacon { version: 1, name: "Knit (Mac)".into() }).unwrap();
+        let responder = thread::spawn(move || {
+            let mut buf = [0; 128];
+            if let Ok((n, from)) = fake.recv_from(&mut buf) {
+                if &buf[..n] == ASK {
+                    let _ = fake.send_to(&beacon, from);
+                }
+            }
+        });
+        // 偽の UDP ポートと同じ番号の TCP が閉じていることを自分で確かめる
+        //(同番号を bind して直ぐ閉じれば、誰も listen していない状態を作れる)
+        if TcpListener::bind(fake_addr).is_ok() {
+            let found = discover_probe(fake_addr, Duration::from_millis(600), fake_addr.port())
+                .unwrap();
+            assert!(found.is_empty(), "TCP を持たない応答者は候補へ出ない: {found:?}");
+        }
+        responder.join().unwrap();
+
+        // 本物: 招待(TCP+UDP が同ポート)を立てると同じ探索で候補に載る
+        let (invitation, real_addr, _token) = invitation(Duration::from_secs(30));
+        let found = discover_probe(real_addr, Duration::from_millis(600), real_addr.port())
+            .unwrap();
+        assert_eq!(found.len(), 1, "待ち受けを持つ応答者は候補へ出る");
+        assert_eq!(found[0].address, real_addr);
+        assert_eq!(found[0].name, beacon_name());
+        drop(invitation);
+    }
+
+    /// tcp_port_open: 接続確立のみで判定する(開いたソケットはすぐ閉じる)
+    #[test]
+    fn tcp_port_open_reports_listener_availability() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap();
+        assert!(tcp_port_open(open, Duration::from_secs(2)));
+        // 閉じたポート: bind→drop で確実に閉じたアドレスを作る
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = held.local_addr().unwrap();
+        drop(held);
+        assert!(!tcp_port_open(closed, Duration::from_secs(2)));
+        let _ = listener;
     }
 
     #[test]
@@ -944,7 +1089,9 @@ mod tests {
     #[test]
     fn pairing_success_is_single_use_and_discovery_exposes_no_secret() {
         let (i, addr, token) = invitation(Duration::from_secs(10));
-        let found = discover_at(addr, Duration::from_millis(150)).unwrap();
+        // 確認ポートは招待と同じポートに向ける(本番の discover が pairing::PORT
+        // を向くのと同じ構成。ビーコンと TCP 待ち受けが同一ポートで揃う)
+        let found = discover_probe(addr, Duration::from_millis(150), addr.port()).unwrap();
         assert_eq!(found.len(), 1);
         // ビーコンは端末名ではなく匿名ラベルで応答する(LAN 全体に見えるため)
         assert_eq!(found[0].name, beacon_name());

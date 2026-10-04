@@ -56,6 +56,31 @@ pub fn clear() {
     }
 }
 
+/// 接続中ミュートの適用を維持するか取りやめるかの決定。
+/// 退避記録をディスクへ書けないままミュートを適用すると、強制終了時に
+/// ミュートが残留し復元手段(退避記録)を失う(スピーカーが恒久ミュート)。
+/// そのため書き込み失敗時は適用を取りやめて元の状態へ戻す
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyDecision {
+    /// ミュートを維持する(退避記録の書き込みまで済んでいる)
+    Keep,
+    /// ミュートの適用自体に失敗: ユーザーの設定は変わっていないため何もしない
+    NotApplied,
+    /// 退避記録を書けない: 強制終了時に復元手段が無くなるため、ミュートを
+    /// 元の状態へ戻して適用を取りやめる
+    Rollback,
+}
+
+/// applied: ミュート適用(SetMute)に成功したか。
+/// persisted: 退避記録(spkstate::save)の書き込みに成功したか
+pub fn apply_decision(applied: bool, persisted: bool) -> ApplyDecision {
+    match (applied, persisted) {
+        (false, _) => ApplyDecision::NotApplied,
+        (true, true) => ApplyDecision::Keep,
+        (true, false) => ApplyDecision::Rollback,
+    }
+}
+
 /// テスト用: パスを指定して記録を読む。整合性検査もここで行う
 fn load_from(path: &std::path::Path) -> Option<Record> {
     let meta = std::fs::metadata(path).ok()?;
@@ -169,5 +194,19 @@ mod tests {
         assert!(load_from(&p).is_none());
         // clear は存在しなくてもエラーにしない(正常切断の後始末で毎回呼ぶ)
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// 退避記録を書けないままミュートを適用すると、強制終了時にミュートが
+    /// 残留し復元手段を失う。書き込み失敗時は適用を取りやめる決定になる
+    #[test]
+    fn apply_is_rolled_back_when_persist_fails() {
+        use ApplyDecision::*;
+        // 適用も退避も成功: ミュートを維持する
+        assert_eq!(apply_decision(true, true), Keep);
+        // 適用は成功したが退避記録が書けない: 元の状態へ戻す(恒久ミュート防止)
+        assert_eq!(apply_decision(true, false), Rollback);
+        // 適用自体が失敗: ユーザーの設定は変わっていないため何もしない
+        assert_eq!(apply_decision(false, true), NotApplied);
+        assert_eq!(apply_decision(false, false), NotApplied);
     }
 }

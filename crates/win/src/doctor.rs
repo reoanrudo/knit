@@ -54,6 +54,8 @@ pub(crate) fn start() {
         loop {
             std::thread::sleep(TICK);
             let findings = observe(&mut stuck, &mut link, &mut helper_down, &mut installed_noted);
+            // 連発制限(Governor)の時刻源は単調時計の ms。壁時計を渡すと NTP 補正や
+            // スリープ復帰で gap/窓の判定が狂う(Mac 側 doctor と同じ)
             let now = crate::state::now_ms();
             doctor::cycle(&findings, &mut gov, now, &mut |fix| match fix {
                 Fix::ReleaseInput => {

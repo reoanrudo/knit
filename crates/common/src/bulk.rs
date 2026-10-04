@@ -202,6 +202,13 @@
                 } else {
                     format!("{prefix}/{}", name.to_string_lossy().into_owned())
                 };
+                // 相手側で保存時に弾かれる長さの rel は、送る前に止めて skipped へ
+                // 積む(フォルダは子の rel が必ず更长くなるため、サブツリーごと外す)。
+                // バッチ全体をエラーに落とさない(深い階層の 1 フォルダだけの問題)
+                if crate::files::utf16_len(&rel) > crate::files::MAX_REL_UNITS {
+                    skipped.push(child);
+                    continue;
+                }
                 if ft.is_dir() {
                     let skipped_before = skipped.len();
                     let sub = walk(&child, &rel, out, total, keep_empty_dirs, strict, skipped)?;
@@ -265,6 +272,14 @@
                     }
                     continue;
                 };
+                // フォルダ名だけでも上限超過なら、受信側で保存時に弾かれるため
+                // 送る前に skipped へ回す(walk 内のチェックは子の rel 基準)。
+                // symlink と同じく strict(掴みドラッグ)でも skipped に積み、
+                // 呼び出し側の「N 件をスキップ」通知で伝える
+                if crate::files::utf16_len(&base) > crate::files::MAX_REL_UNITS {
+                    skipped.push(p.clone());
+                    continue;
+                }
                 let emitted = walk(p, &base, &mut out, &mut total, keep_empty_dirs, strict, &mut skipped)?;
                 // フォルダ全体が空のときも(中身が空でも)フォルダ自体を送れる
                 if emitted == 0 && keep_empty_dirs {
@@ -283,6 +298,12 @@
                     }
                     continue;
                 };
+                // 受信側で保存時に弾かれる長さの名前は、送る前に skipped へ回す
+                //(フォルダと同じく strict でも通知で伝える)
+                if crate::files::utf16_len(&name) > crate::files::MAX_REL_UNITS {
+                    skipped.push(p.clone());
+                    continue;
+                }
                 total = total.saturating_add(meta.len());
                 out.push(OutFile {
                     src: p.clone(),
@@ -367,7 +388,15 @@
                         format!("展開後 {actual} 件以上(上限 {limit} 件)")
                     }
                     Some((actual, limit)) => {
-                        format!("合計 {}(上限 {})", human_gib(actual), human_gib(limit))
+                        // 上限を超えているのに human_gib の丸めで同表記(例: 上限+数
+                        // バイトが「10GiB」)になると「合計 10GiB(上限 10GiB)」と
+                        // 意味をなさないため、超過時は小数第1位を強制する
+                        let actual_label = if actual > limit {
+                            format!("{:.1}GiB", actual as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else {
+                            human_gib(actual)
+                        };
+                        format!("合計 {actual_label}(上限 {})", human_gib(limit))
                     }
                     None => format!(
                         "件数または容量が上限を超えています(1回は展開後 {} 件・合計 {} まで)",
@@ -628,6 +657,9 @@
         /// このバッチで受け付けた FILE_BEGIN の件数(0 バイトファイル・空フォルダの
         /// 連打によるディスクエントリ・メモリの枯渇を防ぐ。BATCH_END でリセット)
         batch_files: usize,
+        /// ファイル群・画像のバッチが進行中か(BATCH_END/IMAGE_END で閉じる)。
+        /// 端末切替時の経路張替延期(受信中は切らない)と履歴ラベルの固定に使う
+        batch_open: bool,
         /// 保存できなかったファイル(名前, 理由)。BATCH_END で UI へ報告する
         failed: Vec<(String, String)>,
         /// 同名衝突で「名前 (n)」へ保存した件数(BATCH_END で UI へ報告する)
@@ -651,6 +683,7 @@
                 limit: MAX_TOTAL,
                 tainted: false,
                 batch_files: 0,
+                batch_open: false,
                 failed: Vec::new(),
                 renamed: 0,
                 on_interrupted: None,
@@ -675,6 +708,12 @@
         /// 上限超過等でこの接続の受信を拒否している状態か(ログ・通知の判定用)
         pub fn is_tainted(&self) -> bool {
             self.tainted
+        }
+
+        /// ファイル群・画像のバッチが進行中か。進行中に bulk 経路を切ると
+        /// FILE_END までの分しか残らないため、切替側が張替を延期する判断に使う
+        pub fn batch_open(&self) -> bool {
+            self.batch_open
         }
 
         /// テスト用: 上限を縮小する
@@ -710,10 +749,15 @@
                     }
                     self.drop = true;
                     self.drag_id = Some(id);
+                    self.batch_open = true;
                 }
-                DROP_BEGIN => self.drop = true,
+                DROP_BEGIN => {
+                    self.drop = true;
+                    self.batch_open = true;
+                }
                 FILE_BEGIN => {
                     self.discard_open_file("");
+                    self.batch_open = true;
                     if self.tainted {
                         return None;
                     }
@@ -733,8 +777,19 @@
                         let fail = |me: &mut Self, name: &str, reason: &str| {
                             me.failed.push((name.to_string(), reason.to_string()));
                         };
+                        // 上限超過とそれ以外(空コンポーネント・遷移等)で理由を分ける
+                        let too_long =
+                            crate::files::utf16_len(name) > crate::files::MAX_REL_UNITS;
                         let Some(rel) = crate::files::sanitize_rel(name) else {
-                            fail(self, name, "無効なフォルダ名");
+                            fail(
+                                self,
+                                name,
+                                if too_long {
+                                    "ファイル名またはパスが長すぎる"
+                                } else {
+                                    "無効なフォルダ名"
+                                },
+                            );
                             return None;
                         };
                         let Some(final_path) =
@@ -764,8 +819,20 @@
                     let fail = |me: &mut Self, name: &str, reason: &str| {
                         me.failed.push((name.to_string(), reason.to_string()));
                     };
+                    // 上限超過(正当だが長すぎる)と不正な名前(遷移・空部等)で理由を
+                    // 分ける。「無効なファイル名」だと正当な長い名前の対処を邪魔する
+                    let too_long =
+                        crate::files::utf16_len(name) > crate::files::MAX_REL_UNITS;
                     let Some(rel) = crate::files::sanitize_rel(name) else {
-                        fail(self, name, "無効なファイル名");
+                        fail(
+                            self,
+                            name,
+                            if too_long {
+                                "ファイル名またはパスが長すぎる"
+                            } else {
+                                "無効なファイル名"
+                            },
+                        );
                         return None; // このファイルの DATA は空読みし、次へ続ける
                     };
                     // 空き容量(余裕 1MiB)。取得できない環境は確認なしで続ける
@@ -882,6 +949,7 @@
                 BATCH_END => {
                     // FILE_END が無いファイルは完了として公開しない。
                     self.discard_open_file("");
+                    self.batch_open = false;
                     if !self.tainted {
                         self.written = 0;
                         self.batch_files = 0;
@@ -910,12 +978,14 @@
                     if n == 0 || n > MAX_IMAGE {
                         return None;
                     }
+                    self.batch_open = true;
                     self.sink = Sink::Image {
                         data: Vec::with_capacity(n),
                         remain: n,
                     };
                 }
                 IMAGE_END => {
+                    self.batch_open = false;
                     if let Sink::Image { data, remain: 0 } =
                         std::mem::replace(&mut self.sink, Sink::None)
                     {
@@ -1041,8 +1111,21 @@
         }
         // Reply on the authenticated socket that received the heartbeat. A
         // retired reader must never write to a replacement peer's connection.
+        //
+        // ロックは try_lock で取り、送信中(slot のロック保持中)は応答をスキップ
+        // する: ここでブロックすると受信ループの read_frame が止まり、双方向の
+        // 同時転送で逆方向のデータが吸われなくなり、相手の書き込みタイムアウト
+        // (20 秒)で転送が失敗する。ロックを掴む者がいる=今まさにデータが流れて
+        // いる=経路は生きているため、生存確認を急ぐ必要は無い(is_up_fast と
+        // 同じ判断)。切断判定はこの応答ではなく受信側の読み出しタイムアウトと
+        // 相手側の書き込み失敗で行われるため、スキップは切断扱いに波及しない
         fn reply_keepalive(&self, gen: u64) -> std::io::Result<()> {
-            let mut slot = self.slot();
+            let mut slot = match self.w.try_lock() {
+                Ok(g) => g,
+                // ポイズン回復は slot() と同じ方針(ロック取得済みのまま続行)
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+            };
             let Some((current, writer)) = slot.as_mut() else { return Ok(()) };
             if *current != gen { return Ok(()) }
             let result = write_frame(writer, KEEPALIVE, &[]).and_then(|_| writer.flush());
@@ -1083,6 +1166,32 @@
         /// 受信進捗(バッチ累計バイト)。掴みドラッグ中にユーザーが見ている
         /// 画面(主に Windows)へ進捗を出すために使う
         pub on_rx_bytes: fn(u64),
+        /// ファイル群・画像の受信バッチが始まった瞬間に呼ぶ(毎回・接続側スレッドで
+        /// 軽く保つ)。バッチ開始時点の状態を記録したい利用側のためのフック
+        pub on_batch_begin: fn(),
+        /// 待受(bind)に失敗した初回に限り呼ぶ(ユーザーへの通知用)。
+        /// 本線(入力・テキスト)は生きていてファイル・画像だけが届かなくなる
+        /// 状態を、ログだけでなく画面にも出すために使う
+        pub on_bind_error: fn(&str),
+    }
+
+    /// このプロセスの bulk 受信でファイル群・画像のバッチが進行中か。
+    /// 端末切替時の経路張替延期(受信中は clear を遅らせる)に使う。
+    /// 受信スレッド(spawn_reader)だけが書き、true の間はバッチの完走が近い
+    static RX_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// bulk 受信のバッチ(ファイル群・画像)が進行中か
+    pub fn rx_active() -> bool {
+        RX_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 待受側の bulk 経路が今動いているか(bind に成功して accept 中か)。
+    /// 診断(diagnose)が「ファイル・画像の待受」の実測として読む
+    static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// 待受側の bulk 経路(ファイル・画像の受信口)が稼働中か
+    pub fn serving() -> bool {
+        SERVING.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 受信フレームを処理してよいか。画像はクリップボード、それ以外(ファイル・ドラッグ)はファイルの範囲
@@ -1167,28 +1276,64 @@
                     (ep.log)("[bulk] 受信を拒否しています(上限超過の疑い。相手のログを確認してください)");
                     tainted_logged = true;
                 }
+                // バッチ進行中の状態を公開(端末切替の経路張替延期の判断材料)。
+                // 開始(false→true)の遷移だけ利用側へ知らせ、完了時点の状態を
+                // 記録したい用途(履歴ラベルの固定など)に使う
+                if RX_ACTIVE.swap(rx.batch_open(), std::sync::atomic::Ordering::Relaxed)
+                    != rx.batch_open()
+                    && rx.batch_open()
+                {
+                    (ep.on_batch_begin)();
+                }
             }
             ep.link.clear_if(gen);
+            // スレッドの寿命とバッチ進行フラグの寿命を一致させる: 切断でバッチの
+            // 途中が終わった場合も、張替延期の待ちがこの後ずっと続かないように
+            RX_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             (ep.log)("[bulk] 受信経路が切れました");
         });
     }
 
-    /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす
+    /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす。
+    /// bind に失敗しても諦めない: 本線(入力・テキスト)は生きていてファイル・
+    /// 画像だけが届かない状態が無通知で続くのを防ぐため、一定間隔で再試行する
     pub fn serve(
         ep: &'static Endpoint,
         bind: &str,
         port: u16,
         allow: fn(std::net::IpAddr) -> bool,
     ) {
-        let listener = match std::net::TcpListener::bind((bind, port)) {
-            Ok(l) => l,
-            Err(e) => {
-                (ep.log)(&format!(
-                    "[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可)"
-                ));
-                return;
+        /// bind の再試行間隔。短すぎるとログとCPUの無駄、長すぎると占有解除後の
+        /// 復帰が遅れる。connect_loop(2秒)より長めの 5 秒にする
+        const BIND_RETRY_SECS: u64 = 5;
+        let mut bind_failed_logged = false;
+        let listener = loop {
+            match std::net::TcpListener::bind((bind, port)) {
+                Ok(l) => {
+                    if bind_failed_logged {
+                        (ep.log)(&format!(
+                            "[bulk] listen {bind}:{port} の再試行に成功しました"
+                        ));
+                    }
+                    break l;
+                }
+                Err(e) => {
+                    // 失敗の詳細と通知は初回だけ(以降は黙って再試行し、ログを
+                    // 洗い流さない)。成功時に「再試行に成功」を出して復帰を見せる
+                    if !bind_failed_logged {
+                        bind_failed_logged = true;
+                        (ep.log)(&format!(
+                            "[bulk] listen {bind}:{port} 失敗: {e}(ファイル・画像の転送は不可。{BIND_RETRY_SECS}秒毎に再試行します)"
+                        ));
+                        (ep.on_bind_error)(&format!(
+                            "ファイル転送を開始できません(ポート {port} が使用中)。再試行しています"
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(BIND_RETRY_SECS));
+                }
             }
         };
+        SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
         let mut throttle = crate::secure::FailThrottle::new();
         for s in listener.incoming() {
@@ -1362,5 +1507,153 @@ mod limit_label_tests {
         assert_eq!(human_gib(MAX_TOTAL), "10GiB");
         assert_eq!(human_gib(15_204_352_000), "14.2GiB");
         assert_eq!(human_gib(0), "0GiB");
+    }
+
+    /// 超過時の文言は丸めで上限と同表記にならない(「合計 10GiB(上限 10GiB)」と
+    /// 意味をなさなくなるため、超過時は小数第1位を強制する)
+    #[test]
+    fn oversized_total_label_never_rounds_to_the_limit_label() {
+        let label = |actual: u64| {
+            send_error_label(&std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("file batch exceeds size limit: {actual} (limit {MAX_TOTAL})"),
+            ))
+        };
+        // 上限+1バイト(旧: 丸めで「合計 10GiB(上限 10GiB)」になっていた)
+        assert_eq!(label(MAX_TOTAL + 1), "合計 10.0GiB(上限 10GiB)");
+        // 上限+0.05GiB 未満(human_gib 単体では「10GiB」へ丸まる範囲)でも強制
+        let just_under_round = MAX_TOTAL + 50_000_000; // ≈ +0.047GiB
+        assert_eq!(label(just_under_round), "合計 10.0GiB(上限 10GiB)");
+        // 0.1GiB 超なら小数第1位で違いが見える
+        let over = MAX_TOTAL + 1024 * 1024 * 1024 / 2;
+        assert_eq!(label(over), "合計 10.5GiB(上限 10GiB)");
+    }
+}
+
+/// keepalive 応答の try_lock 化(双方向同時転送で逆方向が止まる回帰の防止)
+#[cfg(test)]
+mod reply_keepalive_tests {
+    use super::{Link, LABEL};
+    use crate::secure;
+    use std::time::{Duration, Instant};
+
+    /// 送信中(slot のロックを誰かが握っている)に keepalive 応答を求められても、
+    /// ブロックせずスキップして Ok を返すこと。従来は slot() の取得で転送終了まで
+    /// 待たされ、受信ループが止まって相手の書き込みタイムアウトを誘発した
+    #[test]
+    fn reply_keepalive_skips_while_the_slot_lock_is_held() {
+        let link = Link::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // 相手側はハンドシェイクだけ済ませて読み続ける(小さな応答なら書ける)
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let (_r, _w) = secure::accept(sock, "ka-test", LABEL).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let socket = std::net::TcpStream::connect(addr).unwrap();
+        let (_reader, writer) = secure::connect(socket, "ka-test", LABEL).unwrap();
+        let gen = link.set(writer);
+
+        // 送信中を再現: slot のロックを掴んだまま応答を試みる
+        let held = link.slot();
+        let started = Instant::now();
+        assert!(
+            link.reply_keepalive(gen).is_ok(),
+            "ロック保持中はスキップして Ok を返す"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "ロック待ちでブロックしてはいけない"
+        );
+        drop(held);
+
+        // ロックが空いていれば従来どおり書き込める
+        let started = Instant::now();
+        assert!(link.reply_keepalive(gen).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// ロック保持中のスキップで接続が捨てられないこと(スキップは無害な No-op)
+    #[test]
+    fn reply_keepalive_skip_keeps_the_link_up() {
+        let link = Link::new();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            let (_r, _w) = secure::accept(sock, "ka-test2", LABEL).unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+        });
+        let socket = std::net::TcpStream::connect(addr).unwrap();
+        let (_reader, writer) = secure::connect(socket, "ka-test2", LABEL).unwrap();
+        let gen = link.set(writer);
+        let held = link.slot();
+        for _ in 0..3 {
+            assert!(link.reply_keepalive(gen).is_ok());
+        }
+        // is_up は slot のロックを取りに来るため、保持中に呼ぶと自分自身を
+        // 待ってしまう(デッドロック)。ロックが取れない=誰かが使っている、を
+        // 見る is_up_fast で確かめる
+        assert!(
+            link.is_up_fast(),
+            "スキップしただけで接続が捨てられてはいけない"
+        );
+        drop(held);
+        assert!(link.is_up());
+    }
+}
+
+/// 受信バッチの進行判定(batch_open): ファイル群は BATCH_END まで・画像は
+/// IMAGE_END までが「進行中」。端末切替側の経路張替延期はこの判定を信じて
+/// 待つため、閉じるタイミングの回帰を防ぐ
+#[cfg(test)]
+mod batch_open_tests {
+    use super::{Receiver, BATCH_END, DATA, FILE_BEGIN, FILE_END, IMAGE_BEGIN, IMAGE_END};
+    use blake2::Digest;
+
+    fn scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "knit-batch-open-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_batch_stays_open_until_batch_end() {
+        let dir = scratch();
+        let mut rx = Receiver::new(&dir);
+        assert!(!rx.batch_open(), "何も受信していなければ閉じている");
+        let head = serde_json::json!({"name":"a.txt","size":3}).to_string();
+        rx.feed(FILE_BEGIN, head.as_bytes());
+        assert!(rx.batch_open(), "FILE_BEGIN でバッチが開く");
+        rx.feed(DATA, b"abc");
+        let digest: [u8; 32] = blake2::Blake2s256::digest(b"abc").into();
+        rx.feed(FILE_END, &digest);
+        assert!(
+            rx.batch_open(),
+            "FILE_END の後もバッチは継続(次のファイルが来る)"
+        );
+        rx.feed(BATCH_END, &[]);
+        assert!(!rx.batch_open(), "BATCH_END でバッチが閉じる");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn image_batch_spans_begin_to_end() {
+        let dir = scratch();
+        let mut rx = Receiver::new(&dir);
+        rx.feed(IMAGE_BEGIN, &(3u64.to_le_bytes()));
+        assert!(rx.batch_open(), "IMAGE_BEGIN でバッチが開く");
+        rx.feed(DATA, b"abc");
+        rx.feed(IMAGE_END, &[]);
+        assert!(!rx.batch_open(), "IMAGE_END でバッチが閉じる");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

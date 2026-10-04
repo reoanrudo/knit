@@ -61,6 +61,10 @@ pub(crate) const FLAG_CTRL: CGEventFlags = 0x0004_0000;
 pub(crate) const FLAG_OPT: CGEventFlags = 0x0008_0000;
 pub(crate) const FLAG_CMD: CGEventFlags = 0x0010_0000;
 pub(crate) const FLAG_FN: CGEventFlags = 0x8000_0000; // kCGEventFlagMaskSecondaryFn
+/// Caps Lock(alphaShift)。越境時の Caps 状態同期(Msg::Caps)で使う
+pub(crate) const FLAG_ALPHA_SHIFT: CGEventFlags = 0x0001_0000;
+/// kCGEventSourceStateCombinedSessionState(全セッション合成の状態)
+pub(crate) const EVENT_SOURCE_STATE_COMBINED: i32 = 0;
 
 pub(crate) const KC_F13: i64 = 105;
 /// 切替ホットキー(Mac keycode)。KNIT_HOTKEY_KC で変更可。
@@ -90,6 +94,8 @@ unsafe extern "C" {
     pub(crate) fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
     pub(crate) fn CGEventGetIntegerValueField(event: CGEventRef, field: i32) -> i64;
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    /// 合成セッション状態の修飾フラグ(Caps Lock の ON/OFF 読み取り用)
+    pub(crate) fn CGEventSourceFlagsState(state_id: i32) -> CGEventFlags;
     pub(crate) fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     pub(crate) fn CGMainDisplayID() -> u32;
     pub(crate) fn CGDisplayBounds(display: u32) -> CGRect;

@@ -42,6 +42,13 @@ struct Persisted {
     entries: Vec<Entry>,
 }
 
+/// 保存用の借用ビュー。全件の clone を作らずに serde で書き出すためのもの
+/// (50 件×1MB のクローンがコピーのたびに発生するのを避ける)
+#[derive(Serialize)]
+struct PersistedRef<'a> {
+    entries: &'a [Entry],
+}
+
 /// 上限つき履歴。新しいものを末尾に置く
 pub struct History {
     entries: Vec<Entry>,
@@ -52,6 +59,12 @@ pub struct History {
 /// 載せる本文の上限(クリップボード同期と同じ 1MB。バイト数で見るため
 /// 日本語の長文は約35万文字で引っかかる)
 pub const MAX_CHARS: usize = 1024 * 1024;
+
+/// 履歴へ残す本文の上限(同期の 1MB 上限とは別)。コピーのたびに全 50 件を
+/// 丸ごと書き出す保存コストを 50 件×8KB≈400KB で頭打ちにする。超えた分は
+/// 先頭から UTF-8 の文字境界で切って「…(履歴用に省略)」を添える
+/// (共有・送信には影響せず、履歴からの復元だけ省略版になる)
+pub const HISTORY_TEXT_BYTES: usize = 8 * 1024;
 
 /// クリップボード本文が上限(1MB)を超えたときの通知文。実サイズを文字数と
 /// バイト数の両方で伝える(上限がバイト数ベースのため、日本語の長文は約35万文字
@@ -106,11 +119,13 @@ impl History {
         } else {
             trimmed.to_string()
         };
-        if text.len() > MAX_CHARS
-            // 本文全体が桁列(マスクと空白以外に残るものが無い)は、マスクで中身が
-            // 残らないため載せない(ワンタイムコード単体のコピー等)
-            || !text.chars().any(|c| c != '●' && !c.is_whitespace())
-        {
+        // 履歴へ残す本文は HISTORY_TEXT_BYTES(8KB)までの先頭部分。長文コピーの
+        // 履歵載せを断る代わりに省略版で残す(1MB 上限で履歴からこぼれていた
+        // ローカルの長文コピーも履歴から辿れるようにする)
+        let text = truncate_for_history(&text, HISTORY_TEXT_BYTES);
+        // 本文全体が桁列(マスクと空白以外に残るものが無い)は、マスクで中身が
+        // 残らないため載せない(ワンタイムコード単体のコピー等)
+        if !text.chars().any(|c| c != '●' && !c.is_whitespace()) {
             return None;
         }
         if text != trimmed {
@@ -144,7 +159,9 @@ impl History {
     }
 
     /// ファイル群を履歴へ追加する。本文はパスの改行区切り(復元側は行ごとに
-    /// パスとして扱う)。ファイル同期は機密判定の対象外のためここでも検査しない
+    /// パスとして扱う)。改行を含むパス(Mac では合法なファイル名)は行割れして
+    /// 復元不能になるため、履歴への載せから除外する(転送・通知には影響しない)。
+    /// ファイル同期は機密判定の対象外のためここでも検査しない
     pub fn push_files(
         &mut self,
         paths: &[std::path::PathBuf],
@@ -154,9 +171,17 @@ impl History {
         if paths.is_empty() {
             return None;
         }
-        let text = paths
+        let usable: Vec<std::borrow::Cow<'_, str>> = paths
             .iter()
-            .map(|p| p.to_string_lossy().into_owned())
+            .map(|p| p.as_os_str().to_string_lossy())
+            .filter(|s| !s.contains('\n') && !s.contains('\r'))
+            .collect();
+        if usable.is_empty() {
+            return None;
+        }
+        let text = usable
+            .into_iter()
+            .map(|s| s.into_owned())
             .collect::<Vec<_>>()
             .join("\n");
         if text.is_empty() || text.len() > MAX_CHARS {
@@ -242,8 +267,9 @@ impl History {
     /// 履歴を JSON ファイルへ保存する。書けない場合も静かに失敗する
     /// (履歴が消えるだけで操作は止めない)
     pub fn save_to(&self, path: &std::path::Path) {
-        let data = Persisted {
-            entries: self.entries.clone(),
+        // entries は借り参照のまま書き出す(clone は保存の都度全件複製になる)
+        let data = PersistedRef {
+            entries: &self.entries,
         };
         if let Ok(json) = serde_json::to_string(&data) {
             if let Some(parent) = path.parent() {
@@ -259,15 +285,31 @@ impl History {
     }
 
     /// JSON ファイルから履歴を復元する。上限を超えた分は古い方から落とす。
-    /// ファイルが無い・壊れている場合は空のまま起動する
+    /// ファイルが無い場合は空のまま起動する。壊れている場合は
+    /// (1) 退避して(.corrupt)から (2) 末尾欠けの回復的パースで完全な要素だけ
+    /// 復元する(全損の場合は空)。退避を先にするのは、最初の保存で上書きされて
+    /// 救出材料ごと消えるのを防ぐため
     pub fn load_from(&mut self, path: &std::path::Path) {
         let Ok(s) = std::fs::read_to_string(path) else {
             return;
         };
         // 旧版が umask 既定(644)で作ったファイルを読めたら 600 へ是正する
         restrict(path);
-        let Ok(p) = serde_json::from_str::<Persisted>(&s) else {
-            return;
+        let p = match serde_json::from_str::<Persisted>(&s) {
+            Ok(p) => p,
+            Err(e) => {
+                let recovered = recover_partial(&s);
+                let backup = crate::persist::quarantine(path);
+                eprintln!(
+                    "[history] 履歴ファイルが壊れています({e})。{}{}件を復元しました",
+                    backup
+                        .as_ref()
+                        .map(|p| format!("{} へ退避しました。", p.display()))
+                        .unwrap_or_default(),
+                    recovered.len()
+                );
+                Persisted { entries: recovered }
+            }
         };
         let mut loaded = p.entries;
         while loaded.len() > self.cap {
@@ -281,6 +323,84 @@ impl History {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+}
+
+/// 末尾欠けした history.json(保存中の電源断などで途中までしか書かれていない
+/// テキスト)から、完全な形で残っている要素だけを復元する純関数。
+/// 「{"entries":[e1,e2,…」の形を前提に、要素(オブジェクト)の閉じ括号の直後
+/// 位置を文字列リテラルを飛ばしながら列挙し、最後の完全な要素まで切り詰めて
+/// `]}` を補ってパースする。パースは serde が検証するため、本文中の `}` 等の
+/// 誤認は復元失敗(空)として現れるだけで誤った復元にはならない
+fn recover_partial(text: &str) -> Vec<Entry> {
+    // 保存形式は常に {"entries":[…]}(to_string の compact 形式)。先頭のキーが
+    // entries でなければ復元の見当が付かないため諦める
+    let t = text.trim_start();
+    if !t.starts_with('{') {
+        return Vec::new();
+    }
+    let after_obj = t[1..].trim_start();
+    let Some(rest) = after_obj.strip_prefix("\"entries\"") else {
+        return Vec::new();
+    };
+    let Some(colon) = rest.find(':') else {
+        return Vec::new();
+    };
+    let after_colon = rest[colon + 1..].trim_start();
+    let Some(open) = after_colon.strip_prefix('[') else {
+        return Vec::new();
+    };
+    let array_start = open.as_ptr() as usize - text.as_ptr() as usize;
+    // 要素ごとの終了位置(閉じ '}' の直後)を列挙する
+    let ends = element_ends(text, array_start);
+    // 後ろ(新しい項目)から順に「切り詰めて ]} を補う」パースを試み、最初に
+    // 通ったもので復元する。末尾欠けの直前まで完全な要素ほど新しい履歴のため
+    for &end in ends.iter().rev() {
+        let mut candidate = String::with_capacity(end + 2);
+        candidate.push_str(&text[..end]);
+        candidate.push_str("]}");
+        if let Ok(p) = serde_json::from_str::<Persisted>(&candidate) {
+            return p.entries;
+        }
+    }
+    Vec::new()
+}
+
+/// text[array_start..] を JSON として走査し、配列の各要素(トップレベルの
+/// オブジェクト)が閉じた位置(インデックス)を列挙する。文字列リテラル内の
+/// 記号は無視する(履歴本文は任意のテキストを含むため)。バイト単位の走査でも
+/// マルチバイト文字のバイトは ASCII と衝突しないため安全
+fn element_ends(text: &str, array_start: usize) -> Vec<usize> {
+    let b = text.as_bytes();
+    let mut ends = Vec::new();
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut i = array_start;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 1; // エスケープ: 次の 1 文字を読み飛ばす
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' | b'[' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        ends.push(i + 1);
+                    }
+                }
+                b']' if depth == 0 => break, // 配列の閉じ: これ以降は外側
+                b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    ends
 }
 
 /// 履歴本文と画像実体を、所有者だけが読める権限で書き込む。
@@ -327,6 +447,28 @@ pub fn restrict(path: &std::path::Path) -> bool {
     }
 }
 
+/// write_private は truncate+write_all のため、失敗時には部分書き込みの実体が
+/// 残りうる。画像実体の保存のように呼び出し側が「実体があれば書き直さない」
+/// 判定(exists チェック)を使うと、その残骸が恒久的に壊れた実体として固定化
+/// される。失敗時は実体を消して「無い」状態へ戻す
+pub fn write_private_or_remove(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_or_remove_with(path, bytes, write_private)
+}
+
+fn write_or_remove_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    write: impl Fn(&std::path::Path, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match write(path, bytes) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(e)
+        }
+    }
+}
+
 /// 履歴・画像ディレクトリを所有者のみへ限定する
 pub fn restrict_dir(path: &std::path::Path) {
     #[cfg(unix)]
@@ -336,6 +478,20 @@ pub fn restrict_dir(path: &std::path::Path) {
     }
     #[cfg(not(unix))]
     let _ = path;
+}
+
+/// 履歴用に本文を先頭 max_bytes バイトまでに切る。UTF-8 のマルチバイト文字の
+/// 途中で切らないよう、切る位置を文字境界まで戻す。切ったときだけ末尾に断りを添える
+/// (断り書きぶん上限を数バイト超えるが、断り自体を切ると省略が分からなくなる)
+fn truncate_for_history(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…(履歴用に省略)", &text[..cut])
 }
 
 /// 本文全体が 1 つの http(s) URL とみなせるか(表示種別としてのみ使う)
@@ -504,14 +660,42 @@ pub fn parse_image_entry(text: &str) -> Option<(String, u64)> {
     Some((name.to_string(), size))
 }
 
-/// 画像保存ディレクトリの刈り込み。新しい mtime 順に keep 件残して古い実体を
-/// 削除する(履歴上限 50 に対し少し余裕を持たせた件数を呼び出し側が渡す)。
-/// 履歴から追い出された画像の実体が居座り続けるのを防ぐ
-pub fn prune_image_store(dir: &std::path::Path, keep: usize) {
+/// 既存の画像実体の mtime を現在へ更新する(内容は書き換えない)。
+/// 同じ画像の再コピーでは実体が既に存在するため保存を省くが、prune_image_store
+/// は mtime 順に残すため、更新しないと「履歴の最新」として参照中の実体が
+/// 古い方から削除される。64MiB を超える実体の書き直しを避けるため、時刻の
+/// 設定だけを行う(std::fs::File::set_times。設定しなかった時刻は変わらない)
+pub fn touch_mtime(path: &std::path::Path) {
+    let now = std::time::SystemTime::now();
+    let times = std::fs::FileTimes::new().set_modified(now);
+    match std::fs::File::options().write(true).open(path) {
+        Ok(f) => {
+            if let Err(e) = f.set_times(times) {
+                eprintln!("[history] 画像の mtime 更新に失敗: {e}({})", path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("[history] 画像の mtime 更新のため開けません: {e}({})", path.display());
+        }
+    }
+}
+
+/// 画像保存ディレクトリの総バイト上限。1 枠が bulk.rs の MAX_IMAGE(64MiB)
+/// まで入り得るため、件数上限(60 件)だけだと最悪 3.75GiB まで膨らむ。
+/// 件数とは独立にバイトでも頭打ちにする(新しいものから残すため、溢れた分は
+/// 古い画像から消える)
+pub const MAX_IMAGE_STORE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// 画像保存ディレクトリの刈り込み。新しい mtime 順に「keep 件」かつ「総量
+/// max_bytes バイト」に収まる分を残して古い実体から削除する(履歴上限 50 に
+/// 対し少し余裕を持たせた件数を呼び出し側が渡す)。履歴から追い出された画像の
+/// 実体が居座り続けるのを防ぐ。最新の 1 つはサイズに関わらず必ず残す
+/// (今保存した画像をこの刈り込み自身が消さないようにするため)
+pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut items: Vec<(std::path::PathBuf, std::time::SystemTime)> = rd
+    let mut items: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = rd
         .flatten()
         .filter(|e| {
             let n = e.file_name();
@@ -519,16 +703,19 @@ pub fn prune_image_store(dir: &std::path::Path, keep: usize) {
             (n.ends_with(".bmp") || n.ends_with(".dib")) && is_image_store_name(&n)
         })
         .filter_map(|e| {
-            let mtime = e.metadata().ok()?.modified().ok()?;
-            Some((e.path(), mtime))
+            let meta = e.metadata().ok()?;
+            let mtime = meta.modified().ok()?;
+            Some((e.path(), mtime, meta.len()))
         })
         .collect();
-    if items.len() <= keep {
-        return;
-    }
     items.sort_by_key(|a| std::cmp::Reverse(a.1)); // 新しい順
-    for (path, _) in items.into_iter().skip(keep) {
-        let _ = std::fs::remove_file(path);
+    let mut total = 0u64;
+    for (i, (path, _, size)) in items.iter().enumerate() {
+        if i > 0 && (i >= keep || total.saturating_add(*size) > max_bytes) {
+            let _ = std::fs::remove_file(path);
+        } else {
+            total = total.saturating_add(*size);
+        }
     }
 }
 
@@ -695,6 +882,54 @@ mod tests {
         assert!(m.contains("35万"), "日本語長文の目安を含む: {m}");
     }
 
+    /// 履歴用の 8KB truncate: バイト境界で切るとき UTF-8 の文字境界を守る。
+    /// 「あ」(3 バイト)×上限+1 バイトの位置に置くと、切る位置が 1 バイト
+    /// 手前に戻って文字の途中で切らない
+    #[test]
+    fn history_truncation_respects_utf8_char_boundaries() {
+        // 3 バイト文字の並びで境界が割り切れないケース: cut=8 は「あ」の途中
+        // (6 バイト=2 文字目の後。8 バイト地点は 3 文字目の途中)のため
+        // 6 バイト(2 文字)へ戻る
+        let text = "あいうえお";
+        let cut = truncate_for_history(text, 8);
+        assert_eq!(cut, "あい…(履歴用に省略)");
+
+        // 境界がちょうど文字区切りに当たるケース(6 バイト=2 文字)
+        let cut = truncate_for_history(text, 6);
+        assert_eq!(cut, "あい…(履歴用に省略)");
+
+        // 上限内はそのまま(断りも付けない)
+        let cut = truncate_for_history(text, 15);
+        assert_eq!(cut, "あいうえお");
+
+        // 絵文字(4 バイト)の並びでも同様に文字境界を守る
+        let emoji = "😀😃😄";
+        let cut = truncate_for_history(emoji, 6);
+        assert_eq!(cut, "😀…(履歴用に省略)");
+    }
+
+    /// push_text 経由の省略: 8KB 超の長文が断り付きの省略版で履歴に載り、
+    /// 同じ長文の再コピーは省略版同士でマージされる
+    #[test]
+    fn push_text_truncates_long_bodies_for_history() {
+        let mut h = History::new(10);
+        let long = format!("{}{}", "本文".repeat(4_000), "末尾に一意の数字 12345678");
+        let id = h.push_text(&long, "Mac", 1).unwrap();
+        let saved = h.get(id).unwrap().text.clone();
+        assert!(
+            saved.len() <= HISTORY_TEXT_BYTES + 64,
+            "省略後は 8KB+断り書き程度: {}",
+            saved.len()
+        );
+        assert!(saved.ends_with("…(履歴用に省略)"));
+        assert!(saved.starts_with("本文本文"), "先頭部分はそのまま残る");
+        assert!(!saved.contains("末尾に一意"), "上限を超えた末尾は載らない");
+        // 同じ長文を再度コピーしても省略版が一致するため重複扱い(marge)になる
+        let again = h.push_text(&long, "Mac", 2).unwrap();
+        assert_eq!(again, id, "省略版が同じなら同じ項目にマージ");
+        assert_eq!(h.entries().len(), 1);
+    }
+
     #[test]
     fn classifies_a_single_url_and_rejects_empty() {
         let mut h = History::new(10);
@@ -777,6 +1012,27 @@ mod tests {
         assert!(l.contains("資料.pdf ほか1件"), "1 件目の名前と件数で示す");
     }
 
+    /// 改行入りファイル名(Mac では合法)は履歴本文の行区切りを壊すため、
+    /// 履歴への載せから除外する(転送・通知には影響しない。復元不能な項目を
+    /// 作らないための防御)
+    #[test]
+    fn file_entries_drop_paths_containing_newlines() {
+        let mut h = History::new(10);
+        let paths = vec![
+            std::path::PathBuf::from("/Users/me/Desktop/資料.pdf"),
+            std::path::PathBuf::from("/Users/me/Desktop/改行\n入り.txt"),
+            std::path::PathBuf::from("/Users/me/Desktop/復帰\r入り.txt"),
+        ];
+        let id = h.push_files(&paths, "Mac", 1_000).unwrap();
+        let saved = h.get(id).unwrap();
+        assert_eq!(saved.text, "/Users/me/Desktop/資料.pdf", "改行・復帰を含むパスは載せない");
+        // 全て改行入りなら履歴項目自体を作らない
+        assert!(
+            h.push_files(&[std::path::PathBuf::from("/tmp/a\nb.txt")], "Mac", 2_000).is_none(),
+            "載せられるパスが無ければ None"
+        );
+    }
+
     #[test]
     fn file_kind_survives_disk_round_trip() {
         let dir = std::env::temp_dir().join(format!("knit-history-file-{}", std::process::id()));
@@ -849,6 +1105,114 @@ mod tests {
         let mut h = History::new(3);
         h.load_from(&path);
         assert!(h.entries().is_empty(), "壊れたファイルは空として起動する");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保存中の電源断などで末尾が欠けた history.json: 完全な要素だけ復元し、
+    /// 壊れた実ファイルは上書きされる前に .corrupt へ退避する
+    #[test]
+    fn load_recovers_partial_entries_and_quarantines() {
+        let dir = std::env::temp_dir().join(format!("knit-history-part-{}", std::process::id()));
+        let path = dir.join("history.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut h = History::new(10);
+        h.push_text("1st", "Mac", 1);
+        h.push_text("2nd", "Mac", 2);
+        h.push_text("3rd", "Mac", 3);
+        h.save_to(&path);
+        let mut full = std::fs::read_to_string(&path).unwrap();
+        // 末尾欠け: 最後の要素の途中で切れた状態を作る
+        let cut = full.len() - 12;
+        full.truncate(cut);
+        std::fs::write(&path, &full).unwrap();
+        let mut loaded = History::new(10);
+        loaded.load_from(&path);
+        assert_eq!(loaded.entries().len(), 2, "完全な 2 件だけ復元される");
+        assert_eq!(loaded.entries()[0].text, "1st");
+        assert_eq!(loaded.entries()[1].text, "2nd");
+        // 退避: 元の位置からは消え、.corrupt に欠けた実ファイルが残る
+        assert!(!path.exists(), "壊れた実ファイルは退避されて元の位置に無い");
+        let backup = dir.join("history.json.corrupt");
+        assert_eq!(
+            std::fs::read_to_string(&backup).unwrap(),
+            full,
+            "退避先に欠けた実ファイルが残る"
+        );
+        // 復元後も id が継続する(復元した最後の id の次から採番)
+        assert_eq!(loaded.last_id(), 2);
+        loaded.push_text("4th", "Mac", 4);
+        assert_eq!(loaded.last_id(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 完全に不正な履歴ファイル: 復復 0 件で空起動し、退避だけ残る
+    #[test]
+    fn completely_broken_history_is_quarantined_and_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("knit-history-junk-{}", std::process::id()));
+        let path = dir.join("history.json");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "<<<not json at all>>>").unwrap();
+        let mut h = History::new(3);
+        h.load_from(&path);
+        assert!(h.entries().is_empty());
+        assert!(dir.join("history.json.corrupt").exists(), "救出材料として退避が残る");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// recover_partial の純関数テスト: 本文に '}'・']'・エスケープを含む要素が
+    /// あっても要素境界を正しく数え、文字列内の記号を要素の閉じと誤認しない
+    #[test]
+    fn recover_partial_handles_braces_and_escapes_inside_text() {
+        let mut h = History::new(10);
+        h.push_text("a\"}b", "Mac", 1);
+        h.push_text("]} \\\" x", "Mac", 2);
+        h.push_text("last", "Mac", 3);
+        let full = serde_json::to_string(&PersistedRef { entries: h.entries() }).unwrap();
+        // 末尾欠け(最後の要素の途中): 2 件復元
+        let mut cut = full.clone();
+        cut.truncate(full.len() - 10);
+        let got = recover_partial(&cut);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "a\"}b", "本文の '}}' で要素が切れない");
+        assert_eq!(got[1].text, "]} \\\" x", "本文の ']'・エスケープも同様");
+        // 配列の途中で丸ごと切れた場合: そこまでの完全な要素だけ
+        let head_end = full.find("{\"id\":3").unwrap();
+        let got = recover_partial(&full[..head_end + 5]);
+        assert_eq!(got.len(), 2);
+        // 冒頭から壊れている場合は空(誤った復元をしない)
+        assert!(recover_partial("not json").is_empty());
+        assert!(recover_partial("{\"other\":[1,2").is_empty());
+        // 完全なファイルもそのまま通る(末尾の ]} が二重にならない)
+        assert_eq!(recover_partial(&full).len(), 3);
+    }
+
+    /// 同じ画像の再コピーで実体の mtime を更新すると、刈り込みが「履歴の最新」
+    /// の実体を新しい側として残す(mtime 更新が無いと再コピー済みの実体が
+    /// 古い方から削除され、履歴から復元できなくなる)
+    #[test]
+    fn touching_an_existing_image_updates_its_mtime_and_protects_it_from_prune() {
+        let dir = std::env::temp_dir().join(format!("knit-history-touch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let older = image_file_name(1, "bmp");
+        let newer = image_file_name(2, "bmp");
+        std::fs::write(dir.join(&older), b"old").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        std::fs::write(dir.join(&newer), b"new").unwrap();
+        // 古い方(=履歴で使い回している実体)を再コピー相当で touch する
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        touch_mtime(&dir.join(&older));
+        // keep=1: touch した方が新しいので残り、touch しなかった方が消える
+        prune_image_store(&dir, 1, MAX_IMAGE_STORE_BYTES);
+        assert!(
+            std::fs::metadata(dir.join(&older)).is_ok(),
+            "再コピー(touch)した実体は残る"
+        );
+        assert!(
+            std::fs::metadata(dir.join(&newer)).is_err(),
+            "最後に使われていない実体の方が削除される"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -942,7 +1306,7 @@ mod tests {
             names.push(n);
         }
         let _ = std::fs::write(dir.join("readme.txt"), b"x"); // 対象外は触らない
-        prune_image_store(&dir, 2);
+        prune_image_store(&dir, 2, MAX_IMAGE_STORE_BYTES);
         let left: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -954,6 +1318,88 @@ mod tests {
         assert!(
             left.contains(&"readme.txt".to_string()),
             "画像以外のファイルは触らない"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// バイト総量上限: 件数の余裕があっても、新しいものからの累積が max_bytes を
+    /// 超えた分は古い実体から削除される(64MiB 枠×60 件の無限膨張を防ぐ仕組み)
+    #[test]
+    fn prunes_image_store_by_total_bytes() {
+        let dir = std::env::temp_dir().join(format!("knit-history-prune-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut names = Vec::new();
+        for i in 0..4u64 {
+            let n = image_file_name(i, "bmp");
+            std::fs::write(dir.join(&n), vec![b'x'; 100]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            names.push(n);
+        }
+        // keep=10(件数では余裕)・max=250 バイト: 新しい 2 つ(200B)までは入り、
+        // 3 つ目で 300B>250B のため古い 2 つが削除される
+        prune_image_store(&dir, 10, 250);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.contains(&names[3]), "最も新しい画像は残る");
+        assert!(left.contains(&names[2]), "累積 250B 内の新しい方から残す");
+        assert!(!left.contains(&names[1]), "総量超過の古い画像は削除");
+        assert!(!left.contains(&names[0]), "総量超過の最古画像は削除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 件数上限とバイト上限の併用: keep(件数)に余裕があっても総量側が触れた
+    /// 分は削除され、両方を満たす新しいものだけが残る
+    #[test]
+    fn prunes_image_store_by_count_and_bytes_together() {
+        let dir = std::env::temp_dir().join(format!("knit-history-prune-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut names = Vec::new();
+        for i in 0..5u64 {
+            let n = image_file_name(i, "bmp");
+            std::fs::write(dir.join(&n), vec![b'x'; 60]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            names.push(n);
+        }
+        // keep=4(件数では余裕)・max=150: 新い 2 つ(120B)までは入り、3 つ目で
+        // 180B>150B のため 3〜5 番目が削除される(バイト側が効る併用)
+        prune_image_store(&dir, 4, 150);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.contains(&names[4]) && left.contains(&names[3]));
+        for old in &names[0..3] {
+            assert!(!left.contains(old), "件数の余裕があっても総量超過分は削除");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 最新の 1 つは必ず残す: 1 枚だけでも max_bytes を超える巨大画像を保存した
+    /// 直後の初期込みで、自分自身を消して履歴と実体が矛盾しないようにする
+    #[test]
+    fn prune_keeps_the_newest_even_if_it_exceeds_the_byte_cap() {
+        let dir = std::env::temp_dir().join(format!("knit-history-prune-d-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = image_file_name(1, "bmp");
+        std::fs::write(dir.join(&old), b"x").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let newest = image_file_name(2, "bmp");
+        std::fs::write(dir.join(&newest), vec![b'x'; 1_000]).unwrap();
+        prune_image_store(&dir, 60, 100);
+        assert!(
+            std::fs::metadata(dir.join(&newest)).is_ok(),
+            "上限を1枚で超えても最新は残す"
+        );
+        assert!(
+            std::fs::metadata(dir.join(&old)).is_err(),
+            "古い分は総量に収まるよう削除"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -979,6 +1425,32 @@ mod tests {
         }
         let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700, "履歴ディレクトリは 700 になる");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 画像実体の保存に失敗した時、部分書き込みの残骸を消して「実体が無い」
+    /// 状態へ戻す。exists() チェックで再保存を省く呼び出し側では、残骸が残ると
+    /// 恒久的に壊れた実体として固定化されるため
+    #[test]
+    fn write_private_or_remove_leaves_no_partial_file_on_failure() {
+        let dir = std::env::temp_dir().join(format!("knit-hist-rem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("img.bin");
+        // 成功時: 内容がそのまま書かれる
+        write_private_or_remove(&path, b"ok").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        // write_all が途中で失敗した状況の再現(truncate と部分書き込みが済んだ
+        // 状態で Err を返す)。失敗時は実体が消える
+        let broken = |p: &std::path::Path, _: &[u8]| {
+            std::fs::write(p, b"partial").unwrap();
+            Err(std::io::Error::other("disk full"))
+        };
+        assert!(write_or_remove_with(&path, b"bytes", broken).is_err());
+        assert!(!path.exists(), "失敗時は部分書き込みの実体を残さない");
+        // 消した後は再保存できる(次回の exists チェックが正しく働く)
+        write_private_or_remove(&path, b"retry").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"retry");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

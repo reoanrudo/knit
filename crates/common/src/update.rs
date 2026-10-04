@@ -389,6 +389,34 @@ pub enum Launch {
     Restore { restored: bool },
 }
 
+/// 監視中にシステムが止まっていたとみなす、壁と単調の差のしきい値。
+/// これ未満の差は計測の揺らぎ・NTP の微修正として無視する
+const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 前回サンプルとの間にシステムが止まっていた時間(壁の進みが単調の進みを
+/// 大きく上回った分。それ以外は 0)。スリープ中は壁時計だけが進むため、
+/// この差が「止まっていた時間」の目安になる。壁の巻き戻り(進み 0)も 0
+fn stalled_between(
+    prev_wall: std::time::SystemTime,
+    now_wall: std::time::SystemTime,
+    prev_mono: std::time::Instant,
+    now_mono: std::time::Instant,
+) -> std::time::Duration {
+    let wall = now_wall.duration_since(prev_wall).unwrap_or_default();
+    let over = wall.saturating_sub(now_mono.duration_since(prev_mono));
+    (over >= STALL_THRESHOLD).then_some(over).unwrap_or_default()
+}
+
+/// 監視を続けるか: 起動からの単調経過が「生き残り判定の長さ+止まっていた時間」未満か
+fn still_monitoring(
+    started: std::time::Instant,
+    now_mono: std::time::Instant,
+    health: std::time::Duration,
+    paused: std::time::Duration,
+) -> bool {
+    now_mono.duration_since(started) < health + paused
+}
+
 /// 展開済みの新しい配布物(`staged` 直下のファイル)を `target` へ入れ替える。
 /// 各ファイルは `<名前>.knit-old` へ退避してから置き、`start` で起動した新版が `health` の間
 /// 生き続けなければ、全て元に戻して旧版を起動し直す(Windows の更新で使う)。
@@ -461,14 +489,25 @@ pub fn swap_and_start(
     }
     let survived = match start(Launch::New) {
         Ok(mut child) => {
-            let deadline = std::time::Instant::now() + health;
+            let started = std::time::Instant::now();
             let mut alive = true;
-            while std::time::Instant::now() < deadline {
+            // 監視中にシステムが止まっていた(スリープ)時間を壁と単調の組で検出し、
+            // 判定の期限をその分延ばす。眠っている間に子が死んでいなければ失敗扱いに
+            // しない(スリープで正当な新版がロールバックされるのを防ぐ)
+            let mut paused = std::time::Duration::ZERO;
+            let mut prev_wall = std::time::SystemTime::now();
+            let mut prev_mono = started;
+            while still_monitoring(started, std::time::Instant::now(), health, paused) {
                 if child.try_wait().map(|s| s.is_some()).unwrap_or(true) {
                     alive = false;
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
+                let now_wall = std::time::SystemTime::now();
+                let now_mono = std::time::Instant::now();
+                paused += stalled_between(prev_wall, now_wall, prev_mono, now_mono);
+                prev_wall = now_wall;
+                prev_mono = now_mono;
             }
             if !alive {
                 let _ = child.kill();
@@ -678,6 +717,56 @@ mod tests {
             current,
             platform: "macos-arm64",
         }
+    }
+
+    #[test]
+    fn health_monitor_extends_the_deadline_by_the_time_the_system_was_stalled() {
+        use std::time::{Duration, Instant, SystemTime};
+        let wall0 = SystemTime::UNIX_EPOCH;
+        let mono0 = Instant::now();
+        // 監視中に 30 秒のスリープ: 壁は 30.2 秒進み、単調は 0.2 秒しか進まない
+        let stalled = stalled_between(
+            wall0,
+            wall0 + Duration::from_millis(30_200),
+            mono0,
+            mono0 + Duration::from_millis(200),
+        );
+        assert_eq!(stalled, Duration::from_secs(30));
+        // health=10 秒を 11 秒過ぎていても、30 秒止まっていた分はまだ監視を続ける
+        let started = Instant::now() - Duration::from_secs(11);
+        assert!(still_monitoring(started, Instant::now(), Duration::from_secs(10), stalled));
+        // 止まっていなければ延長なし: 10 秒を超えたら監視を終える
+        assert!(!still_monitoring(started, Instant::now(), Duration::from_secs(10), Duration::ZERO));
+        // 延長の分まで経てば終える(延長は無限ではない)
+        let long_past = Instant::now() - Duration::from_secs(45);
+        assert!(!still_monitoring(long_past, Instant::now(), Duration::from_secs(10), stalled));
+    }
+
+    #[test]
+    fn small_wall_mono_gaps_are_treated_as_noise_not_sleep() {
+        use std::time::{Duration, Instant, SystemTime};
+        let wall0 = SystemTime::UNIX_EPOCH;
+        let mono0 = Instant::now();
+        // 1 秒未満の差(計測の揺らぎ・NTP の微修正)は止まっていた時間に数えない
+        assert_eq!(
+            stalled_between(
+                wall0,
+                wall0 + Duration::from_millis(250),
+                mono0,
+                mono0 + Duration::from_millis(200)
+            ),
+            Duration::ZERO
+        );
+        // 壁が巻き戻っても 0
+        assert_eq!(
+            stalled_between(
+                wall0 + Duration::from_secs(5),
+                wall0,
+                mono0,
+                mono0 + Duration::from_millis(100)
+            ),
+            Duration::ZERO
+        );
     }
 
     #[test]

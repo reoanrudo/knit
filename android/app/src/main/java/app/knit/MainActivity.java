@@ -133,9 +133,16 @@ public final class MainActivity extends Activity {
             if(uris.isEmpty()){ui.post(()->message("Macへ接続してから、もう一度共有してください。「接続を開始」でつながると、近くのMacは自動で見つかります。"));return;}
             final int total=uris.size();
             worker.execute(()->{try{
+                // 受け取り時点で上限を検査(本体のドラッグ送信と同じ512件・合計10GiB)。
+                // 超過はコピーを始める前に断る(サイズ問い合わせは取れない物を除外しない)
+                String over=ShareLimits.reject(uris.size(),ShareLimits.totalBytes(this,uris));
+                if(over!=null){ui.post(()->{if(!isDestroyed())message(over);});return;}
                 java.util.ArrayList<String> paths=new java.util.ArrayList<>();
                 for(Uri u:uris)paths.add(Sharing.prepareUpload(this,u).getAbsolutePath());
+                // 未接続での積み込みは新しい共有のため、再送済みの印を戻す
+                //(失敗時の 1 回だけ保留戻しをこの共有にも適用できるように)
                 ConnectionService.pendingFiles.set(new JSONArray(paths));
+                ConnectionService.pendingFilesRetried.set(false);
                 ui.post(()->{if(!isDestroyed())message("Macへ接続すると、"+total+"件を自動で送ります。「接続を開始」を押してください。");});
             }catch(Exception e){ui.post(()->{if(!isDestroyed())message(ConnectionService.safe(e));});}});
             return;
@@ -144,6 +151,9 @@ public final class MainActivity extends Activity {
         if(uris.isEmpty())return;
         final int total=uris.size();
         worker.execute(()->{try{
+            // 接続中の共有も同じ上限で検査してからコピーする
+            String over=ShareLimits.reject(uris.size(),ShareLimits.totalBytes(this,uris));
+            if(over!=null){ui.post(()->{if(!isDestroyed())message(over);});return;}
             java.util.ArrayList<String> paths=new java.util.ArrayList<>();
             for(Uri u:uris)paths.add(Sharing.prepareUpload(this,u).getAbsolutePath());
             ConnectionService service=ConnectionService.current;

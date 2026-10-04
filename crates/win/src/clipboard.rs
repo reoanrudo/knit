@@ -116,12 +116,24 @@ pub(crate) fn history_push_image(dib: &[u8], device: &str) {
     knit_common::history::restrict_dir(&dir);
     let path = dir.join(&name);
     if !path.exists() {
-        if knit_common::history::write_private(&path, dib).is_err() {
+        // 失敗時は部分書き込みの実体を消す(exists チェックで壊れた実体が
+        // 固定化され、復元だけが恒久失敗するのを防ぐ)
+        if knit_common::history::write_private_or_remove(&path, dib).is_err() {
             println!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
             return;
         }
-        knit_common::history::prune_image_store(&dir, IMAGE_KEEP);
+    } else {
+        // 同じ画像の再コピー: 実体は既に有るため書き直さず mtime だけ現在へ
+        // 更新する(刈り込みが mtime 順に残すため。Mac 側と対称の修正)
+        knit_common::history::touch_mtime(&path);
     }
+    // 刈り込みは if の外: 同じ画像の再コピー(実体の新規保存が無い)の間も
+    // バイト総量上限(512MiB)へ収め続ける。件数とバイトの両方で頭打ちにする
+    knit_common::history::prune_image_store(
+        &dir,
+        IMAGE_KEEP,
+        knit_common::history::MAX_IMAGE_STORE_BYTES,
+    );
     let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
         if h.push_image(&name, dib.len(), device, ts).is_some() {
@@ -129,6 +141,17 @@ pub(crate) fn history_push_image(dib: &[u8], device: &str) {
             history_save();
         }
     }
+}
+
+/// 起動時に画像履歴の実体を刈り込む(履歴 load の後に 1 回)。保存時の刈り込みは
+/// 画像が届いた時しか走らないため、起動をまたぐと総量超過が残り続くのを防ぐ
+pub fn prune_image_store_now() {
+    let Some(dir) = image_store_dir() else { return };
+    knit_common::history::prune_image_store(
+        &dir,
+        IMAGE_KEEP,
+        knit_common::history::MAX_IMAGE_STORE_BYTES,
+    );
 }
 
 /// 履歴の全消去(トレイメニュー)。保存ファイルも消して次回起動に残さない
@@ -327,7 +350,8 @@ pub(crate) fn sync_clipboard_to_mac() {
         return;
     }
     let seq = clipboard_seq();
-    if LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed) == seq {
+    let prev_seq = LAST_SYNC_SEQ.swap(seq, Ordering::Relaxed);
+    if prev_seq == seq {
         return;
     }
     let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
@@ -370,6 +394,17 @@ pub(crate) fn sync_clipboard_to_mac() {
                 return;
             }
             if dib.len() <= bulk::MAX_IMAGE {
+                if crate::xfer::tx_busy() {
+                    // ファイル転送中に画像を送ると、bulk の送信口(転送が終わるまで
+                    // ロックを保持)を待ってこのスレッドが留まり、転送完了後に古い
+                    // 画像が上書いてしまう。Mac 側と同じ Busy 扱いで今回はスキップし、
+                    // 同期済みの印を戻して次の同期(シーケンス変化)で再送する
+                    LAST_SYNC_SEQ
+                        .compare_exchange(seq, prev_seq, Ordering::Relaxed, Ordering::Relaxed)
+                        .ok();
+                    println!("[clip] 他の転送中のため画像同期を保留します(次の同期で再試行します)");
+                    return;
+                }
                 match BULK_LINK.send(|w| bulk::send_image(w, &dib)) {
                     Ok(()) => {
                         println!("[clip] win->mac image {}KB", dib.len() / 1024);

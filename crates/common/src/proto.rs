@@ -71,6 +71,34 @@
         }
     }
 
+    /// hello/hello_ok の monitors として受け付ける件数上限。
+    /// 実用上 8 面で十分(異常に長い配列でレイアウト計算を引っ張らせない)
+    pub const MAX_MONITORS: usize = 8;
+
+    /// 1 枚のモニターの値域。w/h は Screen と同じ 1..=32768、x/y は仮想画面
+    /// 座標として両方向へ同じ幅を許す(-32768..=32768)。
+    /// hello は暗号化ハンドシェイクの先だが相手の値をそのままレイアウトへ
+    /// 使うため、Screen の受信ガードと対称に検査する
+    pub fn monitor_valid(m: &Monitor) -> bool {
+        (1..=32768).contains(&m.w)
+            && (1..=32768).contains(&m.h)
+            && (-32768..=32768).contains(&m.x)
+            && (-32768..=32768).contains(&m.y)
+    }
+
+    /// 受信したモニター群から値域外の物を除き、件数を上限へ切り詰める。
+    /// 全て不正なら空配列(= 従来どおり w/h の単一画面扱い)。
+    /// 除外は「接続を切らない」方向の無害化: 旧版相互接続で空配列が来る
+    /// 経路と同じ状態に落ち着く
+    pub fn sanitize_monitors(monitors: &[Monitor]) -> Vec<Monitor> {
+        monitors
+            .iter()
+            .filter(|m| monitor_valid(m))
+            .take(MAX_MONITORS)
+            .cloned()
+            .collect()
+    }
+
     /// 端末識別子(初回に生成して保存)。暗号用途ではなく、同じ Mac へ
     /// 接続した複数端末と、同一端末の再接続を区別するための値。
     /// 再起動で変わってはならない: 接続先の配置・選択の保存が id に紐づくため、
@@ -80,14 +108,8 @@
         ID.get_or_init(|| {
             let path = crate::envutil::data_dir().map(|d| d.join("device-id.txt"));
             if let Some(p) = &path {
-                if let Ok(s) = std::fs::read_to_string(p) {
-                    let s = s.trim().to_string();
-                    if !s.is_empty()
-                        && s.len() <= 64
-                        && s.chars().all(|c| c.is_ascii_alphanumeric())
-                    {
-                        return s;
-                    }
+                if let Some(id) = load_device_id_from(p) {
+                    return id;
                 }
             }
             let mut seed = std::time::SystemTime::now()
@@ -105,10 +127,7 @@
             };
             let id = format!("{:016x}", next());
             if let Some(p) = &path {
-                if let Some(dir) = p.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                if let Err(e) = std::fs::write(p, &id) {
+                if let Err(e) = save_device_id_to(p, &id) {
                     // 毎回新しい端末として振る舞うことになる(選択端末の維持が効かない)ため記録する
                     eprintln!("[proto] 端末 id を保存できません: {e}");
                 }
@@ -116,6 +135,33 @@
             id
         })
         .clone()
+    }
+
+    /// device-id.txt から有効な id を読む。検査に落ちる(壊れている)場合は
+    /// 上書きで失われる前に .corrupt へ退避して None を返す。無言で新しい id を
+    /// 生成すると peer-sides 等の id 紐付けが全て切れるため
+    fn load_device_id_from(path: &std::path::Path) -> Option<String> {
+        let Ok(s) = std::fs::read_to_string(path) else {
+            return None;
+        };
+        let s = s.trim();
+        if !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Some(s.to_string());
+        }
+        let backup = crate::persist::quarantine(path);
+        eprintln!(
+            "[proto] device-id.txt が壊れています。{}新しい id を生成します(旧 id での紐付けは失われます)",
+            backup
+                .as_ref()
+                .map(|p| format!("{} へ退避しました。", p.display()))
+                .unwrap_or_default()
+        );
+        None
+    }
+
+    /// 生成した id の保存(一時ファイル+sync+rename のアトミック置換)
+    fn save_device_id_to(path: &std::path::Path, id: &str) -> std::io::Result<()> {
+        crate::persist::write_atomic(path, id.as_bytes())
     }
 
     /// 通信で受け取った表示名を UI・ログへ載せられる形にする: 制御文字と
@@ -322,6 +368,12 @@
         /// Windows 側 IME の開閉へ反映する(ビジョン§7 IME Follow Cursor)
         #[serde(rename = "ime")]
         Ime { kana: bool },
+        /// Caps Lock 状態同期(Mac→Windows、画面を移る時に送る)。Mac の
+        /// alphaShift と Windows の VK_CAPITAL トグルがズレていると越境直後の
+        /// 大文字/小文字が反転するため、入りの時点で合わせる。旧側は未知行と
+        /// して無視する拡張(版 15 のまま)
+        #[serde(rename = "caps")]
+        Caps { on: bool },
         /// Continue Here(ビジョン§11): 相手側の既定ブラウザで開く URL。
         /// スキーム・長さの検査は urlx::transferable で両側で行う
         #[serde(rename = "open_url")]
@@ -399,3 +451,104 @@
     pub fn decode(line: &str) -> Option<Msg> {
         serde_json::from_str(line.trim()).ok()
     }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("knit-devid-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 有効な id はそのまま読まれ、保存はアトミックに書かれる
+    #[test]
+    fn device_id_round_trips_through_disk() {
+        let dir = temp_dir("roundtrip");
+        let path = dir.join("device-id.txt");
+        save_device_id_to(&path, "0123456789abcdef").unwrap();
+        // 前後の空白は読み込み側で落とす(エディタで開いた痕跡への耐性)
+        std::fs::write(&path, " 0123456789abcdef\n").unwrap();
+        assert_eq!(load_device_id_from(&path).as_deref(), Some("0123456789abcdef"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 壊れた id ファイル: 無言で新 id を作らず、退避してから None を返す。
+    /// 退避先には元のバイトが残る(何が起きたか後から調べられる)
+    #[test]
+    fn broken_device_id_is_quarantined_and_regenerated() {
+        let dir = temp_dir("broken");
+        let path = dir.join("device-id.txt");
+        for bad in ["", "  \n", "not!alphanumeric", &"x".repeat(65)] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(load_device_id_from(&path).is_none(), "壊れた id は拒否: {bad:?}");
+            assert!(!path.exists(), "壊れたファイルは元の位置に残さない");
+            let backup = dir.join("device-id.txt.corrupt");
+            assert_eq!(
+                std::fs::read_to_string(&backup).unwrap(),
+                bad,
+                "退避先に元の内容が残る"
+            );
+            // 次の生成: 退避を壊さず新しい id が書ける
+            save_device_id_to(&path, "abc123").unwrap();
+            assert_eq!(load_device_id_from(&path).as_deref(), Some("abc123"));
+            // 次の壊れケースに備えて掃除(退避ファイルの番号増加を確認するのは
+            // persist::quarantine の単体テスト側で行う)
+            let _ = std::fs::remove_file(dir.join("device-id.txt.corrupt"));
+            let _ = std::fs::remove_file(dir.join("device-id.txt.corrupt.1"));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 存在しないファイルは退避を作らない(初回起動と破損を区別する)
+    #[test]
+    fn missing_device_id_creates_no_backup() {
+        let dir = temp_dir("missing");
+        let path = dir.join("device-id.txt");
+        assert!(load_device_id_from(&path).is_none());
+        assert!(!dir.join("device-id.txt.corrupt").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn mon(x: i32, y: i32, w: i32, h: i32) -> Monitor {
+        Monitor { x, y, w, h, name: String::new() }
+    }
+
+    /// monitors の値域: 境界値(1・32768・-32768)は通し、1 つでも外れる値
+    /// (0・負の幅・32769・座標が ±32768 を超える)は不正
+    #[test]
+    fn monitor_valid_accepts_screen_range_boundaries() {
+        assert!(monitor_valid(&mon(-32768, 32768, 1, 32768)), "全て境界値でも有効");
+        for bad in [
+            mon(0, 0, 0, 1080),      // 幅 0
+            mon(0, 0, 1920, -1),     // 負の高さ
+            mon(0, 0, 32769, 1080),  // 幅が上限超え
+            mon(0, 0, 1920, i32::MAX),
+            mon(-32769, 0, 1920, 1080), // x が下限未満
+            mon(0, 32769, 1920, 1080),  // y が上限超え
+            mon(0, 0, 1920, i32::MIN),
+        ] {
+            assert!(!monitor_valid(&bad), "値域外は不正: {bad:?}");
+        }
+    }
+
+    /// sanitize_monitors: 不正な枚を除外し、件数は MAX_MONITORS で止める。
+    /// 全滅なら空配列(単一画面扱い)に落ちる
+    #[test]
+    fn sanitize_monitors_drops_invalid_and_caps_count() {
+        let good = mon(0, 0, 1920, 1080);
+        let bad = mon(0, 0, 0, 0);
+        // 不正混じり: 正しい物だけ残る
+        let got = sanitize_monitors(&[good.clone(), bad.clone(), good.clone()]);
+        assert_eq!(got.len(), 2);
+        // 件数上限: 10 面送られても 8 面
+        let many = vec![good.clone(); 10];
+        assert_eq!(sanitize_monitors(&many).len(), MAX_MONITORS);
+        // 全滅: 空配列(= hello の単一画面フォールバックと同じ状態)
+        assert!(sanitize_monitors(&[bad.clone(), bad]).is_empty());
+        // 空入力は空のまま
+        assert!(sanitize_monitors(&[]).is_empty());
+    }
+}

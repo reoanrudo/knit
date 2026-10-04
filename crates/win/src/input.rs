@@ -190,6 +190,28 @@ pub(crate) fn sync_numlock_on() {
     }
 }
 
+/// Mac の Caps Lock 状態(alphaShift)へ合わせる(越境時の Msg::Caps で呼ぶ)。
+/// 両 OS のトグル状態がズレていると越境直後の大文字/小文字が反転するため、
+/// 現在の Windows 側状態と異なる場合だけ VK_CAPITAL を 1 回トグル注入する。
+/// 判定は knit_common::keymap::caps_toggle_needed(両 OS の対応を 1 箇所で保証)
+pub(crate) fn sync_caps_state(on: bool) {
+    unsafe {
+        extern "system" {
+            fn GetKeyState(n_key: i32) -> i16;
+        }
+        const VK_CAPITAL: i32 = 0x14;
+        let now_on = GetKeyState(VK_CAPITAL) & 1 != 0;
+        if knit_common::keymap::caps_toggle_needed(now_on, on) {
+            inject_key(VK_CAPITAL as u16, false);
+            inject_key(VK_CAPITAL as u16, true);
+            println!(
+                "[input] Mac の Caps Lock({})へ合わせました",
+                if on { "ON" } else { "OFF" }
+            );
+        }
+    }
+}
+
 pub(crate) fn inject_key(vk: u16, up: bool) -> bool {
     inject_key_ex(vk, up, is_extended_vk(vk))
 }
