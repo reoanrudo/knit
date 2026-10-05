@@ -256,9 +256,10 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
         tray::notify(
             "Knit",
             &format!(
-                "{} 件・合計 {} を Mac へ送信します(相手の保存先 Downloads/Knit の空き容量をご確認ください)",
+                "{} 件・合計 {} を {} へ送信します(相手の保存先 Downloads/Knitの空き容量をご確認ください)",
                 entries.len(),
-                human_bytes(total)
+                human_bytes(total),
+                crate::conn::peer_display()
             ),
         );
     }
@@ -314,19 +315,19 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
                 Some((_, _, true)) => {
                     tray::notify(
                         "Knit",
-                        &format!("Mac の設定でファイルの受け取りが拒否されています(相手側アプリの「共有」設定を確認してください){note}"),
+                        &format!("相手側の設定でファイルの受け取りが拒否されています(相手側アプリの「共有」設定を確認してください){note}"),
                     );
                 }
                 Some((_, rejected, false)) if rejected > 0 => {
                     tray::notify(
                         "Knit",
-                        &format!("{n} 件を Mac へ送信しましたが、{rejected} 件は相手側で保存できませんでした(相手側の通知と受信フォルダを確認してください){note}"),
+                        &format!("{n} 件を {} へ送信しましたが、{rejected} 件は相手側で保存できませんでした(相手側の通知と受信フォルダを確認してください){note}", crate::conn::peer_display()),
                     );
                 }
                 _ => {
                     tray::notify(
                         "Knit",
-                        &format!("{n} 件({})を Mac へ送信しました{note}", human_bytes(total)),
+                        &format!("{n} 件({})を {} へ送信しました{note}", human_bytes(total), crate::conn::peer_display()),
                     );
                 }
             }
@@ -340,7 +341,8 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
             tray::notify(
                 "Knit",
                 &format!(
-                    "Mac へファイルを送れませんでした({}: {e})",
+                    "{} へファイルを送れませんでした({}: {e})",
+                    crate::conn::peer_display(),
                     bulk::send_error_label(e)
                 ),
             );
@@ -509,8 +511,8 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                         }
                     );
                     // 履歴には載せる(メニューから選び直せるように。
-                    // Mac の受信も履歴に載るため挙動を揃える)
-                    history_push_files(&paths, "Mac");
+                    // 相手の受信も履歴に載るため挙動を揃える)
+                    history_push_files(&paths, &crate::conn::peer_display());
                     let dir = saved_dir();
                     tray::notify(
                         "Knit",
@@ -530,7 +532,7 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             }
             if clipboard_write_files(&files) {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
-                history_push_files(&paths, "Mac");
+                history_push_files(&paths, &crate::conn::peer_display());
                 println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
                 let dir = saved_dir();
                 let message = match mismatch {
@@ -575,7 +577,7 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             let ok = clipboard_write_dib(&dib);
             if ok {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
-                history_push_image(&dib, "Mac");
+                history_push_image(&dib, &crate::conn::peer_display());
             }
             println!(
                 "[clip] mac->win image {}KB {}",

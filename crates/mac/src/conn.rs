@@ -152,13 +152,13 @@ pub(crate) fn peer_display_label(alias: Option<&str>, name: &str, ip: &str) -> S
 }
 
 /// 相手から受信したもののクリップボード履歴ラベル。接続中の端末は
-/// エイリアス/コンピュータ名で載せる(同じ "Windows" ラベルで複数台を
-/// 区別できないため)。Android アプリはエイリアスが無い間は従来どおり
-/// 「タブレット」、未接続・未知の id は "Windows"。旧履歴の "Windows"・
+/// エイリアス/コンピュータ名で載せる(同じラベルで複数台を区別できない
+/// ため)。Android アプリはエイリアスが無い間は従来どおり「タブレット」、
+/// 未接続・未知の id は "端末"(name 受信前の汎用表示)。旧履歴の "Windows"・
 /// 「タブレット」の値はそのまま表示互換
 pub(crate) fn history_device_for_peer(peer_id: &str) -> String {
     if peer_id.is_empty() {
-        return "Windows".into();
+        return "端末".into();
     }
     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = peers.iter().find(|p| p.id == peer_id) {
@@ -173,7 +173,7 @@ pub(crate) fn history_device_for_peer(peer_id: &str) -> String {
     if peer_id.starts_with("android-app-") {
         "タブレット".into()
     } else {
-        "Windows".into()
+        "端末".into()
     }
 }
 
@@ -211,11 +211,11 @@ pub(crate) fn note_bulk_rx_device() {
 /// 互いに他人の PEERS を覗いて間欠失敗するため、置換中の区間を排他する
 pub(crate) static PEERS_TEST_SERIAL: Mutex<()> = Mutex::new(());
 
-/// 記録した bulk 受信バッチ開始時点の履歴ラベル(未記録の初回は "Windows")
+/// 記録した bulk 受信バッチ開始時点の履歴ラベル(未記録の初回は "端末")
 pub(crate) fn bulk_rx_device() -> String {
     let label = BULK_RX_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
     if label.is_empty() {
-        "Windows".into()
+        "端末".into()
     } else {
         label.clone()
     }
@@ -267,7 +267,7 @@ pub(crate) fn bulk_defer_clear_action(
     BulkDeferAction::Pending
 }
 
-/// アクティブな接続先の表示名(エイリアス優先。Windows 接続・未接続は "Windows")
+/// アクティブな接続先の表示名(エイリアス優先。未接続・name 受信前は "端末")
 pub(crate) fn active_peer_label() -> String {
     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
     let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
@@ -276,7 +276,7 @@ pub(crate) fn active_peer_label() -> String {
         .map(|p| peer_label(p).to_string())
         .unwrap_or_else(|| {
             let name = PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if name.is_empty() { "Windows".into() } else { name }
+            if name.is_empty() { "端末".into() } else { name }
         })
 }
 
@@ -344,9 +344,14 @@ fn activate_peer_locked(new: usize, reason: &str) {
         }
         if std::time::Instant::now() >= deadline {
             eprintln!("[conn] 接続先へ切り替えられませんでした(writer が戻りません idx={new})");
-            // 自動系の切り替えは頻発し得るため、明示的な選択の失敗だけ通知する
+            // 自動系の切り替えは頻発し得るため、明示的な選択の失敗だけ通知する。
+            // この失敗は相手が半開き等で応答不能=待っても直らないため、相手側の
+            // 起動確認と、この端末が一覧から外れること(再選択は無意味)を伝える
             if !reason.contains("再接続") && !reason.contains("自動切替") {
-                notify("Knit", "切り替えられませんでした。もう一度選んでください");
+                notify(
+                    "Knit",
+                    "切り替えられませんでした(相手が応答しません)。相手側アプリの起動を確認してください。この端末はまもなく一覧から消えます",
+                );
             }
             return;
         }
@@ -525,12 +530,14 @@ pub(crate) fn allow_bulk_peer(ip: std::net::IpAddr) -> bool {
     knit_common::net::is_allowed(ip) && *PEER_IP.lock().unwrap_or_else(|e|e.into_inner())==Some(ip)
 }
 
-/// 接続経路の短い表示(メニューバー用)。LAN 内なら "LAN 直"、100.x なら "Tailscale"
+/// 接続経路の短い表示(メニューバー用)。LAN 内なら "LAN 直"、100.x なら "Tailscale"。
+/// ループバック(Android 中継経由)は画面の他箇所と同じ「タブレット」と呼ぶ
 pub fn route_label() -> &'static str {
     match *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) {
         Some(ip) if knit_common::net::is_tailscale(ip) => "Tailscale",
-        // Android の中継は同じ Mac の中から繋ぐ(端末とは adb のワイヤレスデバッグで結ぶ)
-        Some(ip) if ip.is_loopback() => "adb",
+        // Android の中継は同じ Mac の中から繋ぐ(端末とは adb のワイヤレスデバッグで結ぶ)。
+        // 経路名は開発ツール名ではなく、ユーザーが接続相手を読める呼び方で出す
+        Some(ip) if ip.is_loopback() => "タブレット",
         Some(_) => "LAN 直",
         None => "",
     }
@@ -609,7 +616,7 @@ pub fn last_connected_line() -> Option<String> {
     }
     let ago = now_ms().saturating_sub(ms) / 1000;
     let text = match ago {
-        0..=4 => "今しがた".to_string(),
+        0..=4 => "たった今".to_string(),
         5..=59 => format!("{ago}秒前"),
         60..=3599 => format!("{}分前", ago / 60),
         _ => format!("{}時間前", ago / 3600),
@@ -659,7 +666,12 @@ pub(crate) fn mark_connected() {
     }
     METRIC_CONNECTS.fetch_add(1, Ordering::Relaxed);
     if since != 0 && now.saturating_sub(since) > 60_000 {
-        notify("Knit", "Windows と再接続しました");
+        // 再接続した相手の実名(hello の name。未受信の間は汎用の「端末」)で知らせる
+        let peer = PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        notify(
+            "Knit",
+            &format!("{} と再接続しました", if peer.is_empty() { "端末".to_string() } else { peer }),
+        );
     }
 }
 
@@ -759,15 +771,15 @@ mod tests {
 
     /// 受信データの履歴ラベル: 接続中の端末はコンピュータ名(エイリアスが
     /// あれば優先)で載る。Android アプリはエイリアスが無い間は「タブレット」、
-    /// 未接続・未知の id は従来どおり "Windows"
+    /// 未接続・未知の id は汎用の "端末"
     #[test]
     fn history_device_labels_follow_peer_name_alias_and_fallbacks() {
         assert_eq!(history_device_for_peer("android-app-abc"), "タブレット");
-        assert_eq!(history_device_for_peer("android-adb1"), "Windows");
-        assert_eq!(history_device_for_peer(""), "Windows");
-        // bulk 経路(ファイル)はアクティブな接続先で判別する。未接続は "Windows"
+        assert_eq!(history_device_for_peer("android-adb1"), "端末");
+        assert_eq!(history_device_for_peer(""), "端末");
+        // bulk 経路(ファイル)はアクティブな接続先で判別する。未接続は "端末"
         with_peers(vec![], usize::MAX, || {
-            assert_eq!(history_device_for_active(), "Windows");
+            assert_eq!(history_device_for_active(), "端末");
         });
         // Android アプリ選択中: エイリアスが無ければ従来どおり「タブレット」
         with_peers(vec![entry("win-1"), entry("android-app-abc")], 1, || {
@@ -807,12 +819,13 @@ mod tests {
         );
     }
 
-    /// アクティブな接続先の表示名もエイリアス優先(設定の接続ページ・通知で使う)
+    /// アクティブな接続先の表示名もエイリアス優先(設定の接続ページ・通知で使う)。
+    /// 未接続・name 未受信のフォールバックは汎用の "端末"
     #[test]
     fn active_peer_label_prefers_alias() {
         with_peers(vec![], usize::MAX, || {
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
-            assert_eq!(active_peer_label(), "Windows");
+            assert_eq!(active_peer_label(), "端末");
         });
         let mut named = entry("win-1");
         named.name = "DESKTOP-X".into();
@@ -850,7 +863,7 @@ mod tests {
         // 未接続で始まったバッチのラベル(既定)
         with_peers(vec![], usize::MAX, || {
             note_bulk_rx_device();
-            assert_eq!(bulk_rx_device(), "Windows");
+            assert_eq!(bulk_rx_device(), "端末");
         });
     }
 

@@ -29,6 +29,15 @@ Macの画面の端までカーソルを動かすと、そのままWindowsの画�
 | 接続の安定 | スリープ復帰後も自動で再接続。断が 60 秒を超えたときだけ通知。安定性はログで実測できる([集計方法](scripts/stability-report.sh)) |
 | Android タブレット | 別の操作先として接続可能([案内](docs/android.md)) |
 
+### つなげる相手
+
+- **入力共有(キーボード/マウス)は Mac のキーボード → Windows の方向のみ**です
+  (Mac が入力を取得し、Windows が受け取る構造のため)
+- **接続・ファイル転送・クリップボード共有は相手の種類を問いません**。
+  [IPとトークンで直接つなぐ](docs/usage.md#ipとトークンで直接つなぐ登録なしの手動接続)なら
+  Mac 同士・Windows 同士でもファイルとクリップボードが通ります
+- 入力共有を任意の2台(Mac 同士・Windows 同士を含む)へ拡張することを、将来の課題として進めています
+
 ## はじめる / Get started
 
 1. **Mac と Windows の両方に Knit を入れる。** [Releases](https://github.com/reoanrudo/knit/releases) から
@@ -82,6 +91,9 @@ Barrier・Synergy・Input Leap のスリープ復帰・切断系の不満は Red
 - Mac: macOS(Apple Silicon)
 - Windows: 対話セッションのデスクトップ環境
 - 両 PC が同じ LAN、有線直結、または同じ Tailscale ネットワーク上にあること
+- 入力共有は Mac と Windows の組で使います。ファイル・クリップボードだけなら
+  同じ OS 同士(Mac 同士・Windows 同士)の組み合わせも、上の
+  [つなげる相手](#つなげる相手) のとおり手動接続で使えます
 
 ## 開発・貢献
 

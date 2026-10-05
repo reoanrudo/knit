@@ -83,7 +83,7 @@ unsafe fn choose(index: usize) {
         }
         Some(false) => {
             clear_pending();
-            hint("番号が違います。Macの画面に出ている番号を確かめて、「登録する」からやり直してください。");
+            hint("番号が違います。相手の画面に出ている番号を確かめて、「登録する」からやり直してください。");
         }
         None => {}
     }
@@ -105,14 +105,14 @@ unsafe fn search() {
     }
     clear_pending();
     enable_controls(false);
-    hint("登録を受け付けているMacを探しています…");
+    hint("登録を受け付けている相手の端末を探しています…");
     let (tx, rx) = mpsc::channel();
     *EVENTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
     let preview = PREVIEW.load(Ordering::Relaxed);
     std::thread::spawn(move || {
         let peers = if preview {
             vec![Candidate {
-                name: "Mac · 確認用".into(),
+                name: "端末・確認用".into(),
                 address: "192.168.1.10:24904".parse().unwrap(),
             }]
         } else {
@@ -132,18 +132,18 @@ unsafe fn target_address() -> Result<std::net::SocketAddr, &'static str> {
     peers
         .get(selected as usize)
         .map(|p| p.address)
-        .ok_or("Macの設定「接続」で「端末を登録…」を開き、再検索してください。IPでも指定できます。")
+        .ok_or("相手側の設定「接続」で「端末を登録…」を開き、再検索してください。IPでも指定できます。")
 }
 fn save_error_message(e: &std::io::Error, save_failed: bool) -> String {
     if save_failed { "登録情報を保存できませんでした。Windowsのユーザーと保存先を確認してください。".into() }
-    else if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) { "Macに接続できません。登録画面・ネットワーク・IPを確認してください。".into() }
-    else if e.kind() == std::io::ErrorKind::PermissionDenied { "Macで許可されませんでした。もう一度やり直してください。".into() }
-    else { "登録できませんでした。Macの画面を確認し、期限切れなら新しく開いてやり直してください。".into() }
+    else if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) { "相手の端末に接続できません。登録画面・ネットワーク・IPを確認してください。".into() }
+    else if e.kind() == std::io::ErrorKind::PermissionDenied { "相手の端末で許可されませんでした。もう一度やり直してください。".into() }
+    else { "登録できませんでした。相手の画面を確認し、期限切れなら新しく開いてやり直してください。".into() }
 }
 /// 承認方式: Mac に「つなぎたい」と伝え、確認番号を受け取る。持ち主が押すまで何も保存しない
 unsafe fn request_approval() {
     if PREVIEW.load(Ordering::Relaxed) {
-        hint("確認モードでは、Macへ接続しません。");
+        hint("確認モードでは、相手へ接続しません。");
         return;
     }
     let address = match target_address() {
@@ -156,7 +156,7 @@ unsafe fn request_approval() {
     clear_pending();
     BUSY.store(true, Ordering::Relaxed);
     enable_controls(false);
-    hint("Macに確認を求めています…");
+    hint("相手に確認を求めています…");
     let cancel = Arc::new(AtomicBool::new(false));
     *CANCEL.lock().unwrap_or_else(|e| e.into_inner()) = Some(cancel.clone());
     let (tx, rx) = mpsc::channel();
@@ -199,7 +199,7 @@ unsafe fn connect() {
     // コード欄が空なら承認方式(確認番号を見比べる)。コードが入っていれば従来どおりコードで登録する
     if text_of(&FIELD).trim().is_empty() {
         if PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
-            hint("Macの画面に出ている番号を、下の4つから選んでください。");
+            hint("相手の画面に出ている番号を、下の4つから選んでください。");
         } else {
             request_approval();
         }
@@ -209,7 +209,7 @@ unsafe fn connect() {
     let code = match pairing::parse_code(&text_of(&FIELD)) {
         Ok(c) => c,
         Err(_) => {
-            hint("Macに表示された6桁の数字を入力してください。");
+            hint("相手に表示された6桁の数字を入力してください。");
             return;
         }
     };
@@ -294,7 +294,7 @@ unsafe fn poll(hwnd: HWND) {
                     list,
                     CB_ADDSTRING,
                     0,
-                    wide(&format!("{}  ·  {}", peer.name, peer.address.ip())).as_ptr() as isize,
+                    wide(&format!("{} ・ {}", peer.name, peer.address.ip())).as_ptr() as isize,
                 );
             }
             // Multiple results require an explicit choice, never silently pair the first device.
@@ -302,9 +302,9 @@ unsafe fn poll(hwnd: HWND) {
                 SendMessageW(list, CB_SETCURSEL, 0, 0);
             }
             hint(if peers.is_empty() {
-                "Macが見つかりません。Macで登録画面を開くか、IPを入力してください。"
+                "相手が見つかりません。相手側で登録画面を開くか、IPを入力してください。"
             } else {
-                "Macが見つかりました。確認番号が出るまでお待ちください。"
+                "相手が見つかりました。確認番号が出るまでお待ちください。"
             });
             let focus = if peers.len() == 1 {
                 FIELD.load(Ordering::Relaxed) as HWND
@@ -324,7 +324,7 @@ unsafe fn poll(hwnd: HWND) {
         UiEvent::Approval(Ok(pending)) => match pairing::number_choices(&pending.sas) {
             Ok(list) => {
                 hint(&format!(
-                    "Mac「{}」(アドレス {})の画面に出ている番号を、下から選んでください。Macに何も出ていない、または心当たりがなければ、閉じてください。",
+                    "「{}」(アドレス {})の画面に出ている番号を、下から選んでください。相手に何も出ていない、または心当たりがなければ、閉じてください。",
                     pending.server_name,
                     pending.peer().ip()
                 ));
@@ -340,7 +340,7 @@ unsafe fn poll(hwnd: HWND) {
         UiEvent::Registered(Ok(token)) => {
             // 完了が見えるように、少し表示してから閉じる(黙って消えない)。
             // Sleep 中はこのスレッド(UI)のメッセージ処理も止まるため、閉じ操作との競合も起きない
-            hint("登録が完了しました。Macと自動でつながります。");
+            hint("登録が完了しました。登録した端末と自動でつながります。");
             windows_sys::Win32::System::Threading::Sleep(1500);
             *RESULT.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             DestroyWindow(hwnd);
@@ -482,9 +482,9 @@ pub fn first_run(preview: bool) -> Option<String> {
             SendMessageW(child, WM_SETFONT, font as usize, 1);
             child
         };
-        create("STATIC", "Macと、つなぐ。", 36, 28, 608, 44, 0, 0, heading);
-        create("STATIC", "Macの設定「接続」で「端末を登録…」を開いてください。見つかると、確認番号が出ます。\n一度つなげば、次回から自動でつながります。", 36, 83, 608, 52, 0, 0, font);
-        create("STATIC", "1   接続するMac", 36, 158, 608, 26, 0, 0, font);
+        create("STATIC", "相手と、つなぐ。", 36, 28, 608, 44, 0, 0, heading);
+        create("STATIC", "つなぐ相手の端末で、設定「接続」の「端末を登録…」を開いてください。見つかると、確認番号が出ます。\n一度つなげば、次回から自動でつながります。", 36, 83, 608, 52, 0, 0, font);
+        create("STATIC", "1   接続する相手", 36, 158, 608, 26, 0, 0, font);
         let list = create(
             "COMBOBOX",
             "",
@@ -511,7 +511,7 @@ pub fn first_run(preview: bool) -> Option<String> {
         SEARCH.store(searchbutton as usize, Ordering::Relaxed);
         create(
             "STATIC",
-            "見つからない場合は、MacのIP",
+            "見つからない場合は、相手のIP",
             36,
             245,
             270,
@@ -646,7 +646,7 @@ pub fn first_run(preview: bool) -> Option<String> {
             // 終わらず再開方法を案内してから終わる(登録はまだ済んでいない)
             super::MessageBoxW(
                 std::ptr::null_mut(),
-                wide("Knit を終了します。もう一度 Knit を開くと、ここから再開できます。").as_ptr(),
+                wide("Knitを終了します。もう一度Knitを開くと、ここから再開できます。").as_ptr(),
                 wide("Knit — はじめての接続").as_ptr(),
                 MB_OK | MB_ICONINFORMATION,
             );
@@ -674,7 +674,7 @@ pub fn confirm_broken_registration_reset() -> bool {
     unsafe {
         super::MessageBoxW(
             std::ptr::null_mut(),
-            wide("保存した接続キーが読み取れないため、Knit を起動できません。\n登録を初期化してもう一度登録し直しますか?\n\n初期化すると、いま登録済みの端末はすべて接続できなくなり、再登録が必要です。\nWindowsのユーザーが変わっているのが原因の場合は「キャンセル」を選び、前のユーザーで起動するか保存先を確認してください。").as_ptr(),
+            wide("保存した接続キーが読み取れないため、Knitを起動できません。\n登録を初期化してもう一度登録し直しますか?\n\n初期化すると、いま登録済みの端末はすべて接続できなくなり、再登録が必要です。\nWindowsのユーザーが変わっているのが原因の場合は「キャンセル」を選び、前のユーザーで起動するか保存先を確認してください。").as_ptr(),
             wide("Knit — 保存した登録を読み取れません").as_ptr(),
             MB_OKCANCEL | MB_ICONERROR,
         ) == IDOK

@@ -239,7 +239,7 @@ pub fn send_msg_reported(msg: &Msg) -> bool {
 }
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20261004-090802-e3a2973";
+const BUILD_ID: &str = "build-20261005-153737-c8ea7a3";
 
 /// 起動中はロックファイルを保持する(プロセスの終了で自動的に解放される)
 fn acquire_instance_lock() -> bool {
@@ -362,9 +362,9 @@ fn main() {
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
         // プレビューでも「操作する端末」が複数台のときの見た目を確認できるように、
-        // ダミーの Windows を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
+        // ダミーの端末を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
         PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
-            id: "windows-preview".into(), name: "Windows（プレビュー）".into(),
+            id: "pc-preview".into(), name: "PC(プレビュー)".into(),
             ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
             writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
             alias: None,
@@ -372,7 +372,7 @@ fn main() {
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
             PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
-                id: "android-preview".into(), name: "タブレット（プレビュー）".into(),
+                id: "android-preview".into(), name: "タブレット(プレビュー)".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
                 alias: None,
@@ -404,8 +404,18 @@ fn main() {
         t
     } else if envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty()) {
         eprintln!(
-            "[fatal] KNIT_TOKEN が短すぎます(32 文字未満)。scripts/gen-token.sh で生成してください"
+            "[fatal] KNIT_TOKEN が短すぎます(32 文字未満)。設定の「直接つなぐ」の「生成」で作り直してください"
         );
+        // GUI 利用者には stderr が見えず、アプリが黙って死んだようにしか見えない。
+        // 通知センターへも出す(session の listen 失敗と同じ導線)。通知は非同期
+        // 発火のため、表示される時間だけ待ってから終える
+        if !no_gui {
+            crate::notify(
+                "Knit",
+                "接続トークン(KNIT_TOKEN)が短すぎるため起動できません。設定の「直接つなぐ」で「生成」から作り直してください",
+            );
+            std::thread::sleep(Duration::from_millis(1500));
+        }
         std::process::exit(1);
     } else {
         match knit_common::credentials::load() {
@@ -539,7 +549,13 @@ fn main() {
         _ => {}
     }
     if let Some(v) = envutil::get("KNIT_SWITCH_DELAY").and_then(|v| v.parse::<u64>().ok()) {
-        SWITCH_DELAY_MS.store(v.min(5000), Ordering::Relaxed);
+        // 0=滞在なし(無効)はそのまま。それ以外は GUI スライダーと同じ 50-1000ms へ
+        // 収める(設定画面と起動時の受け口で範囲が食い違うと、スライダーに触れた
+        // 瞬間に値が黙って潰れるため)
+        SWITCH_DELAY_MS.store(
+            if v == 0 { 0 } else { v.clamp(50, 1000) },
+            Ordering::Relaxed,
+        );
     }
     if let Some(v) = envutil::get("KNIT_DOUBLE_TAP_MS").and_then(|v| v.parse::<u64>().ok()) {
         DOUBLE_TAP_MS.store(v.clamp(100, 3000), Ordering::Relaxed);
@@ -784,7 +800,13 @@ fn main() {
                 if now == 1 { "直結" } else { "中継(DERP)" }
             );
             if now == 2 {
-                notify("Knit", "Windows との通信が中継経由になりました(遅延が増えます)。同じネットワークか有線直結を推奨します");
+                notify(
+                    "Knit",
+                    &format!(
+                        "{} との通信が中継経路になりました(遅延が増えます)。同じネットワークか有線直結を推奨します",
+                        crate::active_peer_label()
+                    ),
+                );
             }
         }
     });
@@ -881,7 +903,7 @@ fn main() {
     }
 
     // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録。
-    // --diag 起動時の有効化に加え、設定「その他」の「詳しく記録」でも runtime で
+    // --diag 起動時の有効化に加え、設定画面の左下「その他」の「詳しく記録」でも runtime で
     // 切り替えられる(出力スレッドは常駐させて、DIAG_ENABLED の間だけ書き出す)
     if args.iter().any(|a| a == "--diag") {
         DIAG_ENABLED.store(true, Ordering::Relaxed);
@@ -1027,7 +1049,7 @@ fn main() {
                         now.saturating_sub(last_abs),
                         DIAG_ABS_COUNT.load(Ordering::Relaxed)
                     );
-                    knit_common::doctor::note("Windows への転送が止まったため Mac に戻しました");
+                    knit_common::doctor::note("相手の端末への転送が止まったためMacに戻しました");
                     leave_win_mode_cursor_unlock(None);
                     continue;
                 }

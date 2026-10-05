@@ -45,7 +45,7 @@ pub(crate) fn start() {
                 findings.push(Finding {
                     id: "操作先の消失",
                     status: Status::Fail,
-                    detail: format!("Windows 操作中に接続が {} 秒途切れています", t.as_secs()),
+                    detail: format!("操作中の端末との接続が {} 秒途切れています", t.as_secs()),
                     fix: Some(Fix::ReleaseInput),
                 });
             }
@@ -58,14 +58,14 @@ pub(crate) fn start() {
                 findings.push(Finding {
                     id: "カーソル固定の残り",
                     status: Status::Fail,
-                    detail: format!("Mac に戻ったのに位置固定が {} 秒残っています", f.as_secs()),
+                    detail: format!("Macに戻ったのに位置固定が {} 秒残っています", f.as_secs()),
                     fix: Some(Fix::ReleaseInput),
                 });
             }
             doctor::cycle(&findings, &mut gov, crate::now_ms(), &mut |fix| match fix {
                 Fix::ReleaseInput => {
                     leave_win_mode_cursor_unlock(None);
-                    Ok("カーソルと入力を Mac に戻しました".into())
+                    Ok("カーソルと入力をMacに戻しました".into())
                 }
                 Fix::Reconnect => {
                     crate::WAKE.notify();

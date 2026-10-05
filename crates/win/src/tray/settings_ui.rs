@@ -23,6 +23,16 @@ pub(super) static ROLE_NOTE_KIND: AtomicUsize = AtomicUsize::new(0);
 static OWN_IP_LABEL: AtomicUsize = AtomicUsize::new(0);
 /// 接続先の保存ボタン(ホスト役割の間は押せなくする)
 static SAVEHOST_BUTTON: AtomicUsize = AtomicUsize::new(0);
+/// 接続トークン(直接つなぐ)の説明行。KNIT_TOKEN 設定中は運用の注記へ切り替わる
+static TOKEN_NOTE: AtomicUsize = AtomicUsize::new(0);
+/// KNIT_TOKEN(手動直接接続)が設定済みか。保存→再起動でしか変わらないため
+/// 起動時に 1 回だけ .env を見る(毎秒の sync() で読み直さない)
+fn token_manual() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        knit_common::envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty())
+    })
+}
 static HINT: AtomicUsize = AtomicUsize::new(0);
 static DRAW_FONT: AtomicUsize = AtomicUsize::new(0);
 static INPUT_HINT: AtomicUsize = AtomicUsize::new(0);
@@ -34,7 +44,7 @@ pub(super) static HOTKEY_COMBO: AtomicUsize = AtomicUsize::new(0);
 /// 「ショートカットのみ」項目(切替方式コンボの3番目)の前回の文言。同じ間は
 /// コンボへ触れない(開いているドロップダウンが閉じてしまうのを防ぐ)
 static METHOD_ITEM_TITLE: Mutex<String> = Mutex::new(String::new());
-/// 切替キーコンボの「現在のキー（コードN）」項目に入れているキーコード。
+/// 切替キーコンボの「現在のキー(コードN)」項目に入れているキーコード。
 /// 候補外のキーが設定されているときだけ項目を足す(-1 = 無し)
 static HOTKEY_CUSTOM_KC: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 static FLIP_BUTTON: AtomicUsize = AtomicUsize::new(0);
@@ -100,12 +110,25 @@ pub(super) unsafe fn sync() {
             windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow(h as HWND, allowed as i32);
         }
     }
+    // 接続済みなら相手の実名(hello の name。未受信は「端末」)を出す
+    let hint_text = if crate::CONNECTED.load(Ordering::Relaxed) {
+        format!(
+            "接続できています。{}からこのWindowsを操作できます。",
+            crate::conn::peer_display()
+        )
+    } else {
+        "相手側でKnitを開き、同じネットワークまたは直結であることを確認。".to_string()
+    };
+    set_text(HINT.load(Ordering::Relaxed), &hint_text);
+    // トークンの説明は設定中/未設定で切り替わる(Mac 側 token_note_lines と同じ役割。
+    // Win 側には登録の管理行(registration_text)が無いため、設定中である旨は
+    // ここだけが出す=Mac 側より長いままにする)
     set_text(
-        HINT.load(Ordering::Relaxed),
-        if crate::CONNECTED.load(Ordering::Relaxed) {
-            "接続できています。MacからこのWindowsを操作できます。"
+        TOKEN_NOTE.load(Ordering::Relaxed),
+        if token_manual() {
+            "手動接続(共通トークン)で運用中・トークンを空欄にして保存すると、通常の登録に戻ります"
         } else {
-            "MacでKnitを開き、同じネットワークまたは直結であることを確認。"
+            "直接つなぐ:同じトークンを相手側にも設定すると、登録操作なしに直接つなげます"
         },
     );
     static LAST_SIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -170,7 +193,7 @@ fn role_note_text() -> String {
         2 => "切り替えを相手へ送りました。相手の適用を確認しています…".into(),
         3 => "相手の適用を確認しました。再起動します…".into(),
         4 => "相手の適用確認が取れないため、時間経過で再起動します…".into(),
-        _ => "切り替えると、両方のPCで Knit が自動で再起動します".into(),
+        _ => "切り替えると、両方のPCでKnitが自動で再起動します".into(),
     }
 }
 
@@ -187,10 +210,10 @@ fn own_ip_text() -> String {
     }
     let ips = knit_common::discover::local_ipv4s();
     let text = if ips.is_empty() {
-        "このWindowsのアドレス: (取得できません)".to_string()
+        "このPCのアドレス: (取得できません)".to_string()
     } else {
         format!(
-            "このWindowsのアドレス: {}",
+            "このPCのアドレス: {}",
             ips.iter()
                 .map(|ip| ip.to_string())
                 .collect::<Vec<_>>()
@@ -250,13 +273,13 @@ pub(super) unsafe fn build() {
         left: 0,
         top: 0,
         right: 820,
-        bottom: 740,
+        bottom: 870,
     };
     AdjustWindowRect(&mut r, style, 0);
     let hwnd = CreateWindowExW(
         0x00010000, /*WS_EX_CONTROLPARENT*/
         class.as_ptr(),
-        wide("Knit 設定").as_ptr(),
+        wide("Knit設定").as_ptr(),
         style,
         windows_sys::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
         windows_sys::Win32::UI::WindowsAndMessaging::CW_USEDEFAULT,
@@ -418,16 +441,16 @@ pub(super) unsafe fn build() {
     // ラジオは Win32 標準のグループ化(先頭に WS_GROUP、TAB 停止は先頭のみ)
     label(0, "このPCの役割", 236, 134, 300, ID_HEAD_ACT);
     ROLE_CLIENT_RADIO.store(
-        make(Some(0), "BUTTON", "Mac がホスト(既定) — この PC が Mac へ接続しに行きます", 0x9 | WS_TABSTOP | 0x0002_0000 /*WS_GROUP*/, 236, 168, 516, 26, MENU_ROLE_CLIENT, font),
+        make(Some(0), "BUTTON", "相手の端末がホスト(既定) — この PC が接続しに行きます", 0x9 | WS_TABSTOP | 0x0002_0000 /*WS_GROUP*/, 236, 168, 516, 26, MENU_ROLE_CLIENT, font),
         Ordering::Relaxed,
     );
     ROLE_HOST_RADIO.store(
-        make(Some(0), "BUTTON", "この PC がホスト — Mac がこの PC へ接続しに来ます", 0x9, 236, 196, 516, 26, MENU_ROLE_HOST, font),
+        make(Some(0), "BUTTON", "この PC がホスト — 相手の端末がこの PC へ接続しに来ます", 0x9, 236, 196, 516, 26, MENU_ROLE_HOST, font),
         Ordering::Relaxed,
     );
     ROLE_NOTE.store(note(0, "", 236, 230, 520), Ordering::Relaxed);
-    label(0, "接続先のMac", 236, 264, 200, ID_HEAD_ACT);
-    note(0, "MacのIPアドレス", 236, 290, 200);
+    label(0, "接続先の端末", 236, 264, 200, ID_HEAD_ACT);
+    note(0, "相手のIPアドレス", 236, 290, 200);
     // このPC自身のアドレス(相手の Mac 側で IP を指定するときの確認用)
     OWN_IP_LABEL.store(note(0, "", 440, 290, 312), Ordering::Relaxed);
     let host = HOST_NOW.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -450,14 +473,45 @@ pub(super) unsafe fn build() {
         btn(0, "保存して再接続", 562, 320, 190, MENU_SAVEHOST),
         Ordering::Relaxed,
     );
-    // 中段カード: 端末の状態(図は paint_groups が描く)
-    LABEL_STATE.store(
-        label(0, &tray_status_text(), 236, 476, 540, ID_LBL_STATE),
+    // 接続トークン(直接つなぐ)。両側へ同じトークン(KNIT_TOKEN)を設定すると
+    // 登録なしに直接つながる。相手側の設定「接続」で生成した値と同じものを
+    // 入れる(Mac 側設定の「直接つなぐ」欄と対)。空欄=通常の登録(接続キー)へ戻す。
+    // 保存ハンドラ(tray の MENU_SAVETOKEN)が validate_shared_token で検証してから
+    // .env の KNIT_TOKEN へ書き、再起動で反映する
+    label(0, "接続トークン(直接つなぐ)", 236, 372, 300, ID_HEAD_ACT);
+    let token_now = knit_common::envutil::get("KNIT_TOKEN").unwrap_or_default();
+    EDIT_TOKEN.store(
+        make(
+            Some(0),
+            "EDIT",
+            &token_now,
+            0x0080 | 0x00800000 | WS_TABSTOP,
+            236,
+            408,
+            310,
+            30,
+            231,
+            font,
+        ),
         Ordering::Relaxed,
     );
-    HINT.store(note(0, "", 236, 506, 520), Ordering::Relaxed);
+    // トークンは 512 文字が上限(検証と同じ値。それ以上の貼り付けは切り詰められる)
+    SendMessageW(
+        EDIT_TOKEN.load(Ordering::Relaxed) as HWND,
+        0x00C5, /*EM_SETLIMITTEXT*/
+        512,
+        0,
+    );
+    btn(0, "保存して再接続", 562, 402, 190, MENU_SAVETOKEN);
+    TOKEN_NOTE.store(note(0, "", 236, 446, 520), Ordering::Relaxed);
+    // 中段カード: 端末の状態(図は paint_groups が描く)
+    LABEL_STATE.store(
+        label(0, &tray_status_text(), 236, 606, 540, ID_LBL_STATE),
+        Ordering::Relaxed,
+    );
+    HINT.store(note(0, "", 236, 636, 520), Ordering::Relaxed);
     LABEL_RTT.store(
-        label(0, &rtt_line(), 236, 532, 200, ID_LBL_RTT),
+        label(0, &rtt_line(), 236, 662, 200, ID_LBL_RTT),
         Ordering::Relaxed,
     );
     // このPCの名前(相手の Mac へ hello/hello_ok で名乗る名前。静的表示)。
@@ -475,7 +529,7 @@ pub(super) unsafe fn build() {
                 if overridden { "(KNIT_COMPUTERNAME で指定)" } else { "" }
             ),
             440,
-            532,
+            662,
             312,
             ID_HEAD_ACT,
         );
@@ -492,22 +546,22 @@ pub(super) unsafe fn build() {
             0,
             &knit_common::secure::encryption_line(fp.as_deref()),
             236,
-            558,
+            688,
             520,
         );
     }
     // 登録の管理(台数の確認・初期化)は Mac 側の設定にあるため、その案内を出す。
     // この PC は登録される側で、登録済み台数(接続中の端末の一覧)は持たない
-    label(0, "その他", 236, 602, 100, ID_HEAD_ACT);
-    btn(0, "登録情報", 236, 626, 150, MENU_REGISTER);
-    btn(0, "ログ", 394, 626, 130, MENU_OPENLOG);
-    btn(0, "診断", 532, 626, 110, MENU_DIAGNOSE);
-    btn(0, "再起動", 650, 626, 110, MENU_RESTART);
+    label(0, "その他", 236, 732, 100, ID_HEAD_ACT);
+    btn(0, "登録情報", 236, 756, 150, MENU_REGISTER);
+    btn(0, "ログ", 394, 756, 130, MENU_OPENLOG);
+    btn(0, "診断", 532, 756, 110, MENU_DIAGNOSE);
+    btn(0, "再起動", 650, 756, 110, MENU_RESTART);
     note(
         0,
-        "登録済みの台数は Mac の設定「接続」の「登録の管理」で確認できます",
+        "登録済みの台数は、相手がMacならその設定「接続」の「登録の管理」で確認できます",
         236,
-        664,
+        794,
         520,
     );
     // ログの保存場所(Mac 側設定の注記行と対称。「ログ」ボタンが開くのと同じ
@@ -516,11 +570,11 @@ pub(super) unsafe fn build() {
         0,
         "ログ: knit-win.exe と同じフォルダの knit-win.log に追記されます(ボタンで開けない場合はこのファイルを開いてください)",
         236,
-        698,
+        828,
         520,
     );
-    // 画面配置: Mac の設定を Windows から変える(Mac から見たこのPCの位置)
-    label(1, "このPCの位置(Macから見て)", 236, 424, 250, ID_HEAD_ACT);
+    // 画面配置: 相手の設定を Windows から変える(相手から見たこのPCの位置)
+    label(1, "このPCの位置(相手から見て)", 236, 424, 250, ID_HEAD_ACT);
     SIDE_COMBO.store(
         combo(1, &["右", "左", "上", "下", "右上", "右下", "左上", "左下"], 492, 420, 260, ID_SIDE_COMBO),
         Ordering::Relaxed,
@@ -539,15 +593,15 @@ pub(super) unsafe fn build() {
     // 3番目の項目名は sync_mac_prefs が現在の切替キー名へ書き換える(Mac 側と対称)。
     // 初期値は既定キー(F13)の文言にしておく
     METHOD_COMBO.store(
-        combo(2, &["端に2回触れる", "端で少し待つ", "切替キー（F13）のみ", "端に1回触れる"], 440, 314, 312, ID_METHOD_COMBO),
+        combo(2, &["端に2回触れる", "端で少し待つ", "切替キー(F13)のみ", "端に1回触れる"], 440, 314, 312, ID_METHOD_COMBO),
         Ordering::Relaxed,
     );
     label(2, "切替キー", 236, 362, 220, ID_HEAD_ACT);
     // 右⌘(54)は MacBook 内蔵キーボードなど F13 が無い機種での代替(Mac 側と共通の
     // 候補)。候補外のキーが設定されているときは sync_mac_prefs が末尾へ
-    // 「現在のキー（コードN）」項目を足して空選択を潰す
+    // 「現在のキー(コードN)」項目を足して空選択を潰す
     HOTKEY_COMBO.store(
-        combo(2, &["F6（必要に応じてfnと併用）", "F8（必要に応じてfnと併用）", "F13", "右⌘"], 440, 358, 312, ID_HOTKEY_COMBO),
+        combo(2, &["F6(必要に応じてfnと併用)", "F8(必要に応じてfnと併用)", "F13", "右⌘"], 440, 358, 312, ID_HOTKEY_COMBO),
         Ordering::Relaxed,
     );
     label(2, "スクロール方向", 236, 406, 220, ID_HEAD_ACT);
@@ -563,8 +617,8 @@ pub(super) unsafe fn build() {
     label(2, "ピンチで拡大・縮小", 236, 538, 200, ID_HEAD_ACT);
     PINCH_BUTTON.store(btn(2, "", 440, 534, 312, MENU_PAD_PINCH), Ordering::Relaxed);
     label(2, "操作するPC", 236, 612, 250, ID_HEAD_ACT);
-    note(2, "このWindowsの操作を終え、Macに戻ります。", 236, 646, 320);
-    BACK_BUTTON.store(btn(2, "Macへ戻る", 582, 608, 170, MENU_BACKMAC), Ordering::Relaxed);
+    note(2, "このWindowsの操作を終え、相手に戻ります。", 236, 646, 320);
+    BACK_BUTTON.store(btn(2, "相手へ戻る", 582, 608, 170, MENU_BACKMAC), Ordering::Relaxed);
     label(3, "音声", 236, 140, 300, ID_HEAD_ACT);
     LABEL_AUDIO.store(
         label(3, &audio_line(), 236, 172, 520, ID_LBL_AUDIO),
@@ -596,15 +650,15 @@ pub(super) unsafe fn build() {
     btn(3, "受信フォルダを開く", 492, 452, 260, MENU_OPENFOLDER);
     note(
         3,
-        "この設定は、Macの設定にかかわらず、このPCで常に優先されます。",
+        "この設定は、相手側の設定にかかわらず、このPCで常に優先されます。",
         236,
         496,
         520,
     );
-    // 下のブロックは渡すもの(テキスト・ファイル)だけでなく、Mac 自身の記録
-    //(コピーの履歴)や受け取る設定(Macで音声を再生)、相手への指示(スピーカー
-    // ミュート)が混ざるため、「共有する内容」と言い切らず Mac 側の設定とする
-    label(3, "Mac 側の設定", 236, 538, 300, ID_HEAD_ACT);
+    // 下のブロックは渡すもの(テキスト・ファイル)だけでなく、相手側自身の記録
+    //(コピーの履歴)や受け取る設定(音声の再生)、相手への指示(スピーカー
+    // ミュート)が混ざるため、「共有する内容」と言い切らず相手側の設定とする
+    label(3, "相手側の設定", 236, 538, 300, ID_HEAD_ACT);
     MAC_CLIP_BUTTON.store(btn(3, "", 236, 574, 250, MENU_MAC_CLIP), Ordering::Relaxed);
     MAC_FILES_BUTTON.store(btn(3, "", 502, 574, 250, MENU_MAC_FILES), Ordering::Relaxed);
     MAC_HISTORY_BUTTON.store(btn(3, "", 236, 618, 250, MENU_MAC_HISTORY), Ordering::Relaxed);
@@ -619,7 +673,7 @@ pub(super) unsafe fn build() {
             &footer_line(),
             0,
             208,
-            716,
+            846,
             580,
             23,
             222,
@@ -641,6 +695,18 @@ pub(super) unsafe fn build() {
     select(page);
     update_labels();
     bring_to_front(hwnd);
+}
+
+/// 配置図・状態図の四角(144px)に収まるよう相手の名前を詰める。
+/// 相手は hello の実名(未受信は「端末」)。長いコンピュータ名で図が崩れないように
+fn diagram_peer_label() -> String {
+    let name = crate::conn::peer_display();
+    let mut chars: Vec<char> = name.chars().collect();
+    if chars.len() > 8 {
+        chars.truncate(8);
+        chars.push('…');
+    }
+    chars.into_iter().collect()
 }
 
 pub(super) unsafe fn paint_layout(hdc: *mut core::ffi::c_void) {
@@ -682,7 +748,10 @@ pub(super) unsafe fn paint_layout(hdc: *mut core::ffi::c_void) {
         _ => (320, 216, 525, 216),
     };
     let t = theme();
-    for (x, y, text, color) in [(mx, my, "Mac", t.diagram_mac), (wx, wy, "Windows", t.accent)] {
+    for (x, y, text, color) in [
+        (mx, my, diagram_peer_label(), t.diagram_mac),
+        (wx, wy, "このPC".to_string(), t.accent),
+    ] {
         let brush = CreateSolidBrush(rgb(t.diagram_fill));
         let pen = CreatePen(0, 2, rgb(color));
         let ob = SelectObject(hdc, brush);
@@ -700,7 +769,7 @@ pub(super) unsafe fn paint_layout(hdc: *mut core::ffi::c_void) {
             right: x + 144,
             bottom: y + 88,
         };
-        let mut text = wide(text);
+        let mut text = wide(&text);
         DrawTextW(
             hdc,
             text.as_mut_ptr(),
@@ -771,8 +840,10 @@ unsafe fn card(hdc: *mut core::ffi::c_void, top: i32, bottom: i32) {
 }
 pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
     let page = PAGE.load(Ordering::Relaxed);
+    // page0(接続)はトークン欄を役割カードへ足した分、下 2 枚のカードを下へ
+    // 130px ずらしている(要素の座標も build 内で同じだけ移動)
     let groups: &[(i32, i32)] = match page {
-        0 => &[(120, 360), (372, 590), (600, 700)],
+        0 => &[(120, 490), (502, 720), (730, 830)],
         1 => &[(120, 392), (404, 520)],
         2 => &[(120, 290), (302, 596), (608, 700)],
         _ => &[(120, 290), (302, 530), (534, 708)],
@@ -795,13 +866,15 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
         let old = SelectObject(hdc, DRAW_FONT.load(Ordering::Relaxed) as _);
         SetBkMode(hdc, TRANSPARENT_BK);
         SetTextColor(hdc, rgb(theme().head));
-        for (x, name) in [(264, "このWindows"), (574, "Mac")] {
+        // 端末の図: 右は相手の実名(hello の name。未受信は「端末」)
+        let peer = diagram_peer_label();
+        for (x, name) in [(264, "このPC"), (574, peer.as_str())] {
             let mut text = wide(name);
             let mut r = Rect {
                 left: x,
-                top: 439,
+                top: 569,
                 right: x + 150,
-                bottom: 467,
+                bottom: 597,
             };
             DrawTextW(
                 hdc,
@@ -838,9 +911,9 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
             let mut t = [0xE7F4u16, 0];
             let mut r = Rect {
                 left: x,
-                top: 386,
+                top: 516,
                 right: x + 150,
-                bottom: 434,
+                bottom: 564,
             };
             DrawTextW(
                 hdc,
@@ -852,8 +925,8 @@ pub(super) unsafe fn paint_groups(hdc: *mut core::ffi::c_void) {
         }
         let pen = CreatePen(0, 1, rgb(theme().diagram_line));
         let op = SelectObject(hdc, pen);
-        MoveToEx(hdc, 418, 410, std::ptr::null_mut());
-        LineTo(hdc, 568, 410);
+        MoveToEx(hdc, 418, 540, std::ptr::null_mut());
+        LineTo(hdc, 568, 540);
         SelectObject(hdc, op);
         DeleteObject(pen);
         SelectObject(hdc, old);
@@ -982,7 +1055,7 @@ pub(super) unsafe fn sync_mac_prefs() {
     // 文言が変わったときだけ項目を作り直す(ドロップダウン開放中の操作を避ける)
     {
         let title = format!(
-            "切替キー（{}）のみ",
+            "切替キー({})のみ",
             knit_common::keymap::mac_key_label(kc.unwrap_or(105))
         );
         let mut last = METHOD_ITEM_TITLE.lock().unwrap_or_else(|e| e.into_inner());
@@ -996,7 +1069,7 @@ pub(super) unsafe fn sync_mac_prefs() {
         }
     }
     // 切替キー: 既知の候補(F6/F8/F13/右⌘)はその位置を選ぶ。Mac 側で env 等により
-    // 候補外のキーが設定されているときは末尾へ「現在のキー（コードN）」項目を足して
+    // 候補外のキーが設定されているときは末尾へ「現在のキー(コードN)」項目を足して
     // 選ぶ(空選択だと実際のキーと見た目が食い違うため)。候補に戻れば項目を外す
     {
         let h = HOTKEY_COMBO.load(Ordering::Relaxed) as HWND;
@@ -1017,7 +1090,7 @@ pub(super) unsafe fn sync_mac_prefs() {
                         if SendMessageW(h, 0x146 /*CB_GETCOUNT*/, 0, 0) == 5 {
                             SendMessageW(h, 0x144 /*CB_DELETESTRING*/, 4, 0);
                         }
-                        let text = wide(&format!("現在のキー（コード{current}）"));
+                        let text = wide(&format!("現在のキー(コード{current})"));
                         SendMessageW(h, 0x143 /*CB_ADDSTRING*/, 0, text.as_ptr() as isize);
                         HOTKEY_CUSTOM_KC.store(current, Ordering::Relaxed);
                     }
@@ -1041,14 +1114,14 @@ pub(super) unsafe fn sync_mac_prefs() {
             None => format!("{label}: —"),
         }
     };
-    // scroll_flip=true は「Windows 標準に固定」のため、「Macの向きに合わせる」は
-    // 値を反転して表示する(Mac 側チェックボックスの ON と一致させる)
-    set_text(FLIP_BUTTON.load(Ordering::Relaxed), &state("scroll_flip", "Macの向きに合わせる", true));
+    // scroll_flip=true は「Windows 標準に固定」のため、「相手の向きに合わせる」は
+    // 値を反転して表示する(相手側チェックボックスの ON と一致させる)
+    set_text(FLIP_BUTTON.load(Ordering::Relaxed), &state("scroll_flip", "相手の向きに合わせる", true));
     set_text(NAV_BUTTON.load(Ordering::Relaxed), &state("android_navigation", "ナビゲーション", false));
     set_text(PINCH_BUTTON.load(Ordering::Relaxed), &state("android_pinch", "ピンチ", false));
     set_text(MAC_CLIP_BUTTON.load(Ordering::Relaxed), &state("clip_share", "テキストと画像", false));
     set_text(MAC_FILES_BUTTON.load(Ordering::Relaxed), &state("share_files", "ファイル", false));
     set_text(MAC_HISTORY_BUTTON.load(Ordering::Relaxed), &state("local_history", "コピーの履歴", false));
-    set_text(MAC_AUDIO_BUTTON.load(Ordering::Relaxed), &state("audio_muted", "Macで音声を再生", true));
+    set_text(MAC_AUDIO_BUTTON.load(Ordering::Relaxed), &state("audio_muted", "相手側で音声を再生", true));
     set_text(MAC_SPK_BUTTON.load(Ordering::Relaxed), &state("spk_mute", "相手のスピーカーをミュート", false));
 }

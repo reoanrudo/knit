@@ -603,7 +603,7 @@ pub(crate) fn session(
                     text.replace('\n', "\r\n")
                 };
                 *LAST_RECV_CLIP.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
-                history_push(&text, "Mac");
+                history_push(&text, &crate::conn::peer_display());
                 // 書き込みは、クリップボードマネージャ等の他プロセスが掴んでいる間は
                 // 開けない。掴みが数秒続く実測があるため、ここで待つと受信ループ
                 //(マウス・キー)まで止まるため、別スレッドで徐々に間隔を広げて
@@ -683,7 +683,10 @@ pub(crate) fn session(
                     );
                 } else if launch_path(&path) {
                     println!("[app] Windows アプリを起動: {}", log_safe(&path));
-                    tray::notify("Knit", &format!("Mac から起動: {}", log_safe(&path)));
+                    tray::notify(
+                        "Knit",
+                        &format!("{} から起動: {}", crate::conn::peer_display(), log_safe(&path)),
+                    );
                 } else {
                     println!("[app] 起動失敗: {}", log_safe(&path));
                 }

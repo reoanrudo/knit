@@ -282,7 +282,7 @@ fn smart_secret_notify() {
     if due {
         tray::notify(
             "Knit",
-            "クリップボードに機密の可能性があるため Mac へは送りませんでした(履歴にも載りません。KNIT_SMART_SECRET=0 で無効化)",
+            "クリップボードに機密の可能性があるため相手へは送りませんでした(履歴にも載りません。KNIT_SMART_SECRET=0 で無効化)",
         );
     }
 }
@@ -433,8 +433,8 @@ fn send_files_or_note(files: &[String]) {
         return;
     }
     if !FILES_SHARE_W.load(Ordering::Relaxed) {
-        println!("[file] Mac 側でファイル共有がオフのため送りません");
-        tray::notify("Knit", "Mac 側の設定でファイルの受け渡しがオフのため、コピーしたファイルは送りませんでした");
+        println!("[file] 相手側でファイル共有がオフのため送りません");
+        tray::notify("Knit", "相手側の設定でファイルの受け渡しがオフのため、コピーしたファイルは送りませんでした");
         return;
     }
     println!("[file] CF_HDROP: {} files", files.len());

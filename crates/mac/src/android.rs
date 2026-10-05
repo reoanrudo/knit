@@ -97,7 +97,7 @@ pub fn spawn(port: u16, token: String) {
     let mode = envutil::get("KNIT_ANDROID").unwrap_or_default();
     if mode == "0" || mode.eq_ignore_ascii_case("off") {
         state::publish(state::Status {
-            problem: Some("Android 接続は無効です(KNIT_ANDROID=0)".into()),
+            problem: Some("Android接続は無効です(KNIT_ANDROID=0)".into()),
             tablets: Vec::new(),
         });
         return;
@@ -134,7 +134,7 @@ pub fn spawn(port: u16, token: String) {
             let mut tablets = Vec::new();
             for d in &seen {
                 let link = Link::of(&d.serial);
-                let fallback_name = d.model.clone().unwrap_or_else(|| "Android 端末".into());
+                let fallback_name = d.model.clone().unwrap_or_else(|| "Android端末".into());
                 if d.state != "device" {
                     let phase = if d.state == "unauthorized" {
                         notify_once(
@@ -163,7 +163,7 @@ pub fn spawn(port: u16, token: String) {
                         notify_once(
                             &id.key,
                             "ask",
-                            &format!("{} が見つかりました。タブレットの Knit アプリから接続してください(adb で操作する場合は KNIT_ANDROID_ADB=1)", id.name),
+                            &format!("{} が見つかりました。タブレットのKnitアプリから接続してください(adb で操作する場合は KNIT_ANDROID_ADB=1)", id.name),
                         );
                         Phase::AskUser
                     }
@@ -714,13 +714,13 @@ fn run_session(
     }
     // Knit の本線へ 1 台の接続先として入る
     let knit = TcpStream::connect(("127.0.0.1", port))
-        .map_err(|e| format!("Knit へ接続できません: {e}"))?;
+        .map_err(|e| format!("Knitへ接続できません: {e}"))?;
     knit.set_nodelay(true).ok();
     knit.set_write_timeout(Some(Duration::from_secs(5))).ok();
     knit.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let knit_raw = knit.try_clone().map_err(|e| e.to_string())?;
     let (r, mut writer) = secure::connect(knit, token, b"knit-main")
-        .map_err(|e| format!("Knit との暗号化ハンドシェイク失敗: {e}"))?;
+        .map_err(|e| format!("Knitとの暗号化ハンドシェイク失敗: {e}"))?;
     let hello = encode(&Msg::Hello {
         ver: VERSION,
         name: name.clone(),
@@ -740,7 +740,7 @@ fn run_session(
         .read_line(&mut line)
         .map_err(|e| format!("hello_ok を受け取れません: {e}"))?;
     if !matches!(decode(line.trim()), Some(Msg::HelloOk { .. })) {
-        return Err("Knit から hello_ok が返りません".into());
+        return Err("Knitから hello_ok が返りません".into());
     }
     // Knit は 3 秒毎に pong/ping を返すため、9 秒の無通信は経路断とみなす
     reader
@@ -1008,6 +1008,13 @@ fn audio_thread(sock: TcpStream, name: &str) {
 /// 送り先(操作中のセッションが登録する): adb の場所、シリアル、端末の表示名
 static PUSH_TARGET: Mutex<Option<(PathBuf, String, String)>> = Mutex::new(None);
 
+/// adb push で送信中の残り件数(0=送信なし)。adb push はファイルごとに最大120秒
+/// 待つため、複数件の送り込みは長時間音無しになりがち。中止はできないが
+/// 「今どれだけ残っているか」をメニューの状態行へ出すためのフラグ
+///(gui.rs の imp_send_file が立て、push_files のループで減らす)
+pub static PUSH_REMAINING: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn register_push_target(adb: &Path, serial: &str, name: &str) {
     *PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()) =
         Some((adb.to_path_buf(), serial.to_string(), name.to_string()));
@@ -1025,6 +1032,11 @@ pub fn push_files(paths: &[std::path::PathBuf]) -> Option<usize> {
     let (adb, serial, name) = PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
     let mut ok = 0;
     for p in paths {
+        // 1 件済むごとに残りを減らす(進行表示はこの値を見る)。write はこの
+        // ループだけで・read は送信開始時の 1 回だけのため、飽和引き算で足りる
+        // skip(ファイル名が取れない)経路でも減らさないと残りが 0 に届かない
+        let remain = PUSH_REMAINING.load(Ordering::Relaxed);
+        PUSH_REMAINING.store(remain.saturating_sub(1), Ordering::Relaxed);
         let Some(file) = p.file_name() else { continue };
         let dest = format!("/sdcard/Download/{}", file.to_string_lossy());
         match adb_run(
@@ -1153,7 +1165,7 @@ fn input_loop(
             }
             Err(e) => {
                 let _ = gestures::write_to(ctl,pinch.finish(),ptr.size()).and_then(|_|ctl.flush());
-                return Err(format!("Knit との通信が切れました: {e}"));
+                return Err(format!("Knitとの通信が切れました: {e}"));
             }
             Ok(_) => {}
         }
