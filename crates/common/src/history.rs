@@ -719,6 +719,20 @@ pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) {
     }
 }
 
+/// UI の 1 行へ差し込む動的な名前の切り詰め(共通・文字数上限)。エイリアスや
+/// ホスト名のような長さの決まらない文字列を、行幅が決まっている場所(履歴の
+/// 項目・接続ページの状況行・placeholder 等)へ埋め込むときに必ず上限内へ
+/// 収める。超過時は「…」を添えて続きがあることが見えるようにする
+/// (Mac・Windows の両側で同じ規則で切れるよう common へ置く)
+pub fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let head: String = text.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
 /// メニュー/リスト表示用の 1 行プレビュー(改行を潰し max 文字で丸める)
 pub fn preview(text: &str, max: usize) -> String {
     let flat = text
@@ -741,7 +755,9 @@ pub fn preview(text: &str, max: usize) -> String {
 }
 
 /// メニュー用ラベル("URL・3分前・Windows・テキストの先頭…"。URL/ファイルは
-/// 先頭に種別を添える。ファイルは 1 件目の名前と件数で示す)
+/// 先頭に種別を添える。ファイルは 1 件目の名前と件数で示す)。device(エイリアス
+/// 最大 48 文字)は 16 文字で切る: 本文の切り詰め幅(max)を.device が食い潰して
+/// 種別・本文まで読めなくならないようにする(Mac・Windows で共通の効き方)
 pub fn label(entry: &Entry, now_ms: u64, max: usize) -> String {
     let mins = now_ms.saturating_sub(entry.ts) / 60_000;
     let ago = if mins < 1 {
@@ -753,10 +769,10 @@ pub fn label(entry: &Entry, now_ms: u64, max: usize) -> String {
     } else {
         format!("{}日前", mins / (60 * 24))
     };
+    let device = truncate_chars(&entry.device, 16);
     match entry.kind {
         Kind::Url => format!(
-            "{ago}・{}・URL・{}",
-            entry.device,
+            "{ago}・{device}・URL・{}",
             preview(&entry.text, max)
         ),
         Kind::File => {
@@ -775,8 +791,7 @@ pub fn label(entry: &Entry, now_ms: u64, max: usize) -> String {
                 names.first().cloned().unwrap_or_default()
             };
             format!(
-                "{ago}・{}・ファイル・{}",
-                entry.device,
+                "{ago}・{device}・ファイル・{}",
                 preview(&shown, max)
             )
         }
@@ -785,9 +800,9 @@ pub fn label(entry: &Entry, now_ms: u64, max: usize) -> String {
             let size = parse_image_entry(&entry.text)
                 .map(|(_, s)| format!("・{}KB", (s / 1024).max(1)))
                 .unwrap_or_default();
-            format!("{ago}・{}・画像{size}", entry.device)
+            format!("{ago}・{device}・画像{size}")
         }
-        Kind::Text => format!("{ago}・{}・{}", entry.device, preview(&entry.text, max)),
+        Kind::Text => format!("{ago}・{device}・{}", preview(&entry.text, max)),
     }
 }
 
@@ -987,6 +1002,38 @@ mod tests {
         h.push_text("https://example.com", "Mac", 1);
         let l = label(h.entries().last().unwrap(), 2_000, 30);
         assert!(l.contains("URL・"), "URL 種別をラベルへ出す");
+    }
+
+    /// メニュー 1 行の切り詰め(truncate_chars): 上限内はそのまま、超えたら
+    /// 上限文字+「…」。エイリアス(最大 48 文字)を埋め込むすべての表示が
+    /// この規則に乗る(共通関数のため Mac・Windows の両側へ同じ効き方)
+    #[test]
+    fn truncate_chars_bounds_dynamic_names() {
+        assert_eq!(truncate_chars("ReoのMac", 12), "ReoのMac", "上限内は切らない");
+        assert_eq!(truncate_chars("", 16), "", "空は空のまま");
+        let full = "あ".repeat(48);
+        let cut = truncate_chars(&full, 12);
+        assert_eq!(cut.chars().count(), 13, "12 文字+「…」");
+        assert!(cut.ends_with('…'));
+        // 半角混じりでも文字数で数える(幅は呼び出し側の行毎に別途守る)
+        let mixed = format!("{}{}", "a".repeat(20), "あ".repeat(20));
+        assert_eq!(truncate_chars(&mixed, 10), format!("{}…", "a".repeat(10)));
+    }
+
+    /// 履歴ラベルの device 名: エイリアス(最大 48 文字)が本文(max 文字)を
+    /// 食い潰して種別・本文まで読めなくならないよう、16 文字+「…」へ切り詰める
+    #[test]
+    fn label_truncates_long_device_names() {
+        let mut h = History::new(10);
+        let alias = "太".repeat(48);
+        let id = h.push_text("本文テキスト", &alias, 1_000).unwrap();
+        let l = label(h.get(id).unwrap(), 2_000, 34);
+        let shown = format!("{}…", "太".repeat(16));
+        assert!(
+            l.contains(&format!("たった今・{shown}・本文テキスト")),
+            "device は 16 文字+「…」へ切り詰める: {l}"
+        );
+        assert_eq!(l.matches('…').count(), 1, "本文は切れていない(1 つの「…」のみ)");
     }
 
     #[test]

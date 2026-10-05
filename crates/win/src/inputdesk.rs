@@ -157,12 +157,12 @@ fn fall_back_to_mac(secure: bool) {
     } else {
         "管理者権限で動いているアプリ"
     };
-    println!("[desk] {what}は Mac から操作できません(操作補助が未導入)。制御を Mac へ返します");
+    println!("[desk] {what}は相手から操作できません(操作補助が未導入)。制御を相手へ返します");
     if CONTROLLED.load(Ordering::Relaxed) {
         crate::state::send_main_msg(&Msg::Return { ny: 0.5 });
         crate::tray::notify(
             "Knit",
-            &format!("{what}は Mac から操作できないため、操作を Mac へ戻しました。Windows 側で直接操作してください"),
+            &format!("{what}は相手から操作できないため、操作を相手へ戻しました。Windows側で直接操作してください"),
         );
     }
 }

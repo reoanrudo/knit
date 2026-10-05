@@ -1,5 +1,36 @@
 //! Main-thread native text editor: macOS IME commits Unicode before transfer.
 use super::*;
+
+/// モーダルの「送信」ボタン(do_command から Return で押す用)。
+/// runModal の間だけ有効(show の最後で 0 へ戻す)
+static TEXT_SEND_BUTTON: AtomicUsize = AtomicUsize::new(0);
+
+/// テキスト編集欄(textview)へコマンドセレクタが来た時の delegate。
+/// IME 確定後の Return(insertNewline:)で「送信」を押したのと同じ扱いにする
+/// (direct_input.m の doCommandBySelector: と同じ作法)。YES を返すと
+/// NSTextView はコマンド(改行の挿入)を実行しないため、送る文字列に
+/// 改行が混ざらない。IME 未確定(marked text)の Return は入力メソッドが
+/// 消費するためそもそもここへ来ないが、確定直後の誤動作を防ぐため二重に確認する
+pub(super) unsafe extern "C" fn do_command(
+    _s: ID,
+    _c: SEL,
+    textview: ID,
+    command: SEL,
+) -> u8 {
+    if command == sel(c"insertNewline:") && !textview.is_null() {
+        let marked: unsafe extern "C" fn(ID, SEL) -> u8 =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        if marked(textview, sel(c"hasMarkedText")) == 0 {
+            let send = TEXT_SEND_BUTTON.load(Ordering::Relaxed) as ID;
+            if !send.is_null() {
+                msg1_void_id(send, sel(c"performClick:"), std::ptr::null_mut());
+                return 1;
+            }
+        }
+    }
+    0
+}
+
 pub(super) unsafe extern "C" fn show(_s: ID, _c: SEL, _sender: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
@@ -29,8 +60,13 @@ pub(super) unsafe extern "C" fn show(_s: ID, _c: SEL, _sender: ID) {
         nsstring("タブレットへ文字を入力"),
     );
     msg1_void_id(alert,sel(c"setInformativeText:"),nsstring("タブレットの入力欄を先に選び、Knitキーボードを使ってください。\nここではMacの日本語変換を使えます。変換を確定してから送信してください。"));
-    crate::msg1_id(alert, sel(c"addButtonWithTitle:"), nsstring("送信"));
-    crate::msg1_id(alert, sel(c"addButtonWithTitle:"), nsstring("戻る"));
+    let send = crate::msg1_id(alert, sel(c"addButtonWithTitle:"), nsstring("送信"));
+    TEXT_SEND_BUTTON.store(send as usize, Ordering::Relaxed);
+    let back = crate::msg1_id(alert, sel(c"addButtonWithTitle:"), nsstring("戻る"));
+    // Esc で「戻る」を押せるようにする(Return は do_command が「送信」へ流す)
+    if !back.is_null() {
+        msg1_void_id(back, sel(c"setKeyEquivalent:"), nsstring("\u{1b}"));
+    }
     let init: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
         std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let editor = init(
@@ -45,6 +81,13 @@ pub(super) unsafe extern "C" fn show(_s: ID, _c: SEL, _sender: ID) {
     );
     msg1_void_u8(editor, sel(c"setRichText:"), 0);
     msg1_void_u8(editor, sel(c"setEditable:"), 1);
+    // Return/Esc を do_command(textView:doCommandBySelector:)へ受ける delegate。
+    // メニューバー常駐型はメインメニューが無いため、alert 自体はデフォルトの
+    // キー操作(Return=先頭ボタン)に頼らず明示的に流す
+    let target = super::GUI_TARGET.load(Ordering::Relaxed) as ID;
+    if !target.is_null() {
+        msg1_void_id(editor, sel(c"setDelegate:"), target);
+    }
     let font = msg1_id_f64(
         objc_getClass(c"NSFont".as_ptr()),
         sel(c"systemFontOfSize:"),
@@ -67,6 +110,7 @@ pub(super) unsafe extern "C" fn show(_s: ID, _c: SEL, _sender: ID) {
     let window = msg0(alert, sel(c"window"));
     msg1_void_id(window, sel(c"setInitialFirstResponder:"), editor);
     let choice = crate::msg0_isize(alert, sel(c"runModal"));
+    TEXT_SEND_BUTTON.store(0, Ordering::Relaxed);
     let raw = msg0_cstr(msg0(editor, sel(c"string")), sel(c"UTF8String"));
     if choice == 1000 && !raw.is_null() {
         let text = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();

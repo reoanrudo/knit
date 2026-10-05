@@ -195,7 +195,7 @@ pub fn on_click() {
             set_state(State::Installing);
             std::thread::spawn(move || match install(&Available { version, artifact }) {
                 Ok(()) => {
-                    crate::tray::notify("Knit", "更新を適用します。Knit は自動で再起動します");
+                    crate::tray::notify("Knit", "更新を適用します。Knitは自動で再起動します");
                     std::thread::sleep(Duration::from_millis(1500));
                     crate::audio::speaker_disconnect();
                     crate::release_all_input();
@@ -291,7 +291,7 @@ pub fn run_apply(args: &[String]) -> i32 {
     // 結果は、起動する側のプロセスが読める「起動の前」に書く(新版は起動直後に読むため)
     let start = |launch: Launch| {
         let message = match launch {
-            Launch::New => "Knit を更新しました",
+            Launch::New => "Knitを更新しました",
             Launch::Restore { restored: true } => "更新できませんでした。元の版へ戻しました",
             Launch::Restore { restored: false } => "更新できませんでした。元の版へ完全には戻せませんでした。インストール先の「.knit-old」が付いたファイルを元の名前に戻してください",
         };

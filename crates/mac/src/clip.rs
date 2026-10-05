@@ -525,7 +525,7 @@ pub(crate) fn sync_clipboard_to_win() {
             // 入力経路(タップ)は塞がない
             if knit_common::smartguard::looks_secret(&text) == Some(true) {
                 eprintln!("[clip] smartguard: 機密の可能性が高いため Windows へ送りません");
-                smart_secret_notify("Windows へは送りませんでした");
+                smart_secret_notify(&format!("{} へは送りませんでした", active_peer_label()));
                 return;
             }
             eprintln!("[clip] mac->win {} bytes", text.len());

@@ -19,6 +19,9 @@ enum State {
     Checking,
     Available { version: String, artifact: Artifact },
     Installing,
+    /// 確認(or 適用)に失敗した。通知は数秒で消えるため、失敗が分かる表示を
+    /// 次のクリックまで残す(クリックで Idle へ戻して最初からやり直す)
+    Failed(String),
 }
 
 static STATE: Mutex<State> = Mutex::new(State::Idle);
@@ -35,11 +38,19 @@ fn set_state(s: State) {
 
 /// メニュー項目の表示。状態に応じて変わる
 pub fn menu_title() -> String {
+    menu_title_with_reason().0
+}
+
+/// メニュー項目の表示と、失敗時の理由(メニュー項目のツールチップ用)。Failed の
+/// 理由は通知だと数秒で消えるため、メニューバーの項目へはこちらで理由も載せる
+/// (設定画面のアップデートボタンは廃止したため、退避先はメニュー項目のみ)
+pub fn menu_title_with_reason() -> (String, Option<String>) {
     match state() {
-        State::Idle => "アップデートを確認…".into(),
-        State::Checking => "アップデートを確認中…".into(),
-        State::Available { version, .. } => format!("Knit {version} に更新…"),
-        State::Installing => "更新を準備中…".into(),
+        State::Idle => ("アップデートを確認…".into(), None),
+        State::Checking => ("アップデートを確認中…".into(), None),
+        State::Available { version, .. } => (format!("Knit {version} に更新…"), None),
+        State::Installing => ("更新を準備中…".into(), None),
+        State::Failed(reason) => ("更新を確認できません".into(), Some(reason)),
     }
 }
 
@@ -139,7 +150,7 @@ fn plist_string(app: &Path, key: &str) -> Option<String> {
 /// 展開した新しい .app が、宣言どおりの Knit か・署名が壊れていないか・署名者が変わっていないかを確認する
 fn verify_bundle(new: &Path, current: &Path, version: &str) -> Result<(), String> {
     if plist_string(new, "CFBundleIdentifier").as_deref() != Some(BUNDLE_ID) {
-        return Err("更新ファイルが Knit ではありません".into());
+        return Err("更新ファイルがKnitではありません".into());
     }
     if plist_string(new, "CFBundleShortVersionString").as_deref() != Some(version) {
         return Err("更新ファイルの版が更新情報と一致しません".into());
@@ -183,14 +194,14 @@ alive() { [ -n "$(pids)" ]; }
 cleanup() { case "$(basename "$STAGE")" in .knit-update-*) rm -rf "$STAGE" ;; esac; }
 i=0
 while kill -0 "$PID" 2>/dev/null; do
-  i=$((i+1)); [ "$i" -gt 150 ] && { notify "更新できませんでした。Knit を終了できなかったため、現在の版のままです"; cleanup; exit 1; }; sleep 0.1
+  i=$((i+1)); [ "$i" -gt 150 ] && { notify "更新できませんでした。Knitを終了できなかったため、現在の版のままです"; cleanup; exit 1; }; sleep 0.1
 done
 rm -rf "$OLD"
 mv "$TARGET" "$OLD" || { notify "更新できませんでした。現在の版のままです"; start; cleanup; exit 1; }
 if ! mv "$NEW" "$TARGET"; then mv "$OLD" "$TARGET"; notify "更新できませんでした。元の版へ戻しました"; start; cleanup; exit 1; fi
 start
 sleep "$WAIT"
-if alive; then rm -rf "$OLD"; notify "Knit を更新しました"; cleanup; exit 0; fi
+if alive; then rm -rf "$OLD"; notify "Knitを更新しました"; cleanup; exit 0; fi
 for p in $(pids); do kill "$p" 2>/dev/null; done
 rm -rf "$TARGET"; mv "$OLD" "$TARGET"; notify "新しい版が起動しなかったため、元の版へ戻しました"; start; cleanup; exit 1
 "#;
@@ -254,7 +265,7 @@ fn install(a: &Available) -> Result<(), String> {
         let new = pkg.join("Knit.app");
         // シンボリックリンクではなく実体のフォルダだけを受け付ける
         if !std::fs::symlink_metadata(&new).map(|m| m.is_dir()).unwrap_or(false) {
-            return Err("更新ファイルに Knit.app がありません".to_string());
+            return Err("更新ファイルにKnit.appがありません".to_string());
         }
         verify_bundle(&new, &target, &a.version)?;
         let staged = stage.join("Knit.app");
@@ -297,10 +308,19 @@ pub fn on_click() {
                     }
                     Err(e) => {
                         crate::notify("Knit", &e);
-                        set_state(State::Idle);
+                        // Idle へ戻すと通知だけで失敗が消え、ボタンが何事も無かった
+                        // かのように戻るため、失敗の表示を次のクリックまで残す
+                        set_state(State::Failed(e));
                     }
                 }
             });
+        }
+        // 失敗表示のまま押されたら最初からやり直す(1 段の再帰で必ず Idle へ着く)。
+        // 通知は数秒で消えるため、前回の失敗理由はログへ残す(問い合わせの確認用)
+        State::Failed(reason) => {
+            eprintln!("[update] 確認を再試行します(前回の失敗理由: {reason})");
+            set_state(State::Idle);
+            on_click();
         }
         State::Available { version, artifact } => {
             set_state(State::Installing);
@@ -308,16 +328,17 @@ pub fn on_click() {
                 Ok(()) => {
                     // 署名者(Team)が無い版同士の更新では、macOS がアクセシビリティ許可を引き継がない
                     let note = if running_bundle().is_some_and(|b| team_id(&b).is_none()) {
-                        "更新を適用します。Knit は自動で再起動します。許可が外れた場合は、システム設定でアクセシビリティを許可し直してください"
+                        "更新を適用します。Knitは自動で再起動します。許可が外れた場合は、システム設定でアクセシビリティを許可し直してください"
                     } else {
-                        "更新を適用します。Knit は自動で再起動します"
+                        "更新を適用します。Knitは自動で再起動します"
                     };
                     crate::notify("Knit", note);
                     crate::request_quit_for_update();
                 }
                 Err(e) => {
                     crate::notify("Knit", &e);
-                    set_state(State::Idle);
+                    // 確認時と同じく、失敗が通知だけで消えないように表示を残す
+                    set_state(State::Failed(e));
                 }
             });
         }
@@ -415,14 +436,17 @@ pub fn start_background() {
     std::thread::spawn(|| {
         std::thread::sleep(FIRST_CHECK_DELAY);
         loop {
-            if matches!(state(), State::Idle) {
+            // Failed 中も自動確認は回す: 失敗表示の解除をクリック待ちにすると、
+            // 6 時間毎の確認が一度の失敗で止まってしまうため(新しい版が見つかれば
+            // Available が Failed を上書きする。エラー時は通知を増やさず何もしない)
+            if matches!(state(), State::Idle | State::Failed(_)) {
                 if let Ok(Some(a)) = check() {
                     let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
                     if *n != a.version {
                         *n = a.version.clone();
                         crate::notify("Knit", &available_text(&a.version));
                     }
-                    if matches!(state(), State::Idle) {
+                    if matches!(state(), State::Idle | State::Failed(_)) {
                         set_state(State::Available { version: a.version, artifact: a.artifact });
                     }
                 }
@@ -507,6 +531,22 @@ mod tests {
             artifact: Artifact { platform: "p".into(), url: "u".into(), size: 1, sha256: "0".into() },
         });
         assert_eq!(menu_title(), "Knit 9.9.9 に更新…");
+        set_state(State::Idle);
+    }
+
+    /// 確認の失敗は通知だけで消えず、項目名が「更新を確認できません」へ切り替わる
+    /// (理由の詳細は通知で既に出ているため、項目は状態だけ示す)。
+    /// STATE は共有 static のため、このテストは状態遷移を 1 本にまとめる
+    #[test]
+    fn failed_state_keeps_title_until_next_click() {
+        set_state(State::Idle);
+        set_state(State::Failed("確認できませんでした".into()));
+        assert_eq!(menu_title(), "更新を確認できません");
+        // 次のクリックで Idle へ戻る(=再試行の導線が復活する)
+        if let State::Failed(_) = state() {
+            set_state(State::Idle);
+        }
+        assert_eq!(menu_title(), "アップデートを確認…");
         set_state(State::Idle);
     }
 }

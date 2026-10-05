@@ -94,7 +94,7 @@ pub fn parse_code(input: &str) -> io::Result<String> {
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_digit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Macに表示された6桁の数字を入力してください。",
+            "相手の画面に表示された6桁の数字を入力してください。",
         ));
     }
     Ok(code)
@@ -952,7 +952,7 @@ pub fn manual_address(input: &str) -> io::Result<SocketAddr> {
     let ip: IpAddr = input.trim().parse().map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "MacのIPアドレスを入力してください。",
+            "相手のIPアドレスを入力してください。",
         )
     })?;
     if !ip.is_ipv4()

@@ -42,7 +42,7 @@ impl Drop for Owned {
     }
 }
 fn error(status: i32) -> io::Error {
-    io::Error::other(format!("キーチェーンを利用できません（{status}）。"))
+    io::Error::other(format!("キーチェーンを利用できません({status})。"))
 }
 const SERVICE: &str = "local.knit.connection";
 unsafe fn query(service: &str) -> io::Result<Owned> {

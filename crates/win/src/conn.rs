@@ -43,7 +43,8 @@ fn mark_connected() {
     }
     METRIC_CONNECTS.fetch_add(1, Ordering::Relaxed);
     if since != 0 && now.saturating_sub(since) > 60_000 {
-        conn_notify(true, "Mac と再接続しました");
+        // 再接続した相手の実名(hello の name。未受信の間は汎用の「端末」)で知らせる
+        conn_notify(true, &format!("{} と再接続しました", peer_display()));
     }
 }
 
@@ -65,7 +66,7 @@ pub fn last_connected_line() -> Option<String> {
     }
     let ago = now_ms().saturating_sub(ms) / 1000;
     let text = match ago {
-        0..=4 => "今しがた".to_string(),
+        0..=4 => "たった今".to_string(),
         5..=59 => format!("{ago}秒前"),
         60..=3599 => format!("{}分前", ago / 60),
         _ => format!("{}時間前", ago / 3600),
@@ -125,6 +126,21 @@ fn conn_notify(connected: bool, text: &str) {
 pub(crate) static PEER: std::sync::Mutex<Option<std::net::IpAddr>> = std::sync::Mutex::new(None);
 /// 接続相手の名前(hello で受け取る)。通知・ログへ出す
 pub static PEER_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// 表示に使う相手の名前(実名)。hello を受け取る前・切断後は汎用の「端末」に
+/// 落ちる(Mac 側の再接続通知・履歴ラベルと同じ規則。Mac 以外が相手でも成り立つ)
+pub(crate) fn peer_display() -> String {
+    let name = PEER_NAME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        "端末".into()
+    } else {
+        name
+    }
+}
 
 /// LAN 昇格監視の世代(Tailscale 接続のたびに発行)。単一の常駐スレッド
 ///(lan_promotion_watch_loop)がこの世代を見て監視対象のセッションを切り替える
@@ -207,7 +223,7 @@ pub(crate) fn client_loop(hosts: Option<String>, port: u16, token: &str, w: i32,
             // 候補が空なら first_reachable を呼ばない(スレッド 0 のまま 3.5 秒待つだけの
             // 無駄。発見 600ms と合算して再接続が遅れる)
             println!(
-                "[conn] 接続先が見つかりません(LAN の Mac を発見できず KNIT_HOST の候補も空です)"
+                "[conn] 接続先が見つかりません(LAN の相手を発見できず KNIT_HOST の候補も空です)"
             );
             let delay = backoff.next_delay();
             NEXT_RETRY_AT_MS.store(now_ms() + delay.as_millis() as u64, Ordering::Relaxed);
@@ -290,7 +306,7 @@ fn handshake_and_hello(
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
                 let n = safe_peer_name(name.trim());
                 if n.is_empty() {
-                    "Mac".into()
+                    "端末".into()
                 } else {
                     n
                 }
@@ -341,9 +357,9 @@ pub(crate) fn server_loop(token: &str, port: u16, w: i32, h: i32) {
             // ポート占有での起動失敗をトレイのバルーンへも出す(exit するとログしか
             // 残らないため)。tray::start は main の中で先に走っているため通知窓はある
             tray::notify(
-                "Knit を起動できません",
+                "Knitを起動できません",
                 &format!(
-                    "ポート {port} が他のアプリに使用中です。他の Knit(旧 Tsunagu 等)が動いていないか確認してください"
+                    "ポート {port} が他のアプリに使用中です。他のKnit(旧 Tsunagu 等)が動いていないか確認してください"
                 ),
             );
             exit(1);
@@ -491,7 +507,7 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
                 let n = safe_peer_name(name.trim());
                 if n.is_empty() {
-                    "Mac".into()
+                    "端末".into()
                 } else {
                     n
                 }
