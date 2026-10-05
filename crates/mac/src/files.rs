@@ -28,7 +28,7 @@ pub enum SendFilesOutcome {
 /// 掴んだまま境界を越える場合は offer_drag_to_win を使う
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
     if !knit_common::share::allow_files() {
-        notify("Knit", "この Mac ではファイルの共有が許可されていません(KNIT_SHARE)");
+        notify("Knit", "このMacではファイルの共有が許可されていません(KNIT_SHARE)");
         return SendFilesOutcome::Denied;
     }
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
@@ -78,7 +78,7 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
             notify(
                 "Knit",
                 &format!(
-                    "{} 件・合計 {} を {peer} へ送信します(相手の保存先 Downloads/Knit の空き容量をご確認ください)",
+                    "{} 件・合計 {} を {peer} へ送信します(相手の保存先 Downloads/Knitの空き容量をご確認ください)",
                     entries.len(),
                     human_bytes(total)
                 ),
@@ -599,7 +599,9 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             let ok = unsafe { mac_set_clipboard_image_bmp(&bmp) };
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
             if ok {
-                history_push_image(&bmp, "Windows");
+                // 履歴ラベルは他の bulk 受信(ファイル)と同じくバッチ開始時点の
+                // アクティブ端末(エイリアス優先。未受信の間は汎用の「端末」)
+                history_push_image(&bmp, &bulk_rx_device());
             }
             eprintln!(
                 "[clip] win->mac image {}KB {}",
@@ -758,10 +760,70 @@ pub fn xfer_line() -> Option<String> {
         x.label
     ))
 }
+
+/// 本線の転送進捗(xfer_line)が無い間の補助表示(純粋関数・単体テストで守る)。
+/// ・adb_remaining: ADB 経由でタブレットへ送信中の残り件数(0=送信なし)。
+///   adb push はファイルごとに最大120秒待つため、完了通知まで何も出ない
+///   「画面が固まった?」状態を防ぐ(中止はできないため件数のみ出す)
+/// ・rx_active: 大容量経路でファイルの受信バッチが進行中か。相手からの送信は
+///   進捗がこちらからは測れないため「受信中」であることだけ出す
+///(送信と受信が重なったときは、遅い ADB 側を優先して見せる)
+pub(crate) fn xfer_extra_line(adb_remaining: usize, rx_active: bool) -> Option<String> {
+    if adb_remaining > 0 {
+        Some(format!("タブレットへ送信中(残り{adb_remaining}件)"))
+    } else if rx_active {
+        Some("ファイルを受信中".into())
+    } else {
+        None
+    }
+}
 /// 直近に送ったクリップボードファイルの指紋(同じ ⌘C の再送防止)
 pub(crate) static LAST_SENT_FILES: Mutex<String> = Mutex::new(String::new());
 
 /// 掴みドラッグ offer の経路猶予判定(切替直後の未接続で構造的に失敗する回帰の防止)
+/// 補助進捗表示(xfer_extra_line)の文言: ADB 送信は残り件数、bulk 受信は
+/// 「受信中」であることだけを出す。どちらも進捗% が測れない経路のため、
+/// 出ない(=完了通知しかない)状態に戻さないことをテストで守る
+#[cfg(test)]
+mod xfer_extra_line_tests {
+    use super::xfer_extra_line;
+
+    #[test]
+    fn adb_push_shows_remaining_count() {
+        // adb push はファイルごとに最大120秒待つため、残り件数が見えないと
+        // 「画面が固まった?」と誤読させる。残り 1 件でも必ず文言が出る
+        assert_eq!(
+            xfer_extra_line(3, false).as_deref(),
+            Some("タブレットへ送信中(残り3件)"),
+            "残り件数がそのまま読み取れる"
+        );
+        assert_eq!(
+            xfer_extra_line(1, false).as_deref(),
+            Some("タブレットへ送信中(残り1件)")
+        );
+    }
+
+    #[test]
+    fn bulk_rx_shows_receiving_without_progress() {
+        // 相手からの受信は進捗が測れないため「受信中」の文言のみ
+        assert_eq!(
+            xfer_extra_line(0, true).as_deref(),
+            Some("ファイルを受信中")
+        );
+    }
+
+    #[test]
+    fn adb_takes_priority_and_idle_shows_nothing() {
+        // 送受信の重なりでは待ちの長い ADB 側を優先(受信は完了通知で補完される)。
+        // どちらも進行していないときは従来どおり何も出さない(常時表示にしない)
+        assert_eq!(
+            xfer_extra_line(2, true).as_deref(),
+            Some("タブレットへ送信中(残り2件)")
+        );
+        assert_eq!(xfer_extra_line(0, false), None);
+    }
+}
+
 #[cfg(test)]
 mod drag_offer_link_tests {
     use super::{drag_offer_link_ok, DRAG_LINK_REBUILD_WINDOW_MS};

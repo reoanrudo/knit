@@ -110,7 +110,7 @@ pub fn accept(id: u64) {
                 crate::tray::notify(
                     "Knit",
                     &format!(
-                        "Macへファイルを渡せませんでした({}。接続を確認してもう一度掴んでください)",
+                        "相手へファイルを渡せませんでした({}。接続を確認してもう一度掴んでください)",
                         bulk::send_error_label(&error)
                     ),
                 );
@@ -318,7 +318,7 @@ unsafe extern "system" fn enter(
         crate::tray::notify(
             "Knit",
             &format!(
-                "Macへ転送中です({})。境界で押したまま待つと、準備後にMacへ移ります(サイズによって数十秒以上かかることがあります)",
+                "相手へ転送中です({})。境界で押したまま待つと、準備後に相手へ移ります(サイズによって数十秒以上かかることがあります)",
                 crate::human_bytes(total)
             ),
         );

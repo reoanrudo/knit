@@ -591,28 +591,28 @@ pub fn start(paths: Vec<String>) {
         src_release(src);
         drop(host);
         if effect == DROPEFFECT_COPY {
-            // ドロップできた files も「Macからの受信」なので、⌘C・fallback
+            // ドロップできた files も「相手からの受信」なので、⌘C・fallback
             // 経路と同じく履歴に載せる(経路で履歴の残り方が変わらないようにする)
             crate::history_push_files(
                 &paths
                     .iter()
                     .map(std::path::PathBuf::from)
                     .collect::<Vec<_>>(),
-                "Mac",
+                &crate::conn::peer_display(),
             );
             println!("[drag] ドロップ完了(コピー。元は Downloads\\Knit に残ります)");
         } else if hr == DRAGDROP_S_CANCEL {
             // この時点で転送は完了済みのため、取消で受信済みファイルが消えることは
             // ない。残ることを通知で言い切る(消えたと思って探させるトラブルの防止)
             println!(
-                "[drag] ドロップを取り消しました(受信済みの {} 件は Downloads\\Knit に残っています)",
+                "[drag] ドロップを取り消しました(受信済みの {} 件は Downloads\\Knitに残っています)",
                 paths.len()
             );
             #[cfg(not(test))]
             crate::tray::notify(
                 "Knit",
                 &format!(
-                    "ドロップを取り消しました。受信済みの {} 件は Downloads\\Knit に残っています",
+                    "ドロップを取り消しました。受信済みの {} 件は Downloads\\Knitに残っています",
                     paths.len()
                 ),
             );
@@ -638,7 +638,7 @@ fn fallback(paths: &[String]) {
                 .iter()
                 .map(std::path::PathBuf::from)
                 .collect::<Vec<_>>(),
-            "Mac",
+            &crate::conn::peer_display(),
         );
         println!(
             "[drag] ドロップとして渡せなかったため、{} 件をクリップボードに載せました(Ctrl+V で貼り付け可。Downloads\\Knit にも保存済み)",

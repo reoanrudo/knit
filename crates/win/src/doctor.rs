@@ -90,13 +90,13 @@ fn observe(
     let controlled = CONTROLLED.load(Ordering::Relaxed);
     let mut out = Vec::new();
 
-    // Mac が離しそびれた注入ボタン: 制御されていない(または切断中)のに押下が残る
+    // 相手が離しそびれた注入ボタン: 制御されていない(または切断中)のに押下が残る
     let held = stuck.update(injected_button_down() && (!controlled || !connected));
     if held >= STUCK_AFTER {
         out.push(Finding {
             id: "入力の取り残し",
             status: Status::Fail,
-            detail: format!("Mac から押したボタンが {} 秒離されていません", held.as_secs()),
+            detail: format!("相手から押したボタンが {} 秒離されていません", held.as_secs()),
             fix: Some(Fix::ReleaseInput),
         });
     }
@@ -106,7 +106,7 @@ fn observe(
         out.push(Finding {
             id: "接続",
             status: Status::Fail,
-            detail: format!("Mac と {} 秒つながっていません", down.as_secs()),
+            detail: format!("相手と {} 秒つながっていません", down.as_secs()),
             fix: Some(Fix::Reconnect),
         });
     }
