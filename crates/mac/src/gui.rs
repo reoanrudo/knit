@@ -31,6 +31,18 @@ pub fn restore_preferences() {
     preferences::restore();
 }
 
+/// tap(peer-sides.json)側から保存状態行(全ページ共通の最下部)へエラーを
+/// 出す導線。peer-sides.json は tap が保存するため、退避の検知も tap で行うが、
+/// 出す場所は他の保存系エラーと同じ prefs::set_save_error に一本化する
+pub(crate) fn report_peer_sides_error(note: String) {
+    prefs::set_save_error(prefs::SaveErrorSource::PeerSidesFile, note);
+}
+/// peer-sides.json を保存し直せたら退避の案内を外す(tap の save_peer_sides
+/// 成功から呼ぶ。preferences::save が PrefsFile を外すのと対称)
+pub(crate) fn clear_peer_sides_error() {
+    prefs::clear_save_error(prefs::SaveErrorSource::PeerSidesFile);
+}
+
 /// セレクタ登録の薄いラッパ(extern fn はそのまま import できないため)
 unsafe fn sel(name: &std::ffi::CStr) -> SEL {
     crate::sel_registerName(name.as_ptr())
@@ -130,6 +142,9 @@ static GUI_XFER_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// クリップボード履歴のサブメニュー(項目は refresh_status が変化時だけ作り直す)
 static GUI_HISTORY_MENU: AtomicUsize = AtomicUsize::new(0);
 static GUI_UPDATE_ITEM: AtomicUsize = AtomicUsize::new(0);
+/// メニューの「接続を診断…」項目(実行中は題名を「診断中…」へ書き換える。
+/// 設定画面の診断ボタン(prefs::DIAG_BUTTON)と同じ作法)
+static GUI_DIAG_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_ROLE_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Android タブレットのサブメニュー(状態・操作する/しないの切替)。世代が変わった時だけ作り直す
 /// 変化検知の初期値は最大値にして、起動直後の 1 回目で必ず作り直させる
@@ -141,6 +156,12 @@ static GUI_HISTORY_OPEN: AtomicBool = AtomicBool::new(false);
 static GUI_HISTORY_PENDING: AtomicBool = AtomicBool::new(false);
 /// 履歴の見出し項目(件数表示を setTitle で更新する)
 static GUI_HISTORY_ITEM: AtomicUsize = AtomicUsize::new(0);
+/// メニューバー本体のメニュー(状態行などを持つ)。開示中の追跡に使う
+static GUI_MAIN_MENU: AtomicUsize = AtomicUsize::new(0);
+/// メニューバー本体が開示中(tracking 中)か。開示中は状態行の setTitle を控える
+/// (可変幅の長い文言が毎秒書き換わると表示中のメニュー幅が脈動するため。
+/// 履歴サブメニューの GUI_HISTORY_OPEN と同じ作法で、閉じた時に 1 回反映する)
+static GUI_MAIN_MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 /// 毎秒の再構築判断: 履歴に変化があり、かつメニューが閉じている時にだけ作り直す。
 /// 開示中の保留(未定義動作の回避)と閉じた時の反映を分けて試験で固定する
@@ -153,6 +174,13 @@ fn history_flush_on_close(pending: bool, last_id: u64, seen: u64) -> bool {
     pending && last_id != seen
 }
 
+/// 状態行の setTitle を打つ判断(純粋関数・単体テストで守る)。メニューバー本体が
+/// 開示中は打たない(開示中の書き換えは表示中のメニュー幅を脈動させる)。閉じた
+/// 時に 1 回だけ反映するため、開示中の更新は失われない
+fn state_title_set_now(menu_open: bool) -> bool {
+    !menu_open
+}
+
 // ---------- 設定ウィンドウ(メニュー「設定…」で開く) ----------
 static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_AUDIO: AtomicUsize = AtomicUsize::new(0);
@@ -161,6 +189,11 @@ static PREFS_CHK_SCROLL: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
 static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
 static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
+/// カーソル速度スライダー(0.2..3.0 の倍率)とその値表示。設定「操作」ページ
+static PREFS_MOUSE_SLIDER: AtomicUsize = AtomicUsize::new(0);
+static PREFS_MOUSE_SCALE_LABEL: AtomicUsize = AtomicUsize::new(0);
+/// スクロール互換モードのスイッチ(120 未満を無視する古いアプリ用)。設定「操作」
+static PREFS_CHK_SCROLL_COMPAT: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_FILES: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_HISTORY: AtomicUsize = AtomicUsize::new(0);
@@ -233,7 +266,7 @@ unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
         .spawn();
 }
 
-/// 設定「その他」の「設定フォルダを開く」: 設定の保存先(~/.config/knit)を
+/// 設定画面の左下「その他」の「設定フォルダを開く」: 設定の保存先(~/.config/knit)を
 /// Finder で開く(imp_open_log と同じ open コマンドの導線)。フォルダがまだ
 /// 無いときは作ってから開く(初回起動で env が無い場合でも導線が死なないように)
 unsafe extern "C" fn imp_open_settings_dir(_s: ID, _c: SEL, _n: ID) {
@@ -253,7 +286,7 @@ unsafe extern "C" fn imp_open_settings_dir(_s: ID, _c: SEL, _n: ID) {
     }
 }
 
-/// 設定「その他」の「設定を書き出す…」: 現在の設定一式を JSON ファイルへ保存
+/// 設定画面の左下「その他」の「設定を書き出す…」: 現在の設定一式を JSON ファイルへ保存
 /// する(引っ越し・バックアップ用。NSSavePanel で場所を選ぶ)
 unsafe extern "C" fn imp_export_prefs(_s: ID, _c: SEL, _n: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
@@ -275,7 +308,11 @@ unsafe extern "C" fn imp_export_prefs(_s: ID, _c: SEL, _n: ID) {
     msg1_void_id(
         panel,
         sel(c"setMessage:"),
-        nsstring("Knit の設定を書き出します(接続キー・履歴は含まれません)"),
+        // 対象外の説明は実際の対象と一致させる(過少に書くと「入れておいた
+        // 接続先まで移った」と誤解させる): snapshot は GUI 設定のみで、
+        // 接続キー(キーチェーン)・履歴・接続先(KNIT_HOST)・直接つなぐ
+        // (KNIT_TOKEN)・画面配置(peer-sides.json)は含まれない
+        nsstring("Knitの設定を書き出します(接続キー・履歴・接続先・直接つなぐ・画面配置は含まれません)"),
     );
     msg1_void_id(
         panel,
@@ -310,7 +347,7 @@ unsafe extern "C" fn imp_export_prefs(_s: ID, _c: SEL, _n: ID) {
     }
 }
 
-/// 設定「その他」の「設定を読み込む…」: 書き出した JSON から設定を復元する。
+/// 設定画面の左下「その他」の「設定を読み込む…」: 書き出した JSON から設定を復元する。
 /// 読み込みは apply(知らないキー無視・範囲検査つき)を通すため、外部で
 /// 編集されたファイルでも安全。反映は保存と同じ経路で、画面の表示は
 /// 毎秒の sync() が追いつける
@@ -337,7 +374,7 @@ unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
     msg1_void_id(
         panel,
         sel(c"setMessage:"),
-        nsstring("書き出しておいた Knit の設定ファイルを選んでください"),
+        nsstring("書き出しておいたKnitの設定ファイルを選んでください"),
     );
     let resp = crate::msg0_isize(panel, sel(c"runModal"));
     if resp != 1 {
@@ -355,6 +392,40 @@ unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
     let source = std::ffi::CStr::from_ptr(utf8)
         .to_string_lossy()
         .into_owned();
+    // 現在の全設定が確認なしで置き換わるため、確認(既定=キャンセル)を挟む。
+    // 置き換え前に現在の設定を設定フォルダへ 1 世代だけ自動書き出しする
+    // (常に同じファイル名へ上書き=退避のように番号を増やさない。読み込んだ
+    // ファイル側に不具合があっても元へ戻せる事故復旧用の材料)
+    if confirm_alert(
+        "現在の設定を読み込んだ内容で置き換えますか?",
+        "置き換える前に、いまの設定を設定フォルダの preferences-backup.json へ保存してから読み込みます。",
+        &["キャンセル", "置き換える"],
+    ) != 1001 {
+        return;
+    }
+    // バックアップが書けないまま置き換えると復旧材料が無いため、失敗したら
+    // 読み込みを中止する(import_from 自体は範囲検査つきで安全なため、保存先が
+    // 書けない状況だけがここでの止めどころ)
+    match knit_common::envutil::config_dir() {
+        Some(dir) => {
+            if let Err(e) = preferences::export_to(&dir.join("preferences-backup.json")) {
+                eprintln!("[prefs] 置き換え前の設定の書き出しに失敗: {e}");
+                crate::notify(
+                    "Knit",
+                    "置き換え前の設定を設定フォルダへ保存できなかったため、読み込みを中止しました。設定フォルダ(~/.config/knit)の権限を確認してください",
+                );
+                return;
+            }
+        }
+        None => {
+            eprintln!("[prefs] 設定フォルダが取得できないため読み込みを中止します");
+            crate::notify(
+                "Knit",
+                "置き換え前の設定を保存する設定フォルダが取得できないため、読み込みを中止しました",
+            );
+            return;
+        }
+    }
     match preferences::import_from(std::path::Path::new(&source)) {
         Ok(()) => {
             eprintln!("[prefs] 設定を読み込みました: {source}");
@@ -362,6 +433,17 @@ unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
                 "Knit",
                 "設定を読み込みました。環境変数・envファイルの指定がある項目は、そちらが優先されます",
             );
+            // 読み込んだ値に「このMacの名前」も含まれるため、欄の表示を現在値へ
+            // 合わせる(sync_alias_field と同じ作法。旧い名前が欄に残っていると、
+            // 次の保存で欄の値が読み込んだ値を黙って上書きしてしまう)
+            let field = prefs::own_name_field() as ID;
+            if !field.is_null() {
+                let name = crate::OWN_NAME
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                msg1_void_id(field, sel(c"setStringValue:"), nsstring(&name));
+            }
             refresh_status();
         }
         Err(e) => {
@@ -371,8 +453,65 @@ unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
     }
 }
 
-/// 履歴メニューの「消す」クリック。本文は不要(メニュー操作で即反映)
+/// 破壊的操作の確認ダイアログ(setup.rs の確認ダイアログと同じ作法: 先頭のボタンが
+/// Return の既定=キャンセル)。メニューバー常駐(Accessory)のままではアラートが
+/// 前面に出ないことがあるため、表示中だけ Regular へ切り替える。
+/// メニュー/ボタンのハンドラ(メインスレッド)からのみ呼ぶ。戻り値は runModal の
+/// ボタン番号(最初のボタン=1000、2番目=1001)。生成に失敗した時は 0=キャンセル扱い
+unsafe fn confirm_alert(title: &str, body: &str, buttons: &[&str]) -> isize {
+    let app = msg0(
+        objc_getClass(c"NSApplication".as_ptr()),
+        sel(c"sharedApplication"),
+    );
+    if !app.is_null() {
+        msg1_void_i64(app, sel(c"setActivationPolicy:"), 0);
+        msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    }
+    let a = msg0(objc_getClass(c"NSAlert".as_ptr()), sel(c"new"));
+    if a.is_null() {
+        return 0;
+    }
+    msg1_void_id(a, sel(c"setMessageText:"), nsstring(title));
+    msg1_void_id(a, sel(c"setInformativeText:"), nsstring(body));
+    for button in buttons {
+        let _: ID = crate::msg1_id(a, sel(c"addButtonWithTitle:"), nsstring(button));
+    }
+    let result = crate::msg0_isize(a, sel(c"runModal"));
+    msg0_void(a, sel(c"release"));
+    if !app.is_null() {
+        msg1_void_i64(app, sel(c"setActivationPolicy:"), 1);
+    }
+    result
+}
+
+/// NSButton を破壊的操作の見た目へ(macOS 12+: 赤文字で通常ボタンと区別させる。
+/// API が無い古い OS では何もせず通常ボタンとして機能する=レイアウト側の
+/// 間隔確保だけでも区別は保たれる)
+unsafe fn mark_destructive(button: ID) {
+    if button.is_null() {
+        return;
+    }
+    let responds: unsafe extern "C" fn(ID, SEL, SEL) -> u8 =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    if responds(button, sel(c"respondsToSelector:"), sel(c"setHasDestructiveAction:")) != 0 {
+        msg1_void_u8(button, sel(c"setHasDestructiveAction:"), 1);
+    }
+}
+
+/// 履歴メニューの「すべて消す…」クリック。全履歴が戻せずに消えるため確認を挟む
+/// (既定=キャンセル)。プレビュー中は本物の履歴ファイルを触らない
 unsafe extern "C" fn imp_history_clear(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let confirmed = confirm_alert(
+        "履歴をすべて消しますか?",
+        "履歴すべて(最大50件)が消え、元に戻せません。",
+        &["キャンセル", "消す"],
+    );
+    if confirmed != 1001 {
+        return;
+    }
     crate::history_clear();
     crate::HISTORY_LAST_ID.store(0, Ordering::Relaxed);
 }
@@ -387,6 +526,9 @@ unsafe extern "C" fn imp_cancel_xfer(_s: ID, _c: SEL, _n: ID) {
 /// クリップボード履歴メニューの項目クリック。representedObject(NSString)から
 /// 本文を取り出して Mac のクリップボードへ復元する
 unsafe extern "C" fn imp_history_restore(_s: ID, _c: SEL, sender: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
     if sender.is_null() {
         return;
     }
@@ -433,30 +575,39 @@ unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
     };
     // 形式の確認: カンマ区切りの各要素が IP アドレス(IPv4/IPv6)として書けているか。
     // ホスト名は Knit の接続先指定では使わないため、入力ミスをここで止める。
-    // 判定は Windows 側(MENU_SAVEHOST)と共通の knit_common::connect::validate_host_input
+    // 判定は Windows 側(MENU_SAVEHOST)と共通の knit_common::connect::validate_host_input。
+    // エラーは通知だけでなく設定ウィンドウの保存状態行にも出す(通知は数秒で
+    // 消えるため、入力を直す間ずっと見える場所が要る)。文言は prefs::
+    // host_validation_error(入力原文を 30 文字へ切り詰め、対処文言が保存状態行
+    // から押し出されない構造)が担う
     if let Err(bad) = knit_common::connect::validate_host_input(&text) {
-        crate::notify(
-            "Knit",
-            &format!("接続先「{bad}」が IP アドレスとして読めません。192.168.1.23 の形式で入力してください(カンマ区切りで複数可)"),
-        );
+        let message = prefs::host_validation_error(&bad);
+        prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
+        crate::notify("Knit", &message);
         eprintln!("[prefs] 接続先の形式が不正のため保存しません: {bad}");
         return;
     }
     let Some(dir) = knit_common::envutil::config_dir() else {
-        crate::notify("Knit", "ホームが取得できず接続先を保存できませんでした");
+        let message = "ホームが取得できず接続先を保存できませんでした".to_string();
+        prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
+        crate::notify("Knit", &message);
         return;
     };
     let path = dir.join("env");
-    // Windows 側(save_host_to_env)と同じ安全策: 失敗したら通知して元のまま続ける
+    // Windows 側(save_host_to_env)と同じ安全策: 失敗したら通知して元のまま続ける。
+    // 失敗の理由({e})も本文へ出す(ログを見る手段が分からない利用者にも原因が伝わる)
     if let Err(e) = knit_common::envutil::set_env_value(&path, "KNIT_HOST", &text) {
+        let message = format!("接続先を保存できませんでした。\n{e}");
+        prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
+        crate::notify("Knit", &message);
         eprintln!("[prefs] 接続先の保存に失敗: {e}");
-        crate::notify("Knit", "接続先を保存できませんでした。ログを確認してください");
         return;
     }
+    prefs::clear_save_error(prefs::SaveErrorSource::Host);
     let message = if text.is_empty() {
-        "接続先の指定を外しました(自動発見へ戻します)。Knit を再起動します".to_string()
+        "接続先の指定を外しました(自動発見へ戻します)。Knitを再起動します".to_string()
     } else {
-        format!("接続先を {text} に保存しました。Knit を再起動します")
+        format!("接続先を {text} に保存しました。Knitを再起動します")
     };
     // 保存先(~/.config/knit/env)より優先される指定(起動時の環境変数)があるときは
     // 保存が効かないため、上書き方法を併せて案内する
@@ -483,6 +634,99 @@ unsafe fn field_text(field: ID) -> String {
     }
 }
 
+/// 設定「接続」の「直接つなぐ(手動接続)」の「保存して再接続」: ~/.config/knit/env の
+/// KNIT_TOKEN 行を書き換えて再起動する(トークンは起動時に読まれるため。imp_save_host
+/// と同じ導線)。空欄なら行を消して通常の登録(キーチェーンの接続キー)へ戻る。
+/// 相手は Windows・Mac・タブレットのどれでもよく、両側へ同じ値を設定すると
+/// 登録操作なしに直接つながる
+unsafe extern "C" fn imp_save_token(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let text = field_text(prefs::token_field() as ID);
+    // 読み込み側(main)は 32 文字未満の KNIT_TOKEN で起動が止まる(fatal)ため、
+    // common の検証で先に弾く(短いトークンを保存して再起動後につながらない事故の防止)。
+    // エラーは入力欄の直下の注記行(TOKEN_NOTE)にも出す(通知は数秒で消えるため)
+    if let Err(msg) = knit_common::credentials::validate_shared_token(&text) {
+        prefs::set_save_error(prefs::SaveErrorSource::Token, msg.to_string());
+        crate::notify("Knit", msg);
+        eprintln!(
+            "[prefs] 直接つなぐのトークンが不正のため保存しません(長さ {})",
+            text.len()
+        );
+        return;
+    }
+    let Some(dir) = knit_common::envutil::config_dir() else {
+        let message = "ホームが取得できず直接つなぐのトークンを保存できませんでした".to_string();
+        prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
+        crate::notify("Knit", &message);
+        return;
+    };
+    // Windows 側(.env の KNIT_TOKEN)と同じ安全策: 失敗したら通知して元のまま続ける。
+    // 失敗の理由({e})も本文へ出す(ログを見る手段が分からない利用者にも原因が伝わる)
+    if let Err(e) = knit_common::envutil::set_env_value(&dir.join("env"), "KNIT_TOKEN", &text) {
+        let message = format!("直接つなぐのトークンを保存できませんでした。\n{e}");
+        prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
+        crate::notify("Knit", &message);
+        eprintln!("[prefs] 直接つなぐのトークンの保存に失敗: {e}");
+        return;
+    }
+    prefs::clear_save_error(prefs::SaveErrorSource::Token);
+    let message = if text.is_empty() {
+        "直接つなぐのトークンを外しました(通常の登録へ戻します)。Knitを再起動します".to_string()
+    } else {
+        "直接つなぐのトークンを保存しました。相手側にも同じトークンを設定すると、再起動後に直接つながります".to_string()
+    };
+    // 保存先(~/.config/knit/env)より優先される指定(起動時の環境変数)があるときは
+    // 保存が効かないため、外し方を併せて案内する(imp_save_host と同じ安全策)
+    let message = if std::env::var("KNIT_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
+        format!("{message}。なお環境変数 KNIT_TOKEN が設定されているため、そちらが優先されます(外すには設定元で削除してください)")
+    } else {
+        message
+    };
+    crate::notify("Knit", &message);
+    restart_now();
+}
+
+/// 設定「接続」の「直接つなぐ」の「生成」: 32 文字の共有トークン(半角英数字)を
+/// 作って入力欄へ入れる。乱数は登録鍵と同じ OS の安全な乱数。保存はしない
+/// (「保存して再接続」で両側へ設定してから反映する運用のため)
+unsafe extern "C" fn imp_gen_token(_s: ID, _c: SEL, _n: ID) {
+    let field = prefs::token_field() as ID;
+    if field.is_null() {
+        return;
+    }
+    match knit_common::credentials::generate_shared_token() {
+        Ok(token) => {
+            msg1_void_id(field, sel(c"setStringValue:"), nsstring(&token));
+            // 生成しただけでは保存ではないため、ここではエラーを外さない:
+            // 前回保存の失敗理由は「保存して再接続」が成功するまで出し続ける
+            if !UI_PREVIEW.load(Ordering::Relaxed) {
+                crate::notify(
+                    "Knit",
+                    "トークンを生成しました。この値を相手側にも設定してから「保存して再接続」を押してください",
+                );
+            }
+        }
+        Err(e) => {
+            // 失敗の理由({e})も本文へ出し、入力欄の直下の注記行にも保持する
+            let message = format!("トークンを生成できませんでした。\n{e}");
+            eprintln!("[prefs] トークン生成に失敗: {e}");
+            prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
+            if !UI_PREVIEW.load(Ordering::Relaxed) {
+                crate::notify("Knit", &message);
+            }
+        }
+    }
+}
+
+/// 設定「接続」の「直接つなぐ」の開閉ラベル: トークン未設定の間だけ節の
+/// 表示/非表示をトグルする(設定済み=手動接続中は常に展開のため何も変わらない。
+/// 開閉状態は prefs 側の static が持つため、ウィンドウを開き直しても維持される)
+unsafe extern "C" fn imp_toggle_token_section(_s: ID, _c: SEL, _n: ID) {
+    prefs::toggle_token_section();
+}
+
 /// 設定「接続」の「選択中の端末の名前」: アクティブな端末のエイリアス(表示名)を
 /// peer-sides.json へ保存する。空欄ならコンピュータ名(hello の name)へ戻す。
 /// ポップアップ・配置エディタ・履歴・通知の表示がエイリアス優先へ切り替わる
@@ -493,10 +737,19 @@ unsafe extern "C" fn imp_save_alias(_s: ID, _c: SEL, _n: ID) {
     let text = field_text(prefs::alias_field() as ID);
     let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
     if act == usize::MAX {
-        crate::notify("Knit", "接続中の端末がありません。つながってから名前を設定してください");
+        // 通知だけでは数秒で消えるため、保存状態行(SAVE_LABEL)にも同じ理由を出す
+        // (imp_save_own_name の検証エラーと同じ導線。次の保存成功まで保持する)
+        let message = "接続中の端末がありません。つながってから名前を設定してください".to_string();
+        prefs::set_save_error(prefs::SaveErrorSource::Alias, message.clone());
+        crate::notify("Knit", &message);
         return;
     }
     crate::tap::set_peer_alias(act, &text);
+    // peer-sides.json への保存は preferences::save() を経由しないため、保存状態行が
+    // 古い文言(エラー含む)のまま残る。ここで保存済みの文言へ揃える(表示だけ。
+    // 固定キーの案内も save_status_saved が同じ形で出す)
+    prefs::set_save_status(&prefs::save_status_saved(&preferences::override_keys()));
+    prefs::clear_save_error(prefs::SaveErrorSource::Alias);
     let message = if text.is_empty() {
         "端末の名前をコンピュータ名に戻しました"
     } else {
@@ -520,19 +773,31 @@ unsafe extern "C" fn imp_save_own_name(_s: ID, _c: SEL, _n: ID) {
     // 混じんでいたら除去して保存せず弾く(意図しない名前になるのを防ぐ)
     let cleaned = knit_common::proto::safe_peer_name(&text);
     if !cleaned.is_empty() && cleaned != text {
-        crate::notify(
-            "Knit",
-            "名前に使えない文字が含まれています。制御文字などを除いてください",
-        );
+        // 通知だけでは数秒で消えるため、保存状態行(SAVE_LABEL)にも出す
+        // (次の保存成功まで保持。欄の下に注記行は作らない=全ページ共通の
+        // 最下部へ集約する他の保存系エラーと同じ導線)
+        let message = "名前に使えない文字が含まれています。制御文字などを除いてください".to_string();
+        prefs::set_save_error(prefs::SaveErrorSource::OwnName, message.clone());
+        crate::notify("Knit", &message);
         eprintln!("[prefs] このMacの名前は不正な文字を含むため保存しません: {text:?}");
         return;
     }
     *crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()) = cleaned.clone();
+    // 保存が成功したらこの欄の出元のエラーだけ外す(他の出元の未解決エラーは残す。
+    // 外さないと sync() が毎秒エラー文言で保存状態行を書き戻してしまう)
+    prefs::clear_save_error(prefs::SaveErrorSource::OwnName);
     preferences::save();
+    // 反映は再接続時(hello/hello_ok の name)のため、今の接続には効かないことを
+    // 通知で先に言う(保存したのに相手側表示が変わらず「効いてない」と誤読させるのを防ぐ)
     let message = if cleaned.is_empty() {
-        format!("このMacの名前をホスト名({})に戻しました", crate::hostname_label())
+        format!(
+            "このMacの名前をホスト名({})に戻しました。次の接続から相手側の表示へ反映されます",
+            crate::hostname_label()
+        )
     } else {
-        format!("このMacの名前を「{cleaned}」に保存しました")
+        format!(
+            "このMacの名前を「{cleaned}」に保存しました。次の接続から相手側の表示へ反映されます"
+        )
     };
     crate::notify("Knit", &message);
     // クリーン済みの値を見た目へ戻す(trim 済み)
@@ -561,16 +826,25 @@ fn restart_command(exe: &std::path::Path, args: &[String]) -> String {
     cmd
 }
 
+/// 再起動へ向かっている間は設定を保存しない(preferences::save() 等が参照)。
+/// 「すべての設定を初期化」は設定ファイルを消した直後に立てる: 再起動の待ち
+/// 間(結果の案内表示中)に毎秒の sync() や相手からの遠隔適用がメモリの旧設定を
+/// preferences.json へ書き戻し、初期化を黙って取り消すのを防ぐ
+pub(crate) static RESTARTING: AtomicBool = AtomicBool::new(false);
+
 /// 自分を終了して、すぐ起こし直す(スクリプトや LaunchAgent に頼らない)。
 /// Windows へ操作中なら先に Mac へ戻し、環境変数と標準出力はそのまま引き継ぐ。
 /// Role 受信の適用スレッドと自発的切替の待ちスレッドの両方から呼ばれるため、
-/// 二重進入で .app を二重起動しないよう先頭で1回だけ通す
+/// 二重進入で .app を二重起動しないよう先頭で1回だけ通す(初期化導線が保存止め
+/// (RESTARTING)だけを先に立てるため、二重進入ガードは別の static に分ける)
 fn restart_now() {
     use std::os::unix::process::CommandExt;
-    static RESTARTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if RESTARTING.swap(true, Ordering::Relaxed) {
+    static ENTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if ENTERED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // ここから先に保存しても再起動で捨てられるため、書き戻し防止の保存止めを立てる
+    RESTARTING.store(true, Ordering::Relaxed);
     if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
         crate::leave_win_mode_cursor_unlock(None);
     }
@@ -587,6 +861,11 @@ fn restart_now() {
         std::thread::sleep(std::time::Duration::from_millis(400));
     }
     let Ok(exe) = std::env::current_exe() else {
+        // 失敗時はプロセスが続くため、保存止めを解く(上の spawn 失敗と同じ理由)。
+        // 役割切替の進行注記(「再起動します…」)も戻す: 再起動しないのに
+        // 進行中の表示が残ると、いつ再起動するのか分からなくなる
+        RESTARTING.store(false, Ordering::Relaxed);
+        prefs::ROLE_NOTE_KIND.store(0, Ordering::Relaxed);
         crate::notify("Knit", "実行ファイルの場所が分からず再起動できません");
         return;
     };
@@ -599,6 +878,11 @@ fn restart_now() {
     {
         Ok(_) => std::process::exit(0),
         Err(e) => {
+            // 失敗時はプロセスが続くため、保存止めを解く(このままでは利用者の
+            // 設定変更が一切保存されず、黙って捨てられる状態が続いてしまう)。
+            // 役割切替の進行注記も通常文言へ戻す(再起動しないままの表示を残さない)
+            RESTARTING.store(false, Ordering::Relaxed);
+            prefs::ROLE_NOTE_KIND.store(0, Ordering::Relaxed);
             eprintln!("[gui] 再起動を始められません: {e}");
             crate::notify("Knit", "再起動できませんでした。ログを確認してください");
         }
@@ -628,9 +912,9 @@ pub fn apply_peer_role(peer_is_host: bool) {
     preferences::save_quiet();
     eprintln!("[role] 相手の切替に合わせて {} へ変更し再起動します", if peer_is_host { "接続側" } else { "待ち受け" });
     let message = if peer_is_host {
-        format!("{peer} がホストになったため、この Mac を接続側に切り替えて再起動します")
+        format!("{peer} がホストになったため、このMacを接続側に切り替えて再起動します")
     } else {
-        format!("{peer} が接続側へ戻ったため、この Mac を待ち受けに切り替えて再起動します")
+        format!("{peer} が接続側へ戻ったため、このMacを待ち受けに切り替えて再起動します")
     };
     crate::notify("Knit", &message);
     std::thread::sleep(std::time::Duration::from_millis(600));
@@ -663,7 +947,7 @@ fn wait_role_ack(timeout: std::time::Duration) -> bool {
 fn role_menu_title() -> String {
     let peer = crate::active_peer_label();
     if crate::effective_client_role() {
-        format!("{peer} をホストにする(解除してこの Mac が待ち受ける)")
+        format!("{peer} をホストにする(解除してこのMacが待ち受ける)")
     } else {
         format!("{peer} をホストにする")
     }
@@ -701,6 +985,24 @@ unsafe extern "C" fn imp_role(_s: ID, _c: SEL, sender: ID) {
     set_role(want_client);
 }
 
+/// 役割切替の確認。テストから差し替えられるようフック(0=既定の NSAlert 実装)を
+/// 挟む。戻り値 true=「切り替える」が選ばれた
+static ROLE_CONFIRM_HOOK: AtomicUsize = AtomicUsize::new(0);
+fn confirm_role_switch() -> bool {
+    let hook = ROLE_CONFIRM_HOOK.load(Ordering::Relaxed);
+    if hook != 0 {
+        let f: fn() -> bool = unsafe { std::mem::transmute(hook) };
+        return f();
+    }
+    unsafe {
+        confirm_alert(
+            "接続の方向を切り替えますか?",
+            "両方の端末でKnitが自動で再起動します。進行中のファイル転送は中止されます。",
+            &["キャンセル", "切り替える"],
+        ) == 1001
+    }
+}
+
 /// 役割を決める。すでにその役割なら選択表示だけ合わせ直す
 unsafe fn set_role(next: bool) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
@@ -708,6 +1010,15 @@ unsafe fn set_role(next: bool) {
     }
     if crate::effective_client_role() == next {
         prefs::sync_role();
+        return;
+    }
+    // 確認はこの1回だけ(役割切替は日常操作のため、以降の流れ(Role 送信→
+    // role_ack 待ち→再起動)は従来どおりで何も挟まない)。両端末の再起動と
+    // 進行中の転送の破棄が起きるため、既定(Return)はキャンセルにする
+    if !confirm_role_switch() {
+        // キャンセル: ラジオの選択表示を現在の役割へ戻す(切り替わったままに見せない)
+        prefs::sync_role();
+        eprintln!("[role] 確認でキャンセルされたため切り替えません");
         return;
     }
     crate::CLIENT_ROLE.store(next, Ordering::Relaxed);
@@ -728,9 +1039,9 @@ unsafe fn set_role(next: bool) {
     prefs::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
     crate::send_msg(&knit_common::proto::Msg::Role { host: !next });
     let message = if next {
-        format!("この Mac を {peer}(ホスト)へ接続する側に切り替えました。Knit を再起動します")
+        format!("このMacを {peer}(ホスト)へ接続する側に切り替えました。Knitを再起動します")
     } else {
-        "この Mac を接続を待ち受ける側に戻しました。Knit を再起動します".to_string()
+        "このMacを接続を待ち受ける側に戻しました。Knitを再起動します".to_string()
     };
     crate::notify("Knit", &message);
     std::thread::spawn(|| {
@@ -793,6 +1104,17 @@ unsafe extern "C" fn imp_mouse_scale(_s: ID, _c: SEL, sender: ID) {
             std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let v = get(sender, sel(c"doubleValue"));
         crate::set_mouse_scale(v);
+        // 値表示は毎秒の sync() を待たずに即座に切り替える(scroll_speed と同じ。
+        // set_label は prefs 内のヘルパのため、ここでは imp_scroll_gain と同じく
+        // setStringValue: を直接打つ)
+        let lbl = PREFS_MOUSE_SCALE_LABEL.load(Ordering::Relaxed) as ID;
+        if !lbl.is_null() {
+            msg1_void_id(
+                lbl,
+                sel(c"setStringValue:"),
+                nsstring(&prefs::mouse_scale_text(crate::mouse_scale())),
+            );
+        }
     }
     preferences::save();
 }
@@ -966,13 +1288,18 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
         // 共有範囲の審査は Windows 経路と ADB 経路のどちらでも必ず通す
         //(UI の無効化だけでは抜け穴になるため)
         if !knit_common::share::allow_files() {
-            crate::notify("Knit", "この Mac ではファイルの共有が許可されていません(KNIT_SHARE)");
+            crate::notify("Knit", "このMacではファイルの共有が許可されていません(KNIT_SHARE)");
         } else if crate::active_peer_is_android() && !crate::active_peer_is_android_app() {
             // ADB中継は大容量経路を持たないため Download へ置く。adb push は
             // ファイルごとに最大120秒待つため、メニュー操作(UI スレッド)を
-            // 固めないよう別スレッドで実行する
+            // 固めないよう別スレッドで実行する。待ちの間も「残り何件」かが
+            // メニューの状態行へ出るように残り件数を立ててから送る(中止は不可)
+            crate::android::PUSH_REMAINING.store(pb.len(), Ordering::Relaxed);
             std::thread::spawn(move || {
-                match crate::android::push_files(&pb) {
+                let r = crate::android::push_files(&pb);
+                // 未接続で 1 件も始まらない場合も残りを確実に戻す(表示が残らないように)
+                crate::android::PUSH_REMAINING.store(0, Ordering::Relaxed);
+                match r {
                     Some(n) => crate::notify(
                         "Knit",
                         &format!("タブレットの Download へ {n} 件を保存しました"),
@@ -1074,9 +1401,31 @@ unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
     show_prefs();
 }
 
-/// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)
+/// 設定ウィンドウを閉じる(⌘W・ウィンドウの閉じるボタンから)。ウィンドウは
+/// setReleasedWhenClosed:0 のため隠れるだけで破棄されず、次回の show_prefs で
+/// 同じウィンドウ(入力欄の値もそのまま)が戻る
+unsafe extern "C" fn imp_close_prefs(_s: ID, _c: SEL, _n: ID) {
+    let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
+    if !win.is_null() {
+        msg1_void_id(win, sel(c"performClose:"), std::ptr::null_mut());
+    }
+}
+
+/// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)。
+/// 設定ウィンドウが表示されていない間は毎秒の全書き換え(50 メッセージ超/秒)を
+/// 行わず early return する: 表示の復帰は show_prefs 末尾の呼び出しで即座に
+/// 最新化され、最小化からドック経由で戻ったときだけ次の毎秒タイマーが拾う
 fn sync_prefs_state() {
     unsafe {
+        let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
+        if win.is_null() {
+            return;
+        }
+        let is_visible: unsafe extern "C" fn(ID, SEL) -> u8 =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        if is_visible(win, sel(c"isVisible")) == 0 {
+            return;
+        }
         prefs::sync();
         let set = |slot: &AtomicUsize, on: bool| {
             let b = slot.load(Ordering::Relaxed) as ID;
@@ -2125,15 +2474,153 @@ unsafe extern "C" fn imp_diag(_s: ID, _c: SEL, _n: ID) {
     });
 }
 
-/// 診断結果を NSAlert で出す(メインスレッドからのみ呼ぶ)
+/// 接続の診断が実行中か。メニュー項目「接続を診断…」の題名を「診断中…」へ
+/// 切り替える判定に使う(refresh_status が毎秒呼ぶ。設定画面の診断ボタンは
+/// 廃止したため、押した反応の表示はメニュー側が担う)
+pub(super) fn diag_running() -> bool {
+    DIAG_RESULT.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some("__RUNNING__")
+}
+
+/// 診断結果を NSAlert で出す(メインスレッドからのみ呼ぶ)。
+/// メニューバー常駐(Accessory)のままではアラートが前面に出ず、診断結果が
+/// 他のウィンドウの背面に隠れることがあるため、confirm_alert と同じ作法で
+/// 表示中だけ Regular へ切り替えて前面化する
 unsafe fn show_diag_alert(text: &str) {
+    let app = msg0(
+        objc_getClass(c"NSApplication".as_ptr()),
+        sel(c"sharedApplication"),
+    );
+    if !app.is_null() {
+        msg1_void_i64(app, sel(c"setActivationPolicy:"), 0);
+        msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
+    }
     let alert = msg0(objc_getClass(c"NSAlert".as_ptr()), sel(c"new"));
     if alert.is_null() {
+        if !app.is_null() {
+            msg1_void_i64(app, sel(c"setActivationPolicy:"), 1);
+        }
         return;
     }
     msg1_void_id(alert, sel(c"setMessageText:"), nsstring("接続の診断"));
     msg1_void_id(alert, sel(c"setInformativeText:"), nsstring(text));
     let _ = msg0(alert, sel(c"runModal"));
+    // confirm_alert と同じく閉じた時点で release し、policy へも Accessory へ戻す
+    msg0_void(alert, sel(c"release"));
+    if !app.is_null() {
+        msg1_void_i64(app, sel(c"setActivationPolicy:"), 1);
+    }
+}
+
+/// メニューバー状態行の本文(純粋関数・単体テストで守る)。sync() が毎秒組み立てて
+/// いた連結をここへ切り出した: 並びと接続語(・)が変わらないことをテストで保証する。
+/// retry/not_found(再試行までの残り秒・見つけられない継続)は「未接続かつ登録済み」
+/// の間だけ連結する(設定画面の connection_state_text と同じ条件): 一度も登録して
+/// いない人に「登録の案内」と「再試行まで N秒」を同時に出すと矛盾した導線になる。
+/// 連結するのは 1 本だけ(設定画面と同じ not_found.or(retry)): 画面ごとに情報量が
+/// 違うと同じ待ち状態の読み取りが変わってしまうため、「N分見つけられません」(1分超
+/// の断)を優先し、出ている間は retry を並記しない。
+/// 履歴の件数はここには出さない(履歴サブメニューの見出しが既に出すため二重)。
+/// 接続済みの間は「利用できます」を出さない(「接続済み」と同義反復になるため。
+/// 未接続の「このMacは操作できます」は方向の誤読を防ぐ役があるので現状維持)。
+/// xfer は本線の転送進捗、xfer_extra は無い間の補助表示(ADB 送信残り・受信中)。
+/// manual は手動接続(KNIT_TOKEN)運用中: 設定画面の connection_state_text と同じ
+/// 条件・文言で「直接つなぐで待機中」を出す(通常の未接続と同じ表示だと相手側の
+/// トークン不一致に気づけない)。登録への案内は !manual && !paired の間だけ:
+/// 手動接続は登録と無関係に待つため、接続歴が無い(paired_registered=false)人に
+/// 「端末を登録…」を出すと設定画面と食い違う導線になる。
+fn status_line_text(
+    connected: bool,
+    manual: bool,
+    paired: bool,
+    rtt_ms: u64,
+    route: &str,
+    xfer: Option<&str>,
+    xfer_extra: Option<&str>,
+    last_connected: Option<&str>,
+    retry: Option<&str>,
+    not_found: Option<&str>,
+) -> String {
+    let conn = if connected {
+        "接続済み".to_string()
+    } else if manual {
+        "未接続(直接つなぐで待機中)".to_string()
+    } else if !paired {
+        "未接続(設定の「端末を登録…」から相手と登録できます)".to_string()
+    } else {
+        "未接続(自動で再接続します・相手側アプリの起動を確認)".to_string()
+    };
+    let mode_s = if connected {
+        String::new()
+    } else {
+        "・このMacは操作できます".to_string()
+    };
+    let rtt_s = if connected && rtt_ms > 0 {
+        format!("・遅延 {rtt_ms}ms")
+    } else {
+        String::new()
+    };
+    let route_s = if connected && !route.is_empty() {
+        format!("・{route}")
+    } else {
+        String::new()
+    };
+    let xfer_s = match xfer.or(xfer_extra) {
+        Some(x) => format!("・{x}"),
+        None => String::new(),
+    };
+    let last_s = if !connected {
+        last_connected.map(|l| format!("・{l}")).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    // 待ちの補足は手動接続(manual)か登録済み(paired)の間だけ(設定画面と同じ条件):
+    // !manual && !paired は登録の案内だけを出すため連結しない
+    let wait_s = if !connected && (manual || paired) {
+        not_found
+            .or(retry)
+            .map(|l| format!("・{l}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!("{conn}{mode_s}{rtt_s}{route_s}{xfer_s}{last_s}{wait_s}")
+}
+
+/// メニューバーの状態行へ本文を反映する(refresh_status と閉じた時の 1 回反映で
+/// 共用)。本文は純粋関数(status_line_text)が組立てる。並び・接続語・「未登録に
+/// は再試行を出さない」条件はそちらの単体テストで守る。paired は PAIRED のまま
+/// 渡さず prefs::paired_registered(登録の実体が 1件でもあるか)へ通す: 接続キーの
+/// 保存だけが残る状態(招待を発行したまま相手の登録がまだ)で「自動で再接続します」
+/// は永久に繋がらない嘘になるため。manual は KNIT_TOKEN の有無(設定画面の
+/// connection_state_text と同じ判定): 手動接続の待ち状態を通常の未接続と同じ
+/// 文言にすると、設定画面とメニューで導線が食い違う
+unsafe fn update_state_item() {
+    let state = GUI_STATE_ITEM.load(Ordering::Relaxed) as ID;
+    if state.is_null() {
+        return;
+    }
+    let manual = crate::envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty());
+    let text = status_line_text(
+        crate::CONNECTED.load(Ordering::Relaxed),
+        manual,
+        prefs::paired_registered(
+            crate::PAIRED.load(Ordering::Relaxed),
+            crate::PEERS.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            crate::tap::saved_peer_count(),
+        ),
+        crate::RTT_MS.load(Ordering::Relaxed),
+        crate::route_label(),
+        crate::xfer_line().as_deref(),
+        crate::xfer_extra_line(
+            crate::android::PUSH_REMAINING.load(Ordering::Relaxed),
+            knit_common::bulk::rx_active(),
+        )
+        .as_deref(),
+        crate::last_connected_line().as_deref(),
+        crate::next_retry_line().as_deref(),
+        crate::not_found_line().as_deref(),
+    );
+    msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
 }
 
 fn refresh_status() {
@@ -2159,6 +2646,10 @@ fn refresh_status() {
         //(どちらの画面を見ているかは操作の結果で分かる。ユーザー指示 459/494)
         let title = if let Some(pct) = crate::xfer_title() {
             pct
+        } else if knit_common::bulk::rx_active() {
+            // 相手からの受信中も題名へ出す(進捗% はこちらから測れないため文言で。
+            // 受信が終わるまで何も出ないと「送ったのに届かない」と見えるのを防ぐ)
+            "ファイルを受信中".to_string()
         } else if !connected {
             "未接続".to_string()
         } else {
@@ -2168,9 +2659,32 @@ fn refresh_status() {
 
         let upd = GUI_UPDATE_ITEM.load(Ordering::Relaxed) as ID;
         if !upd.is_null() {
-            msg1_void_id(upd, sel(c"setTitle:"), nsstring(&crate::updater::menu_title()));
+            let (title, reason) = crate::updater::menu_title_with_reason();
+            msg1_void_id(upd, sel(c"setTitle:"), nsstring(&title));
+            // 確認(適用)の失敗理由は通知だと数秒で消えるため、メニュー項目へ
+            // ツールチップとして残す(設定画面のアップデートボタンを廃止した分、
+            // ここが唯一の退避先。理由が無いときは既存のツールチップを書き換えない)
+            if let Some(reason) = reason {
+                msg1_void_id(upd, sel(c"setToolTip:"), nsstring(&reason));
+            }
         }
-        // 転送の中止項目(進行中だけ押せる。Esc でも中止できる)
+        // 接続の診断: 実行中は項目名を「診断中…」へ(完了で NSAlert が出て戻る。
+        // アップデート確認の menu_title と同じ作法=押した反応が結果まで残る)
+        let diagm = GUI_DIAG_ITEM.load(Ordering::Relaxed) as ID;
+        if !diagm.is_null() {
+            msg1_void_id(
+                diagm,
+                sel(c"setTitle:"),
+                nsstring(if diag_running() {
+                    "診断中…"
+                } else {
+                    "接続を診断…"
+                }),
+            );
+        }
+        // 転送の中止項目(進行中だけ押せる。Esc でも中止できる)。転送していない
+        // 大半の時間に「転送: なし」の無効行がメニューを占有するため、行ごと
+        // 隠す(転送中だけ現れる=メニューの項目数もその分減る)
         let xfer_item = GUI_XFER_ITEM.load(Ordering::Relaxed) as ID;
         if !xfer_item.is_null() {
             if let Some(line) = crate::xfer_line() {
@@ -2180,70 +2694,21 @@ fn refresh_status() {
                     nsstring(&format!("転送を中止する({line}・Esc でも可)")),
                 );
                 msg1_void_u8(xfer_item, sel(c"setEnabled:"), 1);
+                msg1_void_u8(xfer_item, sel(c"setHidden:"), 0);
             } else {
-                msg1_void_id(xfer_item, sel(c"setTitle:"), nsstring("転送: なし"));
-                msg1_void_u8(xfer_item, sel(c"setEnabled:"), 0);
+                // 非転送の間は行ごと隠す(隠れた項目への毎秒の setTitle/setEnabled は
+                // やめる。表示するときは if 節が setTitle/setEnabled を必ず打つため、
+                // 「転送: なし」の残留は画面に出ない)
+                msg1_void_u8(xfer_item, sel(c"setHidden:"), 1);
             }
         }
-        let state = GUI_STATE_ITEM.load(Ordering::Relaxed) as ID;
-        if !state.is_null() {
-            // 接続状態は「未接続 / 接続済み」の2語に統一する(設定画面・Windows 側と
-            // 同じ表記)。まだ一度も登録していない人には再接続の案内を出さない
-            let conn = if connected {
-                "接続済み".to_string()
-            } else if !crate::PAIRED.load(Ordering::Relaxed) {
-                "未接続(設定の「端末を登録…」から相手と登録できます)".to_string()
-            } else {
-                "未接続(自動で再接続します・相手側アプリの起動を確認)".to_string()
-            };
-            let mode = if connected { "利用できます" } else { "このMacは操作できます" };
-            let rtt = crate::RTT_MS.load(Ordering::Relaxed);
-            let rtt_s = if connected && rtt > 0 {
-                format!("・遅延 {rtt}ms")
-            } else {
-                String::new()
-            };
-            // 経路(LAN 直 / Tailscale)も出す: 中継へ落ちていないかの常時確認用
-            let route = crate::route_label();
-            let route_s = if connected && !route.is_empty() {
-                format!("・{route}")
-            } else {
-                String::new()
-            };
-            let history = crate::HISTORY
-                .lock()
-                .map(|h| h.entries().len())
-                .unwrap_or(0);
-            // メニューに並ぶのは最近の 10 件まで(全件の保存上限は履歴 50 件)
-            let history_s = if history > 0 {
-                format!("・履歴{history}件(メニューは最近の10件)")
-            } else {
-                String::new()
-            };
-            // 転送の進捗と最終接続時刻(再接続の目安)
-            let xfer_s = match crate::xfer_line() {
-                Some(x) => format!("・{x}"),
-                None => String::new(),
-            };
-            let last_s = if !connected {
-                crate::last_connected_line()
-                    .map(|l| format!("・{l}"))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            // 未接続が続くときの見える化(Windows 側のステータス窓と同じ):
-            // クライアントモードの再試行までの残り秒と、1 分を超えた「見つけられない」表示
-            let retry_s = crate::next_retry_line()
-                .map(|l| format!("・{l}"))
-                .unwrap_or_default();
-            let missing_s = crate::not_found_line()
-                .map(|l| format!("・{l}"))
-                .unwrap_or_default();
-            let text = format!("{conn} ・ {mode}{rtt_s}{route_s}{history_s}{xfer_s}{last_s}{retry_s}{missing_s}");
-            msg1_void_id(state, sel(c"setTitle:"), nsstring(&text));
+        // 状態行はメニューバー本体が開示中は書き換えない(開示中の setTitle は
+        // 表示中のメニュー幅を脈動させる)。閉じた時に 1 回反映する
+        if state_title_set_now(GUI_MAIN_MENU_OPEN.load(Ordering::Relaxed)) {
+            update_state_item();
         }
-        // 設定ウィンドウが開いていればチェック状態も保ち直す
+        // チェック状態の保ち直し(設定ウィンドウの表示中だけ。sync_prefs_state の
+        // 先頭で非表示を判定して毎秒の書き換えをやめている)
         sync_prefs_state();
 
         // クリップボード履歴メニュー(push があったときだけ作り直す。
@@ -2292,6 +2757,24 @@ pub(super) unsafe fn history_menu_closed() {
     rebuild_history_menu(history_menu);
 }
 
+/// NSMenuDelegate(menuWillOpen:/menuDidClose:)の送り主がメニューバー本体か
+/// (履歴サブメニューの history_menu_tracking と同じ作法)
+pub(super) unsafe fn main_menu_tracking(menu: ID) -> bool {
+    let m = GUI_MAIN_MENU.load(Ordering::Relaxed) as ID;
+    !m.is_null() && menu == m
+}
+
+/// メニューバー本体の開示開始(状態行の書き換えを控え始める)
+pub(super) unsafe fn main_menu_opened() {
+    GUI_MAIN_MENU_OPEN.store(true, Ordering::Relaxed);
+}
+
+/// メニューバー本体の閉鎖(開示中に控えていた状態行の変化を 1 回だけ反映する)
+pub(super) unsafe fn main_menu_closed() {
+    GUI_MAIN_MENU_OPEN.store(false, Ordering::Relaxed);
+    update_state_item();
+}
+
 /// 接続先メニューの選択: representedObject の端末 id でピアを探してアクティブへ
 unsafe extern "C" fn imp_peer_activate(_s: ID, _c: SEL, sender: ID) {
     if sender.is_null() {
@@ -2312,8 +2795,27 @@ unsafe extern "C" fn imp_peer_activate(_s: ID, _c: SEL, sender: ID) {
     refresh_status();
 }
 
+/// 履歴サブメニューの見出し文言(メニューバー本体の項目タイトルも兼ねる)。全件数
+/// がメニューに出せる件数(MENU_ITEMS)を超えるときは「全 N 件」のほかに選べる件数
+/// も出す(見出しだけ読んで「N 件ある」と思って開いても 10 件しか選べない食い違い
+/// を無くす)。全件数が MENU_ITEMS 以下のときは見出しのまま(全件=選べる件数)
+fn history_menu_title(count: usize) -> String {
+    let max = knit_common::history::MENU_ITEMS;
+    if count == 0 {
+        "クリップボード履歴".to_string()
+    } else if count > max {
+        format!("クリップボード履歴(新しい順{max}件・全{count}件)")
+    } else {
+        format!("クリップボード履歴({count}件)")
+    }
+}
+
 /// 履歴サブメニューの項目を作り直す(新しい順 10 件+「消す」)。
-/// 本文は representedObject に載せ、クリックで sdHistoryRestore: へ渡す
+/// 本文は representedObject に載せ、クリックで sdHistoryRestore: へ渡す。
+/// 履歴 0 件の間はサブメニューの親項目(holder)ごと隠す(「まだありません」の
+/// 1項目だけのサブメニューを日常のメニューに並べない)。初回 rebuild は
+/// GUI_HISTORY_SEEN の初期値(u64::MAX)と HISTORY_LAST_ID(0)が必ず異なるため
+/// 履歴 0 件でも build 直後の refresh_status で 1 回走り、起動直後に隠れる
 unsafe fn rebuild_history_menu(menu: ID) {
     msg0(menu, sel(c"removeAllItems"));
     let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
@@ -2321,16 +2823,6 @@ unsafe fn rebuild_history_menu(menu: ID) {
         .lock()
         .map(|h| h.entries().len())
         .unwrap_or(0);
-    // 見出しに件数を出す(メニューバー本体の項目タイトルも更新)
-    let holder = GUI_HISTORY_ITEM.load(Ordering::Relaxed) as ID;
-    if !holder.is_null() {
-        let t = if count > 0 {
-            format!("クリップボード履歴({count}件)")
-        } else {
-            "クリップボード履歴".to_string()
-        };
-        msg1_void_id(holder, sel(c"setTitle:"), nsstring(&t));
-    }
     let items = crate::HISTORY.lock().ok().map(|h| {
         let now = knit_common::history::now_epoch_ms();
         h.recent(knit_common::history::MENU_ITEMS)
@@ -2339,6 +2831,14 @@ unsafe fn rebuild_history_menu(menu: ID) {
             .collect::<Vec<_>>()
     });
     let items = items.unwrap_or_default();
+    // 見出しに件数を出す(メニューバー本体の項目タイトルも更新)。
+    // 0件の間は親項目ごと隠し、1件以上で再表示する
+    let holder = GUI_HISTORY_ITEM.load(Ordering::Relaxed) as ID;
+    if !holder.is_null() {
+        let t = history_menu_title(count);
+        msg1_void_id(holder, sel(c"setTitle:"), nsstring(&t));
+        msg1_void_u8(holder, sel(c"setHidden:"), u8::from(items.is_empty()));
+    }
     if items.is_empty() {
         let item = menu_item("履歴はまだありません(コピーすると記録されます)", None, "");
         msg1_void_u8(item, sel(c"setEnabled:"), 0);
@@ -2354,17 +2854,16 @@ unsafe fn rebuild_history_menu(menu: ID) {
         msg1_void_id(item, sel(c"setRepresentedObject:"), crate::nsstring(&text));
         add_item(menu, item);
     }
-    let sep = msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem"));
-    add_item(menu, sep);
-    // 平文保存の常時通知(利用者が気づけるように履歴がある間は常に表示する)
-    let note = menu_item("※履歴は平文で保存されています(残したくない場合は「履歴を消す」)", None, "");
-    if !note.is_null() {
-        msg1_void_u8(note, sel(c"setEnabled:"), 0);
-        add_item(menu, note);
-    }
-    let clear = menu_item("履歴を消す", Some(c"sdHistoryClear:"), "");
+    let clear = menu_item("履歴をすべて消す…", Some(c"sdHistoryClear:"), "");
     if !clear.is_null() {
         msg1_void_id(clear, sel(c"setTarget:"), target);
+        // 平文保存の注記は常設の無効行からここ(ツールチップ)へ退避する
+        //(「ログを開く」と同じ setToolTip 導線=困った時だけ読む情報は引っ込める)
+        msg1_void_id(
+            clear,
+            sel(c"setToolTip:"),
+            nsstring("履歴は平文で保存されています(残したくない場合はここで消せます)"),
+        );
         add_item(menu, clear);
     }
 }
@@ -2487,6 +2986,9 @@ unsafe fn make_target() -> ID {
         (c"sdPeerActivate:", imp_peer_activate as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
         (c"sdSaveHost:", imp_save_host as *const () as usize),
+        (c"sdSaveToken:", imp_save_token as *const () as usize),
+        (c"sdGenToken:", imp_gen_token as *const () as usize),
+        (c"sdToggleTokenSection:", imp_toggle_token_section as *const () as usize),
         (c"sdSaveAlias:", imp_save_alias as *const () as usize),
         (c"sdSaveOwnName:", imp_save_own_name as *const () as usize),
         (c"sdCheckUpdate:", imp_check_update as *const () as usize),
@@ -2500,6 +3002,7 @@ unsafe fn make_target() -> ID {
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdTabletText:", text_input::show as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
+        (c"sdClosePrefs:", imp_close_prefs as *const () as usize),
         (c"sdScrollGain:", imp_scroll_gain as *const () as usize),
         (c"sdSide:", imp_side as *const () as usize),
         (c"sdClipShare:", imp_clip_share as *const () as usize),
@@ -2522,6 +3025,17 @@ unsafe fn make_target() -> ID {
         if class_addMethod(cls, sel(name), *imp, types) == 0 {
             return std::ptr::null_mut();
         }
+    }
+    // タブレット文字入力モーダルの NSTextView delegate(textView:doCommandBySelector:)。
+    // 戻り値が BOOL(処理を握りつぶすか)のため、sender と同じ型の
+    // 「v@:@」とは別の型シグネチャ「B@:@:」で登録する
+    if class_addMethod(
+        cls,
+        sel(c"textView:doCommandBySelector:"),
+        text_input::do_command as *const () as usize,
+        c"B@:@:".as_ptr(),
+    ) == 0 {
+        return std::ptr::null_mut();
     }
     objc_registerClassPair(cls);
     msg0(cls, sel(c"new"))
@@ -2572,6 +3086,11 @@ pub fn start() -> bool {
         }
         // 自動有効化を切る(action 無しの状態行をクリック可能に見せないため)
         msg1_void_u8(menu, sel(c"setAutoenablesItems:"), 0);
+        // 開示中に状態行の setTitle が毎秒走るとメニュー幅が脈動するため、
+        // menuWillOpen:/menuDidClose: を受けて開示中の書き換えを控える
+        //(履歴サブメニューと同じ delegate IMP を sender で区別して共有する)
+        msg1_void_id(menu, sel(c"setDelegate:"), target);
+        GUI_MAIN_MENU.store(menu as usize, Ordering::Relaxed);
 
         // 状態行(選択不可・refresh_status で毎秒更新)
         let state = menu_item("状態: …", None, "");
@@ -2582,7 +3101,8 @@ pub fn start() -> bool {
         GUI_STATE_ITEM.store(state as usize, Ordering::Relaxed);
         add_item(menu, state);
 
-        // ファイル転送の中止(進行中だけ有効化。タイトルは refresh_status が更新)
+        // ファイル転送の中止(進行中だけ有効化。タイトルは refresh_status が更新)。
+        // 転送していない間は行ごと隠す(refresh_status が転送中だけ再表示する)
         let xfer = menu_item("転送: なし", Some(c"sdCancelXfer:"), "");
         if xfer.is_null() {
             return false;
@@ -2590,6 +3110,7 @@ pub fn start() -> bool {
         msg1_void_id(xfer, sel(c"setTarget:"), target);
         msg1_void_sel(xfer, sel(c"setAction:"), sel(c"sdCancelXfer:"));
         msg1_void_u8(xfer, sel(c"setEnabled:"), 0);
+        msg1_void_u8(xfer, sel(c"setHidden:"), 1);
         GUI_XFER_ITEM.store(xfer as usize, Ordering::Relaxed);
         add_item(menu, xfer);
 
@@ -2600,6 +3121,34 @@ pub fn start() -> bool {
             msg1_void_id(sendf, sel(c"setTarget:"), target);
             msg1_void_sel(sendf, sel(c"setAction:"), sel(c"sdSendFile:"));
             add_item(menu, sendf);
+        }
+
+        // クリップボード履歴(送信・受信したテキストから選んで復元)。
+        // 項目は refresh_status が履歴の変化だけ検知して作り直す。
+        // 開示中の再構築を控えるため、追跡状態(menuWillOpen:/menuDidClose:)を
+        // 受け取る delegate を設定する(IMP は接続先ピッカーと共通・sender で区別)。
+        // ここまでが日常の操作(送る・戻す・切替)で、下の sep から低頻度の項目
+        let history_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
+        if !history_menu.is_null() {
+            msg1_void_u8(history_menu, sel(c"setAutoenablesItems:"), 0);
+            msg1_void_id(history_menu, sel(c"setDelegate:"), target);
+            let holder = menu_item("クリップボード履歴", None, "");
+            if !holder.is_null() {
+                msg1_void_id(holder, sel(c"setSubmenu:"), history_menu);
+                add_item(menu, holder);
+                GUI_HISTORY_ITEM.store(holder as usize, Ordering::Relaxed);
+                GUI_HISTORY_MENU.store(history_menu as usize, Ordering::Relaxed);
+            }
+        }
+
+        // 接続の方向(この Mac が待ち受けるか/Windows ホストへ接続しに行くか)。
+        // 表示は refresh_status も更新する
+        let role = menu_item(&role_menu_title(), Some(c"sdHostRole:"), "");
+        if !role.is_null() {
+            msg1_void_id(role, sel(c"setTarget:"), target);
+            msg1_void_sel(role, sel(c"setAction:"), sel(c"sdHostRole:"));
+            add_item(menu, role);
+            GUI_ROLE_ITEM.store(role as usize, Ordering::Relaxed);
         }
 
         add_item(
@@ -2615,55 +3164,58 @@ pub fn start() -> bool {
         msg1_void_sel(prefs, sel(c"setAction:"), sel(c"sdShowPrefs:"));
         add_item(menu, prefs);
 
-        // 接続の診断(繋がらない原因を順に確かめて教える)。
-        // 実測は diag.rs、判定と対処の文言は common::diagnose
-        let diagm = menu_item("接続を診断…", Some(c"sdDiagnose:"), "");
-        if !diagm.is_null() {
-            msg1_void_id(diagm, sel(c"setTarget:"), target);
-            msg1_void_sel(diagm, sel(c"setAction:"), sel(c"sdDiagnose:"));
-            add_item(menu, diagm);
+        // 端末を登録(2台目以降の追加導線)。設定「接続」の「端末を登録…」ボタンと
+        // 同じ setup::show_registration へ接続する=メニューバーにも入口を置く
+        // (設定画面の奥にしか無いと、2台目の登録に行き着けない)
+        let regm = menu_item("端末を登録…", Some(c"sdRegistration:"), "");
+        if !regm.is_null() {
+            msg1_void_id(regm, sel(c"setTarget:"), target);
+            msg1_void_sel(regm, sel(c"setAction:"), sel(c"sdRegistration:"));
+            add_item(menu, regm);
         }
 
-        // ログを開く(Windows トレイ・設定画面の同名項目と対称。診断と並べて
-        // 「繋がらない時の困った時」がここで揃う。Console で /tmp/knit-mac.log を開く)
-        let logm = menu_item("ログを開く", Some(c"sdOpenLog:"), "");
-        if !logm.is_null() {
-            msg1_void_id(logm, sel(c"setTarget:"), target);
-            msg1_void_sel(logm, sel(c"setAction:"), sel(c"sdOpenLog:"));
-            add_item(menu, logm);
-        }
-
-        // クリップボード履歴(送信・受信したテキストから選んで復元)。
-        // 項目は refresh_status が履歴の変化だけ検知して作り直す。
-        // 開示中の再構築を控えるため、追跡状態(menuWillOpen:/menuDidClose:)を
-        // 受け取る delegate を設定する(IMP は接続先ピッカーと共通・sender で区別)
-        let history_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
-        if !history_menu.is_null() {
-            msg1_void_u8(history_menu, sel(c"setAutoenablesItems:"), 0);
-            msg1_void_id(history_menu, sel(c"setDelegate:"), target);
-            let holder = menu_item("クリップボード履歴", None, "");
-            if !holder.is_null() {
-                msg1_void_id(holder, sel(c"setSubmenu:"), history_menu);
-                add_item(menu, holder);
-                GUI_HISTORY_ITEM.store(holder as usize, Ordering::Relaxed);
-                GUI_HISTORY_MENU.store(history_menu as usize, Ordering::Relaxed);
-            }
-        }
-
-
-        // 接続の方向(この Mac が待ち受けるか/Windows ホストへ接続しに行くか)。
-        // 表示は refresh_status も更新する
-        let role = menu_item(&role_menu_title(), Some(c"sdHostRole:"), "");
-        if !role.is_null() {
-            msg1_void_id(role, sel(c"setTarget:"), target);
-            msg1_void_sel(role, sel(c"setAction:"), sel(c"sdHostRole:"));
-            add_item(menu, role);
-            GUI_ROLE_ITEM.store(role as usize, Ordering::Relaxed);
-        }
+        // ここからは困った時だけ使う項目(診断・ログ)と更新・終了
         add_item(
             menu,
             msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
         );
+
+        // 接続の診断(繋がらない原因を順に確かめて教える)。
+        // 実測は diag.rs、判定と対処の文言は common::diagnose。
+        // 実行中は refresh_status が題名を「診断中…」へ書き換える
+        let diagm = menu_item("接続を診断…", Some(c"sdDiagnose:"), "");
+        if !diagm.is_null() {
+            msg1_void_id(diagm, sel(c"setTarget:"), target);
+            msg1_void_sel(diagm, sel(c"setAction:"), sel(c"sdDiagnose:"));
+            GUI_DIAG_ITEM.store(diagm as usize, Ordering::Relaxed);
+            add_item(menu, diagm);
+        }
+
+        // ログを開く(Windows トレイの同名項目と対称。診断と並べて「繋がらない時の
+        // 困った時」がここで揃う。Console で /tmp/knit-mac.log を開く)。設定画面の
+        // 左下「その他」にも同じ導線があったが二重のため外し、開き方の注意と経路ごとの
+        // ポート一覧(ファイアウォール整理で必要な時に読める=5経路の常設行を増やさ
+        // ない。待受アドレス行を既定時に隠した分、ポートの発見可能性はここが担う)
+        // はこの項目のツールチップへ集約する(upd 項目と同じ setToolTip の導線)
+        let logm = menu_item("ログを開く", Some(c"sdOpenLog:"), "");
+        if !logm.is_null() {
+            msg1_void_id(logm, sel(c"setTarget:"), target);
+            msg1_void_sel(logm, sel(c"setAction:"), sel(c"sdOpenLog:"));
+            msg1_void_id(
+                logm,
+                sel(c"setToolTip:"),
+                nsstring(&format!(
+                    "/tmp/knit-mac.log を開きます(Macの再起動で消えることがあります)。開けない場合は、このファイルを開いてください\n経路: 本線 {} / 音声 {} / ファイル {} / 発見 {}(UDP) / 登録 {}",
+                    knit_common::proto::PORT,
+                    knit_common::proto::PORT + 1,
+                    knit_common::proto::PORT + knit_common::bulk::PORT_OFFSET,
+                    knit_common::proto::PORT + knit_common::discover::PORT_OFFSET,
+                    knit_common::pairing::PORT
+                )),
+            );
+            add_item(menu, logm);
+        }
+
         let upd = menu_item(&crate::updater::menu_title(), Some(c"sdCheckUpdate:"), "");
         if !upd.is_null() {
             msg1_void_id(upd, sel(c"setTarget:"), target);
@@ -2671,7 +3223,7 @@ pub fn start() -> bool {
             add_item(menu, upd);
             GUI_UPDATE_ITEM.store(upd as usize, Ordering::Relaxed);
         }
-        let quit = menu_item("Knit を終了", Some(c"sdQuit:"), "q");
+        let quit = menu_item("Knitを終了", Some(c"sdQuit:"), "q");
         if quit.is_null() {
             return false;
         }
@@ -2794,6 +3346,52 @@ mod history_rebuild_defer_tests {
     }
 }
 
+/// メニューバー本体開示中の状態行書き換え保留(履歴サブメニューと同じ作法)。
+/// 開示中の setTitle は可変幅の長い文言で表示中のメニュー幅を脈動させるため、
+/// 閉じた時に 1 回だけ反映する
+#[cfg(test)]
+mod state_title_defer_tests {
+    use super::state_title_set_now;
+
+    #[test]
+    fn state_title_set_is_deferred_while_the_menu_is_tracking() {
+        // 閉じている → 毎秒の反映が走る
+        assert!(state_title_set_now(false));
+        // 開示中 → setTitle を控える(閉じた時に 1 回反映するため失われない)
+        assert!(!state_title_set_now(true));
+    }
+}
+
+/// 履歴サブメニューの見出し文言: 全件数と実際に選べる件数(MENU_ITEMS)が食い違う
+/// ときだけ両方を出す(見出しと実態の件数が一致するなら全件数だけのまま)
+#[cfg(test)]
+mod history_menu_title_tests {
+    use super::history_menu_title;
+    use knit_common::history::MENU_ITEMS;
+
+    #[test]
+    fn title_matches_selectable_count() {
+        assert_eq!(history_menu_title(0), "クリップボード履歴");
+        // 全件が選べる範囲なら全件数だけを出す(現状の見出しのまま)
+        assert_eq!(history_menu_title(1), "クリップボード履歴(1件)");
+        assert_eq!(
+            history_menu_title(MENU_ITEMS),
+            format!("クリップボード履歴({MENU_ITEMS}件)"),
+            "選べる件数どおりまでは全件数だけ"
+        );
+        // 上回ったら「新しい順10件・全N件」へ切り替わる(食い違いを読み取れるように)
+        assert_eq!(
+            history_menu_title(MENU_ITEMS + 1),
+            format!("クリップボード履歴(新しい順{MENU_ITEMS}件・全{}件)", MENU_ITEMS + 1)
+        );
+        assert_eq!(
+            history_menu_title(50),
+            "クリップボード履歴(新しい順10件・全50件)",
+            "保存上限いっぱいのとき"
+        );
+    }
+}
+
 #[cfg(test)]
 mod role_ack_tests {
     // ROLE_ACK は単一の static のため、テストは直列で1本にまとめる
@@ -2807,6 +3405,28 @@ mod role_ack_tests {
         assert!(wait_role_ack(Duration::from_millis(0)));
         // 消費済みなので、次の待ち(旧版相手相当)は false
         assert!(!wait_role_ack(Duration::from_millis(30)));
+    }
+}
+
+#[cfg(test)]
+mod role_confirm_hook_tests {
+    // set_role の確認ダイアログは NSAlert(メインスレッド必須)のため、テストからは
+    // ROLE_CONFIRM_HOOK で差し替える。差し替え・復帰が正しく働くことだけ検証する
+    // (フックが効けば、テストは実際のダイアログを出さずに set_role を通過できる)
+    use super::{confirm_role_switch, ROLE_CONFIRM_HOOK};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn hook_overrides_the_dialog_result() {
+        // 非キャプチャのクロージャは fn ポインタへ強制できる(フックの差し替え単位)
+        let yes: fn() -> bool = || true;
+        ROLE_CONFIRM_HOOK.store(yes as usize, Ordering::Relaxed);
+        assert!(confirm_role_switch());
+        let no: fn() -> bool = || false;
+        ROLE_CONFIRM_HOOK.store(no as usize, Ordering::Relaxed);
+        assert!(!confirm_role_switch());
+        // 復帰(0)=既定実装。ここではダイアログを出さないよう 0 に戻して終わる
+        ROLE_CONFIRM_HOOK.store(0, Ordering::Relaxed);
     }
 }
 
@@ -2845,6 +3465,193 @@ mod lay_side_center_tests {
                 "side {s} が他と同じ位置: {p:?}"
             );
             seen.push(p);
+        }
+    }
+}
+
+/// メニューバー状態行(status_line_text)の並びと条件の回帰防止:
+/// ・未登録(!manual && !paired)には「再試行まで N秒」「見つけられない」を出さない
+///  (登録の案内と再試行の待ちが同時に出る矛盾を防ぐ=設定画面と同じ条件)
+/// ・手動接続(manual)は登録と無関係に待つため、接続歴が無くても登録の案内を
+///  出さず「直接つなぐで待機中」を出す(設定画面の connection_state_text と同じ)
+/// ・待ちの補足は 1 本だけ(not_found.or(retry)=設定画面と同じ情報量に揃える)
+/// ・履歴の件数は出さない(履歴サブメニューの見出しが既に出すため二重)
+#[cfg(test)]
+mod status_line_tests {
+    use super::status_line_text;
+
+    /// 未登録の未接続: 登録への導線だけを出し、retry/not_found が入っていても
+    /// 連結しない(登録が無ければ再試行の相手が存在しないため)
+    #[test]
+    fn unpaired_hides_retry_and_missing() {
+        let text = status_line_text(
+            false,
+            false,
+            false,
+            0,
+            "",
+            None,
+            None,
+            None,
+            Some("再試行まで 3秒"),
+            Some("相手を 5分見つけられません"),
+        );
+        assert_eq!(
+            text,
+            "未接続(設定の「端末を登録…」から相手と登録できます)・このMacは操作できます"
+        );
+        assert!(!text.contains("再試行"), "未登録に再試行は出さない: {text}");
+        assert!(!text.contains("見つけられません"), "未登録に断の文言は出さない: {text}");
+    }
+
+    /// 手動接続+接続歴なし(KNIT_TOKEN で PAIRED=true でも PEERS が空で
+    /// paired_registered=false): 登録の案内を出さず設定画面と同じ文言で待ちを
+    /// 出す(出してしまうと設定画面は「直接つなぐで待機中」なのにメニューだけが
+    /// 「端末を登録…」へ誘導する食い違いになる)
+    #[test]
+    fn manual_without_registration_waits_for_direct_connect() {
+        let text = status_line_text(
+            false,
+            true,
+            false,
+            0,
+            "",
+            None,
+            None,
+            None,
+            Some("再試行まで 3秒"),
+            None,
+        );
+        assert_eq!(
+            text,
+            "未接続(直接つなぐで待機中)・このMacは操作できます・再試行まで 3秒"
+        );
+        assert!(!text.contains("端末を登録"), "手動接続の待ちに登録案内は出さない: {text}");
+    }
+
+    /// 手動接続の未接続も断(not_found)を優先して 1 本だけ連結する
+    /// (manual は paired_registered によらず待ちの補足を受ける=設定画面と同じ条件)
+    #[test]
+    fn manual_prefers_missing_over_retry() {
+        let text = status_line_text(
+            false,
+            true,
+            false,
+            0,
+            "",
+            None,
+            None,
+            Some("最終接続 12:34"),
+            Some("再試行まで 3秒"),
+            Some("相手を 5分見つけられません"),
+        );
+        assert_eq!(
+            text,
+            "未接続(直接つなぐで待機中)・このMacは操作できます\
+             ・最終接続 12:34・相手を 5分見つけられません"
+        );
+        assert!(!text.contains("再試行"), "断の文言が出ている間は retry を並記しない: {text}");
+    }
+
+    /// 登録済みの未接続: 待ちの補足は設定画面(connection_state_text)と同じく
+    /// 優先度の高い方(not_found)だけを 1 本連結し、retry は並記しない
+    #[test]
+    fn paired_disconnected_appends_one_wait_note() {
+        let text = status_line_text(
+            false,
+            false,
+            true,
+            0,
+            "",
+            None,
+            None,
+            Some("最終接続 12:34"),
+            Some("再試行まで 3秒"),
+            Some("相手を 5分見つけられません"),
+        );
+        assert_eq!(
+            text,
+            "未接続(自動で再接続します・相手側アプリの起動を確認)・このMacは操作できます\
+             ・最終接続 12:34・相手を 5分見つけられません"
+        );
+        assert!(!text.contains("再試行"), "断の文言が出ている間は retry を並記しない: {text}");
+    }
+
+    /// 登録済みの未接続・断(not_found)が無い間は retry だけが 1 本連結される
+    #[test]
+    fn paired_disconnected_appends_retry_when_no_missing() {
+        let text = status_line_text(
+            false,
+            false,
+            true,
+            0,
+            "",
+            None,
+            None,
+            None,
+            Some("再試行まで 3秒"),
+            None,
+        );
+        assert_eq!(
+            text,
+            "未接続(自動で再接続します・相手側アプリの起動を確認)・このMacは操作できます\
+             ・再試行まで 3秒"
+        );
+    }
+
+    /// 接続済み: 遅延と経路が付き、最終接続時刻・待ちの補足は付かない。
+    /// 「利用できます」は「接続済み」と同義反復のため出さない
+    #[test]
+    fn connected_shows_rtt_and_route_only() {
+        let text = status_line_text(
+            true,
+            false,
+            true,
+            12,
+            "LAN 直",
+            None,
+            None,
+            Some("最終接続 12:34"),
+            Some("再試行まで 3秒"),
+            Some("相手を 5分見つけられません"),
+        );
+        assert_eq!(text, "接続済み・遅延 12ms・LAN 直");
+        assert!(!text.contains("利用できます"), "同義反復は出さない: {text}");
+    }
+
+    /// 転送の進捗は本線(xfer)を優先し、無い間は補助表示(xfer_extra)へ切替わる。
+    /// どの組合せでも履歴の件数は含まれない(サブメニュー見出しと二重になるため)
+    #[test]
+    fn xfer_prefers_main_line_and_never_lists_history() {
+        let main = status_line_text(
+            true,
+            false,
+            true,
+            0,
+            "",
+            Some("転送 42%(3/7)"),
+            Some("ADB 送信 残り 2件"),
+            None,
+            None,
+            None,
+        );
+        assert!(main.contains("・転送 42%(3/7)"), "{main}");
+        assert!(!main.contains("ADB"), "本線がある間は補助を出さない: {main}");
+        let extra = status_line_text(
+            true,
+            false,
+            true,
+            0,
+            "",
+            None,
+            Some("ADB 送信 残り 2件"),
+            None,
+            None,
+            None,
+        );
+        assert!(extra.contains("・ADB 送信 残り 2件"), "{extra}");
+        for t in [main, extra] {
+            assert!(!t.contains("履歴"), "状態行に履歴件数は出さない: {t}");
         }
     }
 }

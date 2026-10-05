@@ -219,7 +219,7 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 if guide {
                                     notify(
                                         "Knit",
-                                        "遅延が続いています(80ms超)。Wi-Fi の場合は有線直結を検討してください。経路は設定「接続」で確認できます",
+                                        "遅延が続いています(80ms超)。Wi-Fiの場合は有線直結を検討してください。経路は設定「接続」で確認できます",
                                     );
                                 }
                                 send_msg(&Msg::Stat { rtt });
@@ -437,7 +437,7 @@ fn handshake_and_hello(
             let disp = {
                 let n = safe_peer_name(name.trim());
                 if n.is_empty() {
-                    "Windows".to_string()
+                    "端末".to_string()
                 } else {
                     n
                 }
@@ -479,7 +479,7 @@ pub(crate) fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f
             crate::notify(
                 "Knit",
                 &format!(
-                    "ポート {port} が他のアプリに使用中のため Knit を起動できません。他の Knit(旧 Tsunagu 等)が動いていないか確認してください"
+                    "ポート {port} が他のアプリに使用中のためKnitを起動できません。他のKnit(旧 Tsunagu 等)が動いていないか確認してください"
                 ),
             );
             std::thread::sleep(Duration::from_millis(1500));
@@ -685,7 +685,7 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
             *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = {
                 let n = safe_peer_name(name.trim());
                 if n.is_empty() {
-                    "Windows".into()
+                    "端末".into()
                 } else {
                     n
                 }
@@ -720,7 +720,7 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
         &format!(
             "{} と接続しました",
             if peer.is_empty() {
-                "Windows".into()
+                "端末".into()
             } else {
                 peer
             }

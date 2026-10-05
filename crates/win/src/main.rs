@@ -211,7 +211,7 @@ fn registration_authenticated(_token: &str) {
     if JUST_REGISTERED.swap(false, Ordering::Relaxed) {
         tray::notify(
             "接続を確認しました",
-            "登録したMacへ、次回から自動で接続します。",
+            "登録した端末へ、次回から自動で接続します。",
         );
     }
 }

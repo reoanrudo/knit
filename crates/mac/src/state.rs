@@ -100,7 +100,7 @@ pub static DOUBLE_TAP_MS: AtomicU64 = AtomicU64::new(700);
 pub static CORNER_PX: AtomicU64 = AtomicU64::new(0);
 /// クリップボード共有(clipboardSharing)
 pub static CLIP_SHARE: AtomicBool = AtomicBool::new(true);
-/// スクロール互換モード(KNIT_SCROLL_COMPAT=1 / 設定窓): 120 未満の
+/// スクロール互換モード(KNIT_SCROLL_COMPAT=1 / 設定「操作」のチェック): 120 未満の
 /// ホイール量を無視する古い設計のアプリ向けに 1 ノッチ(120)単位で送る。
 /// 既定 OFF=高解像度(0.05 ノッチ刻み)で滑らかに
 pub static SCROLL_COMPAT: AtomicBool = AtomicBool::new(false);
@@ -212,7 +212,7 @@ pub fn set_scroll_div(v: f64) {
     SCROLL_DIV.store(clamped.to_bits(), Ordering::Relaxed);
 }
 /// マウス移動の倍率(Mac の加速済み delta に Windows の加速が重なる調整用)。
-/// カーソル速度倍率(abs 座標系)。設定ウィンドウのスライダーから可変。
+/// カーソル速度倍率(abs 座標系)。設定「操作」のカーソル速度スライダーから可変。
 /// f64 を AtomicU64 ビットで保持(スクロール除数と同じ方式)
 pub(crate) static MOUSE_SCALE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1.0f64.to_bits());

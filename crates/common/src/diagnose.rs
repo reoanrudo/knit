@@ -297,22 +297,22 @@ fn advice_for(cause: Cause, f: &Facts, os: Os) -> String {
             format!("問題ありません{rtt}。")
         }
         Cause::NotListening => {
-            "Knit の常駐が止まっています。Knit を起動すると自動で待ち受けます。".into()
+            "Knitの常駐が止まっています。Knitを起動すると自動で待ち受けます。".into()
         }
         Cause::NoPeer => match os {
-            Os::Mac => "まだ端末登録がありません。Knit 設定の「端末を登録…」から登録します。".into(),
+            Os::Mac => "まだ端末登録がありません。Knit設定の「端末を登録…」から登録します。".into(),
             Os::Windows => "まだ端末登録がありません。トレイメニューの「登録情報」から登録します。".into(),
         },
         Cause::PeerUnreachable => {
             let peer = f.peer.map(|p| p.to_string()).unwrap_or_default();
             let fw = match os {
                 Os::Mac => "システム設定 > ネットワーク > ファイアウォール",
-                Os::Windows => "Windows セキュリティ > ファイアウォールとネットワーク保護",
+                Os::Windows => "Windowsセキュリティ > ファイアウォールとネットワーク保護",
             };
             format!(
-                "{peer} に届きません。両 PC が同じ Wi-Fi/LAN にいるか、相手が起動しているか確認してください。\
+                "{peer} に届きません。両PCが同じWi-Fi/LANにいるか、相手が起動しているか確認してください。\
                  同じネットワークのはずなら、ファイアウォールの設定({fw})が \
-                 Knit の受信をブロックしていないか確認します。"
+                 Knitの受信をブロックしていないか確認します。"
             )
         }
         Cause::PeerProbeOkButNoSession => {
@@ -322,7 +322,7 @@ fn advice_for(cause: Cause, f: &Facts, os: Os) -> String {
                 Os::Windows => "トレイメニューの「登録情報」",
             };
             format!(
-                "{peer} のポートには届くのに接続が成立していません。両 PC で Knit の版が同じか確認し、\
+                "{peer} のポートには届くのに接続が成立していません。両PCでKnitの版が同じか確認し、\
                  改善しない場合は{re_register}で登録のやり直しを試してください。"
             )
         }
@@ -331,17 +331,17 @@ fn advice_for(cause: Cause, f: &Facts, os: Os) -> String {
             // 自動発見(UDP 24903)は AP 分離・ゲスト用 Wi-Fi では届かない。
             // その環境の正解は相手 IP の直接指定(KNIT_HOST)
             let host_howto = match os {
-                Os::Mac => "Mac 側の ~/.config/knit/env へ KNIT_HOST=(Windows の IP) を書く\
-                    (IP は Windows の「設定 > ネットワークとインターネット」で確認)",
+                Os::Mac => "Mac側の ~/.config/knit/env へ KNIT_HOST=(WindowsのIP)を書く\
+                    (IPはWindowsの「設定 > ネットワークとインターネット」で確認)",
                 Os::Windows => {
-                    "Windows 側の %USERPROFILE%\\knit\\.env へ KNIT_HOST=(Mac の IP) を書く\
-                    (IP は Mac の「システム設定 > Wi-Fi > 詳細」で確認)"
+                    "Windows側の %USERPROFILE%\\knit\\.env へ KNIT_HOST=(MacのIP)を書く\
+                    (IPはMacの「システム設定 > Wi-Fi > 詳細」で確認)"
                 }
             };
             format!(
                 "{peer} に届くか確認できませんでした。相手がスリープ・電源オフ・別ネットワークの可能性があります。\
-                 相手側の Knit が起動しているか確認してください。自動発見が届かない Wi-Fi\
-                 (AP 分離・ゲスト用ネットワーク)では IP の直接指定が正解です: {host_howto}"
+                 相手側のKnitが起動しているか確認してください。自動発見が届かないWi-Fi\
+                 (AP 分離・ゲスト用ネットワーク)ではIPの直接指定が正解です: {host_howto}"
             )
         }
     }
@@ -552,7 +552,7 @@ mod tests {
         let mac = advice_for(judge(&f), &f, Os::Mac);
         let win = advice_for(judge(&f), &f, Os::Windows);
         assert!(mac.contains("システム設定 > ネットワーク > ファイアウォール"));
-        assert!(win.contains("Windows セキュリティ > ファイアウォールとネットワーク保護"));
+        assert!(win.contains("Windowsセキュリティ > ファイアウォールとネットワーク保護"));
         assert!(!win.contains("システム設定 > ネットワーク"));
     }
 

@@ -208,7 +208,7 @@ fn continue_here() {
             if now.saturating_sub(LAST_ERR_MS.swap(now, Ordering::Relaxed)) > 60_000 {
                 notify(
                     "Knit",
-                    "ブラウザの URL を取得できませんでした(初回は Mac 側で自動化の許可が必要です)",
+                    "ブラウザの URL を取得できませんでした(初回はMac側で自動化の許可が必要です)",
                 );
             }
         }
@@ -668,8 +668,13 @@ pub(crate) fn save_peer_sides() {
     if let Ok(json) = serde_json::to_string_pretty(&map) {
         // 直書きだと書き込み途中の電源断で全端末の境界設定が壊れるため、
         // 一時ファイル+rename のアトミック置換で保存する(preferences と同じ手法)
-        if let Err(e) = knit_common::persist::write_atomic(&dir.join("peer-sides.json"), json.as_bytes()) {
-            eprintln!("[tap] peer-sides.json の保存に失敗: {e}");
+        match knit_common::persist::write_atomic(&dir.join("peer-sides.json"), json.as_bytes()) {
+            Ok(()) => {
+                // 保存し直せたため、壊れて退避した際の案内を外す
+                // (preferences::save が PrefsFile を外すのと対称の解除導線)
+                crate::gui::clear_peer_sides_error();
+            }
+            Err(e) => eprintln!("[tap] peer-sides.json の保存に失敗: {e}"),
         }
     }
 }
@@ -725,12 +730,31 @@ fn parse_saved_side(v: &serde_json::Value) -> Option<(u8, Option<usize>, Option<
     ))
 }
 
+/// peer-sides.json が壊れて退避された時の保存状態行の文言(純粋関数・単体テストで
+/// 守る)。preferences.json の corrupt_restore_note と同じ導線(prefs::set_save_error)
+/// で設定画面の保存状態行へ出す
+fn peer_sides_corrupt_note() -> &'static str {
+    "端末の配置ファイルが壊れていたため初期設定で起動しました(退避: peer-sides.json.corrupt)"
+}
+
 /// peer-sides.json を全体を読む(読めなければ None)。壊れている場合は
 /// .corrupt へ退避してから None: 無言で空扱いにすると以後の保存で旧設定が
-/// 恒久喪失するため、上書き前に救出材料を残す
+/// 恒久喪失するため、上書き前に救出材料を残す。退避したことを GUI へも
+/// 出す(黙って初期設定で起動したように見せない=preferences.json と対称)
 fn load_peer_sides_json() -> Option<serde_json::Value> {
     let dir = knit_common::envutil::config_dir()?;
-    knit_common::persist::read_json_or_quarantine(&dir.join("peer-sides.json"))
+    let path = dir.join("peer-sides.json");
+    let existed = path.exists();
+    let v = knit_common::persist::read_json_or_quarantine(&path);
+    // 読み込み前にファイルが有ったのに読めず、読み込み後に元のパスが消えている
+    // =退避(rename)に成功した(preferences.rs restore と同じ判定)。退避後は
+    // path が存在しなくなるため、この条件が成り立つのは退避した直後の 1 回だけ
+    if v.is_none() && existed && !path.exists() {
+        let note = peer_sides_corrupt_note();
+        eprintln!("[tap] {note}");
+        crate::gui::report_peer_sides_error(note.to_string());
+    }
+    v
 }
 
 /// 端末 id に保存された画面の位置(無ければ None)。戻り値は (side, モニター番号)。
@@ -786,6 +810,15 @@ pub(crate) fn has_saved_peer_sides() -> bool {
     load_peer_sides_json()
         .and_then(|v| v.as_object().map(|o| !o.is_empty()))
         .unwrap_or(false)
+}
+
+/// peer-sides.json に保存済みの端末の件数。設定「接続」の登録済み台数の表示は
+/// 接続中の PEERS とこの値の max を使う: PEERS は切断中に空になるため、
+/// 保存だけが残る運用(未接続・自動再接続)で台数が 0 に見えるのを防ぐ
+pub(crate) fn saved_peer_count() -> usize {
+    load_peer_sides_json()
+        .and_then(|v| v.as_object().map(|o| o.len()))
+        .unwrap_or(0)
 }
 
 /// 新しい端末の画面の位置を決める: 保存があればそれ、無ければ全体設定の辺が
@@ -1136,7 +1169,7 @@ pub(crate) fn enter_win_mode_cursor_lock() {
             if now.saturating_sub(LAST.swap(now, Ordering::Relaxed)) > 60_000 {
                 notify(
                     "Knit",
-                    &format!("「{app}」がパスワード入力等の保護を有効にしているため、キーボードを Windows へ送れません。そのアプリの入力欄から離れてください"),
+                    &format!("「{app}」がパスワード入力等の保護を有効にしているため、キーボードを {} へ送れません。そのアプリの入力欄から離れてください", active_peer_label()),
                 );
             }
         }
@@ -1357,6 +1390,14 @@ pub(crate) fn surrender_on_permission_loss() -> ! {
         }
     }
     eprintln!("[fatal] アクセシビリティ権限が外れました。入力を解放して Knit を終了します");
+    // GUI 利用者には stderr が見えないため、復旧手順を通知センターへも出す。
+    // notify は別スレッド spawn のため、表示される時間だけ待ってから終える
+    //(main.rs の request_quit_for_update と同じ作法)
+    crate::notify(
+        "Knit",
+        "アクセシビリティ権限が外れたためKnitを終了しました。システム設定の「アクセシビリティ」で許可し直してから、Knitをもう一度開いてください",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     std::process::exit(0);
 }
 
@@ -1701,7 +1742,7 @@ pub(crate) unsafe extern "C" fn tap_callback(
                         let now = now_ms();
                         if now.saturating_sub(DRAG_GUIDE_MS.swap(now, Ordering::Relaxed)) >= 120_000
                         {
-                            notify("Knit", "ファイルを掴んだままです。Mac のドロップ先でボタンを離すとそこへ置けます(境界では切り替わりません)");
+                            notify("Knit", "ファイルを掴んだままです。Macのドロップ先でボタンを離すとそこへ置けます(境界では切り替わりません)");
                         }
                         return event;
                     }
@@ -2664,5 +2705,27 @@ mod alias_tests {
             "monitor": -1,
         });
         assert_eq!(alias_from_entry(&without_alias), None);
+    }
+}
+
+#[cfg(test)]
+mod quarantine_note_tests {
+    use super::peer_sides_corrupt_note;
+
+    /// 壊れた peer-sides.json で起動した時の案内: 「初期設定で起動した」ことと
+    /// 救出材料の手がかり(退避先のファイル名)を出す。preferences.json の
+    /// corrupt_restore_note と同じ構造の文言
+    #[test]
+    fn corrupt_note_mentions_default_startup_and_quarantine() {
+        let note = peer_sides_corrupt_note();
+        assert!(note.contains("初期設定で起動しました"), "初期設定での起動を伝える: {note}");
+        assert!(
+            note.contains("peer-sides.json.corrupt"),
+            "退避先を手がかりとして出す: {note}"
+        );
+        assert!(
+            note.contains("端末の配置ファイル"),
+            "どのファイルが壊れていたかを言う: {note}"
+        );
     }
 }

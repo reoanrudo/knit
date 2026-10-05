@@ -80,7 +80,7 @@ pub(super) fn snapshot() -> Value {
 
 /// 画面に触れない保存(別スレッドから呼ぶ用)
 pub(super) fn save_quiet() {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
+    if UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
         return;
     }
     if let Some(path) = path() {
@@ -91,14 +91,19 @@ pub(super) fn save_quiet() {
 }
 
 pub(super) fn save() {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
+    // RESTARTING=再起動待ちの間はメモリの設定が旧いままのため、保存すると
+    // 「すべての設定を初期化」が消したファイルを書き戻してしまう
+    if UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
         return;
     }
     let result = (|| -> std::io::Result<()> {
-        let path = path().ok_or_else(|| std::io::Error::other("HOME がありません"))?;
+        let path = path().ok_or_else(|| std::io::Error::other("HOMEがありません"))?;
         write_to(&path, &snapshot())
     })();
     let status = if result.is_ok() {
+        // 保存が成功した=壊れたファイル(退避済み)に代わる新しい設定が書けたため、
+        // 起動時の破損の案内(PrefsFile)だけを外す(他の出元の未解決エラーは残す)
+        prefs::clear_save_error(prefs::SaveErrorSource::PrefsFile);
         prefs::save_status_saved(&override_keys())
     } else {
         "設定を保存できません。ログを確認してください".to_string()
@@ -116,7 +121,7 @@ pub(super) fn snapshot_json() -> String {
     snapshot().to_string()
 }
 
-/// 現在の設定を JSON ファイルへ書き出す(設定「その他」の「設定を書き出す…」)。
+/// 現在の設定を JSON ファイルへ書き出す(設定画面の左下「その他」の「設定を書き出す…»)。
 /// 中身は snapshot と同じ形式(version 1)。引っ越しやバックアップに使う。
 /// 書き込みは通常の保存と同じ一時ファイル+リネームのため、失敗しても
 /// 既存ファイルは壊れない
@@ -132,7 +137,7 @@ pub(super) fn import_from(source: &std::path::Path) -> Result<(), String> {
     let v: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("設定ファイルとして読めません: {e}"))?;
     if v["version"].as_u64() != Some(1) {
-        return Err("このファイルは Knit の設定ファイルではありません".into());
+        return Err("このファイルはKnitの設定ファイルではありません".into());
     }
     apply(&v);
     if let Some(dest) = path() {
@@ -152,7 +157,12 @@ pub(super) fn apply_remote(json: &str) {
         "share_files", "local_history", "audio_muted", "audio_gain", "layout_range",
         "android_pinch", "android_navigation", "peer_layout_reset",
     ];
-    if json.len() > 4096 || UI_PREVIEW.load(Ordering::Relaxed) {
+    // RESTARTING も同じ理由で止める(遠隔適用は受信スレッドから呼ばれるため、
+    // 初期化後の再起動待ちでも届き得る)
+    if json.len() > 4096
+        || UI_PREVIEW.load(Ordering::Relaxed)
+        || RESTARTING.load(Ordering::Relaxed)
+    {
         return;
     }
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(json) else {
@@ -220,24 +230,44 @@ fn write_to(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
+/// 壊れた preferences.json で起動した時の保存状態行の文言(純粋関数・単体テストで
+/// 守る)。quarantined=退避に成功したか(persist は rename で退避するため、読み込み
+/// 後に元のパスが消えていたかで判る)
+fn corrupt_restore_note(quarantined: bool) -> &'static str {
+    if quarantined {
+        "設定ファイルが壊れていたため初期設定で起動しました(退避: preferences.json.corrupt)"
+    } else {
+        "設定ファイルが壊れていたため初期設定で起動しました(退避できませんでした。ログを確認してください)"
+    }
+}
+
 pub(super) fn restore() {
     let Some(path) = path() else { return };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return;
-    };
-    // 旧版が 644 で作ったファイルを読めたら 600 へ是正する
-    knit_common::history::restrict(&path);
-    let v: Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[prefs] invalid preferences: {e}");
-            return;
+    // 壊れた preferences.json を黙って無視すると、次の保存で上書きされて全設定が
+    // 救出不能になる。persist の共通導線(peer-sides.json 等と同じ)で .corrupt へ
+    // 退避してから既定値で起動し、退避したことを保存状態行へ出す(黙って設定が
+    // 消えたように見せない)
+    let existed = path.exists();
+    match knit_common::persist::read_json_or_quarantine(&path) {
+        Some(v) => {
+            // 旧版が 644 で作ったファイルを読めたら 600 へ是正する
+            knit_common::history::restrict(&path);
+            if v["version"].as_u64() != Some(1) {
+                return;
+            }
+            apply(&v);
         }
-    };
-    if v["version"].as_u64() != Some(1) {
-        return;
+        None => {
+            // 読み込み前にファイルが有ったのに読めない=壊れて退避した(または退避に
+            // 失敗した)。初回起動(ファイルが無い)では出さない
+            if existed {
+                // rename で退避されていれば元のパスは消えている
+                let note = corrupt_restore_note(!path.exists());
+                eprintln!("[prefs] {note}");
+                prefs::set_save_error(prefs::SaveErrorSource::PrefsFile, note.to_string());
+            }
+        }
     }
-    apply(&v);
 }
 
 fn apply(v: &Value) {
@@ -276,7 +306,14 @@ fn apply(v: &Value) {
         crate::EDGE_TAPS.store(n.clamp(1, 3) as u32, Ordering::Relaxed);
     }
     if let Some(n) = v["delay"].as_u64() {
-        crate::SWITCH_DELAY_MS.store(n.min(5000), Ordering::Relaxed);
+        // 0=「端で少し待つ」以外の方式(滞在を使わない)のため素通し。それ以外は
+        // GUI スライダー(50-1000ms)と同じ範囲へ収める: 範囲外の値で復元すると
+        // スライダーに触れた瞬間に黙って値が潰れるため、受け口の段階で揃える
+        let ms = if n == 0 { 0 } else { n.clamp(50, 1000) };
+        crate::SWITCH_DELAY_MS.store(ms, Ordering::Relaxed);
+        // 復元経由でも滞在値を記憶する: 方式を切り替えて 0 に戻った後、
+        // 「端で少し待つ」へ戻ったときにこの値へ復元する(スライダと同じ導線)
+        super::prefs::remember_dwell(ms);
     }
     if let Some(n) = v["double_tap"].as_u64() {
         crate::DOUBLE_TAP_MS.store(n.clamp(100, 3000), Ordering::Relaxed);
@@ -342,6 +379,43 @@ mod tests {
         assert!(import_from(&file).is_err(), "JSON 不一致は拒否");
         std::fs::remove_dir_all(dir).unwrap();
         apply(&before);
+    }
+
+    /// 滞在時間(delay)の復元: 0(=「端で少し待つ」以外の方式・滞在なし)はそのまま
+    /// 通し、それ以外は GUI スライダーと同じ 50-1000ms へ収める。復元値が GUI の
+    /// 操作範囲を超えていると、スライダーに触れた瞬間に値が黙って潰れるため
+    #[test]
+    fn restored_delay_is_clamped_to_slider_range_but_zero_passes() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot();
+        apply(&json!({"delay": 0}));
+        assert_eq!(
+            crate::SWITCH_DELAY_MS.load(Ordering::Relaxed),
+            0,
+            "0=滞在なしは方式の情報のため素通り"
+        );
+        apply(&json!({"delay": 10}));
+        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 50, "下限は 50ms");
+        apply(&json!({"delay": 4000}));
+        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 1000, "上限は 1000ms");
+        apply(&json!({"delay": 300}));
+        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 300, "範囲内はそのまま");
+        apply(&before);
+    }
+
+    /// 壊れた preferences.json で起動した時の案内: 退避の成否で文言が変わる。
+    /// どちらも「初期設定で起動した」ことと救出材料の手がかりを出す
+    #[test]
+    fn corrupt_restore_note_mentions_quarantine() {
+        let saved = corrupt_restore_note(true);
+        assert!(saved.contains("初期設定で起動しました"), "{saved}");
+        assert!(
+            saved.contains("preferences.json.corrupt"),
+            "退避先を手がかりとして出す: {saved}"
+        );
+        let failed = corrupt_restore_note(false);
+        assert!(failed.contains("初期設定で起動しました"), "{failed}");
+        assert!(failed.contains("退避できませんでした"), "{failed}");
     }
 
     #[test]
@@ -425,7 +499,8 @@ mod tests {
         assert_eq!(crate::scroll_div(), 20.0);
         assert_eq!(crate::mouse_scale(), 3.0);
         assert_eq!(crate::EDGE_TAPS.load(Ordering::Relaxed), 1);
-        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 5000);
+        // 滞在時間は GUI スライダー(50-1000ms)と同じ上限へ潰される
+        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 1000);
         assert_eq!(
             crate::SIDE.load(Ordering::Relaxed),
             side_before,

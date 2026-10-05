@@ -228,6 +228,8 @@ const MENU_DIAGNOSE: u32 = 1017;
 const MENU_OPENSETDIR: u32 = 1018;
 /// 設定を初期化(.env の KNIT_* 行削除+配置の既定化のみ)
 const MENU_RESETSETTINGS: u32 = 1019;
+/// 接続トークン(手動直接接続の KNIT_TOKEN)を .env へ保存して再接続
+const MENU_SAVETOKEN: u32 = 1020;
 const MENU_SHARE_CLIP: u32 = 1014;
 const MENU_SHARE_FILES: u32 = 1015;
 const MENU_UPDATE: u32 = 1013;
@@ -315,6 +317,8 @@ static LABEL_FOOTER: AtomicUsize = AtomicUsize::new(0);
 /// プロセス起動時刻(稼働時間表示用)
 static START_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 static EDIT_HOST: AtomicUsize = AtomicUsize::new(0);
+/// 接続トークン(直接つなぐ)の入力欄。初期値は .env の KNIT_TOKEN
+pub static EDIT_TOKEN: AtomicUsize = AtomicUsize::new(0);
 /// 現在接続先としているホスト(サーバー編集欄の初期値)
 pub static HOST_NOW: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
@@ -335,7 +339,9 @@ fn build_line() -> String {
 }
 fn audio_line() -> String {
     if crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed) {
-        "音声転送: ON(Windows の音を Mac で再生)".to_string()
+        // 音声の受け手は現状 Mac 的な相手(キーボード入力と同じ制約)だが、文言は
+        // 相手の種類を固定しない(将来の一般化でそのまま使えるように)
+        "音声転送: ON(Windowsの音を相手側で再生)".to_string()
     } else {
         "音声転送: OFF".to_string()
     }
@@ -373,6 +379,18 @@ fn save_host_to_env(host: &str) -> std::io::Result<()> {
     knit_common::envutil::set_env_value(&dir.join(".env"), "KNIT_HOST", host)
 }
 
+/// exe と同じフォルダの .env の KNIT_TOKEN 行を書き換える(無ければ追記)。
+/// token が空のときは行を書かない=通常の登録(接続キー)へ戻す。Mac 側の
+/// imp_save_token と同じ条件の保存で、検証だけ共通の validate_shared_token に
+/// 任せる(短いトークンで起動が止まる問題を保存段階で弾く)
+fn save_token_to_env(token: &str) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| std::io::Error::other("exe directory is unavailable"))?;
+    knit_common::envutil::set_env_value(&dir.join(".env"), "KNIT_TOKEN", token)
+}
+
 /// Mac 側の設定(画面位置・⌘キー割当)の表示。Mac から Cfg で同期された値
 fn maccfg_line() -> String {
     let side = match crate::SIDE_W.load(Ordering::Relaxed) {
@@ -390,7 +408,7 @@ fn maccfg_line() -> String {
     } else {
         "Ctrl"
     };
-    format!("Mac の設定: Windows は{side}・⌘キーは {cmd}")
+    format!("相手の設定: このPCは{side}・⌘キーは {cmd}")
 }
 
 /// フッター: 接続先サーバー・最終接続・次の再試行・稼働時間(1 秒タイマーで更新)
@@ -450,7 +468,7 @@ fn spk_line() -> String {
     let mode = crate::SPK_MUTE_MODE.load(Ordering::Relaxed);
     let conn = crate::CONNECTED.load(Ordering::Relaxed);
     match (mode, conn) {
-        (true, true) => "スピーカー: ミュート中(Mac のみ発音)".to_string(),
+        (true, true) => "スピーカー: ミュート中(相手側のみ発音)".to_string(),
         (true, false) => "スピーカー: 接続時にミュート".to_string(),
         _ => "スピーカー: 常時鳴らす".to_string(),
     }
@@ -485,14 +503,14 @@ fn tray_status_text() -> String {
     } else if registered() {
         // 登録済みなら再接続は自動。初回ユーザーに「自動でつながる」という
         // 不正確な期待を与えない(Mac 側の PAIRED 分岐と同じ方針)
-        "未接続 · 自動再接続中"
+        "未接続・自動再接続中"
     } else {
-        "未接続 · はじめてなら「登録情報」から"
+        "未接続・はじめてなら「登録情報」から"
     };
     // 遅延と経路(接続中のみ。履歴件数は接続の有無に関係なく役立つ)
     let rtt = crate::RTT_MS.load(Ordering::Relaxed);
     let rtt_s = if crate::CONNECTED.load(Ordering::Relaxed) && rtt > 0 {
-        format!(" · 遅延{}ms", rtt)
+        format!("・遅延{}ms", rtt)
     } else {
         String::new()
     };
@@ -501,9 +519,9 @@ fn tray_status_text() -> String {
         .unwrap_or_else(|e| e.into_inner())
         .map(|ip| {
             if knit_common::net::is_tailscale(ip) {
-                " · Tailscale"
+                "・Tailscale"
             } else {
-                " · LAN 直"
+                "・LAN 直"
             }
         })
         .unwrap_or_default();
@@ -512,16 +530,16 @@ fn tray_status_text() -> String {
         .map(|h| h.entries().len())
         .unwrap_or(0);
     let history_s = if history > 0 {
-        format!(" · 履歴{history}件")
+        format!("・履歴{history}件")
     } else {
         String::new()
     };
     // 転送中は進捗を常に見える場所へ(ツールチップとステータス窓の状態行で共用)
     let xfer_s = match crate::xfer_line() {
-        Some(x) => format!(" · {x}"),
+        Some(x) => format!("・{x}"),
         None => String::new(),
     };
-    format!("Knit · {conn}{rtt_s}{route}{history_s}{xfer_s}")
+    format!("Knit・{conn}{rtt_s}{route}{history_s}{xfer_s}")
 }
 
 /// バルーン通知(接続/切断の可視化)。どのスレッドからでも呼べる
@@ -688,7 +706,7 @@ pub(crate) fn apply_peer_role(peer_is_host: bool) {
     notify(
         "Knit",
         if want_host {
-            "相手がMac側のホストをやめたため、このPCをホスト(待受側)に切り替えて再起動します"
+            "相手がホストをやめたため、このPCをホスト(待受側)に切り替えて再起動します"
         } else {
             "相手がホストになったため、このPCを接続側に切り替えて再起動します"
         },
@@ -734,6 +752,22 @@ unsafe fn handle_command(id: u32) {
             }
         }
         MENU_HISTORY_CLEAR => {
+            // 戻せない操作のため確認を挟む(Mac 側「履歴をすべて消す…」と対称。
+            // 既定(Enter/フォーカス)は「いいえ」=キャンセル側に置く)
+            let text = wide(
+                "クリップボードの履歴すべて(最大50件)が消え、元に戻せません。\n履歴をすべて消しますか?",
+            );
+            let caption = wide("履歴をすべて消す");
+            let choice = MessageBoxW(
+                std::ptr::null_mut(),
+                text.as_ptr(),
+                caption.as_ptr(),
+                0x0001_0134 /*MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND*/,
+            );
+            if choice != 6 {
+                /*IDYES 以外 = キャンセル*/
+                return;
+            }
             crate::history_clear();
             update_tip();
             update_labels();
@@ -772,7 +806,7 @@ unsafe fn handle_command(id: u32) {
                 let report = crate::diag::run();
                 DIAG_RUNNING.store(false, Ordering::Relaxed);
                 let w: Vec<u16> = report.encode_utf16().chain(std::iter::once(0)).collect();
-                let caption = wide("Knit 接続診断");
+                let caption = wide("Knit接続診断");
                 unsafe {
                     MessageBoxW(
                         std::ptr::null_mut(),
@@ -817,7 +851,7 @@ unsafe fn handle_command(id: u32) {
             // .env の KNIT_* 行を消し、配置を既定へ戻す。履歴と端末の登録は
             // 消さない。環境変数として設定された KNIT_* はここからは消えない
             let text = wide(
-                "このPCの Knit の設定を初期化しますか?\n対象: .env の KNIT_* 行・画面配置\n履歴と端末の登録は消えません。\n\n環境変数として設定されている KNIT_* は消えません。\nこの操作は取り消せません。",
+                "このPCのKnitの設定を初期化しますか?\n対象: .env の KNIT_* 行・画面配置\n履歴と端末の登録は消えません。\n\n環境変数として設定されている KNIT_* は消えません。\nこの操作は取り消せません。",
             );
             let caption = wide("設定の初期化");
             let choice = MessageBoxW(
@@ -849,7 +883,7 @@ unsafe fn handle_command(id: u32) {
             eprintln!("[tray] 設定を初期化しました(.env の KNIT_* 行を削除し配置を既定化)");
             notify(
                 "設定を初期化しました",
-                "Knit を再起動すると、最初の状態で起動します。",
+                "Knitを再起動すると、最初の状態で起動します。",
             );
         }
         MENU_OPENLOG => {
@@ -881,7 +915,7 @@ unsafe fn handle_command(id: u32) {
                 println!("[tray] Mac へ戻る: 未接続のため何も起きません");
                 notify(
                     "Knit",
-                    "未接続のため戻れません(Mac側アプリが起動していれば自動で再接続します)",
+                    "未接続のため戻れません(相手側アプリが起動していれば自動で再接続します)",
                 );
             }
         }
@@ -950,6 +984,52 @@ unsafe fn handle_command(id: u32) {
                 // 接続中ミュートの状態を復帰させてから終わる(ミュート恒久化の防止)。
                 // 終了だけだと毎分の自動復帰タスクが起こすまで最長 1 分消えたままに
                 // なるため、restart_self で即座に起こし直す(MENU_RESTART と同じ)
+                crate::audio::speaker_disconnect();
+                crate::release_all_input();
+                restart_self();
+            }
+        }
+        MENU_SAVETOKEN => {
+            // 接続トークン(直接つなぐ)を .env へ保存して再起動(自動復帰が起こす)。
+            // 空欄は KNIT_TOKEN 行を消して通常の登録(接続キー)へ戻す。トークンは
+            // 両側へ同じ値を設定すると登録なしに直接つなげる(Mac 側設定の
+            // 「直接つなぐ」と対になる操作)
+            let hwnd = EDIT_TOKEN.load(Ordering::Relaxed) as HWND;
+            if !hwnd.is_null() {
+                extern "system" {
+                    fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
+                    fn GetWindowTextLengthW(hwnd: HWND) -> i32;
+                }
+                let len = GetWindowTextLengthW(hwnd);
+                let mut buf = vec![0u16; len as usize + 1];
+                GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
+                let text = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
+                let token = text.trim().to_string();
+                if UI_PREVIEW.load(Ordering::Relaxed) {
+                    return;
+                }
+                // 形式の確認(共通の validate_shared_token。Mac 側の保存と同じ基準):
+                // 32 文字以上の半角英数字。短いトークンは読み込み側(main)が起動を
+                // 止めるため、保存前にここで弾く
+                if let Err(bad) = knit_common::credentials::validate_shared_token(&token) {
+                    eprintln!("[prefs] token save rejected: {bad}");
+                    notify("接続トークンを保存できません", bad);
+                    return;
+                }
+                if let Err(e) = save_token_to_env(&token) {
+                    eprintln!("[prefs] token save failed: {e}");
+                    notify(
+                        "接続トークンを保存できません",
+                        "アプリのフォルダへの書込み権限を確認してください。",
+                    );
+                    return;
+                }
+                eprintln!(
+                    "[tray] 接続トークンを {} へ変更し再起動します",
+                    if token.is_empty() { "(解除)" } else { "設定" }
+                );
+                // host 保存と同じ後始末: 接続中ミュートを戻し、自動復帰タスクが
+                // 起こすまで待たずにすぐ起こし直す(MENU_SAVEHOST と同じ)
                 crate::audio::speaker_disconnect();
                 crate::release_all_input();
                 restart_self();
@@ -1038,9 +1118,9 @@ unsafe fn handle_command(id: u32) {
             notify(
                 "Knit",
                 if next {
-                    "このPCをホスト(待受側)に切り替えました。Knit を再起動します"
+                    "このPCをホスト(待受側)に切り替えました。Knitを再起動します"
                 } else {
-                    "このPCを接続側に戻しました。Knit を再起動します"
+                    "このPCを接続側に戻しました。Knitを再起動します"
                 },
             );
             // 相手(Mac)にも反対の役割へ合わせさせる(双方が待ち受け/双方が接続側になり、
@@ -1466,9 +1546,9 @@ unsafe fn open_menu(hwnd: HWND) {
                 ids.push(*entry_id);
             }
             // 平文保存の常時通知(利用者が気づけるように履歴がある間は常に表示する)
-            let note = wide("※履歴は平文で保存されています(残したくない場合は「履歴を消す」)");
+            let note = wide("※履歴は平文で保存されています(残したくない場合は「履歴をすべて消す…」)");
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, note.as_ptr());
-            let clear = wide("履歴を消す");
+            let clear = wide("履歴をすべて消す…");
             AppendMenuW(menu, MF_STRING, MENU_HISTORY_CLEAR as usize, clear.as_ptr());
             if let Ok(mut g) = MENU_HISTORY_IDS.lock() {
                 *g = ids;
@@ -1481,7 +1561,7 @@ unsafe fn open_menu(hwnd: HWND) {
     }
     let audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
-    let bm = wide("Macへ戻る");
+    let bm = wide("相手へ戻る");
     AppendMenuW(
         menu,
         MF_STRING | if crate::CONNECTED.load(Ordering::Relaxed) {
