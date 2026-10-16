@@ -48,7 +48,8 @@ fn override_keys_with(get: impl Fn(&str) -> Option<String>) -> Vec<&'static str>
 
 pub(super) fn snapshot() -> Value {
     json!({
-        "version": 1, "hotkey": crate::hotkey_kc(), "side": crate::SIDE.load(Ordering::Relaxed),
+        "version": 1, "ui_language": localization::language().code(),
+        "hotkey": crate::hotkey_kc(), "side": crate::SIDE.load(Ordering::Relaxed),
         "client_role": crate::CLIENT_ROLE.load(Ordering::Relaxed),
         "hotkey_only": crate::HOTKEY_ONLY.load(Ordering::Relaxed),
         "edge_taps": crate::EDGE_TAPS.load(Ordering::Relaxed),
@@ -64,6 +65,7 @@ pub(super) fn snapshot() -> Value {
         "local_history": crate::LOCAL_HISTORY.load(Ordering::Relaxed),
         "audio_muted": crate::audio::MUTED.load(Ordering::Relaxed),
         "audio_gain": crate::audio::gain() as f64,
+        "audio_output_uid": crate::audio::output_uid(),
         "android_pinch": crate::trackpad::ENABLED.load(Ordering::Relaxed),
         "android_navigation": crate::trackpad::NAV_ENABLED.load(Ordering::Relaxed),
         "layout_range": *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()),
@@ -72,6 +74,9 @@ pub(super) fn snapshot() -> Value {
         // 詳細記録(--diag 相当。1秒ごとの診断行)。起動時の --diag 引数は
         // これより優先する(起動時に true へ上書きされるため矛盾しない)
         "diag_log": crate::DIAG_ENABLED.load(Ordering::Relaxed),
+        // 更新の自動確認(手動確認は常に可能。この Mac のみの設定のため
+        // 遠隔適用の許可リストには含めない)
+        "update_check": crate::UPDATE_CHECK.load(Ordering::Relaxed),
         // 環境変数・envファイルで固定されているキー(設定が効かない原因の見える化)。
         // apply は知らないキーを無視するため、読み込み側でそのまま戻しても無害
         "env_overrides": override_keys()
@@ -80,7 +85,7 @@ pub(super) fn snapshot() -> Value {
 
 /// 画面に触れない保存(別スレッドから呼ぶ用)
 pub(super) fn save_quiet() {
-    if UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
+    if cfg!(test) || UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
         return;
     }
     if let Some(path) = path() {
@@ -93,7 +98,7 @@ pub(super) fn save_quiet() {
 pub(super) fn save() {
     // RESTARTING=再起動待ちの間はメモリの設定が旧いままのため、保存すると
     // 「すべての設定を初期化」が消したファイルを書き戻してしまう
-    if UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
+    if cfg!(test) || UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed) {
         return;
     }
     let result = (|| -> std::io::Result<()> {
@@ -106,7 +111,9 @@ pub(super) fn save() {
         prefs::clear_save_error(prefs::SaveErrorSource::PrefsFile);
         prefs::save_status_saved(&override_keys())
     } else {
-        "設定を保存できません。ログを確認してください".to_string()
+        let note = "設定を保存できません。ログを確認してください".to_string();
+        prefs::set_save_error(prefs::SaveErrorSource::PrefsFile, note.clone());
+        localization::copy(&note)
     };
     unsafe {
         prefs::set_save_status(&status);
@@ -125,6 +132,7 @@ pub(super) fn snapshot_json() -> String {
 /// 中身は snapshot と同じ形式(version 1)。引っ越しやバックアップに使う。
 /// 書き込みは通常の保存と同じ一時ファイル+リネームのため、失敗しても
 /// 既存ファイルは壊れない
+#[allow(dead_code)]
 pub(super) fn export_to(path: &std::path::Path) -> std::io::Result<()> {
     write_to(path, &snapshot())
 }
@@ -132,36 +140,50 @@ pub(super) fn export_to(path: &std::path::Path) -> std::io::Result<()> {
 /// 書き出した JSON ファイルから設定を読み込む(「設定を読み込む…」)。
 /// version 1 の形式だけを受け付ける。apply は知らないキーを無視し範囲検査も
 /// 通るため、外部で編集されたファイルでも安全。読み込んだら保存まで行う
+#[allow(dead_code)]
 pub(super) fn import_from(source: &std::path::Path) -> Result<(), String> {
     let bytes = std::fs::read(source).map_err(|e| format!("ファイルを読めません: {e}"))?;
-    let v: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("設定ファイルとして読めません: {e}"))?;
+    let v: Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("設定ファイルとして読めません: {e}"))?;
     if v["version"].as_u64() != Some(1) {
         return Err("このファイルはKnitの設定ファイルではありません".into());
     }
-    apply(&v);
-    if let Some(dest) = path() {
-        if let Err(e) = write_to(&dest, &snapshot()) {
-            return Err(format!("設定を保存できませんでした: {e}"));
-        }
+    let mut patch = v;
+    for key in ["client_role", "side", "layout_range"] {
+        patch.as_object_mut().ok_or("設定が不正です")?.remove(key);
     }
-    Ok(())
+    commit_patch(&patch)
 }
 
 /// Windows から届いた設定変更を適用する。許可したキーだけを範囲検査つきで反映し、
 /// 画面には触れず(別スレッドから呼ばれる)、ファイルへ保存する
 pub(super) fn apply_remote(json: &str) {
     const ALLOWED: [&str; 21] = [
-        "hotkey", "side", "hotkey_only", "edge_taps", "delay", "double_tap", "scroll_div",
-        "mouse_scale", "scroll_flip", "scroll_compat", "cmd_alt", "spk_mute", "clip_share",
-        "share_files", "local_history", "audio_muted", "audio_gain", "layout_range",
-        "android_pinch", "android_navigation", "peer_layout_reset",
+        "hotkey",
+        "side",
+        "hotkey_only",
+        "edge_taps",
+        "delay",
+        "double_tap",
+        "scroll_div",
+        "mouse_scale",
+        "scroll_flip",
+        "scroll_compat",
+        "cmd_alt",
+        "spk_mute",
+        "clip_share",
+        "share_files",
+        "local_history",
+        "audio_muted",
+        "audio_gain",
+        "layout_range",
+        "android_pinch",
+        "android_navigation",
+        "peer_layout_reset",
     ];
     // RESTARTING も同じ理由で止める(遠隔適用は受信スレッドから呼ばれるため、
     // 初期化後の再起動待ちでも届き得る)
-    if json.len() > 4096
-        || UI_PREVIEW.load(Ordering::Relaxed)
-        || RESTARTING.load(Ordering::Relaxed)
+    if json.len() > 4096 || UI_PREVIEW.load(Ordering::Relaxed) || RESTARTING.load(Ordering::Relaxed)
     {
         return;
     }
@@ -180,7 +202,9 @@ pub(super) fn apply_remote(json: &str) {
     }
     // 配置の完全リセット(辺とモニター指定の両方を既定へ戻す。
     // Mac 設定画面の「配置を初期化」と同じ効果)
-    let layout_reset = filtered.remove("peer_layout_reset").is_some_and(|v| v == json!(true));
+    let layout_reset = filtered
+        .remove("peer_layout_reset")
+        .is_some_and(|v| v == json!(true));
     let v = Value::Object(filtered);
     if layout_reset {
         let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
@@ -213,8 +237,12 @@ fn write_to(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("保存先がありません"))?;
+    // 外部への書き出し先の既存権限を変えない。専用設定ディレクトリだけを保護する。
+    let existed = parent.exists();
     std::fs::create_dir_all(parent)?;
-    knit_common::history::restrict_dir(parent);
+    if !existed {
+        knit_common::history::restrict_dir(parent);
+    }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     // 履歴と同じく 0600 で作成する(作成後に chmod する方式だと共有 Mac で
     // 僅かな時間他ユーザーに読まれる窓が残る)
@@ -255,7 +283,16 @@ pub(super) fn restore() {
             if v["version"].as_u64() != Some(1) {
                 return;
             }
-            apply(&v);
+            let mut restored = v;
+            if !cfg!(test) {
+                if let Some(uid) = restored["audio_output_uid"].as_str() {
+                    if let Err(e) = crate::audio::restore_output_uid(uid) {
+                        prefs::set_save_error(prefs::SaveErrorSource::PrefsFile, e);
+                        restored["audio_muted"] = json!(true);
+                    }
+                }
+            }
+            apply(&restored);
         }
         None => {
             // 読み込み前にファイルが有ったのに読めない=壊れて退避した(または退避に
@@ -270,7 +307,114 @@ pub(super) fn restore() {
     }
 }
 
+pub(super) fn validate_patch(patch: &Value) -> Result<(), String> {
+    let map = patch
+        .as_object()
+        .ok_or("設定がオブジェクトではありません")?;
+    for (key, v) in map {
+        match key.as_str() {
+            "clip_share" | "share_files" | "local_history" | "audio_muted" | "spk_mute"
+            | "cmd_alt" | "android_pinch" | "android_navigation" | "diag_log" | "hotkey_only"
+            | "scroll_flip" | "scroll_compat" | "client_role" | "update_check" => {
+                if !v.is_boolean() {
+                    return Err(format!("{key}: 真偽値が必要です"));
+                }
+            }
+            "audio_gain" => {
+                if !v
+                    .as_f64()
+                    .is_some_and(|n| n.is_finite() && (0.0..=2.0).contains(&n))
+                {
+                    return Err("音量は0〜2で指定してください".into());
+                }
+            }
+            "mouse_scale" => {
+                if !v
+                    .as_f64()
+                    .is_some_and(|n| n.is_finite() && (0.2..=3.0).contains(&n))
+                {
+                    return Err("感度は0.2〜3.0で指定してください".into());
+                }
+            }
+            "ui_language" => {
+                if v.as_str().and_then(localization::Language::parse).is_none() {
+                    return Err("言語はjaまたはenで指定してください".into());
+                }
+            }
+            "audio_output_uid" | "own_name" => {
+                if !v
+                    .as_str()
+                    .is_some_and(|s| s.len() <= 4096 && !s.contains('\0'))
+                {
+                    return Err(format!("{key}: 文字列が不正です"));
+                }
+            }
+            "layout_range" => {
+                if !v.as_array().is_some_and(|a| {
+                    a.len() == 2
+                        && a[0]
+                            .as_f64()
+                            .zip(a[1].as_f64())
+                            .is_some_and(crate::screen_settings::valid_range)
+                }) {
+                    return Err("境界範囲が不正です".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+pub(super) fn commit_patch(patch: &Value) -> Result<(), String> {
+    validate_patch(patch)?;
+    let mut next = snapshot();
+    let map = patch
+        .as_object()
+        .ok_or("設定がオブジェクトではありません")?;
+    for (key, value) in map {
+        next[key] = value.clone();
+    }
+    let old_uid = crate::audio::output_uid();
+    let old_muted = crate::audio::MUTED.load(Ordering::Relaxed);
+    let output_change = patch["audio_output_uid"]
+        .as_str()
+        .filter(|uid| *uid != old_uid);
+    if !UI_PREVIEW.load(Ordering::Relaxed) && !cfg!(test) {
+        if let Some(uid) = output_change {
+            crate::audio::set_output_uid(uid)?;
+        }
+        let write_result = path()
+            .ok_or("設定フォルダを取得できません".to_string())
+            .and_then(|p| write_to(&p, &next).map_err(|e| format!("設定を保存できません: {e}")));
+        if let Err(e) = write_result {
+            if output_change.is_some() {
+                if let Err(restore) = crate::audio::restore_output_uid(&old_uid) {
+                    return Err(format!("{e}。出力先の復元にも失敗しました: {restore}"));
+                }
+                if crate::audio::output_status().is_none() {
+                    crate::audio::MUTED.store(old_muted, Ordering::Relaxed);
+                }
+            }
+            return Err(e);
+        }
+    }
+    apply(patch);
+    if let Some(e) = crate::audio::output_status() {
+        prefs::set_save_error(prefs::SaveErrorSource::PrefsFile, e.clone());
+    } else {
+        prefs::clear_save_error(prefs::SaveErrorSource::PrefsFile);
+    }
+    Ok(())
+}
+
 fn apply(v: &Value) {
+    // 表示言語はこの Mac の設定。遠隔適用の許可リストには含めない。
+    if let Some(language) = v["ui_language"]
+        .as_str()
+        .and_then(localization::Language::parse)
+    {
+        localization::set_language(language);
+    }
     let boolean = |key: &str, atom: &AtomicBool| {
         if let Some(b) = v[key].as_bool() {
             atom.store(b, Ordering::Relaxed);
@@ -290,7 +434,23 @@ fn apply(v: &Value) {
     if let Some(on) = v["share_files"].as_bool() {
         knit_common::share::set_user_files(on);
     }
-    boolean("audio_muted", &crate::audio::MUTED);
+    let mut output_failed = false;
+    if !UI_PREVIEW.load(Ordering::Relaxed) && !cfg!(test) {
+        if let Some(uid) = v["audio_output_uid"].as_str() {
+            if uid != crate::audio::output_uid() {
+                if let Err(e) = crate::audio::set_output_uid(uid) {
+                    eprintln!("[prefs] {e}");
+                    prefs::set_save_error(prefs::SaveErrorSource::PrefsFile, e);
+                    output_failed = true;
+                }
+            }
+        }
+    }
+    if output_failed || crate::audio::output_status().is_some() {
+        crate::audio::MUTED.store(true, Ordering::Relaxed);
+    } else {
+        boolean("audio_muted", &crate::audio::MUTED);
+    }
     if let Some(n) = v["audio_gain"].as_f64().filter(|n| n.is_finite()) {
         crate::audio::set_gain(n);
     }
@@ -299,6 +459,8 @@ fn apply(v: &Value) {
     // 詳細記録の復元(--diag 起動時は main が後から true へ上書きするため優先の
     // 順序問題は無い。遠隔適用の許可リストには入れない: 診断行は自分の端末のもの)
     boolean("diag_log", &crate::DIAG_ENABLED);
+    // 更新の自動確認(自分の端末の設定のため遠隔適用の許可リストには入れない)
+    boolean("update_check", &crate::UPDATE_CHECK);
     if let Some(n) = v["side"].as_u64().filter(|n| *n <= 7) {
         crate::set_side(n as u8);
     }
@@ -311,9 +473,6 @@ fn apply(v: &Value) {
         // スライダーに触れた瞬間に黙って値が潰れるため、受け口の段階で揃える
         let ms = if n == 0 { 0 } else { n.clamp(50, 1000) };
         crate::SWITCH_DELAY_MS.store(ms, Ordering::Relaxed);
-        // 復元経由でも滞在値を記憶する: 方式を切り替えて 0 に戻った後、
-        // 「端で少し待つ」へ戻ったときにこの値へ復元する(スライダと同じ導線)
-        super::prefs::remember_dwell(ms);
     }
     if let Some(n) = v["double_tap"].as_u64() {
         crate::DOUBLE_TAP_MS.store(n.clamp(100, 3000), Ordering::Relaxed);
@@ -338,14 +497,27 @@ fn apply(v: &Value) {
     }
 }
 
-/// この画面の設定は static そのもののため、テスト同士の干渉を直列化で防ぐ。
-/// prefs.rs の切替方式テストも同じ static 群(HOTKEY_ONLY 等)を触るため共用する
+/// この画面の設定は static そのもののため、テスト同士の干渉を直列化で防ぐ
 #[cfg(test)]
 pub(super) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_save_entrypoints_do_not_modify_home() {
+        if std::env::var_os("KNIT_TEST_SAVE_CHILD").is_some(){save();save_quiet();return;}
+        let home=std::env::temp_dir().join(format!("knit-save-guard-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let config=home.join(".config/knit");std::fs::create_dir_all(&config).unwrap();
+        let file=config.join("preferences.json");std::fs::write(&file,b"original-settings").unwrap();
+        let child=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","gui::preferences::tests::test_save_entrypoints_do_not_modify_home","--test-threads=1"])
+            .env("HOME",&home).env("KNIT_TEST_SAVE_CHILD","1").output().unwrap();
+        assert!(child.status.success(),"child failed: {}",String::from_utf8_lossy(&child.stderr));
+        assert_eq!(std::fs::read(&file).unwrap(),b"original-settings","test save entrypoints must not write even an explicitly isolated HOME");
+        std::fs::remove_file(&file).unwrap();std::fs::remove_dir(&config).unwrap();std::fs::remove_dir(home.join(".config")).unwrap();std::fs::remove_dir(&home).unwrap();
+    }
 
     /// 書き出し→読み込みのラウンドトリップ。読み込みは version 1 の形式だけを
     /// 受け付け、apply を通すため外部で編集された内容でも範囲検査が効く
@@ -395,11 +567,23 @@ mod tests {
             "0=滞在なしは方式の情報のため素通り"
         );
         apply(&json!({"delay": 10}));
-        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 50, "下限は 50ms");
+        assert_eq!(
+            crate::SWITCH_DELAY_MS.load(Ordering::Relaxed),
+            50,
+            "下限は 50ms"
+        );
         apply(&json!({"delay": 4000}));
-        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 1000, "上限は 1000ms");
+        assert_eq!(
+            crate::SWITCH_DELAY_MS.load(Ordering::Relaxed),
+            1000,
+            "上限は 1000ms"
+        );
         apply(&json!({"delay": 300}));
-        assert_eq!(crate::SWITCH_DELAY_MS.load(Ordering::Relaxed), 300, "範囲内はそのまま");
+        assert_eq!(
+            crate::SWITCH_DELAY_MS.load(Ordering::Relaxed),
+            300,
+            "範囲内はそのまま"
+        );
         apply(&before);
     }
 
@@ -422,7 +606,9 @@ mod tests {
     fn override_keys_list_only_present_entries() {
         // 参照解決を注入した純粋関数で検証: 指定のあるキーだけが一覧に入る
         assert!(override_keys_with(|_| None).is_empty(), "指定が無ければ空");
-        let keys = override_keys_with(|k| (k == "KNIT_ROLE" || k == "KNIT_SCROLL_DIV").then(|| "1".into()));
+        let keys = override_keys_with(|k| {
+            (k == "KNIT_ROLE" || k == "KNIT_SCROLL_DIV").then(|| "1".into())
+        });
         assert_eq!(keys, ["KNIT_SCROLL_DIV", "KNIT_ROLE"], "定義順に並ぶ");
     }
 
@@ -439,7 +625,11 @@ mod tests {
         );
         let before = snapshot();
         apply(&snap);
-        assert_eq!(snapshot()["hotkey"], before["hotkey"], "読み戻しても値は変わらない");
+        assert_eq!(
+            snapshot()["hotkey"],
+            before["hotkey"],
+            "読み戻しても値は変わらない"
+        );
         apply(&before);
     }
 
@@ -451,7 +641,10 @@ mod tests {
         apply_remote(r#"{"client_role": true, "version": 9, "scroll_div": 140.0}"#);
         assert_eq!(crate::CLIENT_ROLE.load(Ordering::Relaxed), role);
         assert_eq!(crate::scroll_div(), 140.0);
-        apply_remote(&format!(r#"{{"scroll_div": 40.0, "pad": "{}"}}"#, "x".repeat(5000)));
+        apply_remote(&format!(
+            r#"{{"scroll_div": 40.0, "pad": "{}"}}"#,
+            "x".repeat(5000)
+        ));
         assert_eq!(crate::scroll_div(), 140.0);
         apply(&before);
     }
@@ -472,7 +665,10 @@ mod tests {
         assert_eq!(snapshot()["own_name"], json!("書斎のMac"));
         // 偽装文字(Bidi オーバーライド)は hello の name と同じ規則で除去
         apply(&json!({"own_name": "A\u{202e}B"}));
-        assert_eq!(*crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()), "AB");
+        assert_eq!(
+            *crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()),
+            "AB"
+        );
         // 空・空白のみはホスト名既定へ戻る
         apply(&json!({"own_name": "   "}));
         assert_eq!(
@@ -482,13 +678,34 @@ mod tests {
         );
         // リモート適用の許可リストに無いため変わらない
         apply_remote(r#"{"own_name": "遠隔のMac"}"#);
-        assert_eq!(*crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()), "");
+        assert_eq!(
+            *crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()),
+            ""
+        );
         apply(&before);
     }
 
     #[test]
-    fn restored_values_are_bounded_and_invalid_layout_is_ignored() {
+    fn interface_language_round_trips_locally_but_remote_changes_are_ignored() {
         let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot();
+        apply(&json!({"ui_language": "en"}));
+        assert_eq!(snapshot()["ui_language"], "en");
+        apply_remote(r#"{"ui_language":"ja"}"#);
+        assert_eq!(
+            snapshot()["ui_language"],
+            "en",
+            "remote peer cannot change this Mac’s language"
+        );
+        apply(&json!({"ui_language": "unsupported"}));
+        assert_eq!(snapshot()["ui_language"], "en");
+        apply(&json!({"ui_language": "ja"}));
+        assert_eq!(snapshot()["ui_language"], "ja");
+        apply(&before);
+    }
+
+    #[test]
+    fn restored_values_are_bounded_and_invalid_layout_is_ignored() {        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = snapshot();
         *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = (0.2, 0.8);
         let side_before = crate::SIDE.load(Ordering::Relaxed);
@@ -506,10 +723,17 @@ mod tests {
             side_before,
             "side:999 は受理されない(apply の n <= 7 フィルタ)"
         );
-        assert_eq!(*crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()), (0.2, 0.8));
+        assert_eq!(
+            *crate::LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()),
+            (0.2, 0.8)
+        );
         // 上限そのもの(7)は受理・直上(8)は拒否
         apply(&json!({"side": 8}));
-        assert_eq!(crate::SIDE.load(Ordering::Relaxed), side_before, "side:8 は拒否");
+        assert_eq!(
+            crate::SIDE.load(Ordering::Relaxed),
+            side_before,
+            "side:8 は拒否"
+        );
         apply(&json!({"side": 7}));
         assert_eq!(crate::SIDE.load(Ordering::Relaxed), 7, "side:7 は受理");
         apply(&before);
@@ -547,6 +771,32 @@ mod tests {
             changed
         );
         std::fs::remove_dir_all(dir).unwrap();
+        apply(&before);
+    }
+
+    /// 更新の自動確認(update_check): snapshot/apply で往復し、検証は真偽値だけを
+    /// 受け付ける。この Mac のみの設定のため遠隔適用(PrefsSet)からは変えない
+    /// (手動の「アップデートを確認…」メニューは常に有力のまま)
+    #[test]
+    fn update_check_round_trips_and_is_not_remotely_writable() {
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = snapshot();
+        assert!(
+            before["update_check"].is_boolean(),
+            "snapshot は update_check を持つ"
+        );
+        apply(&json!({"update_check": false}));
+        assert_eq!(snapshot()["update_check"], json!(false));
+        assert!(!crate::UPDATE_CHECK.load(Ordering::Relaxed));
+        apply(&json!({"update_check": true}));
+        assert_eq!(snapshot()["update_check"], json!(true));
+        assert!(crate::UPDATE_CHECK.load(Ordering::Relaxed));
+        // 真偽値以外は検証で拒否される
+        assert!(validate_patch(&json!({"update_check": "yes"})).is_err());
+        assert!(validate_patch(&json!({"update_check": 1})).is_err());
+        // 遠隔適用の許可リストに無いため変わらない
+        apply_remote(r#"{"update_check": false}"#);
+        assert!(crate::UPDATE_CHECK.load(Ordering::Relaxed));
         apply(&before);
     }
 }
