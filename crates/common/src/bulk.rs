@@ -1296,18 +1296,27 @@
 
     /// 待受側: 認証を通った接続を送信口に据え、受信スレッドを起こす。
     /// bind に失敗しても諦めない: 本線(入力・テキスト)は生きていてファイル・
-    /// 画像だけが届かない状態が無通知で続くのを防ぐため、一定間隔で再試行する
+    /// 画像だけが届かない状態が無通知で続くのを防ぐため、一定間隔で再試行する。
+    /// should_stop は bind 再試行と accept の各周回で呼ばれ、true で待受を終える
+    /// (役割切替で待受側をやめる時など。Windows 側は false 固定で従来どおり帰らない)
     pub fn serve(
         ep: &'static Endpoint,
         bind: &str,
         port: u16,
         allow: fn(std::net::IpAddr) -> bool,
+        should_stop: impl Fn() -> bool,
     ) {
         /// bind の再試行間隔。短すぎるとログとCPUの無駄、長すぎると占有解除後の
         /// 復帰が遅れる。connect_loop(2秒)より長めの 5 秒にする
         const BIND_RETRY_SECS: u64 = 5;
+        /// accept の待ち周回(should_stop の確認間隔)。nonblocking 化した
+        /// listener の WouldBlock を 1 周回として扱う
+        const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(200);
         let mut bind_failed_logged = false;
         let listener = loop {
+            if should_stop() {
+                return;
+            }
             match std::net::TcpListener::bind((bind, port)) {
                 Ok(l) => {
                     if bind_failed_logged {
@@ -1333,11 +1342,42 @@
                 }
             }
         };
+        // accept をブロッキングのままにすると should_stop が次の接続まで効かない
+        // ため、nonblocking でポーリングする(成功した stream は blocking へ戻す)
+        listener.set_nonblocking(true).ok();
         SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
         (ep.log)(&format!("[bulk] listening on {bind}:{port}"));
         let mut throttle = crate::secure::FailThrottle::new();
-        for s in listener.incoming() {
-            let Ok(s) = s else { continue };
+        loop {
+            if should_stop() {
+                // 診断(diag の「ファイル経路の待受」表示)が待受中を示したまま
+                // 残らないよう、立てたフラグを戻してから終わる
+                SERVING.store(false, std::sync::atomic::Ordering::Relaxed);
+                (ep.log)("[bulk] 待受を終了しました(役割の切り替え)");
+                return;
+            }
+            let s = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    std::thread::sleep(ACCEPT_POLL);
+                    continue;
+                }
+                // 従来(incoming の Err 無視)と同じく、fd 枯渇等の一時エラーでも
+                    // 待受を続ける(間引いたログは出さず黙って再試行する。本線の
+                    // accept エラーが 500ms 毎に出るのとは違い、こちらの発生源は
+                    // 稀なため)
+                Err(_) => {
+                    std::thread::sleep(ACCEPT_POLL);
+                    continue;
+                }
+            };
+            // nonblocking listener から取った stream は nonblocking のまま来る
+            s.set_nonblocking(false).ok();
             let Ok(peer) = s.peer_addr() else { continue };
             if !allow(peer.ip()) {
                 (ep.log)(&format!("[bulk] rejected: {peer}"));
@@ -1368,14 +1408,21 @@
     }
 
     /// 接続側: 本線が繋がっている間、大容量経路が無ければ張り直し、キープアライブを送る。
-    /// 接続先は本線がいま使っている相手(複数経路のどれで繋がったか)に追従する
+    /// 接続先は本線がいま使っている相手(複数経路のどれで繋がったか)に追従する。
+    /// should_stop はループの各周回で呼ばれ、true で接続試行を終える
+    /// (役割切替で接続側をやめる時など。Windows 側は false 固定)
     pub fn connect_loop(
         ep: &'static Endpoint,
         addr: impl Fn() -> Option<std::net::SocketAddr>,
         main_up: fn() -> bool,
+        should_stop: impl Fn() -> bool,
     ) {
         let mut last_keepalive = std::time::Instant::now();
         loop {
+            if should_stop() {
+                (ep.log)("[bulk] 接続試行を終了しました(役割の切り替え)");
+                return;
+            }
             std::thread::sleep(std::time::Duration::from_secs(2));
             if !main_up() {
                 ep.link.clear();

@@ -245,6 +245,21 @@ impl History {
         Some(id)
     }
 
+    /// 保存件数の上限を変更する。cap は最低 1 にクランプし、超過分は古い方から
+    /// 除去する。next_id は不変(以降の push も新しい上限に従う)。
+    pub fn set_limit(&mut self, cap: usize) {
+        self.cap = cap.max(1);
+        while self.entries.len() > self.cap {
+            self.entries.remove(0);
+        }
+    }
+
+    /// テスト用: set_limit が next_id を保存しないことの確認に使う。
+    #[cfg(test)]
+    pub fn next_id_for_test(&self) -> u64 {
+        self.next_id
+    }
+
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
@@ -828,6 +843,29 @@ mod tests {
             "Windows",
             "重複更新は最新側を示す"
         );
+    }
+
+    #[test]
+    fn set_limit_shrinks_oldest_first_and_keeps_next_id() {
+        let mut h = History::new(5);
+        for i in 1..=5u64 {
+            h.push_text(&format!("t{i}"), "Mac", i);
+        }
+        let next = h.next_id_for_test();
+        h.set_limit(2);
+        assert_eq!(h.entries().len(), 2, "縮小時は古い方から消える");
+        assert_eq!(h.entries()[0].text, "t4");
+        assert_eq!(h.entries()[1].text, "t5");
+        assert_eq!(h.next_id_for_test(), next, "next_id は不変");
+        // 縮小後の push は新しい上限に従う
+        h.push_text("t6", "Mac", 6);
+        h.push_text("t7", "Mac", 7);
+        h.push_text("t8", "Mac", 8);
+        assert_eq!(h.entries().len(), 2);
+        assert_eq!(h.entries()[0].text, "t7");
+        // 0 は最低 1 へクランプ(空にはしない)
+        h.set_limit(0);
+        assert_eq!(h.entries().len(), 1);
     }
 
     #[test]
