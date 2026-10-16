@@ -214,15 +214,33 @@
         out
     }
 
+    /// recv の読み出しタイムアウト(周回の単位)。待受を止めたい呼び出し側が
+    /// should_stop で自終了を指示できるように、ブロッキングのままではなく
+    /// タイムアウトを 1 周回として扱う
+    const RESPOND_POLL: Duration = Duration::from_millis(200);
+
+    /// recv エラーを「待ち周回」(タイムアウト)か「継続する実エラー」かへ分ける。
+    /// 純粋関数(単体テスト対象): タイムアウト化に伴い増える WouldBlock/TimedOut を
+    /// 実エラーのログ集計から除外する
+    fn recv_is_poll(e: &std::io::Error) -> bool {
+        matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+    }
+
     /// 応答側(待受する側が動かす)。許可範囲の相手からの正しい問い合わせにだけ答える。
-    /// 戻り値は bind 失敗のみ(待受に入ったら戻らない)。呼び出し側でログに出す
+    /// 戻り値は bind 失敗のみ(待受に入ったら should_stop が true を返した時のみ戻る。
+    /// 呼び出し側でログに出す)。should_stop は受信タイムアウトごとに呼ばれ、
+    /// true で待受を終える(役割切替で待受側をやめる時など。Windows 側は false 固定)
     pub fn respond(
         bind: &str,
         port: u16,
         token: &str,
         allow: fn(IpAddr) -> bool,
+        should_stop: impl Fn() -> bool,
     ) -> std::io::Result<()> {
         let sock = UdpSocket::bind((bind, port))?;
+        // タイムアウトを 1 周回として扱う(設定失敗時は旧来のブロッキングのまま
+        // should_stop が効かないが、待受が止まらないだけで応答自体は壊れない)
+        let _ = sock.set_read_timeout(Some(RESPOND_POLL));
         let ask = format!("KNIT?{}", room_id(token));
         let ans = format!("KNIT!{}", room_id(token));
         let mut buf = [0u8; 128];
@@ -234,6 +252,12 @@
         loop {
             let (n, from) = match sock.recv_from(&mut buf) {
                 Ok(x) => x,
+                Err(e) if recv_is_poll(&e) => {
+                    if should_stop() {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 Err(e) => {
                     if err_logged_at.elapsed() >= Duration::from_secs(60) {
                         eprintln!("[discover] recv エラー(継続します): {e}");
@@ -307,7 +331,8 @@
 
     #[cfg(test)]
     mod tests {
-        use super::direct_broadcast;
+        use super::{direct_broadcast, recv_is_poll};
+        use std::io;
         use std::net::Ipv4Addr;
 
         fn v4(s: &str) -> Ipv4Addr {
@@ -350,5 +375,18 @@
             assert_eq!(direct_broadcast(v4("1.2.3.4"), 0), Some(v4("255.255.255.255")));
             // /32 = 単一ホスト
             assert_eq!(direct_broadcast(v4("192.168.1.7"), 32), Some(v4("192.168.1.7")));
+        }
+
+        /// タイムアウト(待ち周回)は実エラー扱いしない: read_timeout 周回化で
+        /// 増える WouldBlock/TimedOut が 60 秒スロットルのログに混ざると、
+        /// 本当の異常(WSAECONNRESET 等)が埋もれる
+        #[test]
+        fn read_timeouts_are_polls_not_errors() {
+            let mk = |k: io::ErrorKind| io::Error::from(k);
+            assert!(recv_is_poll(&mk(io::ErrorKind::WouldBlock)));
+            assert!(recv_is_poll(&mk(io::ErrorKind::TimedOut)));
+            // Windows の閉じた port への ICMP 由来(継続しつつ実エラーとして数える)
+            assert!(!recv_is_poll(&mk(io::ErrorKind::ConnectionReset)));
+            assert!(!recv_is_poll(&mk(io::ErrorKind::Interrupted)));
         }
     }

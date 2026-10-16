@@ -12,7 +12,9 @@
     /// 15: 転送結果の相互確認。FILE_BEGIN の "dir" 印(空フォルダの再現)・
     ///     受理結果を返す XferAck・役割切替の RoleAck・Cfg の files/listen ビット。
     ///     いずれも旧側は未知の行・未知のフィールドとして無視するため MIN_VERSION は据え置き
-    pub const VERSION: u32 = 15;
+    /// 16: ロック解除の連動。Mac のロック解除に合わせて Windows へ Unlock を送る。
+    ///     旧側は未知の行として無視するため MIN_VERSION は据え置き(版ゲートで送らない)
+    pub const VERSION: u32 = 16;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
@@ -32,12 +34,15 @@
         pub dirs: bool,
         /// 空フォルダの再現("dir" 印)ができる(版 15 以降)
         pub empty_dirs: bool,
+        /// ロック解除の連動(Unlock の受信)ができる(版 16 以降)
+        pub unlock: bool,
     }
 
     pub fn peer_features(ver: u32) -> PeerFeatures {
         PeerFeatures {
             dirs: ver >= 14,
             empty_dirs: ver >= 15,
+            unlock: ver >= 16,
         }
     }
 
@@ -265,6 +270,11 @@
         /// 画面ロックの連動(Mac→Windows)。Mac がロックされたら Windows もロックする
         #[serde(rename = "lock")]
         Lock,
+        /// 画面ロック解除の連動(Mac→Windows・版 16 以降)。Mac のロックが解除されたら
+        /// Windows 側の設定(ロック解除の連動)が有効なときだけ、この PC のロック画面へ
+        /// 入力を注入して解除を試みる。旧側は未知の行として無視する
+        #[serde(rename = "unlock")]
+        Unlock,
         #[serde(rename = "key")]
         Key {
             kc: u16,
@@ -346,6 +356,12 @@
             /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下。Deskflow の links 相当)
             #[serde(default)]
             side: u8,
+            /// Windows 側の接続辺の有効区間(0..1、端点を含む)。左右辺は上→下、
+            /// 上下辺は左→右で反転しない。None/省略は旧動作の全辺。
+            /// 旧側は未知フィールドとして無視するため版は据え置き。ただし旧 Windows
+            /// ではこの制限を保証できない。受信側は不正な区間を全辺へ広げず拒否する。
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            target_range: Option<[f64; 2]>,
             /// クリップボード共有。false の間は Windows 側も送らない(相手任せにしない)
             #[serde(default = "default_true")]
             clip: bool,
@@ -512,6 +528,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn cfg_target_range_defaults_for_legacy_and_round_trips() {
+        for json in [
+            r#"{"t":"cfg","cmd_alt":false}"#,
+            r#"{"t":"cfg","cmd_alt":false,"target_range":null}"#,
+        ] {
+            assert!(matches!(decode(json), Some(Msg::Cfg { target_range: None, .. })));
+        }
+        let cfg = Msg::Cfg {
+            cmd_alt: false,
+            spk_mute: false,
+            side: 2,
+            target_range: Some([0.25, 0.75]),
+            clip: true,
+            files: true,
+            listen: true,
+        };
+        assert!(matches!(decode(&encode(&cfg)), Some(Msg::Cfg {
+            target_range: Some([0.25, 0.75]), side: 2, ..
+        })));
+        let legacy_cfg = Msg::Cfg {
+            cmd_alt: false,
+            spk_mute: false,
+            side: 2,
+            target_range: None,
+            clip: true,
+            files: true,
+            listen: true,
+        };
+        assert!(!encode(&legacy_cfg).contains("target_range"));
+        // 旧版相当の型(未知フィールドを拒否しないserde既定)で新Cfgが読める。
+        #[derive(Deserialize)]
+        struct LegacyCfg {
+            cmd_alt: bool,
+            side: u8,
+        }
+        let old: LegacyCfg = serde_json::from_str(&encode(&cfg)).unwrap();
+        assert!(!old.cmd_alt);
+        assert_eq!(old.side, 2);
+    }
+
     fn mon(x: i32, y: i32, w: i32, h: i32) -> Monitor {
         Monitor { x, y, w, h, name: String::new() }
     }
@@ -550,5 +607,26 @@ mod tests {
         assert!(sanitize_monitors(&[bad.clone(), bad]).is_empty());
         // 空入力は空のまま
         assert!(sanitize_monitors(&[]).is_empty());
+    }
+
+    /// Unlock の往復: フィールド無しの行として符号化され、ワイヤ形式 "unlock" で
+    /// 読み戻せる。版 16 追加時のワイヤ互換の基礎保証
+    #[test]
+    fn unlock_round_trips_as_fieldless_line() {
+        let line = encode(&Msg::Unlock);
+        assert_eq!(line.trim_end(), r#"{"t":"unlock"}"#, "フィールド無しの 1 行");
+        assert!(matches!(decode(line.trim()), Some(Msg::Unlock)));
+        assert!(matches!(decode(r#"{"t":"unlock"}"#), Some(Msg::Unlock)));
+    }
+
+    /// peer_features の版ゲート: unlock は版 16 から。既存の dirs/empty_dirs は据え置き
+    #[test]
+    fn peer_features_gate_unlock_from_version_16() {
+        assert!(!peer_features(15).unlock, "版 15 は Unlock 非対応");
+        assert!(peer_features(16).unlock, "版 16 は Unlock 対応");
+        assert!(peer_features(u32::MAX).unlock, "将来版も対応扱い");
+        // 旧ゲートの回帰(版の境界を変えていないことの保証)
+        assert!(!peer_features(13).dirs && peer_features(14).dirs);
+        assert!(!peer_features(14).empty_dirs && peer_features(15).empty_dirs);
     }
 }

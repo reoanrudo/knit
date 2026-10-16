@@ -647,7 +647,7 @@ mod tests {
             on_event: |_| panic!("keepalive must not produce a file event"), log: |_| {},
             on_rx_bytes: |_| {}, on_batch_begin: || {}, on_bind_error: |_| {},
         });
-        std::thread::spawn(move || serve(endpoint, "127.0.0.1", address.port(), |_| true));
+        std::thread::spawn(move || serve(endpoint, "127.0.0.1", address.port(), |_| true, || false));
         let until = Instant::now() + Duration::from_secs(2);
         let socket = loop {
             match std::net::TcpStream::connect(address) {
@@ -706,10 +706,10 @@ mod tests {
             on_batch_begin: || {},
             on_bind_error: |_| {},
         });
-        std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true));
+        std::thread::spawn(move || serve(server, "127.0.0.1", port, |_| true, || false));
         static ADDR: OnceLock<std::net::SocketAddr> = OnceLock::new();
         let addr = *ADDR.get_or_init(|| format!("127.0.0.1:{port}").parse().unwrap());
-        std::thread::spawn(move || connect_loop(client, || ADDR.get().copied(), || true));
+        std::thread::spawn(move || connect_loop(client, || ADDR.get().copied(), || true, || false));
         let t0 = std::time::Instant::now();
         while !CLIENT_LINK.is_up() && t0.elapsed() < std::time::Duration::from_secs(10) {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -857,7 +857,7 @@ mod tests {
             let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             s.local_addr().unwrap().port()
         };
-        std::thread::spawn(move || respond("127.0.0.1", port, "room-token", |_| true));
+        std::thread::spawn(move || respond("127.0.0.1", port, "room-token", |_| true, || false));
         std::thread::sleep(std::time::Duration::from_millis(100));
         let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let found = seek_first(target, "room-token", std::time::Duration::from_millis(500));
