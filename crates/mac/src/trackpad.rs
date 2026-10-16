@@ -14,9 +14,6 @@ fn remote_active() -> bool {
 fn navigation_active() -> bool {
     NAV_ENABLED.load(Ordering::Relaxed) && AVAILABLE.load(Ordering::Relaxed) && remote_active()
 }
-pub fn navigation_available() -> bool {
-    contacts::AVAILABLE.load(Ordering::Relaxed) && AVAILABLE.load(Ordering::Relaxed)
-}
 pub fn reset_session() {
     contacts::reset();
     // 捕捉中のまま切替・切断が起きた場合、合成2指を上げずに捨てると Android 側に

@@ -4,8 +4,234 @@
 // 止まる問題を音声で再現しないため(レビュー Wave1 H3 と同じ設計判断)
 #![allow(non_snake_case)]
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+// AudioQueue の所有者は playback_worker だけ。UI/受信/Android スレッドは
+// 選択世代・要求レートを更新するだけで、同期 Stop/Dispose を呼ばない。
+static OUTPUT: Mutex<OutputSelection> = Mutex::new(OutputSelection {
+    uid: String::new(),
+    target: None,
+    generation: 1,
+    status: None,
+});
+static OUTPUT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static INVALIDATED_GENERATION: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_READY: AtomicBool = AtomicBool::new(false);
+static REQUESTED_RATE: AtomicU32 = AtomicU32::new(0);
+static WORKER: OnceLock<std::thread::Thread> = OnceLock::new();
+static QUEUE_DISPOSE_FAILED: AtomicBool = AtomicBool::new(false);
+
+fn output_permitted() -> bool {
+    OUTPUT_READY.load(Ordering::SeqCst)
+        && INVALIDATED_GENERATION.load(Ordering::SeqCst) != OUTPUT_GENERATION.load(Ordering::SeqCst)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutputTarget {
+    id: u32,
+    uid: String,
+    streams: Vec<u32>,
+    sources: Option<Vec<u32>>,
+    jack: Option<Vec<u32>>,
+}
+
+#[derive(Clone)]
+struct OutputSelection {
+    uid: String,
+    target: Option<OutputTarget>,
+    generation: u64,
+    status: Option<String>,
+}
+
+impl OutputSelection {
+    fn select(&mut self, uid: &str, target: OutputTarget) {
+        // 0 は未失効 sentinel。世代は単調増加し、古い通知は fetch_max で排除する。
+        self.generation = self.generation.saturating_add(1);
+        self.uid = uid.to_string();
+        self.target = Some(target);
+        self.status = None;
+    }
+
+    fn restore(&mut self, uid: &str, result: Result<OutputTarget, String>) -> Result<(), String> {
+        match result {
+            Ok(target) => {
+                self.select(uid, target);
+                Ok(())
+            }
+            Err(reason) => {
+                self.generation = self.generation.saturating_add(1);
+                self.uid = uid.to_string();
+                self.target = None;
+                self.status = Some(reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    // HAL の問い合わせ中に UI が再選択していたら、古い結果を適用しない。
+    // 失効は明示的な set_output_uid があるまでラッチする(再接続でも自動復帰しない)。
+    fn observe(&mut self, generation: u64, current: Result<OutputTarget, String>) -> bool {
+        if generation != self.generation || self.status.is_some() {
+            return false;
+        }
+        match current {
+            Ok(target) if self.target.as_ref().is_none_or(|old| old == &target) => {
+                self.target = Some(target);
+                false
+            }
+            Ok(_) => {
+                self.status = Some(if self.uid.is_empty() {
+                    "システム既定の出力先または物理出力が変わりました。出力先を再選択してください。"
+                } else {
+                    "選択した機器の物理出力または構成が変わりました。出力先を再選択してください。"
+                }.to_string());
+                true
+            }
+            Err(reason) => {
+                self.status = Some(reason);
+                true
+            }
+        }
+    }
+}
+
+/// 使用可能な出力機器の (UID, 表示名)。システム既定の行は含めない。
+/// UID は不透明な識別子で、同名機器を区別できる。列挙失敗時は空配列。
+pub fn output_devices() -> Vec<(String, String)> {
+    let Ok(ids) = property_u32s(1, address(DEVICES, GLOBAL)) else {
+        return Vec::new();
+    };
+    let mut devices: Vec<_> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let target = device_target(id).ok()?;
+            let name = property_string(id, NAME).unwrap_or_else(|_| target.uid.clone());
+            Some((target.uid, name))
+        })
+        .collect();
+    devices.sort_by(|a, b| a.0.cmp(&b.0));
+    devices.dedup_by(|a, b| a.0 == b.0);
+    devices.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    devices
+}
+
+/// 保存用の選択 UID。空文字列はシステム既定(その時点の実機器に固定)。
+pub fn output_uid() -> String {
+    OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).uid.clone()
+}
+
+/// 出力先を検証して選択する。存在しない UID は旧選択を変更せず Err を返す。
+/// Ok は選択の受理であり、AudioQueue の再作成完了ではない。
+/// 切替時は必ず消音する。失効後の復帰には同じ UID でも再選択し、その後 UI 側で
+/// 明示的に MUTED を解除する。再生開始失敗は output_status に非同期で現れる。
+pub fn set_output_uid(uid: &str) -> Result<(), String> {
+    let target = resolve_output(uid)?;
+    {
+        let mut selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT_READY.store(false, Ordering::SeqCst);
+        MUTED.store(true, Ordering::SeqCst);
+        selection.select(uid, target);
+        OUTPUT_GENERATION.store(selection.generation, Ordering::SeqCst);
+    }
+    wake_playback_worker();
+    Ok(())
+}
+
+/// 起動時の保存値復元専用。失敗時も要求UIDを保持して出力を閉じ、既定へ代替しない。
+/// Errは「保存先を復元したが機器は使用不能」を意味する。明示選択にはset_output_uidを使う。
+pub fn restore_output_uid(uid: &str) -> Result<(), String> {
+    let resolved = resolve_output(uid);
+    let result = {
+        let mut selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+        OUTPUT_READY.store(false, Ordering::SeqCst);
+        MUTED.store(true, Ordering::SeqCst);
+        let result = selection.restore(uid, resolved);
+        OUTPUT_GENERATION.store(selection.generation, Ordering::SeqCst);
+        result
+    };
+    wake_playback_worker();
+    result
+}
+
+/// 確認音用に同期再検査した実機器UIDを返す。空の既定値をそのまま返さない。
+pub fn confirmed_output_uid() -> Result<String, String> {
+    let generation = OUTPUT_GENERATION.load(Ordering::SeqCst);
+    check_output_topology();
+    let selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    if selection.generation != generation || OUTPUT_GENERATION.load(Ordering::SeqCst) != generation
+    {
+        return Err("出力先が変更されました。もう一度確認してください".into());
+    }
+    if let Some(e) = &selection.status {
+        return Err(e.clone());
+    }
+    if INVALIDATED_GENERATION.load(Ordering::SeqCst) == generation {
+        return Err("出力先の再選択が必要です".into());
+    }
+    selection
+        .target
+        .as_ref()
+        .map(|t| t.uid.clone())
+        .filter(|s| !s.is_empty())
+        .ok_or("出力先を確認できません".into())
+}
+
+/// 出力の失効・再生キュー作成失敗理由。再接続だけでは解除されない。
+pub fn output_status() -> Option<String> {
+    // HAL 通知が来てからワーカーが処理する短い間も、UI に失効を表示する。
+    let selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    selection.status.clone().or_else(|| {
+        (INVALIDATED_GENERATION.load(Ordering::SeqCst) == selection.generation)
+            .then(|| "出力先の構成が変更されました。出力先を再選択してください。".to_string())
+    })
+}
+
+/// native UI タイマーから呼べる。AudioQueue の操作は行わず、HAL の現在値を検証。
+/// ワーカーも定期検証するため、設定画面を閉じても監視は継続する。
+pub fn check_output_topology() {
+    let before = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if before.status.is_some() {
+        return;
+    }
+    let current = if INVALIDATED_GENERATION.load(Ordering::SeqCst) == before.generation {
+        Err("出力先の構成が変更されました。出力先を再選択してください。".to_string())
+    } else {
+        resolve_output(&before.uid)
+    };
+    let mut selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    if selection.observe(before.generation, current) {
+        OUTPUT_READY.store(false, Ordering::SeqCst);
+        MUTED.store(true, Ordering::SeqCst);
+        if let Some(worker) = WORKER.get() {
+            worker.unpark();
+        }
+    }
+}
+
+fn wake_playback_worker() {
+    WORKER
+        .get_or_init(|| {
+            std::thread::Builder::new()
+                .name("knit-audio-output".into())
+                .spawn(playback_worker)
+                .expect("audio output worker")
+                .thread()
+                .clone()
+        })
+        .unpark();
+}
+
+// HAL/AQ 通知ではロックも AudioQueue 操作も行わない。同期停止中にも呼ばれる。
+fn invalidate_output(generation: u64) {
+    // 遅れて完了した旧世代通知が、新世代の失効を上書きしない。
+    INVALIDATED_GENERATION.fetch_max(generation, Ordering::SeqCst);
+    // global gate を check→store で閉じると、その間の再選択を旧通知が消音する。
+    // 即時停止は output_permitted の世代ラッチで行い、UI状態はワーカーが反映する。
+    if let Some(worker) = WORKER.get() {
+        worker.unpark();
+    }
+}
 
 /// メニューからのミュート(受信は続くが再生しない)
 pub static MUTED: AtomicBool = AtomicBool::new(false);
@@ -23,7 +249,11 @@ pub fn gain() -> f32 {
 
 /// 再生ゲインを設定する(0.0..=2.0 の範囲に丸める)
 pub fn set_gain(v: f64) {
-    let g = if v.is_finite() { (v as f32).clamp(0.0, 2.0) } else { 1.0 };
+    let g = if v.is_finite() {
+        (v as f32).clamp(0.0, 2.0)
+    } else {
+        1.0
+    };
     GAIN_BITS.store(g.to_bits(), Ordering::Relaxed);
 }
 /// 診断カウンタ(受信/再生バイト数)。10秒毎にログへ出す
@@ -36,7 +266,8 @@ static RING: Mutex<std::collections::VecDeque<u8>> = Mutex::new(std::collections
 /// 第2レーン(Android タブレットの中継)。Windows 経路(ネットワーク)と
 /// 同時に届くため、再生コールバックでサンプル単位に加算して「全部の音を重ねる」。
 /// プリロールとドレインのみ持ち、高品質な位相追い込みは第1レーン側に任せる
-static RING_B: Mutex<std::collections::VecDeque<u8>> = Mutex::new(std::collections::VecDeque::new());
+static RING_B: Mutex<std::collections::VecDeque<u8>> =
+    Mutex::new(std::collections::VecDeque::new());
 static PRIMED_B: AtomicBool = AtomicBool::new(false);
 /// 滞留の上限(≈125ms)。溢れたら古い方を捨てる(遅延をこれ以上溜めない)
 const RING_CAP: usize = 48 * 1024;
@@ -46,7 +277,8 @@ const RING_CAP: usize = 48 * 1024;
 /// 低遅延を優先して 42ms とする(旧 83ms は体感の遅延が大きかった)
 const RING_PRE_ROLL: usize = 16 * 1024;
 /// プリロール量(再生開始までの溜め)。接続先の種別によらず同じ値を使う
-static PRE_ROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(RING_PRE_ROLL);
+static PRE_ROLL: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(RING_PRE_ROLL);
 /// プリロール完了状態(開始/ミュート明けごとにやり直す)
 static PRIMED: AtomicBool = AtomicBool::new(false);
 /// ソフト追い込みの目標滞留(≈42ms=プリロール量と同値)。これを超えたら
@@ -61,6 +293,391 @@ const RING_HARD_CLIP: usize = 64 * 1024;
 type AudioQueueRef = *mut core::ffi::c_void;
 type AudioQueueBufferRef = *mut AudioQueueBuffer;
 type OSStatus = i32;
+type CFStringRef = *const core::ffi::c_void;
+
+// 実 SDK: CoreAudio/AudioHardware{,Base}.h, AudioToolbox/AudioQueue.h。
+// AudioObjectID/selector/scope/element は UInt32、CFIndex は signed long。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AudioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+const GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+const OUTPUT_SCOPE: u32 = u32::from_be_bytes(*b"outp");
+const DEVICES: u32 = u32::from_be_bytes(*b"dev#");
+const DEFAULT_OUTPUT: u32 = u32::from_be_bytes(*b"dOut");
+const DEVICE_UID: u32 = u32::from_be_bytes(*b"uid ");
+const NAME: u32 = u32::from_be_bytes(*b"lnam");
+const ALIVE: u32 = u32::from_be_bytes(*b"livn");
+const STREAMS: u32 = u32::from_be_bytes(*b"stm#");
+const DATA_SOURCE: u32 = u32::from_be_bytes(*b"ssrc");
+const JACK: u32 = u32::from_be_bytes(*b"jack");
+const CURRENT_DEVICE: u32 = u32::from_be_bytes(*b"aqcd");
+const UTF8: u32 = 0x0800_0100;
+
+fn address(selector: u32, scope: u32) -> AudioObjectPropertyAddress {
+    AudioObjectPropertyAddress {
+        selector,
+        scope,
+        element: 0,
+    }
+}
+
+type PropertyListener = unsafe extern "C" fn(
+    u32,
+    u32,
+    *const AudioObjectPropertyAddress,
+    *mut core::ffi::c_void,
+) -> OSStatus;
+
+#[link(name = "CoreAudio", kind = "framework")]
+unsafe extern "C" {
+    fn AudioObjectHasProperty(id: u32, addr: *const AudioObjectPropertyAddress) -> u8;
+    fn AudioObjectGetPropertyDataSize(
+        id: u32,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const core::ffi::c_void,
+        size: *mut u32,
+    ) -> OSStatus;
+    fn AudioObjectGetPropertyData(
+        id: u32,
+        addr: *const AudioObjectPropertyAddress,
+        qualifier_size: u32,
+        qualifier: *const core::ffi::c_void,
+        size: *mut u32,
+        data: *mut core::ffi::c_void,
+    ) -> OSStatus;
+    fn AudioObjectAddPropertyListener(
+        id: u32,
+        addr: *const AudioObjectPropertyAddress,
+        listener: PropertyListener,
+        user: *mut core::ffi::c_void,
+    ) -> OSStatus;
+    fn AudioObjectRemovePropertyListener(
+        id: u32,
+        addr: *const AudioObjectPropertyAddress,
+        listener: PropertyListener,
+        user: *mut core::ffi::c_void,
+    ) -> OSStatus;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFStringGetLength(value: CFStringRef) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(value: CFStringRef, buffer: *mut i8, size: isize, encoding: u32) -> u8;
+    fn CFStringCreateWithBytes(
+        allocator: *const core::ffi::c_void,
+        bytes: *const u8,
+        length: isize,
+        encoding: u32,
+        external: u8,
+    ) -> CFStringRef;
+    fn CFRelease(value: *const core::ffi::c_void);
+}
+
+fn property_u32s(id: u32, addr: AudioObjectPropertyAddress) -> Result<Vec<u32>, String> {
+    unsafe {
+        // 列挙中の機器追加による size/data の競合は少数回だけ再試行する。
+        for _ in 0..3 {
+            let mut size = 0u32;
+            let st = AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size);
+            if st != 0 || size % 4 != 0 || size > 1024 * 1024 {
+                return Err(format!(
+                    "出力機器情報を取得できません (property={}, status={st})",
+                    addr.selector
+                ));
+            }
+            if size == 0 {
+                return Ok(Vec::new());
+            }
+            let mut values = vec![0u32; size as usize / 4];
+            let capacity = size;
+            let st = AudioObjectGetPropertyData(
+                id,
+                &addr,
+                0,
+                std::ptr::null(),
+                &mut size,
+                values.as_mut_ptr().cast(),
+            );
+            if st == 0 && size <= capacity && size % 4 == 0 {
+                values.truncate(size as usize / 4);
+                return Ok(values);
+            }
+        }
+    }
+    Err("出力機器の構成が変更中です。もう一度選択してください。".to_string())
+}
+
+fn property_u32(id: u32, selector: u32) -> Result<u32, String> {
+    let values = property_u32s(id, address(selector, GLOBAL))?;
+    if values.len() != 1 {
+        return Err("出力機器の単一プロパティが不正です。".to_string());
+    }
+    Ok(values[0])
+}
+
+unsafe fn cf_string(value: CFStringRef) -> Result<String, String> {
+    unsafe {
+        if value.is_null() {
+            return Err("出力機器の文字列がありません。".to_string());
+        }
+        let size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(value), UTF8);
+        if !(0..1024 * 1024).contains(&size) {
+            return Err("出力機器の文字列長が不正です。".to_string());
+        }
+        let mut bytes = vec![0u8; size as usize + 1];
+        if CFStringGetCString(value, bytes.as_mut_ptr().cast(), bytes.len() as isize, UTF8) == 0 {
+            return Err("出力機器の文字列を変換できません。".to_string());
+        }
+        let length = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        bytes.truncate(length);
+        String::from_utf8(bytes)
+            .map_err(|_| "出力機器の文字列が UTF-8 ではありません。".to_string())
+    }
+}
+
+fn property_string(id: u32, selector: u32) -> Result<String, String> {
+    unsafe {
+        let mut value: CFStringRef = std::ptr::null();
+        let mut size = std::mem::size_of::<CFStringRef>() as u32;
+        let st = AudioObjectGetPropertyData(
+            id,
+            &address(selector, GLOBAL),
+            0,
+            std::ptr::null(),
+            &mut size,
+            (&mut value as *mut CFStringRef).cast(),
+        );
+        if st != 0 {
+            return Err(format!("出力機器の名称/UIDを取得できません (status={st})"));
+        }
+        // HAL の UID/Name は Get でも所有権が渡る(実 SDK の契約)。
+        let result = cf_string(value);
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        result.and_then(|text| {
+            if size as usize == std::mem::size_of::<CFStringRef>() {
+                Ok(text)
+            } else {
+                Err("出力機器の文字列プロパティ長が不正です。".to_string())
+            }
+        })
+    }
+}
+
+fn device_target(id: u32) -> Result<OutputTarget, String> {
+    if id == 0 || property_u32(id, ALIVE)? != 1 {
+        return Err("選択した出力機器が利用できません。出力先を再選択してください。".to_string());
+    }
+    let streams = property_u32s(id, address(STREAMS, OUTPUT_SCOPE))?;
+    if streams.is_empty() {
+        return Err("選択した機器には出力ストリームがありません。".to_string());
+    }
+    let uid = property_string(id, DEVICE_UID)?;
+    if uid.is_empty() || uid.contains('\0') {
+        return Err("出力機器の UID が不正です。".to_string());
+    }
+    Ok(OutputTarget {
+        id,
+        uid,
+        streams,
+        // 内蔵イヤホン/スピーカーのように UID が同じまま物理出力だけ変わる場合も監視。
+        sources: property_u32s(id, address(DATA_SOURCE, OUTPUT_SCOPE)).ok(),
+        jack: property_u32s(id, address(JACK, OUTPUT_SCOPE)).ok(),
+    })
+}
+
+fn resolve_output(uid: &str) -> Result<OutputTarget, String> {
+    if uid.is_empty() {
+        return device_target(property_u32(1, DEFAULT_OUTPUT)?);
+    }
+    if uid.contains('\0') {
+        return Err("出力機器の UID に NUL は指定できません。".to_string());
+    }
+    let ids = property_u32s(1, address(DEVICES, GLOBAL))?;
+    for id in ids {
+        if property_string(id, DEVICE_UID).as_deref() == Ok(uid) {
+            return device_target(id);
+        }
+    }
+    Err("選択した出力機器が見つかりません。接続を確認して出力先を再選択してください。".to_string())
+}
+
+// HAL の user は非参照の整数 token。解除失敗・解除前に配送済みの通知でも
+// 解放済み context に触れず、登録時の世代だけを失効できる(対象は64-bit macOS)。
+fn topology_user(generation: u64) -> *mut core::ffi::c_void {
+    std::ptr::without_provenance_mut(generation as usize)
+}
+
+fn topology_generation(user: *mut core::ffi::c_void) -> Option<u64> {
+    let generation = user.addr() as u64;
+    (generation != 0).then_some(generation)
+}
+
+unsafe extern "C" fn topology_changed(
+    _id: u32,
+    _count: u32,
+    _addresses: *const AudioObjectPropertyAddress,
+    user: *mut core::ffi::c_void,
+) -> OSStatus {
+    if let Some(generation) = topology_generation(user) {
+        invalidate_output(generation);
+    }
+    0
+}
+
+// NewOutput 前から Dispose 成功後まで同じアドレスで保持する。
+// 世代は不変。通知・再投入ゲートも global でなくこの AQ だけに所属する。
+struct QueueContext {
+    generation: u64,
+    queue: AtomicPtr<core::ffi::c_void>,
+    callbacks: AtomicBool,
+    watching: AtomicBool,
+    device_changes: AtomicU64,
+    verified_changes: AtomicU64,
+}
+
+impl QueueContext {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            queue: AtomicPtr::new(std::ptr::null_mut()),
+            callbacks: AtomicBool::new(false),
+            watching: AtomicBool::new(false),
+            device_changes: AtomicU64::new(0),
+            verified_changes: AtomicU64::new(0),
+        }
+    }
+
+    fn matches(&self, aq: AudioQueueRef) -> bool {
+        !aq.is_null() && self.queue.load(Ordering::SeqCst) == aq
+    }
+
+    fn notify_device_change(&self, aq: AudioQueueRef, property: u32) -> bool {
+        if property != CURRENT_DEVICE || !self.matches(aq) || !self.watching.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        // 通知自体は自己 SetProperty/Start の遅延通知でも発生しうる。
+        // 恒久ラッチせず即時消音し、ワーカーで実 UID を検証してから開く。
+        self.device_changes.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn device_verified(&self) -> bool {
+        self.device_changes.load(Ordering::SeqCst) == self.verified_changes.load(Ordering::SeqCst)
+    }
+
+    fn confirm_device(
+        &self,
+        observed: u64,
+        expected: &str,
+        current: Result<String, String>,
+    ) -> Result<(), String> {
+        if current? != expected {
+            return Err(
+                "再生キューの出力先が変わりました。出力先を再選択してください。".to_string(),
+            );
+        }
+        self.verified_changes.store(observed, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn output_permitted(&self) -> bool {
+        OUTPUT_GENERATION.load(Ordering::SeqCst) == self.generation
+            && self.device_verified()
+            && output_permitted()
+    }
+
+    fn disable(&self) {
+        self.callbacks.store(false, Ordering::SeqCst);
+        self.watching.store(false, Ordering::SeqCst);
+    }
+}
+
+struct PlaybackQueue {
+    aq: AudioQueueRef,
+    context: Box<QueueContext>,
+    uid: String,
+    // AQ の停止・破棄まで登録を保持する。通知 token 自体には解放対象がない。
+    _listeners: TopologyListeners,
+}
+
+unsafe extern "C" fn queue_device_changed(
+    user: *mut core::ffi::c_void,
+    aq: AudioQueueRef,
+    property: u32,
+) {
+    // context の寿命は所有ワーカーの同期 Dispose により保証する。
+    if let Some(context) = unsafe { user.cast::<QueueContext>().as_ref() } {
+        if context.notify_device_change(aq, property) {
+            if let Some(worker) = WORKER.get() {
+                worker.unpark();
+            }
+        }
+    }
+}
+
+struct TopologyListeners {
+    generation: u64,
+    properties: Vec<(u32, AudioObjectPropertyAddress)>,
+}
+impl TopologyListeners {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            properties: Vec::new(),
+        }
+    }
+
+    fn add(
+        &mut self,
+        id: u32,
+        addr: AudioObjectPropertyAddress,
+        required: bool,
+    ) -> Result<(), String> {
+        unsafe {
+            if !required && AudioObjectHasProperty(id, &addr) == 0 {
+                return Ok(());
+            }
+            let st = AudioObjectAddPropertyListener(
+                id,
+                &addr,
+                topology_changed,
+                topology_user(self.generation),
+            );
+            if st != 0 {
+                return Err(format!("出力先変更の監視を開始できません (status={st})"));
+            }
+        }
+        self.properties.push((id, addr));
+        Ok(())
+    }
+}
+impl Drop for TopologyListeners {
+    fn drop(&mut self) {
+        for (id, addr) in &self.properties {
+            let st = unsafe {
+                AudioObjectRemovePropertyListener(
+                    *id,
+                    addr,
+                    topology_changed,
+                    topology_user(self.generation),
+                )
+            };
+            if st != 0 {
+                // user は整数 token のため残ったリスナーから UAF は起きない。
+                eprintln!("[audio] 出力先監視の解除に失敗 (device={id}, status={st})");
+            }
+        }
+    }
+}
 
 // AudioToolbox/AudioQueue.h の現行レイアウト(タイムスタンプ等は無い。
 // 旧レイアウトを仮定すると byteSize の書き込み位置がずれ BufferEmpty になる)
@@ -114,7 +731,7 @@ unsafe extern "C" {
     ) -> OSStatus;
     fn AudioQueueAllocateBuffer(
         in_aq: AudioQueueRef,
-        in_buffer_byte_size: usize,
+        in_buffer_byte_size: u32,
         out_buffer: *mut AudioQueueBufferRef,
     ) -> OSStatus;
     fn AudioQueueEnqueueBuffer(
@@ -123,39 +740,191 @@ unsafe extern "C" {
         in_num_packet_descs: u32,
         in_packet_descs: *const core::ffi::c_void,
     ) -> OSStatus;
+    fn AudioQueueGetProperty(
+        aq: AudioQueueRef,
+        property: u32,
+        data: *mut core::ffi::c_void,
+        size: *mut u32,
+    ) -> OSStatus;
+    fn AudioQueueSetProperty(
+        aq: AudioQueueRef,
+        property: u32,
+        data: *const core::ffi::c_void,
+        size: u32,
+    ) -> OSStatus;
+    fn AudioQueueAddPropertyListener(
+        aq: AudioQueueRef,
+        property: u32,
+        callback: unsafe extern "C" fn(*mut core::ffi::c_void, AudioQueueRef, u32),
+        user: *mut core::ffi::c_void,
+    ) -> OSStatus;
     fn AudioQueueStart(in_aq: AudioQueueRef, in_time: *const core::ffi::c_void) -> OSStatus;
     fn AudioQueueStop(in_aq: AudioQueueRef, immediate: u8) -> OSStatus;
     fn AudioQueueDispose(in_aq: AudioQueueRef, immediate: u8) -> OSStatus;
 }
 
-/// 再生中の AudioQueue と、そのサンプリングレート。レートが変わった接続では作り直す
-/// (旧実装は最初の接続のレートで作ったきりで、Windows 側のデバイス切替で
-/// 44.1kHz⇄48kHz が変わると音程がずれたまま再生された)
-static AQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-static AQ_RATE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-
 fn ensure_playback(rate: u32) {
-    // 生成経路を直列化する(2 スレッドが同時に通ると片方の AudioQueue が漏えいし
-    // リングを二重消費する)。レート変更での作り直しは従来どおり許す
-    static AQ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _g = AQ_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if AQ.load(Ordering::Relaxed) != 0 && AQ_RATE.load(Ordering::Relaxed) == rate {
+    if !(4000..=192_000).contains(&rate) {
         return;
     }
-    let old = AQ.swap(0, Ordering::Relaxed);
-    if old != 0 {
-        unsafe {
-            AudioQueueStop(old as AudioQueueRef, 1);
-            AudioQueueDispose(old as AudioQueueRef, 1);
-        }
-        eprintln!(
-            "[audio] サンプリングレート変更 {} → {rate}Hz。再生キューを作り直します",
-            AQ_RATE.load(Ordering::Relaxed)
-        );
+    let previous = REQUESTED_RATE.swap(rate, Ordering::SeqCst);
+    // レート変更はワーカーでキューを停止してからゲートを閉じる。
+    // ここで閉じると、短時間に A→B→A と戻った要求で開き直せなくなる。
+    if previous != rate || WORKER.get().is_none() {
+        wake_playback_worker();
     }
-    if let Some(aq) = start_playback(rate) {
-        AQ.store(aq as usize, Ordering::Relaxed);
-        AQ_RATE.store(rate, Ordering::Relaxed);
+}
+
+fn reset_rings() {
+    // 必ず Stop/Dispose が返ってから、各ロックを単独取得する。
+    RING.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    RING_B.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    PRIMED.store(false, Ordering::Relaxed);
+    PRIMED_B.store(false, Ordering::Relaxed);
+    phase_store(0.0);
+}
+
+fn fail_output(generation: u64, reason: String) {
+    let mut selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+    if selection.generation == generation {
+        OUTPUT_READY.store(false, Ordering::SeqCst);
+        MUTED.store(true, Ordering::SeqCst);
+        selection.status = Some(reason);
+    }
+}
+
+// 停止/破棄はこのワーカーだけが行う。raw AQ ポインタを UI/Android と共有しない。
+// AQStop(true) は同期コールバックを呼ぶため、この関数では共有ロックを保持しない。
+fn stop_playback(queue: PlaybackQueue) -> Result<(), String> {
+    OUTPUT_READY.store(false, Ordering::SeqCst);
+    queue.context.disable();
+    unsafe {
+        let stop = AudioQueueStop(queue.aq, 1);
+        let dispose = AudioQueueDispose(queue.aq, 1);
+        if dispose != 0 {
+            QUEUE_DISPOSE_FAILED.store(true, Ordering::SeqCst);
+            // 解放失敗時は callback がまだ来る可能性がある。context を解放しない。
+            // fatal latch により新しい AQ も作らない。
+            std::mem::forget(queue);
+            return Err(format!(
+                "再生キューを解放できません。Knit を再起動してください (stop={stop}, dispose={dispose})"
+            ));
+        }
+        if stop != 0 {
+            eprintln!("[audio] AudioQueueStop status={stop} (Dispose成功)");
+        }
+    }
+    // 所有ワーカーから呼ぶ同期 Dispose は、復帰後の callback 不在を保証する。
+    // ここで初めて Box<QueueContext> を解放できる。
+    Ok(())
+}
+
+fn verify_queue_device(queue: &PlaybackQueue) -> Result<(), String> {
+    // 読取中に来た通知を取りこぼさないよう、読取前の counter だけを確認済みにする。
+    let observed = queue.context.device_changes.load(Ordering::SeqCst);
+    unsafe {
+        let mut device: CFStringRef = std::ptr::null();
+        let mut size = std::mem::size_of::<CFStringRef>() as u32;
+        let st = AudioQueueGetProperty(
+            queue.aq,
+            CURRENT_DEVICE,
+            (&mut device as *mut CFStringRef).cast(),
+            &mut size,
+        );
+        if st != 0 {
+            return Err(format!("再生キューの出力先を確認できません (status={st})"));
+        }
+        let current = cf_string(device);
+        // AQ の Get も CF オブジェクトは複製され、呼出し側が解放する契約。
+        if !device.is_null() {
+            CFRelease(device);
+        }
+        let current = if size as usize == std::mem::size_of::<CFStringRef>() {
+            current
+        } else {
+            Err("再生キューの出力先プロパティ長が不正です。".to_string())
+        };
+        queue.context.confirm_device(observed, &queue.uid, current)
+    }
+}
+
+fn playback_worker() {
+    let mut aq: Option<PlaybackQueue> = None;
+    let mut active_generation = 0;
+    let mut active_rate = 0;
+    // Dispose 失敗後は同一プロセス内で別キューを作らない(二重再生の可能性を避ける)。
+    let mut fatal = None;
+    loop {
+        check_output_topology();
+        let selection = OUTPUT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let rate = REQUESTED_RATE.load(Ordering::SeqCst);
+        let invalid = selection.status.is_some()
+            || INVALIDATED_GENERATION.load(Ordering::SeqCst) == selection.generation;
+        let changed = selection.generation != active_generation || rate != active_rate;
+        if aq.is_some() && (changed || invalid) {
+            if let Err(reason) = stop_playback(aq.take().unwrap()) {
+                fatal = Some(reason);
+            }
+            reset_rings();
+        }
+        if QUEUE_DISPOSE_FAILED.load(Ordering::SeqCst) {
+            fatal = Some(
+                "再生キューの解放に失敗したため停止中です。Knit を再起動してください。".to_string(),
+            );
+        }
+        if let Some(reason) = fatal.as_ref() {
+            fail_output(selection.generation, reason.clone());
+        } else if aq.is_none() && !invalid && rate != 0 {
+            if let Some(target) = selection.target.as_ref() {
+                reset_rings();
+                // システム通知も登録世代に固定する。DEVICES はポーリング検証で扱い、
+                // 既定変更は「既定」選択時だけこの世代を失効させる。
+                let mut listeners = TopologyListeners::new(selection.generation);
+                let watched = if selection.uid.is_empty() {
+                    listeners.add(1, address(DEFAULT_OUTPUT, GLOBAL), true)
+                } else {
+                    Ok(())
+                }
+                .and_then(|_| listeners.add(target.id, address(ALIVE, GLOBAL), true))
+                .and_then(|_| listeners.add(target.id, address(STREAMS, OUTPUT_SCOPE), true))
+                .and_then(|_| listeners.add(target.id, address(DATA_SOURCE, OUTPUT_SCOPE), false))
+                .and_then(|_| listeners.add(target.id, address(JACK, OUTPUT_SCOPE), false));
+                let created = watched.and_then(|_| start_playback(rate, &target.uid, listeners));
+                match created {
+                    Ok(queue) => {
+                        aq = Some(queue);
+                        active_generation = selection.generation;
+                        active_rate = rate;
+                        // リスナー登録/キュー作成中の抜き差し・UI再選択も公開前に検出。
+                        check_output_topology();
+                    }
+                    Err(reason) => {
+                        fail_output(selection.generation, reason);
+                    }
+                }
+            }
+        }
+        // キュー作成中のレート要求が A→B→A と戻っても、現キューが有効なら開く。
+        if let Some(queue) = aq.as_ref() {
+            // 通知は即時にこの AQ を消音。HAL/AQ 呼出しは callback でなく所有者だけ。
+            // 同 UID の自己通知なら再開、別 UID/問い合わせ失敗なら明示的再選択が必要。
+            if !queue.context.device_verified() {
+                if let Err(reason) = verify_queue_device(queue) {
+                    invalidate_output(queue.context.generation);
+                    fail_output(queue.context.generation, reason);
+                }
+            }
+            let current = OUTPUT.lock().unwrap_or_else(|e| e.into_inner());
+            if current.generation == active_generation
+                && current.status.is_none()
+                && INVALIDATED_GENERATION.load(Ordering::SeqCst) != active_generation
+                && REQUESTED_RATE.load(Ordering::SeqCst) == active_rate
+            {
+                OUTPUT_READY.store(true, Ordering::SeqCst);
+            }
+        }
+        // 受信が止まっても切替・切断を処理する。UI タイマーは補助であり必須ではない。
+        std::thread::park_timeout(std::time::Duration::from_millis(100));
     }
 }
 
@@ -177,11 +946,18 @@ static CB_FIRED: AtomicBool = AtomicBool::new(false);
 /// 間引き(緊急クリップ)した累計バイト。音割れ調査の指標として diag へ出す
 static DROP_BYTES: AtomicU64 = AtomicU64::new(0);
 unsafe extern "C" fn aq_callback(
-    _user: *mut core::ffi::c_void,
+    user: *mut core::ffi::c_void,
     aq: AudioQueueRef,
     buffer: AudioQueueBufferRef,
 ) {
     unsafe {
+        // Stop(true) が呼ぶ完了通知では再投入しない。停止側はリングをロックしない。
+        let Some(context) = user.cast::<QueueContext>().as_ref() else {
+            return;
+        };
+        if !context.matches(aq) || !context.callbacks.load(Ordering::SeqCst) {
+            return;
+        }
         if !CB_FIRED.swap(true, Ordering::Relaxed) {
             eprintln!(
                 "[audio] callback alive (cap={})",
@@ -191,7 +967,7 @@ unsafe extern "C" fn aq_callback(
         let cap = (*buffer).mAudioDataBytesCapacity as usize;
         let dst = (*buffer).mAudioData;
         let mut filled = 0usize;
-        if !MUTED.load(Ordering::Relaxed) {
+        if !MUTED.load(Ordering::Relaxed) && context.output_permitted() {
             let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
             // プリロール: RING_PRE_ROLL 分溜まるまで再生を始めない(ゼロ埋め)。
             // 溜まりきる前に鳴らし始めると供給の到着むらがそのまま音切れに
@@ -204,7 +980,10 @@ unsafe extern "C" fn aq_callback(
                     std::ptr::write_bytes(dst, 0, cap);
                     (*buffer).mAudioDataByteSize = cap as u32;
                     PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);
-                    AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
+                    drop(ring);
+                    if context.callbacks.load(Ordering::SeqCst) {
+                        AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
+                    }
                     return;
                 }
                 if !ring.is_empty() {
@@ -322,16 +1101,15 @@ unsafe extern "C" fn aq_callback(
         // 重要: 加算の前に未書き込み領域をゼロクリアする。バッファには前回の
         // 内容が残っており、そのまま足すと「前回の音+今回の音」が混ざって
         // 不連続な波形(音割れ)になる
-        if !MUTED.load(Ordering::Relaxed) {
+        if !MUTED.load(Ordering::Relaxed) && context.output_permitted() {
             let mut rb = RING_B.lock().unwrap_or_else(|e| e.into_inner());
             if filled < cap {
                 std::ptr::write_bytes(dst.add(filled), 0, cap - filled);
             }
             if !rb.is_empty() {
-                if !PRIMED_B.load(Ordering::Relaxed)
-                    && rb.len() >= RING_PRE_ROLL {
-                        PRIMED_B.store(true, Ordering::Relaxed);
-                    }
+                if !PRIMED_B.load(Ordering::Relaxed) && rb.len() >= RING_PRE_ROLL {
+                    PRIMED_B.store(true, Ordering::Relaxed);
+                }
                 if PRIMED_B.load(Ordering::Relaxed) {
                     // 超過分を 1/32 ずつ捨てて目標滞留へ戻す(荒いが第2レーン限定)
                     const SOFT_B: usize = RING_PRE_ROLL + 2048;
@@ -374,16 +1152,26 @@ unsafe extern "C" fn aq_callback(
         if filled < cap {
             std::ptr::write_bytes(dst.add(filled), 0, cap - filled);
         }
+        // HAL 通知/UI 切替がミックス中に来ても、未投入バッファは無音にする。
+        if MUTED.load(Ordering::SeqCst) || !context.output_permitted() {
+            std::ptr::write_bytes(dst, 0, cap);
+        }
         (*buffer).mAudioDataByteSize = cap as u32;
         PLAY_BYTES.fetch_add(cap as u64, Ordering::Relaxed);
-        AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
+        if context.callbacks.load(Ordering::SeqCst) {
+            AudioQueueEnqueueBuffer(aq, buffer, 0, std::ptr::null());
+        }
     }
 }
 
 /// AudioQueue を起動する(4バッファ x 15ms = 60ms の再生バッファ)。
 /// 低遅延と音切れ防止のバランス点: 供給側の揺らぎ(TCP 到着間隔)を
 /// この余裕で吸収し、滞留はクリップで「目標 ≈78ms」に保つ
-fn start_playback(rate: u32) -> Option<AudioQueueRef> {
+fn start_playback(
+    rate: u32,
+    uid: &str,
+    listeners: TopologyListeners,
+) -> Result<PlaybackQueue, String> {
     unsafe {
         let bytes_per_frame: u32 = 8; // f32 x 2ch
                                       // 15ms 分。奇数サンプルレート環境で L/R が割れないよう 8 バイト境界へ丸める
@@ -399,46 +1187,99 @@ fn start_playback(rate: u32) -> Option<AudioQueueRef> {
             mBitsPerChannel: 32,
             mReserved: 0,
         };
+        let mut context = Box::new(QueueContext::new(listeners.generation));
+        let user = (&mut *context as *mut QueueContext).cast();
         let mut aq: AudioQueueRef = std::ptr::null_mut();
-        if AudioQueueNewOutput(
+        let st = AudioQueueNewOutput(
             &desc,
             aq_callback,
-            std::ptr::null_mut(),
+            user,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             0,
             &mut aq,
-        ) != 0
-        {
-            eprintln!("[audio] AudioQueueNewOutput 失敗");
-            return None;
+        );
+        if st != 0 || aq.is_null() {
+            // 部分的にキューが返された場合も Dispose まで context を保持する。
+            if !aq.is_null() {
+                context.queue.store(aq, Ordering::SeqCst);
+                stop_playback(PlaybackQueue {
+                    aq,
+                    context,
+                    uid: uid.to_string(),
+                    _listeners: listeners,
+                })?;
+            }
+            return Err(format!("再生キューを作成できません (status={st})"));
         }
-        for _ in 0..4 {
-            let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
-            if AudioQueueAllocateBuffer(aq, frame_bytes, &mut buf) != 0 {
-                eprintln!("[audio] AllocateBuffer 失敗");
-                // 生成済みの AudioQueue(内部スレッド・バッファ)を解放せず返ると、
-                // 接続のたびに ensure_playback が再試行して蓄積する
-                AudioQueueDispose(aq, 1);
-                return None;
+        context.queue.store(aq, Ordering::SeqCst);
+        let queue = PlaybackQueue {
+            aq,
+            context,
+            uid: uid.to_string(),
+            _listeners: listeners,
+        };
+        let setup = (|| -> Result<(), String> {
+            let device = CFStringCreateWithBytes(
+                std::ptr::null(),
+                uid.as_ptr(),
+                uid.len() as isize,
+                UTF8,
+                0,
+            );
+            if device.is_null() {
+                return Err("出力機器の UID を作成できません。".to_string());
             }
-            (*buf).mAudioDataByteSize = frame_bytes as u32;
-            for i in 0..frame_bytes {
-                (*buf).mAudioData.add(i).write(0);
-            }
-            let st = AudioQueueEnqueueBuffer(aq, buf, 0, std::ptr::null());
+            // 空 UID でもここでは実機器 UID を設定する。AQ の既定追従は使用しない。
+            let st = AudioQueueSetProperty(
+                aq,
+                CURRENT_DEVICE,
+                (&device as *const CFStringRef).cast(),
+                std::mem::size_of::<CFStringRef>() as u32,
+            );
+            CFRelease(device);
             if st != 0 {
-                eprintln!("[audio] EnqueueBuffer 失敗 st={st}");
+                return Err(format!("選択した出力機器に固定できません (status={st})"));
             }
+            let st = AudioQueueAddPropertyListener(aq, CURRENT_DEVICE, queue_device_changed, user);
+            if st != 0 {
+                return Err(format!(
+                    "再生キューの出力先監視に失敗しました (status={st})"
+                ));
+            }
+            for _ in 0..4 {
+                let mut buf: AudioQueueBufferRef = std::ptr::null_mut();
+                let st = AudioQueueAllocateBuffer(aq, frame_bytes as u32, &mut buf);
+                if st != 0 {
+                    return Err(format!("再生バッファを確保できません (status={st})"));
+                }
+                (*buf).mAudioDataByteSize = frame_bytes as u32;
+                std::ptr::write_bytes((*buf).mAudioData, 0, frame_bytes);
+                let st = AudioQueueEnqueueBuffer(aq, buf, 0, std::ptr::null());
+                if st != 0 {
+                    return Err(format!("再生バッファを登録できません (status={st})"));
+                }
+            }
+            queue.context.callbacks.store(true, Ordering::SeqCst);
+            let st = AudioQueueStart(aq, std::ptr::null());
+            if st != 0 {
+                return Err(format!(
+                    "選択した出力機器で再生を開始できません (status={st})"
+                ));
+            }
+            // SetCurrentDevice/Start 内の同期通知はまだ watching=false。
+            // その間の本当の経路変更も、公開前の実値検証で fail closed にする。
+            queue.context.watching.store(true, Ordering::SeqCst);
+            verify_queue_device(&queue)?;
+            Ok(())
+        })();
+        if let Err(reason) = setup {
+            // 部分生成した AQ も必ず所有ワーカーで破棄する。ロック保持なし。
+            stop_playback(queue)?;
+            return Err(reason);
         }
-        let st = AudioQueueStart(aq, std::ptr::null());
-        if st != 0 {
-            eprintln!("[audio] AudioQueueStart 失敗 st={st}");
-            AudioQueueDispose(aq, 1);
-            return None;
-        }
-        eprintln!("[audio] AudioQueueStart ok ({rate}Hz, frame_bytes={frame_bytes})");
-        Some(aq)
+        eprintln!("[audio] AudioQueueStart ok ({rate}Hz, frame_bytes={frame_bytes}, UID固定)");
+        Ok(queue)
     }
 }
 
@@ -556,7 +1397,9 @@ pub fn start(token: String, port: u16) {
                     // 振り切れは clamp で防ぐ(第2レーンの加算と同じ保護)
                     let g = gain();
                     frame = frame
-                        .as_chunks::<2>().0.iter()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .flat_map(|b| {
                             let v = ((i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0) * g)
                                 .clamp(-1.0, 1.0);
@@ -572,7 +1415,7 @@ pub fn start(token: String, port: u16) {
                     continue;
                 }
                 RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
-                if !MUTED.load(Ordering::Relaxed) {
+                if !MUTED.load(Ordering::Relaxed) && output_permitted() {
                     let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
                     // ミュート明けに古い音を鳴らさない、かつ遅延を溜めない:
                     // 上限超過分は古い方から捨てる(8バイト境界で)
@@ -607,7 +1450,9 @@ pub fn feed_s16(rate: u32, pcm_s16: &[u8]) {
     // ×1.5 に抑える(合計の振り切れは加算後のソフト飽和で保護)
     const GAIN: f32 = 1.5;
     let mut frame: Vec<u8> = pcm_s16
-        .as_chunks::<2>().0.iter()
+        .as_chunks::<2>()
+        .0
+        .iter()
         .flat_map(|b| {
             let v = ((i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0) * GAIN).clamp(-1.0, 1.0);
             v.to_le_bytes()
@@ -618,7 +1463,7 @@ pub fn feed_s16(rate: u32, pcm_s16: &[u8]) {
         return;
     }
     RX_BYTES.fetch_add(pcm_s16.len() as u64, Ordering::Relaxed);
-    if !MUTED.load(Ordering::Relaxed) {
+    if !MUTED.load(Ordering::Relaxed) && output_permitted() {
         let mut ring = RING_B.lock().unwrap_or_else(|e| e.into_inner());
         // 滞留の上限は約 80ms。超過分は一度に全部ではなく 1/8 ずつ捨てる
         // (一括で捨てると波形が周期的に途切れて「プツプツ/割れ」に聞こえる)
@@ -646,7 +1491,8 @@ pub fn clear_lane_b() {
 /// 無音期間はキープアライブ受信時に、鳴っている間はフレーム受信時に呼ばれる。
 /// drop が増え続けていれば波形を切っている=音割れの原因として疑う。
 /// 10 秒→60 秒へ緩和: 常時接続で log が約 1MB/日で育ち続けるのを抑えるため
-fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {    if last_diag.elapsed() < std::time::Duration::from_secs(60) {
+fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {
+    if last_diag.elapsed() < std::time::Duration::from_secs(60) {
         return;
     }
     *last_diag = std::time::Instant::now();
@@ -659,4 +1505,247 @@ fn diag_log(last_diag: &mut std::time::Instant, rate: u32) {    if last_diag.ela
         "[audio] diag rx={rx}KB played={play}KB queued={}KB lag={lag_ms}ms drop={drop}KB",
         queued / 1024
     );
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    // --emit=metadata のみでも ABI の取り違えを検出できる。
+    const _: () = {
+        assert!(std::mem::size_of::<AudioObjectPropertyAddress>() == 12);
+        assert!(std::mem::size_of::<AudioStreamBasicDescription>() == 40);
+        assert!(std::mem::size_of::<AudioQueueBuffer>() == 56);
+        assert!(std::mem::offset_of!(AudioQueueBuffer, mAudioData) == 8);
+        assert!(std::mem::offset_of!(AudioQueueBuffer, mAudioDataByteSize) == 16);
+        assert!(std::mem::offset_of!(AudioQueueBuffer, mPacketDescriptionCount) == 48);
+    };
+
+    fn target(id: u32, uid: &str) -> OutputTarget {
+        OutputTarget {
+            id,
+            uid: uid.to_string(),
+            streams: vec![id + 10],
+            sources: Some(vec![1]),
+            jack: Some(vec![1]),
+        }
+    }
+
+    fn selection(uid: &str) -> OutputSelection {
+        OutputSelection {
+            uid: uid.to_string(),
+            target: None,
+            generation: 1,
+            status: None,
+        }
+    }
+
+    #[test]
+    fn default_is_pinned_and_never_silently_follows_another_device() {
+        let mut selected = selection("");
+        let headphones = target(2, "headphones");
+        assert!(!selected.observe(1, Ok(headphones.clone())));
+        assert!(!selected.observe(1, Ok(headphones.clone())));
+        assert!(selected.observe(1, Ok(target(3, "speakers"))));
+        assert_eq!(selected.uid, ""); // 保存値は「既定」のまま
+        assert_eq!(selected.target, Some(headphones.clone()));
+        assert!(selected.status.is_some());
+        assert!(!selected.observe(1, Ok(headphones))); // 戻っても自動復帰しない
+        assert!(selected.status.is_some());
+    }
+
+    #[test]
+    fn missing_saved_uid_is_retained_and_cannot_bind_system_default() {
+        let mut selected = selection("");
+        let old = selected.generation;
+        assert!(selected
+            .restore("missing-usb", Err("missing".into()))
+            .is_err());
+        assert_eq!(selected.uid, "missing-usb");
+        assert!(selected.target.is_none());
+        assert_eq!(selected.status.as_deref(), Some("missing"));
+        assert!(selected.generation > old);
+        assert!(!selected.observe(selected.generation, Ok(target(2, "speakers"))));
+        assert!(selected.target.is_none());
+        selected.select("missing-usb", target(5, "missing-usb"));
+        assert!(selected.status.is_none());
+        assert_eq!(selected.target.as_ref().unwrap().uid, "missing-usb");
+    }
+
+    #[test]
+    fn same_uid_physical_route_and_stream_changes_invalidate() {
+        let original = target(2, "built-in");
+        for field in 0..4 {
+            let mut selected = selection("built-in");
+            selected.select("built-in", original.clone());
+            let mut changed = original.clone();
+            match field {
+                0 => changed.id = 99,
+                1 => changed.streams = vec![99],
+                2 => changed.sources = Some(vec![2]),
+                _ => changed.jack = Some(vec![0]),
+            }
+            assert!(selected.observe(selected.generation, Ok(changed)));
+            assert!(selected.status.is_some());
+            assert_eq!(selected.target, Some(original.clone()));
+        }
+    }
+
+    #[test]
+    fn missing_device_latches_until_explicit_reselection() {
+        let mut selected = selection("usb");
+        selected.select("usb", target(4, "usb"));
+        let previous = selected.generation;
+        assert!(selected.observe(previous, Err("disconnected".to_string())));
+        assert!(!selected.observe(previous, Ok(target(4, "usb"))));
+        assert_eq!(selected.status.as_deref(), Some("disconnected"));
+        selected.select("usb", target(5, "usb"));
+        assert_ne!(selected.generation, previous);
+        assert!(selected.status.is_none());
+        // 旧 HAL 問い合わせの遅い完了が新選択を失効させない。
+        assert!(!selected.observe(previous, Err("old result".to_string())));
+        assert!(selected.status.is_none());
+        assert!(!selected.observe(selected.generation, Ok(target(5, "usb"))));
+    }
+
+    #[test]
+    fn generation_is_monotonic_and_errors_do_not_bind_default() {
+        let mut selected = selection("");
+        assert!(selected.observe(1, Err("no output".to_string())));
+        assert!(selected.target.is_none());
+        selected.generation = u64::MAX;
+        selected.select("", target(2, "default"));
+        assert_eq!(selected.generation, u64::MAX);
+        assert!(selected.status.is_none());
+    }
+
+    fn queue_context(generation: u64, identity: usize) -> (QueueContext, AudioQueueRef) {
+        let context = QueueContext::new(generation);
+        let aq = std::ptr::without_provenance_mut(identity);
+        context.queue.store(aq, Ordering::SeqCst);
+        (context, aq)
+    }
+
+    #[test]
+    fn stale_queue_notification_stays_with_its_owner_after_reselection() {
+        let (old, aq) = queue_context(7, 1);
+        // AQ アドレスが再利用されても、user/context は異なる所有者に固定される。
+        let (new, _) = queue_context(8, 1);
+        old.watching.store(true, Ordering::SeqCst);
+        new.watching.store(true, Ordering::SeqCst);
+        assert!(old.notify_device_change(aq, CURRENT_DEVICE));
+        assert_eq!(old.generation, 7);
+        assert!(!old.device_verified());
+        assert_eq!(new.generation, 8);
+        assert!(new.device_verified());
+        assert_eq!(new.device_changes.load(Ordering::SeqCst), 0);
+        old.disable();
+        assert!(!old.notify_device_change(aq, CURRENT_DEVICE));
+        assert!(new.watching.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queue_notification_checks_identity_property_and_stopping_gate() {
+        let (context, aq) = queue_context(7, 1);
+        context.watching.store(true, Ordering::SeqCst);
+        assert!(!context.notify_device_change(std::ptr::null_mut(), CURRENT_DEVICE));
+        assert!(!context.notify_device_change(std::ptr::without_provenance_mut(2), CURRENT_DEVICE));
+        assert!(!context.notify_device_change(aq, DEFAULT_OUTPUT));
+        assert!(context.device_verified());
+        context.callbacks.store(true, Ordering::SeqCst);
+        context.disable();
+        assert!(!context.callbacks.load(Ordering::SeqCst));
+        assert!(!context.notify_device_change(aq, CURRENT_DEVICE));
+    }
+
+    #[test]
+    fn startup_and_delayed_self_notifications_do_not_latch_valid_queue() {
+        let (context, aq) = queue_context(7, 1);
+        // 同期 SetCurrentDevice/Start 通知は arm 前に発生する。
+        for _ in 0..2 {
+            assert!(!context.notify_device_change(aq, CURRENT_DEVICE));
+        }
+        context.watching.store(true, Ordering::SeqCst);
+        assert!(context.confirm_device(0, "usb", Ok("usb".into())).is_ok());
+        assert!(context.device_verified());
+        // 遅延した自己通知も実 UID が同じなら再確認後に復帰できる。
+        assert!(context.notify_device_change(aq, CURRENT_DEVICE));
+        assert!(!context.device_verified());
+        let observed = context.device_changes.load(Ordering::SeqCst);
+        assert!(context
+            .confirm_device(observed, "usb", Ok("usb".into()))
+            .is_ok());
+        assert!(context.device_verified());
+    }
+
+    #[test]
+    fn queue_verification_cannot_acknowledge_a_notification_during_the_read() {
+        let (context, aq) = queue_context(7, 1);
+        context.watching.store(true, Ordering::SeqCst);
+        context.notify_device_change(aq, CURRENT_DEVICE);
+        let observed = context.device_changes.load(Ordering::SeqCst);
+        context.notify_device_change(aq, CURRENT_DEVICE);
+        context
+            .confirm_device(observed, "usb", Ok("usb".into()))
+            .unwrap();
+        assert!(!context.device_verified());
+        let observed = context.device_changes.load(Ordering::SeqCst);
+        context
+            .confirm_device(observed, "usb", Ok("usb".into()))
+            .unwrap();
+        assert!(context.device_verified());
+    }
+
+    #[test]
+    fn queue_route_mismatch_or_query_error_remains_closed() {
+        let (context, aq) = queue_context(7, 1);
+        context.watching.store(true, Ordering::SeqCst);
+        context.notify_device_change(aq, CURRENT_DEVICE);
+        let observed = context.device_changes.load(Ordering::SeqCst);
+        assert!(context
+            .confirm_device(observed, "usb", Ok("speakers".into()))
+            .is_err());
+        assert!(!context.device_verified());
+        assert!(context
+            .confirm_device(observed, "usb", Err("query failed".into()))
+            .is_err());
+        assert!(!context.device_verified());
+    }
+
+    #[test]
+    fn topology_notification_token_never_borrows_the_current_generation() {
+        assert_eq!(topology_generation(std::ptr::null_mut()), None);
+        for generation in [1, 7, u64::MAX] {
+            assert_eq!(
+                topology_generation(topology_user(generation)),
+                Some(generation)
+            );
+        }
+        let mut selected = selection("usb");
+        selected.select("usb", target(4, "usb"));
+        let old_user = topology_user(selected.generation);
+        selected.select("usb", target(5, "usb"));
+        let old_generation = topology_generation(old_user).unwrap();
+        assert_ne!(old_generation, selected.generation);
+        assert!(!selected.observe(old_generation, Err("old HAL notification".into())));
+        assert!(selected.status.is_none());
+    }
+
+    #[test]
+    fn core_audio_abi_layout_matches_64_bit_sdk() {
+        assert_eq!(std::mem::size_of::<AudioObjectPropertyAddress>(), 12);
+        assert_eq!(std::mem::size_of::<AudioStreamBasicDescription>(), 40);
+        assert_eq!(std::mem::size_of::<AudioQueueBuffer>(), 56);
+        assert_eq!(std::mem::offset_of!(AudioQueueBuffer, mAudioData), 8);
+        assert_eq!(
+            std::mem::offset_of!(AudioQueueBuffer, mAudioDataByteSize),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(AudioQueueBuffer, mPacketDescriptionCount),
+            48
+        );
+        assert_eq!(CURRENT_DEVICE, 0x6171_6364);
+        assert_eq!(DEFAULT_OUTPUT, 0x644f_7574);
+    }
 }

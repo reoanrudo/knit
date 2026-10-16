@@ -11,6 +11,7 @@ mod audio;
 mod cg;
 mod clip;
 mod conn;
+mod desktop_settings;
 mod diag;
 mod doctor;
 mod file_drag;
@@ -20,6 +21,7 @@ mod incoming_drag;
 mod objc;
 mod outgoing;
 mod peers;
+mod screen_settings;
 mod session;
 mod state;
 mod tap;
@@ -58,6 +60,10 @@ fn request_quit_for_update() {
 /// osascript 起動に数百msかかるため別スレッドで発火し、accept/受信スレッドを
 /// ブロックしない(レビュー Wave1 A-M9/D-F3)
 fn notify(title: &str, body: &str) {
+    // 通知APIの実呼出しもTest/PreviewではOSへ影響させない。
+    if cfg!(test) || gui::UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
     let title = title.to_string();
     let body = body.to_string();
     // osascript の文字列リテラルで特別な意味を持つ文字を先に無効化する(流用時に
@@ -81,6 +87,22 @@ fn notify(title: &str, body: &str) {
         let _ = out;
     });
 }
+
+/// 接続成功など、明示的に分類した通常通知だけを設定で抑制する。
+/// 失敗・切断・警告は従来のnotifyを直接呼び、必ず表示する。
+pub(crate) fn notify_connection(title: &str, body: &str) {
+    if desktop_settings::snapshot().notify_connection {
+        notify(title, body);
+    }
+}
+
+/// 転送が欠けずに成功した通常通知用。部分失敗・スキップ・警告には使わない。
+pub(crate) fn notify_transfer(title: &str, body: &str) {
+    if desktop_settings::snapshot().notify_transfer {
+        notify(title, body);
+    }
+}
+
 /// バイト数を通知・表示用に整形する(2048→"2 KB"、3_500_000→"3.3 MB")
 pub fn human_bytes(n: u64) -> String {
     if n >= 1024 * 1024 * 1024 {
@@ -161,6 +183,11 @@ pub fn send_cfg() {
         files: knit_common::share::allow_files(),
         // この Mac の再生ミュート中は相手の音声ストリームを止めてもよい(版 15 以降)
         listen: !crate::audio::MUTED.load(Ordering::Relaxed) && knit_common::share::allow_audio(),
+        target_range: {
+            let peers=PEERS.lock().unwrap_or_else(|e|e.into_inner());
+            let active=*ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner());
+            peers.get(active).map(|p| { let s=screen_settings::get(&p.id,p.side); [s.target.0,s.target.1] })
+        },
     });
 }
 /// 単調時計の ms。壁時計(SystemTime)は NTP 補正やスリープ復帰で飛び、
@@ -187,7 +214,8 @@ pub(crate) fn send_msg(msg: &Msg) {
 }
 
 /// 設定(GUI)で選んだ「Windows をホストにする」。KNIT_ROLE=client の GUI 版。
-/// 接続方向は起動時に決まるため、再起動後に反映される
+/// 切替時は CLIENT_ROLE を書き換えた上で reconfigure_role が接続系スレッドを
+/// 起こし直すため、プロセスの再起動なしに反映される
 pub(crate) static CLIENT_ROLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 役割の表示決定(純粋関数・単体テスト対象)。環境変数 KNIT_ROLE=client が
@@ -212,6 +240,169 @@ pub(crate) fn role_env_fixed() -> bool {
     envutil::get("KNIT_ROLE").as_deref() == Some("client")
 }
 
+// ---------- 役割切替の再構成(プロセス再起動せず接続スレッドだけ張り直す) ----------
+
+/// 接続系スレッドの世代。役割を切り替えるたびに増え、各スレッドは周回ごとに
+/// 自分の起動時世代と比較して、変わっていたら自終了する(accept/recv の
+/// ブロッキングを周回化しているため、最大でも数百ms で抜ける)
+pub(crate) static ROLE_GENERATION: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 自分の起動時の世代がもう古いか(接続系スレッドの周回ごとの自終了判定)
+pub(crate) fn role_generation_stale(mine: usize) -> bool {
+    ROLE_GENERATION.load(Ordering::Acquire) != mine
+}
+
+/// 再構成の猶予待ちの後に、自分の世代でスレッドを起こしてよいか(純粋関数)。
+/// 猶予中に更なる切替で世代が進んでいたら、古い方の起こし直しは行わない
+/// (二重 spawn と旧役割への逆戻りを防ぐ。新しい世代の再構成が担う)
+pub(crate) fn role_switch_should_spawn(mine: usize, latest: usize) -> bool {
+    mine == latest
+}
+
+/// 再構成の猶予(旧スレッドの自終了を待つ)。accept/recv の周回が 200ms のため、
+/// その 4 倍で確実に間に合う猶予として 800ms を置く
+pub(crate) const ROLE_SWITCH_GRACE_MS: u64 = 800;
+
+/// spawn_role_threads が必要に応じて読む起動時の確定値(切替後も同じ値で
+/// 起こし直すため。--host は起動引数由来で後から取れないため特に保持する)
+static ROLE_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+static ROLE_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ROLE_SCREEN: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
+static ROLE_CLIENT_HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// 役割に応じた接続系スレッドを起こす(起動時=世代0 と役割切替の両方から呼ぶ)。
+/// client_role は CLIENT_ROLE(GUI 設定)と環境変数をその場で解決する
+/// (切替では CLIENT_ROLE が既に新役割へ書き換わっている前提)
+fn spawn_role_threads(generation: usize) {
+    let port = *ROLE_PORT.get().unwrap_or(&PORT);
+    let token = ROLE_TOKEN
+        .get()
+        .cloned()
+        .unwrap_or_default();
+    let (screen_w, screen_h) = ROLE_SCREEN.get().copied().unwrap_or((0.0, 0.0));
+    let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
+        link: &BULK_LINK,
+        token: token.clone(),
+        // EndpointはOnceLock。設定の保存先変更は次回起動から反映する。
+        dir: desktop_settings::receive_dir(),
+        on_event: mac_on_bulk,
+        log: |s| eprintln!("{s}"),
+        on_rx_bytes: |_| {},
+        // 受信バッチの開始時点のアクティブ端末を履歴ラベルとして固定する
+        //(通知時点で読むと、受信中の端末切替でラベルがすり替わる)
+        on_batch_begin: note_bulk_rx_device,
+        // 待受 bind の初回失敗だけ通知センターへも出す(接続は生きているのに
+        // ファイル・画像だけが届かない状態をログだけで終わらせない)
+        on_bind_error: |s: &str| notify("Knit", s),
+    });
+    if crate::effective_client_role() {
+        let host = ROLE_CLIENT_HOST
+            .get()
+            .cloned()
+            .flatten()
+            .or_else(|| envutil::get("KNIT_HOST"));
+        eprintln!(
+            "[info] client mode(世代 {generation}): connecting to {}",
+            host.as_deref().unwrap_or("LAN から自動検出")
+        );
+        std::thread::spawn(move || {
+            bulk::connect_loop(
+                bulk_ep,
+                || {
+                    let ip = *PEER_IP.lock().unwrap_or_else(|e|e.into_inner());
+                    ip.map(|ip| std::net::SocketAddr::new(ip, port + bulk::PORT_OFFSET))
+                },
+                || CONNECTED.load(Ordering::Relaxed),
+                || role_generation_stale(generation),
+            )
+        });
+        std::thread::spawn(move || {
+            client_thread(generation, host, port, token, screen_w, screen_h)
+        });
+    } else {
+        let bind = envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
+        // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
+        let tk = token.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = knit_common::discover::respond(
+                "0.0.0.0",
+                port + knit_common::discover::PORT_OFFSET,
+                &tk,
+                knit_common::net::is_allowed,
+                || role_generation_stale(generation),
+            ) {
+                eprintln!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
+            }
+        });
+        std::thread::spawn(move || {
+            bulk::serve(
+                bulk_ep,
+                &bind,
+                port + bulk::PORT_OFFSET,
+                allow_bulk_peer,
+                || role_generation_stale(generation),
+            )
+        });
+        // Android タブレットの中継(adb とペア済みの端末がある時だけ働く)。
+        // 127.0.0.1 から本線へ 1 台の接続先として入るため、待受モードでのみ起動する
+        //(spawn 内のガードで二重起動しない)
+        android::spawn(port, token.clone());
+        std::thread::spawn(move || {
+            server_thread(generation, port, token, screen_w, screen_h)
+        });
+    }
+}
+
+/// 役割の切替をプロセスを生かしたまま反映する(set_role / apply_peer_role から呼ぶ。
+/// 呼び出し時点で CLIENT_ROLE は新役割へ書き換え済みであること)。
+/// 手順: 世代を進める(旧スレッドが自終了へ) → 既存セッションを切断(相手にも
+/// 切断が伝わる) → 旧スレッドの終了猶予 → 新世代で接続系を起こす。以後は
+/// 既存の自動再接続・自動発見で収束する
+pub(crate) fn reconfigure_role() {
+    // プレビューでは接続系スレッドが無いため何もしない(set_role のガードと二重防御)
+    if gui::UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let generation = ROLE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    eprintln!(
+        "[role] 接続を切り、役割を再構成します(世代 {generation}・新しい役割: {})",
+        if crate::effective_client_role() { "接続側" } else { "待ち受け" }
+    );
+    // 進行中のファイル転送は中止(旧経路の切断で自然に止まるため、先に中止要求を
+    // 出して相手側の表示を整える。restart_now と同じ後始末)
+    if crate::cancel_active_xfer() {
+        eprintln!("[role] 切替前に進行中のファイル送信を中止します");
+    }
+    // 大容量経路(ファイル・画像)の切断。受信中があれば Receiver の Drop が後始末する
+    BULK_LINK.clear();
+    // 待受モードで複数台保持しているセッション(待機中端末・Android 中継含む)の
+    // writer を閉じる。各 receive_loop は読み取りエラーで終わり、各セッション
+    // スレッドの後処理(detach・on_disconnect)が走る(履歴・配置保存の経路を共用)
+    {
+        let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        for p in peers.iter_mut() {
+            if let Some(w) = p.writer.take() {
+                w.shutdown();
+            }
+        }
+    }
+    // アクティブな本線(STREAM_SLOT)の切断。クライアントモードはこれが本体
+    drop_stream("役割の切り替え");
+    // 旧クライアントスレッドの再接続待機(WAKE.sleep)を飛ばして自終了へ向かわせる
+    WAKE.notify();
+    // 旧スレッド終了の猶予(accept/recv の周回 200ms に対する 800ms)
+    std::thread::sleep(Duration::from_millis(ROLE_SWITCH_GRACE_MS));
+    // 猶予中に更なる切替が入っていたら、この再構成は起こし直さない(新しい
+    // 世代の再構成が一括して担う。二重 spawn を防ぐ)
+    if !role_switch_should_spawn(generation, ROLE_GENERATION.load(Ordering::Acquire)) {
+        eprintln!("[role] 更なる切替が入ったため、世代 {generation} の再構成を中止します");
+        return;
+    }
+    spawn_role_threads(generation);
+    eprintln!("[role] 役割の再構成が完了しました(以後は自動再接続で繋がります)");
+}
+
 /// Mac 自身をロックする(Win+L に相当する ⌘Ctrl+Q を System Events 経由で発生させる。
 /// Knit はアクセシビリティ権限を持つためこの経路が使える)
 pub(crate) fn lock_this_mac() {
@@ -227,6 +418,13 @@ pub(crate) fn lock_this_mac() {
     }
 }
 
+/// 相手(Windows)がロック解除の連動(Msg::Unlock の受信)に対応しているか。
+/// 版による機能差は proto::peer_features に集約する方針(呼び出し側で
+/// 閾値リテラルを書かない)。未接続(版 0)・旧版は false
+pub(crate) fn unlock_peer_supported(peer_ver: u32) -> bool {
+    knit_common::proto::peer_features(peer_ver).unlock
+}
+
 /// 送信の成否を返す版(未接続時に操作を通知したい UI から使う)
 pub fn send_msg_reported(msg: &Msg) -> bool {
     let generation = OUTBOUND_GENERATION.load(Ordering::SeqCst);
@@ -239,31 +437,32 @@ pub fn send_msg_reported(msg: &Msg) -> bool {
 }
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20261005-153737-c8ea7a3";
+const BUILD_ID: &str = "build-20261016-132547-200c41b";
 
-/// 起動中はロックファイルを保持する(プロセスの終了で自動的に解放される)
-fn acquire_instance_lock() -> bool {
+/// ロックを取得できない場合は起動しない。保持する File は main の寿命まで生きる。
+fn acquire_instance_lock() -> std::io::Result<std::fs::File> {
+    let dir = knit_common::envutil::config_dir().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "設定フォルダを取得できません")
+    })?;
+    acquire_instance_lock_at(&dir)
+}
+
+fn acquire_instance_lock_at(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     extern "C" {
         fn flock(fd: i32, op: i32) -> i32;
     }
-    let Some(dir) = knit_common::envutil::config_dir() else {
-        return true;
-    };
-    let _ = std::fs::create_dir_all(&dir);
-    let Ok(f) = std::fs::OpenOptions::new()
+    std::fs::create_dir_all(dir)?;
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(dir.join("knit-mac.lock"))
-    else {
-        return true;
-    };
+        .truncate(false)
+        .open(dir.join("knit-mac.lock"))?;
     const LOCK_EX_NB: i32 = 2 | 4;
     if unsafe { flock(f.as_raw_fd(), LOCK_EX_NB) } != 0 {
-        return false;
+        return Err(std::io::Error::last_os_error());
     }
-    std::mem::forget(f);
-    true
+    Ok(f)
 }
 
 /// /tmp/knit-mac.log のローテーション(起動時+実行中の定期チェック)。
@@ -304,6 +503,65 @@ fn rotate_log_at(path: &std::path::Path, backup: &std::path::Path, max_bytes: u6
     std::fs::write(path, b"").is_ok()
 }
 
+fn instance_lock_required(args: &[String]) -> bool {
+    // プレビューは通信も常駐メニューも持たない。通常起動の回避フラグは認めない。
+    if args.iter().any(|a| matches!(a.as_str(), "--preview-ui" | "--preview-setup")) {
+        return false;
+    }
+    // 既存の debug 専用プローブだけは、明示指定時に本番と共存できる。
+    if cfg!(debug_assertions) && args.iter().any(|a| a == "--allow-multiple") {
+        return !args.iter().any(|a| matches!(a.as_str(),
+            "--probe-direct-ime" | "--probe-trackpad" | "--probe-local-history"
+            | "--probe-incoming-drag" | "--probe-setup"));
+    }
+    true
+}
+
+#[cfg(test)]
+mod instance_lock_tests {
+    use super::{acquire_instance_lock_at, instance_lock_required};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| (*v).into()).collect()
+    }
+
+    #[test]
+    fn normal_start_cannot_bypass_the_instance_lock() {
+        assert!(instance_lock_required(&args(&["knit-mac"])));
+        assert!(instance_lock_required(&args(&["knit-mac", "--allow-multiple"])));
+        assert!(instance_lock_required(&args(&["knit-mac", "--allow-multiple", "--show-prefs"])));
+        assert!(instance_lock_required(&args(&["knit-mac", "--allow-multiple", "--probe-unknown"])));
+    }
+
+    #[test]
+    fn previews_coexist_without_disabling_normal_instance_protection() {
+        assert!(!instance_lock_required(&args(&["knit-mac", "--preview-ui"])));
+        assert!(!instance_lock_required(&args(&["knit-mac", "--preview-setup"])));
+        assert!(!instance_lock_required(&args(&["knit-mac", "--allow-multiple", "--preview-ui"])));
+    }
+
+    #[test]
+    fn lock_lifetime_blocks_duplicates_then_allows_restart() {
+        let dir = std::env::temp_dir().join(format!("knit-instance-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("knit-mac.lock"), b"existing inode fixture").unwrap();
+        let first = acquire_instance_lock_at(&dir).unwrap();
+        assert_eq!(acquire_instance_lock_at(&dir).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(std::fs::read(dir.join("knit-mac.lock")).unwrap(), b"existing inode fixture");
+        drop(first);
+        drop(acquire_instance_lock_at(&dir).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inaccessible_lock_path_cannot_allow_an_unprotected_instance() {
+        let dir = std::env::temp_dir().join(format!("knit-instance-lock-error-{}", std::process::id()));
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert!(acquire_instance_lock_at(&dir).is_err());
+        std::fs::remove_file(dir).unwrap();
+    }
+}
+
 fn main() {
     rotate_tmp_log();
     eprintln!("[info] knit-mac {BUILD_ID}");
@@ -317,10 +575,21 @@ fn main() {
     }
     // 二重起動の防止: 役割の切替などで再起動が重なると、同じ Mac が複数動いて
     // 待ち受けや接続を取り合い、つながるまで数分かかる(実測)。ロックを握れなければ終了する
-    if !args.iter().any(|a| a == "--allow-multiple") && !acquire_instance_lock() {
-        eprintln!("[info] すでに起動中のため終了します");
-        return;
-    }
+    let _instance_lock = if instance_lock_required(&args) {
+        match acquire_instance_lock() {
+            Ok(lock) => Some(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                eprintln!("[info] すでに起動中のため終了します");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[error] 二重起動を防止できないため起動を中止します: {e}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
     #[cfg(debug_assertions)]
     if args.iter().any(|a| a == "--probe-direct-ime") {
         unsafe { gui::direct_input::probe(); }
@@ -364,7 +633,7 @@ fn main() {
         // プレビューでも「操作する端末」が複数台のときの見た目を確認できるように、
         // ダミーの端末を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
         PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
-            id: "pc-preview".into(), name: "PC(プレビュー)".into(),
+            id: "pc-preview".into(), name: "DESKTOP-PREVIEW".into(),
             ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
             writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
             alias: None,
@@ -372,7 +641,7 @@ fn main() {
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
             PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
-                id: "android-preview".into(), name: "タブレット(プレビュー)".into(),
+                id: "android-preview".into(), name: "TABLET-PREVIEW".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
                 alias: None,
@@ -614,11 +883,10 @@ fn main() {
         EDGE_TAPS.load(Ordering::Relaxed)
     );
     // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
-    let _ = std::fs::create_dir_all(
-        std::env::var_os("HOME")
-            .map(|h| std::path::Path::new(&h).join("Downloads/Knit"))
-            .unwrap_or_default(),
-    );
+    // 既定フォルダの初回作成は起動時だけ行う（applyは作成せず検証する）。
+    if let Err(e) = std::fs::create_dir_all(desktop_settings::receive_dir()) {
+        eprintln!("[bulk] 受信フォルダを用意できません: {e}");
+    }
     history_load();
     // 画像履歴の実体を件数(60)と総量(512MiB)の両上限へ刈り込む(起動時に 1 回)。
     // 保存時の刈り込みは画像が届いた時しか走らないため、ここで残った超過を掃く
@@ -725,7 +993,9 @@ fn main() {
     });
 
     // 画面ロックの連動(1 秒毎)。Mac がロックされたら Windows 操作中でも制御を
-    // Mac へ戻し(ロック中の入力を Windows へ流さない)、Windows もロックする
+    // Mac へ戻し(ロック中の入力を Windows へ流さない)、Windows もロックする。
+    // 解除は版 16 以降の Windows が「ロック解除の連動」を有効にしているときだけ
+    // Msg::Unlock を送る(旧 Windows へ送らない・受け側の設定は Windows 任せ)
     std::thread::spawn(|| {
         let mut was = false;
         loop {
@@ -739,6 +1009,19 @@ fn main() {
                 if LOCK_SYNC.load(Ordering::Relaxed) && CONNECTED.load(Ordering::Relaxed) {
                     if !send_msg_reported(&Msg::Lock) {
                         eprintln!("[lock] Windows へのロック指示を送れませんでした(接続経路が死んでいる可能性)");
+                    }
+                }
+            }
+            if !now && was {
+                eprintln!("[lock] Mac のロックが解除されました");
+                let peer_ver = PEER_VERSION.load(Ordering::Relaxed);
+                if LOCK_SYNC.load(Ordering::Relaxed)
+                    && CONNECTED.load(Ordering::Relaxed)
+                    && unlock_peer_supported(peer_ver)
+                {
+                    eprintln!("[lock] Mac のロック解除に合わせて Windows へ解放を送ります");
+                    if !send_msg_reported(&Msg::Unlock) {
+                        eprintln!("[lock] Windows への解除指示を送れませんでした(接続経路が死んでいる可能性)");
                     }
                 }
             }
@@ -821,86 +1104,27 @@ fn main() {
     // KNIT_HOST(または --host)で Mac=クライアント(通常ネットワークの配布先向け。
     // その場合は Windows 側を KNIT_ROLE=server で待ち受ける)
     // GUI 設定(Windows をホストにする)か環境変数 KNIT_ROLE=client で接続側になる。
-    // 環境変数が優先(GUI は配布時の既定、env は開発者の上書き)
-    let client_role = crate::effective_client_role();
-    let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
-        link: &BULK_LINK,
-        token: token.clone(),
-        dir: std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .map(|h| h.join("Downloads/Knit"))
-            .unwrap_or_else(|| {
-                // HOME 未設定(変則起動)で空 PathBuf のまま join すると相対パスに
-                // 落ち、起動 cwd 次第で意図しない場所へ保存されるため固定する
-                eprintln!("[bulk] HOME が未設定のため受信先を一時領域にします");
-                std::env::temp_dir().join("knit-downloads")
-            }),
-        on_event: mac_on_bulk,
-        log: |s| eprintln!("{s}"),
-        on_rx_bytes: |_| {},
-        // 受信バッチの開始時点のアクティブ端末を履歴ラベルとして固定する
-        //(通知時点で読むと、受信中の端末切替でラベルがすり替わる)
-        on_batch_begin: note_bulk_rx_device,
-        // 待受 bind の初回失敗だけ通知センターへも出す(接続は生きているのに
-        // ファイル・画像だけが届かない状態をログだけで終わらせない)
-        on_bind_error: |s: &str| notify("Knit", s),
-    });
+    // 環境変数が優先(GUI は配布時の既定、env は開発者の上書き)。
+    // スレッドの起こしは spawn_role_threads に切り出してある(役割切替の再構成と
+    // 共用。起動時は世代 0)
+    let _ = ROLE_PORT.set(port);
+    let _ = ROLE_TOKEN.set(token.clone());
+    let _ = ROLE_SCREEN.set((screen_w, screen_h));
+    let _ = ROLE_CLIENT_HOST.set(
+        args.iter()
+            .position(|a| a == "--host")
+            .and_then(|i| args.get(i + 1))
+            .cloned(),
+    );
     // 前回終了時に残った受信中ファイルの一時実体(.knit-*.part)を掃除する。
     // exit(0) は Receiver の Drop を飛ばすため、再起動・初期化経路の保険として
     // 起動時(まだ受信が始まっていない=安全な時期)に消す
-    let swept = knit_common::files::sweep_temp_files(&bulk_ep.dir);
+    let bulk_dir = desktop_settings::receive_dir();
+    let swept = knit_common::files::sweep_temp_files(&bulk_dir);
     if swept > 0 {
         eprintln!("[bulk] 前回の受信中ファイルの残骸を {swept} 件掃除しました");
     }
-    if client_role {
-        let host = args
-            .iter()
-            .position(|a| a == "--host")
-            .and_then(|i| args.get(i + 1))
-            .cloned()
-            .or_else(|| envutil::get("KNIT_HOST"));
-        eprintln!(
-            "[info] client mode: connecting to {}",
-            host.as_deref().unwrap_or("LAN から自動検出")
-        );
-        std::thread::spawn(move || {
-            bulk::connect_loop(
-                bulk_ep,
-                || {
-                    let ip = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
-                    ip.map(|ip| std::net::SocketAddr::new(ip, port + bulk::PORT_OFFSET))
-                },
-                || CONNECTED.load(Ordering::Relaxed),
-            )
-        });
-        std::thread::spawn(move || client_thread(host, port, token, screen_w, screen_h));
-    } else {
-        let bind = envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
-        // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
-        let tk = token.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = knit_common::discover::respond(
-                "0.0.0.0",
-                port + knit_common::discover::PORT_OFFSET,
-                &tk,
-                knit_common::net::is_allowed,
-            ) {
-                eprintln!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
-            }
-        });
-        std::thread::spawn(move || {
-            bulk::serve(
-                bulk_ep,
-                &bind,
-                port + bulk::PORT_OFFSET,
-                allow_bulk_peer,
-            )
-        });
-        // Android タブレットの中継(adb とペア済みの端末がある時だけ働く)。
-        // 127.0.0.1 から本線へ 1 台の接続先として入るため、待受モードでのみ起動する
-        android::spawn(port, token.clone());
-        std::thread::spawn(move || server_thread(port, token, screen_w, screen_h));
-    }
+    spawn_role_threads(0);
 
     // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録。
     // --diag 起動時の有効化に加え、設定画面の左下「その他」の「詳しく記録」でも runtime で
@@ -1145,6 +1369,65 @@ fn main() {
         unsafe { CFRunLoopRun() };
     }
 }
+#[cfg(test)]
+mod role_generation_tests {
+    use super::{
+        role_generation_stale, role_switch_should_spawn, ROLE_GENERATION, ROLE_SWITCH_GRACE_MS,
+    };
+    use std::sync::atomic::Ordering;
+
+    /// テスト間で ROLE_GENERATION を共有するため、このモジュールのテストは
+    /// 値の保存・復元を行う(他テストへの波及を防ぐ)
+    fn with_generation<R>(f: impl FnOnce() -> R) -> R {
+        let saved = ROLE_GENERATION.load(Ordering::Acquire);
+        let r = f();
+        ROLE_GENERATION.store(saved, Ordering::Release);
+        r
+    }
+
+    /// 自分の起動時世代と現在が一致している間は自終了しない
+    #[test]
+    fn current_generation_is_not_stale() {
+        with_generation(|| {
+            ROLE_GENERATION.store(7, Ordering::Release);
+            assert!(!role_generation_stale(7), "同世代の間は継続する");
+        });
+    }
+
+    /// 世代が進む(=役割が切り替わる)と古いスレッドは自終了する
+    #[test]
+    fn advanced_generation_is_stale() {
+        with_generation(|| {
+            ROLE_GENERATION.store(8, Ordering::Release);
+            assert!(role_generation_stale(7), "進んだ世代は自終了する");
+            // 世代が戻る方向(稀な再設定)でも「一致しない」ことが自終了の条件
+            assert!(role_generation_stale(9), "不一致ならどちら向きでも自終了する");
+        });
+    }
+
+    /// 猶予待ちの後、自分が最新世代のままである時だけ起こし直す。猶予中に更なる
+    /// 切替で世代が進んでいたら、古い再構成は二重 spawn をしない
+    #[test]
+    fn spawns_only_when_still_the_latest_generation() {
+        assert!(role_switch_should_spawn(3, 3), "最新のままなら起こす");
+        assert!(!role_switch_should_spawn(3, 4), "進んでいたら新しい再構成に任せる");
+        assert!(!role_switch_should_spawn(0, 1), "起動世代が置き換わっても同じ");
+    }
+
+    /// 猶予は接続系ループの周回(200ms)より十分長い: accept/recv の 1 周回分の
+    /// ブロッキングを跨いで旧スレッドの終了を待てること
+    #[test]
+    fn grace_covers_multiple_poll_cycles() {
+        const POLL_MS: u64 = 200;
+        assert!(
+            ROLE_SWITCH_GRACE_MS >= POLL_MS * 4,
+            "猶予 {}ms は周回 {}ms の 4 倍以上を確保すること",
+            ROLE_SWITCH_GRACE_MS,
+            POLL_MS
+        );
+    }
+}
+
 #[cfg(test)]
 mod file_tx_tests {
     use super::*;
@@ -1908,5 +2191,22 @@ mod handoff_tests {
             "存在しないアプリは不一致"
         );
         assert!(app_handoff_match("", &a).is_none(), "空の名前は不一致");
+    }
+}
+
+#[cfg(test)]
+mod unlock_sync_tests {
+    use super::unlock_peer_supported;
+
+    /// Unlock の送信は版ゲートで守る: 未接続(版 0)・版 15 以下の Windows へは
+    /// 送らない(旧側は受け取れず、誤動作のない未知行として捨てられるだけとはいえ
+    /// 意味のない送信をしない)
+    #[test]
+    fn unlock_is_sent_only_to_version_16_peers() {
+        for legacy in [0, 11, 14, 15] {
+            assert!(!unlock_peer_supported(legacy), "版 {legacy} は非対応");
+        }
+        assert!(unlock_peer_supported(16), "版 16 は対応");
+        assert!(unlock_peer_supported(17), "将来版も対応");
     }
 }

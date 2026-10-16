@@ -113,14 +113,14 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             eprintln!("[handoff] Windows アプリ {} 件を受信", apps.len());
                         }
                         Msg::Role { host } => {
-                            // 適用済みを相手へ知らせてから再起動へ移る。
-                            // 相手はこの確認を待って再起動する(版 15 以降。
+                            // 適用済みを相手へ知らせてから接続の再構成へ移る。
+                            // 相手はこの確認を待って切り替える(版 15 以降。
                             // 旧側は無視するため、旧側相手では従来どおり時間頼み)
                             let _ = send_msg_reported(&Msg::RoleAck);
                             std::thread::spawn(move || gui::apply_peer_role(host));
                         }
                         Msg::RoleAck => {
-                            // 相手の役割切替適用が済んだ。再起動を待っていた
+                            // 相手の役割切替適用が済んだ。切り替えを待っていた
                             // GUI へ知らせる
                             gui::note_role_ack();
                         }
@@ -152,9 +152,9 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             if !WIN_MODE.load(Ordering::Relaxed) {
                                 continue;
                             }
-                            WIN_MODE.store(false, Ordering::Relaxed);
-                            eprintln!("[mode] MAC (return)");
-                            leave_win_mode_cursor_unlock(Some(ny));
+                            if crate::tap::return_from_peer(ny) {
+                                eprintln!("[mode] MAC (return)");
+                            }
                         }
                         Msg::Clip { text } => {
                             if !CLIP_SHARE.load(Ordering::Relaxed) || !knit_common::share::allow_clip() {
@@ -200,6 +200,7 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 // ステータス窓表示にも回す(接続品質の見える化)
                                 let rtt = now.saturating_sub(ts).min(60_000);
                                 RTT_MS.store(rtt, Ordering::Relaxed);
+                                note_rtt(rtt);
                                 // [rtt] 行は 80ms 超の間も 10 分に 1 回まで
                                 //(劣化通知と同じスロットル。毎秒出すと常駐運用の
                                 // ログが際限なく増えるため)
@@ -345,6 +346,7 @@ pub(crate) fn on_disconnect(auto_fallback: bool) {
         .ok();
     // 旧セッションの RTT が再接続直後に「前の接続の値」として表示されるのを防ぐ
     RTT_MS.store(0, Ordering::Relaxed);
+    note_rtt(0);
     TS_PATH.store(0, Ordering::Relaxed);
     *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
     *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -465,39 +467,97 @@ fn handshake_and_hello(
     }
 }
 
-pub(crate) fn server_thread(port: u16, token: String, screen_w: f64, screen_h: f64) {
+/// 本線待受の bind 再試行の待ち時間(純粋関数・単体テスト対象)。
+/// 役割切替の直後は旧待受スレッドの listener がまだ生きていて AddressInUse に
+/// なることがあるため、数回だけ再試行する(それでも失敗すれば従来どおり致命的)。
+/// None=もう再試行しない
+pub(crate) fn server_bind_retry_wait(attempt: u32) -> Option<Duration> {
+    const MAX_BIND_RETRIES: u32 = 10;
+    if attempt >= MAX_BIND_RETRIES {
+        return None;
+    }
+    Some(Duration::from_millis(300))
+}
+
+pub(crate) fn server_thread(
+    generation: usize,
+    port: u16,
+    token: String,
+    screen_w: f64,
+    screen_h: f64,
+) {
     // 待受アドレス: 既定は全インターフェース(LAN 直を受け入れる)。
-    // 防御は is_allowed(接続元絞り)+ Noise ハンドシェイクが担う
+    // 防御は is_allowed(接続元絞り)+ Noise ハンドシェイクが担う。
+    // 役割切替直後の旧 listener 残存に備え、bind は短い間隔で数回だけ再試行する
     let bind_ip = envutil::get("KNIT_BIND").unwrap_or_else(|| "0.0.0.0".to_string());
-    let listener = match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
-            // ポート占有での起動失敗を通知センターへも出す(exit するとログしか
-            // 残らないため)。通知は非同期発火のため、表示される時間だけ待つ
-            //(request_quit_for_update と同じ待ち方)
-            crate::notify(
-                "Knit",
-                &format!(
-                    "ポート {port} が他のアプリに使用中のためKnitを起動できません。他のKnit(旧 Tsunagu 等)が動いていないか確認してください"
-                ),
-            );
-            std::thread::sleep(Duration::from_millis(1500));
-            std::process::exit(1);
+    let listener = {
+        let mut attempt: u32 = 0;
+        loop {
+            match std::net::TcpListener::bind((bind_ip.as_str(), port)) {
+                Ok(l) => break l,
+                Err(e) => {
+                    match server_bind_retry_wait(attempt) {
+                        Some(wait) => {
+                            // 切替直後の占有(旧 listener の解放待ち)は通常 1 回で空く
+                            if attempt == 0 {
+                                eprintln!(
+                                    "[conn] listen {bind_ip}:{port} が一時的に失敗: {e}(再試行します)"
+                                );
+                            }
+                            attempt += 1;
+                            std::thread::sleep(wait);
+                        }
+                        None => {
+                            eprintln!("[fatal] listen {bind_ip}:{port} failed: {e}");
+                            // ポート占有での起動失敗を通知センターへも出す(exit すると
+                            // ログしか残らないため)。通知は非同期発火のため、表示される
+                            // 時間だけ待つ(request_quit_for_update と同じ待ち方)
+                            crate::notify(
+                                "Knit",
+                                &format!(
+                                    "ポート {port} が他のアプリに使用中のためKnitを起動できません。他のKnit(旧 Tsunagu 等)が動いていないか確認してください"
+                                ),
+                            );
+                            std::thread::sleep(Duration::from_millis(1500));
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
     };
     eprintln!("[info] server mode. listening on {bind_ip}:{port}");
+    // accept をブロッキングのままにすると世代チェックが次の接続まで効かない
+    // ため、nonblocking でポーリングする(成功した stream は blocking へ戻す)。
+    // 世代が変わったら listener ごと drop してポートを空ける(新旧の待受競合を防ぐ)
+    listener.set_nonblocking(true).ok();
     let mut accept_errs: u32 = 0;
     // 認証に失敗し続ける接続の連打を鈍らせる(正規の接続が成功すれば即回復)
     let mut throttle = secure::FailThrottle::new();
     // 非アクティブピアへの生存確認(複数台保持のために一度だけ起こす)
     keepalive_inactive_peers();
     loop {
+        if crate::role_generation_stale(generation) {
+            eprintln!("[conn] 待受を終了しました(役割の切り替え・世代 {generation})");
+            return;
+        }
         let (stream, peer) = match listener.accept() {
             Ok(x) => {
                 accept_errs = 0;
+                // nonblocking listener から取った stream は nonblocking のまま来る
+                x.0.set_nonblocking(false).ok();
                 knit_common::net::tune_tcp(&x.0);
                 x
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // 誰も来ていない(1 周回)。世代チェックへ戻る
+                std::thread::sleep(Duration::from_millis(200));
+                continue;
             }
             Err(e) => {
                 // fd 枯渇等で失敗が続くと 500ms 毎の洪水になるため、最初と
@@ -715,7 +775,7 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
     send_cfg();
     eprintln!("[conn] established");
     let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
-    notify(
+    crate::notify_connection(
         "Knit",
         &format!(
             "{} と接続しました",
@@ -730,7 +790,7 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
     let bye = session_receive_loop(&mut reader, "", 0);
     on_disconnect(false);
     if bye {
-        // 相手の Bye による正常終了(役割切替の再起動等)。Ok として返し、
+        // 相手の Bye による正常終了(役割切替の再接続待ち等)。Ok として返し、
         // 呼び出し側のバックオフをリセットさせる(異常切断だけ待ち時間を進める)
         return Ok(());
     }
@@ -741,13 +801,26 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
 
 /// 接続モード(KNIT_ROLE=client): Windows(サーバ)へ接続し続ける。
 /// 待機は指数バックオフ+フルジッター。スリープ復帰・ネットワーク変化の
-/// WAKE 通知で待機を飛ばしてすぐ再試行する
-pub(crate) fn client_thread(host: Option<String>, port: u16, token: String, screen_w: f64, screen_h: f64) {
+/// WAKE 通知で待機を飛ばしてすぐ再試行する。
+/// generation は役割切替の世代: 周回ごとに比較し、変わっていたら自終了する
+/// (切替側が WAKE.notify するため、待機中でも遅れず抜ける)
+pub(crate) fn client_thread(
+    generation: usize,
+    host: Option<String>,
+    port: u16,
+    token: String,
+    screen_w: f64,
+    screen_h: f64,
+) {
     let mut backoff = knit_common::retry::Backoff::new(
         Duration::from_millis(500),
         Duration::from_secs(10),
     );
     loop {
+        if crate::role_generation_stale(generation) {
+            eprintln!("[conn] 接続試行を終了しました(役割の切り替え・世代 {generation})");
+            return;
+        }
         let addrs = knit_common::connect::resolve(host.as_deref(), port, &token);
         let delay = if addrs.is_empty() {
             // 候補が空なら first_reachable を呼ばない(Windows 側と同じ: 3.5 秒の空待ち防止)
@@ -775,6 +848,28 @@ pub(crate) fn client_thread(host: Option<String>, port: u16, token: String, scre
             Ordering::Relaxed,
         );
         WAKE.sleep(delay);
+    }
+}
+
+/// server_bind_retry_wait の境界: 切替直後の旧 listener 残存による一時的な
+/// AddressInUse を再試行で跨ぎ、本当に占有されている場合のみ致命的へ落とす
+#[cfg(test)]
+mod server_bind_retry_tests {
+    use super::server_bind_retry_wait;
+
+    #[test]
+    fn retries_a_few_times_then_gives_up() {
+        // 初回〜9 回目までは 300ms の待ちを返す(計 3 秒で旧 listener の解放を待つ)
+        for attempt in 0..10 {
+            assert_eq!(
+                server_bind_retry_wait(attempt),
+                Some(std::time::Duration::from_millis(300)),
+                "attempt {attempt} は再試行する"
+            );
+        }
+        // 10 回目(=3 秒待っても空かなかった)はもう再試行しない
+        assert_eq!(server_bind_retry_wait(10), None);
+        assert_eq!(server_bind_retry_wait(99), None);
     }
 }
 

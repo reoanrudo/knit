@@ -16,6 +16,7 @@ type CLS = *mut core::ffi::c_void;
 mod text_input;
 pub(crate) mod direct_input;
 mod preferences;
+mod localization;
 
 /// Windows の設定画面向け: 設定一覧と、Windows からの変更の適用
 pub fn prefs_snapshot_json() -> String {
@@ -25,6 +26,7 @@ pub fn apply_remote_prefs(json: &str) {
     preferences::apply_remote(json);
 }
 mod prefs;
+mod settings_archive;
 pub mod setup;
 pub static UI_PREVIEW: AtomicBool = AtomicBool::new(false);
 pub fn restore_preferences() {
@@ -146,6 +148,9 @@ static GUI_UPDATE_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// 設定画面の診断ボタン(prefs::DIAG_BUTTON)と同じ作法)
 static GUI_DIAG_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_ROLE_ITEM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// 役割メニューへ最後に設定した文言(refresh_status が変化時だけ setTitle するための
+/// 比較元。役割切替が再起動なしで反映されるようになったため、毎秒の同期で揃える)
+static ROLE_MENU_TITLE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 /// Android タブレットのサブメニュー(状態・操作する/しないの切替)。世代が変わった時だけ作り直す
 /// 変化検知の初期値は最大値にして、起動直後の 1 回目で必ず作り直させる
 static GUI_HISTORY_SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -185,15 +190,6 @@ fn state_title_set_now(menu_open: bool) -> bool {
 static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_AUDIO: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CMD: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_SCROLL: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_SPK: AtomicUsize = AtomicUsize::new(0);
-static PREFS_SLIDER: AtomicUsize = AtomicUsize::new(0);
-static PREFS_GAIN_LABEL: AtomicUsize = AtomicUsize::new(0);
-/// カーソル速度スライダー(0.2..3.0 の倍率)とその値表示。設定「操作」ページ
-static PREFS_MOUSE_SLIDER: AtomicUsize = AtomicUsize::new(0);
-static PREFS_MOUSE_SCALE_LABEL: AtomicUsize = AtomicUsize::new(0);
-/// スクロール互換モードのスイッチ(120 未満を無視する古いアプリ用)。設定「操作」
-static PREFS_CHK_SCROLL_COMPAT: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_FILES: AtomicUsize = AtomicUsize::new(0);
 static PREFS_CHK_HISTORY: AtomicUsize = AtomicUsize::new(0);
@@ -212,32 +208,6 @@ struct NSRect {
 }
 
 // ---------- メニュー項目のアクション(Objective-C クラスの IMP) ----------
-
-/// スクロール速度スライダー(値=除数。小さいほど速い)。ドラッグ中も連続で飛ぶ
-unsafe extern "C" fn imp_scroll_gain(_s: ID, _c: SEL, sender: ID) {
-    unsafe {
-        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        let v = get(sender, sel(c"doubleValue"));
-        crate::set_scroll_div(v);
-        let lbl = PREFS_GAIN_LABEL.load(Ordering::Relaxed) as ID;
-        if !lbl.is_null() {
-            let speed = if v <= 40.0 {
-                "速い"
-            } else if v >= 140.0 {
-                "遅い"
-            } else {
-                "標準"
-            };
-            msg1_void_id(
-                lbl,
-                sel(c"setStringValue:"),
-                nsstring(&format!("スクロール速度: {speed}({v:.0})")),
-            );
-        }
-    }
-    preferences::save();
-}
 
 unsafe extern "C" fn imp_switch_mode(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::HOTKEY_ONLY.load(Ordering::Relaxed);
@@ -266,193 +236,6 @@ unsafe extern "C" fn imp_open_log(_s: ID, _c: SEL, _n: ID) {
         .spawn();
 }
 
-/// 設定画面の左下「その他」の「設定フォルダを開く」: 設定の保存先(~/.config/knit)を
-/// Finder で開く(imp_open_log と同じ open コマンドの導線)。フォルダがまだ
-/// 無いときは作ってから開く(初回起動で env が無い場合でも導線が死なないように)
-unsafe extern "C" fn imp_open_settings_dir(_s: ID, _c: SEL, _n: ID) {
-    let Some(dir) = knit_common::envutil::config_dir() else {
-        crate::notify("Knit", "ホームが取得できないため設定フォルダを開けません");
-        return;
-    };
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("[prefs] 設定フォルダの作成に失敗: {e}");
-    }
-    let status = std::process::Command::new("open").arg(&dir).status();
-    if !matches!(status, Ok(s) if s.success()) {
-        crate::notify(
-            "Knit",
-            &format!("設定フォルダを開けませんでした: {}", dir.display()),
-        );
-    }
-}
-
-/// 設定画面の左下「その他」の「設定を書き出す…」: 現在の設定一式を JSON ファイルへ保存
-/// する(引っ越し・バックアップ用。NSSavePanel で場所を選ぶ)
-unsafe extern "C" fn imp_export_prefs(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
-    }
-    let app = msg0(
-        objc_getClass(c"NSApplication".as_ptr()),
-        sel(c"sharedApplication"),
-    );
-    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
-    let panel = msg0(
-        objc_getClass(c"NSSavePanel".as_ptr()),
-        sel(c"savePanel"),
-    );
-    if panel.is_null() {
-        eprintln!("[gui] NSSavePanel を生成できません");
-        return;
-    }
-    msg1_void_id(
-        panel,
-        sel(c"setMessage:"),
-        // 対象外の説明は実際の対象と一致させる(過少に書くと「入れておいた
-        // 接続先まで移った」と誤解させる): snapshot は GUI 設定のみで、
-        // 接続キー(キーチェーン)・履歴・接続先(KNIT_HOST)・直接つなぐ
-        // (KNIT_TOKEN)・画面配置(peer-sides.json)は含まれない
-        nsstring("Knitの設定を書き出します(接続キー・履歴・接続先・直接つなぐ・画面配置は含まれません)"),
-    );
-    msg1_void_id(
-        panel,
-        sel(c"setNameFieldStringValue:"),
-        nsstring("knit-settings.json"),
-    );
-    let resp = crate::msg0_isize(panel, sel(c"runModal"));
-    if resp != 1 {
-        return; // NSModalResponseOK 以外 = キャンセル
-    }
-    let url = msg0(panel, sel(c"URL"));
-    if url.is_null() {
-        return;
-    }
-    let path = msg0(url, sel(c"path"));
-    let utf8 = crate::msg0_cstr(path, sel(c"UTF8String"));
-    if utf8.is_null() {
-        return;
-    }
-    let target = std::ffi::CStr::from_ptr(utf8)
-        .to_string_lossy()
-        .into_owned();
-    match preferences::export_to(std::path::Path::new(&target)) {
-        Ok(()) => {
-            eprintln!("[prefs] 設定を書き出しました: {target}");
-            crate::notify("Knit", &format!("設定を書き出しました:\n{target}"));
-        }
-        Err(e) => {
-            eprintln!("[prefs] 設定の書き出しに失敗: {e}");
-            crate::notify("Knit", "設定を書き出せませんでした。保存先の権限を確認してください");
-        }
-    }
-}
-
-/// 設定画面の左下「その他」の「設定を読み込む…」: 書き出した JSON から設定を復元する。
-/// 読み込みは apply(知らないキー無視・範囲検査つき)を通すため、外部で
-/// 編集されたファイルでも安全。反映は保存と同じ経路で、画面の表示は
-/// 毎秒の sync() が追いつける
-unsafe extern "C" fn imp_import_prefs(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
-    }
-    let app = msg0(
-        objc_getClass(c"NSApplication".as_ptr()),
-        sel(c"sharedApplication"),
-    );
-    msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
-    let panel = msg0(
-        objc_getClass(c"NSOpenPanel".as_ptr()),
-        sel(c"openPanel"),
-    );
-    if panel.is_null() {
-        eprintln!("[gui] NSOpenPanel を生成できません");
-        return;
-    }
-    msg1_void_u8(panel, sel(c"setCanChooseFiles:"), 1);
-    msg1_void_u8(panel, sel(c"setCanChooseDirectories:"), 0);
-    msg1_void_u8(panel, sel(c"setAllowsMultipleSelection:"), 0);
-    msg1_void_id(
-        panel,
-        sel(c"setMessage:"),
-        nsstring("書き出しておいたKnitの設定ファイルを選んでください"),
-    );
-    let resp = crate::msg0_isize(panel, sel(c"runModal"));
-    if resp != 1 {
-        return; // NSModalResponseOK 以外 = キャンセル
-    }
-    let url = msg0(panel, sel(c"URL"));
-    if url.is_null() {
-        return;
-    }
-    let path = msg0(url, sel(c"path"));
-    let utf8 = crate::msg0_cstr(path, sel(c"UTF8String"));
-    if utf8.is_null() {
-        return;
-    }
-    let source = std::ffi::CStr::from_ptr(utf8)
-        .to_string_lossy()
-        .into_owned();
-    // 現在の全設定が確認なしで置き換わるため、確認(既定=キャンセル)を挟む。
-    // 置き換え前に現在の設定を設定フォルダへ 1 世代だけ自動書き出しする
-    // (常に同じファイル名へ上書き=退避のように番号を増やさない。読み込んだ
-    // ファイル側に不具合があっても元へ戻せる事故復旧用の材料)
-    if confirm_alert(
-        "現在の設定を読み込んだ内容で置き換えますか?",
-        "置き換える前に、いまの設定を設定フォルダの preferences-backup.json へ保存してから読み込みます。",
-        &["キャンセル", "置き換える"],
-    ) != 1001 {
-        return;
-    }
-    // バックアップが書けないまま置き換えると復旧材料が無いため、失敗したら
-    // 読み込みを中止する(import_from 自体は範囲検査つきで安全なため、保存先が
-    // 書けない状況だけがここでの止めどころ)
-    match knit_common::envutil::config_dir() {
-        Some(dir) => {
-            if let Err(e) = preferences::export_to(&dir.join("preferences-backup.json")) {
-                eprintln!("[prefs] 置き換え前の設定の書き出しに失敗: {e}");
-                crate::notify(
-                    "Knit",
-                    "置き換え前の設定を設定フォルダへ保存できなかったため、読み込みを中止しました。設定フォルダ(~/.config/knit)の権限を確認してください",
-                );
-                return;
-            }
-        }
-        None => {
-            eprintln!("[prefs] 設定フォルダが取得できないため読み込みを中止します");
-            crate::notify(
-                "Knit",
-                "置き換え前の設定を保存する設定フォルダが取得できないため、読み込みを中止しました",
-            );
-            return;
-        }
-    }
-    match preferences::import_from(std::path::Path::new(&source)) {
-        Ok(()) => {
-            eprintln!("[prefs] 設定を読み込みました: {source}");
-            crate::notify(
-                "Knit",
-                "設定を読み込みました。環境変数・envファイルの指定がある項目は、そちらが優先されます",
-            );
-            // 読み込んだ値に「このMacの名前」も含まれるため、欄の表示を現在値へ
-            // 合わせる(sync_alias_field と同じ作法。旧い名前が欄に残っていると、
-            // 次の保存で欄の値が読み込んだ値を黙って上書きしてしまう)
-            let field = prefs::own_name_field() as ID;
-            if !field.is_null() {
-                let name = crate::OWN_NAME
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone();
-                msg1_void_id(field, sel(c"setStringValue:"), nsstring(&name));
-            }
-            refresh_status();
-        }
-        Err(e) => {
-            eprintln!("[prefs] 設定の読み込みに失敗: {e}");
-            crate::notify("Knit", &format!("設定を読み込めませんでした。\n{e}"));
-        }
-    }
-}
-
 /// 破壊的操作の確認ダイアログ(setup.rs の確認ダイアログと同じ作法: 先頭のボタンが
 /// Return の既定=キャンセル)。メニューバー常駐(Accessory)のままではアラートが
 /// 前面に出ないことがあるため、表示中だけ Regular へ切り替える。
@@ -471,10 +254,10 @@ unsafe fn confirm_alert(title: &str, body: &str, buttons: &[&str]) -> isize {
     if a.is_null() {
         return 0;
     }
-    msg1_void_id(a, sel(c"setMessageText:"), nsstring(title));
-    msg1_void_id(a, sel(c"setInformativeText:"), nsstring(body));
+    msg1_void_id(a, sel(c"setMessageText:"), nsstring(&localization::copy(title)));
+    msg1_void_id(a, sel(c"setInformativeText:"), nsstring(&localization::copy(body)));
     for button in buttons {
-        let _: ID = crate::msg1_id(a, sel(c"addButtonWithTitle:"), nsstring(button));
+        let _: ID = crate::msg1_id(a, sel(c"addButtonWithTitle:"), nsstring(&localization::copy(button)));
     }
     let result = crate::msg0_isize(a, sel(c"runModal"));
     msg0_void(a, sel(c"release"));
@@ -620,193 +403,6 @@ unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
     restart_now();
 }
 
-/// NSTextField の stringValue を読み取る(入力欄の保存ハンドラ共通)
-unsafe fn field_text(field: ID) -> String {
-    if field.is_null() {
-        return String::new();
-    }
-    let obj = msg0(field, sel(c"stringValue"));
-    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
-    if utf8.is_null() {
-        String::new()
-    } else {
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().trim().to_string()
-    }
-}
-
-/// 設定「接続」の「直接つなぐ(手動接続)」の「保存して再接続」: ~/.config/knit/env の
-/// KNIT_TOKEN 行を書き換えて再起動する(トークンは起動時に読まれるため。imp_save_host
-/// と同じ導線)。空欄なら行を消して通常の登録(キーチェーンの接続キー)へ戻る。
-/// 相手は Windows・Mac・タブレットのどれでもよく、両側へ同じ値を設定すると
-/// 登録操作なしに直接つながる
-unsafe extern "C" fn imp_save_token(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
-    }
-    let text = field_text(prefs::token_field() as ID);
-    // 読み込み側(main)は 32 文字未満の KNIT_TOKEN で起動が止まる(fatal)ため、
-    // common の検証で先に弾く(短いトークンを保存して再起動後につながらない事故の防止)。
-    // エラーは入力欄の直下の注記行(TOKEN_NOTE)にも出す(通知は数秒で消えるため)
-    if let Err(msg) = knit_common::credentials::validate_shared_token(&text) {
-        prefs::set_save_error(prefs::SaveErrorSource::Token, msg.to_string());
-        crate::notify("Knit", msg);
-        eprintln!(
-            "[prefs] 直接つなぐのトークンが不正のため保存しません(長さ {})",
-            text.len()
-        );
-        return;
-    }
-    let Some(dir) = knit_common::envutil::config_dir() else {
-        let message = "ホームが取得できず直接つなぐのトークンを保存できませんでした".to_string();
-        prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
-        crate::notify("Knit", &message);
-        return;
-    };
-    // Windows 側(.env の KNIT_TOKEN)と同じ安全策: 失敗したら通知して元のまま続ける。
-    // 失敗の理由({e})も本文へ出す(ログを見る手段が分からない利用者にも原因が伝わる)
-    if let Err(e) = knit_common::envutil::set_env_value(&dir.join("env"), "KNIT_TOKEN", &text) {
-        let message = format!("直接つなぐのトークンを保存できませんでした。\n{e}");
-        prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
-        crate::notify("Knit", &message);
-        eprintln!("[prefs] 直接つなぐのトークンの保存に失敗: {e}");
-        return;
-    }
-    prefs::clear_save_error(prefs::SaveErrorSource::Token);
-    let message = if text.is_empty() {
-        "直接つなぐのトークンを外しました(通常の登録へ戻します)。Knitを再起動します".to_string()
-    } else {
-        "直接つなぐのトークンを保存しました。相手側にも同じトークンを設定すると、再起動後に直接つながります".to_string()
-    };
-    // 保存先(~/.config/knit/env)より優先される指定(起動時の環境変数)があるときは
-    // 保存が効かないため、外し方を併せて案内する(imp_save_host と同じ安全策)
-    let message = if std::env::var("KNIT_TOKEN").map(|v| !v.is_empty()).unwrap_or(false) {
-        format!("{message}。なお環境変数 KNIT_TOKEN が設定されているため、そちらが優先されます(外すには設定元で削除してください)")
-    } else {
-        message
-    };
-    crate::notify("Knit", &message);
-    restart_now();
-}
-
-/// 設定「接続」の「直接つなぐ」の「生成」: 32 文字の共有トークン(半角英数字)を
-/// 作って入力欄へ入れる。乱数は登録鍵と同じ OS の安全な乱数。保存はしない
-/// (「保存して再接続」で両側へ設定してから反映する運用のため)
-unsafe extern "C" fn imp_gen_token(_s: ID, _c: SEL, _n: ID) {
-    let field = prefs::token_field() as ID;
-    if field.is_null() {
-        return;
-    }
-    match knit_common::credentials::generate_shared_token() {
-        Ok(token) => {
-            msg1_void_id(field, sel(c"setStringValue:"), nsstring(&token));
-            // 生成しただけでは保存ではないため、ここではエラーを外さない:
-            // 前回保存の失敗理由は「保存して再接続」が成功するまで出し続ける
-            if !UI_PREVIEW.load(Ordering::Relaxed) {
-                crate::notify(
-                    "Knit",
-                    "トークンを生成しました。この値を相手側にも設定してから「保存して再接続」を押してください",
-                );
-            }
-        }
-        Err(e) => {
-            // 失敗の理由({e})も本文へ出し、入力欄の直下の注記行にも保持する
-            let message = format!("トークンを生成できませんでした。\n{e}");
-            eprintln!("[prefs] トークン生成に失敗: {e}");
-            prefs::set_save_error(prefs::SaveErrorSource::Token, message.clone());
-            if !UI_PREVIEW.load(Ordering::Relaxed) {
-                crate::notify("Knit", &message);
-            }
-        }
-    }
-}
-
-/// 設定「接続」の「直接つなぐ」の開閉ラベル: トークン未設定の間だけ節の
-/// 表示/非表示をトグルする(設定済み=手動接続中は常に展開のため何も変わらない。
-/// 開閉状態は prefs 側の static が持つため、ウィンドウを開き直しても維持される)
-unsafe extern "C" fn imp_toggle_token_section(_s: ID, _c: SEL, _n: ID) {
-    prefs::toggle_token_section();
-}
-
-/// 設定「接続」の「選択中の端末の名前」: アクティブな端末のエイリアス(表示名)を
-/// peer-sides.json へ保存する。空欄ならコンピュータ名(hello の name)へ戻す。
-/// ポップアップ・配置エディタ・履歴・通知の表示がエイリアス優先へ切り替わる
-unsafe extern "C" fn imp_save_alias(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
-    }
-    let text = field_text(prefs::alias_field() as ID);
-    let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-    if act == usize::MAX {
-        // 通知だけでは数秒で消えるため、保存状態行(SAVE_LABEL)にも同じ理由を出す
-        // (imp_save_own_name の検証エラーと同じ導線。次の保存成功まで保持する)
-        let message = "接続中の端末がありません。つながってから名前を設定してください".to_string();
-        prefs::set_save_error(prefs::SaveErrorSource::Alias, message.clone());
-        crate::notify("Knit", &message);
-        return;
-    }
-    crate::tap::set_peer_alias(act, &text);
-    // peer-sides.json への保存は preferences::save() を経由しないため、保存状態行が
-    // 古い文言(エラー含む)のまま残る。ここで保存済みの文言へ揃える(表示だけ。
-    // 固定キーの案内も save_status_saved が同じ形で出す)
-    prefs::set_save_status(&prefs::save_status_saved(&preferences::override_keys()));
-    prefs::clear_save_error(prefs::SaveErrorSource::Alias);
-    let message = if text.is_empty() {
-        "端末の名前をコンピュータ名に戻しました"
-    } else {
-        "端末の名前を保存しました"
-    };
-    crate::notify("Knit", message);
-    // 配置エディタのラベルも名前を出すため即座に描き直す
-    prefs::redraw_layout();
-    refresh_status();
-}
-
-/// 設定「接続」の「このMacの名前」: 相手へ hello/hello_ok で名乗る名前を上書きする。
-/// 空欄ならホスト名(kern.hostname)既定。再起動不要で次の接続から反映
-unsafe extern "C" fn imp_save_own_name(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
-    }
-    let field = prefs::own_name_field() as ID;
-    let text = field_text(field);
-    // hello の name と同じ規則で検査する。不正文字(制御文字・偽装文字)が
-    // 混じんでいたら除去して保存せず弾く(意図しない名前になるのを防ぐ)
-    let cleaned = knit_common::proto::safe_peer_name(&text);
-    if !cleaned.is_empty() && cleaned != text {
-        // 通知だけでは数秒で消えるため、保存状態行(SAVE_LABEL)にも出す
-        // (次の保存成功まで保持。欄の下に注記行は作らない=全ページ共通の
-        // 最下部へ集約する他の保存系エラーと同じ導線)
-        let message = "名前に使えない文字が含まれています。制御文字などを除いてください".to_string();
-        prefs::set_save_error(prefs::SaveErrorSource::OwnName, message.clone());
-        crate::notify("Knit", &message);
-        eprintln!("[prefs] このMacの名前は不正な文字を含むため保存しません: {text:?}");
-        return;
-    }
-    *crate::OWN_NAME.lock().unwrap_or_else(|e| e.into_inner()) = cleaned.clone();
-    // 保存が成功したらこの欄の出元のエラーだけ外す(他の出元の未解決エラーは残す。
-    // 外さないと sync() が毎秒エラー文言で保存状態行を書き戻してしまう)
-    prefs::clear_save_error(prefs::SaveErrorSource::OwnName);
-    preferences::save();
-    // 反映は再接続時(hello/hello_ok の name)のため、今の接続には効かないことを
-    // 通知で先に言う(保存したのに相手側表示が変わらず「効いてない」と誤読させるのを防ぐ)
-    let message = if cleaned.is_empty() {
-        format!(
-            "このMacの名前をホスト名({})に戻しました。次の接続から相手側の表示へ反映されます",
-            crate::hostname_label()
-        )
-    } else {
-        format!(
-            "このMacの名前を「{cleaned}」に保存しました。次の接続から相手側の表示へ反映されます"
-        )
-    };
-    crate::notify("Knit", &message);
-    // クリーン済みの値を見た目へ戻す(trim 済み)
-    if !field.is_null() {
-        msg1_void_id(field, sel(c"setStringValue:"), nsstring(&cleaned));
-    }
-    refresh_status();
-}
-
 /// 再起動のためのシェル文字列。1 秒待って(古いプロセスが終わり二重起動のロックが
 /// 空くのを待って)、同じ実行ファイル・同じ引数で起こし直す。.app の中なら .app ごと開く
 fn restart_command(exe: &std::path::Path, args: &[String]) -> String {
@@ -890,14 +486,15 @@ fn restart_now() {
 }
 
 /// 相手(Windows)から接続の方向の切替を知らされたときの対応(別スレッドから呼ばれる)。
-/// 相手がホストになるならこの Mac は接続側へ、相手が接続側へ戻るなら待ち受けへ
+/// 相手がホストになるならこの Mac は接続側へ、相手が接続側へ戻るなら待ち受けへ。
+/// プロセスは再起動せず、接続スレッドだけ張り直す(crate::reconfigure_role)
 pub fn apply_peer_role(peer_is_host: bool) {
     // 実効役割(GUI 設定+環境変数)が既に相手の指示と一致していれば何も要らない
     if crate::effective_client_role() == peer_is_host {
         return;
     }
-    // 環境変数で役割を固定しているときは追従できない(再起動しても env が優先する)。
-    // 黙って再起動すると役割が変わらないまま切れるだけのため、案内で留める
+    // 環境変数で役割を固定しているときは追従できない(再構成しても env が優先する)。
+    // 黙って切り替えると役割が変わらないまま切れるだけのため、案内で留める
     if crate::role_env_fixed() {
         let peer = crate::active_peer_label();
         crate::notify(
@@ -910,15 +507,20 @@ pub fn apply_peer_role(peer_is_host: bool) {
     let peer = crate::active_peer_label();
     crate::CLIENT_ROLE.store(peer_is_host, Ordering::Relaxed);
     preferences::save_quiet();
-    eprintln!("[role] 相手の切替に合わせて {} へ変更し再起動します", if peer_is_host { "接続側" } else { "待ち受け" });
+    eprintln!("[role] 相手の切替に合わせて {} へ変更します", if peer_is_host { "接続側" } else { "待ち受け" });
     let message = if peer_is_host {
-        format!("{peer} がホストになったため、このMacを接続側に切り替えて再起動します")
+        format!("{peer} がホストになったため、このPCを接続側に切り替えて自動で再接続します")
     } else {
-        format!("{peer} が接続側へ戻ったため、このMacを待ち受けに切り替えて再起動します")
+        format!("{peer} が接続側へ戻ったため、このPCを待ち受けに切り替えて自動で再接続します")
     };
     crate::notify("Knit", &message);
+    // RoleAck の送信(outgoing キュー)が先方へ届く猶予。この待ちの間に本線を
+    // 切ると相手が切替完了を確認できないまま沈黙する
     std::thread::sleep(std::time::Duration::from_millis(600));
-    restart_now();
+    crate::reconfigure_role();
+    // 切替の進行注記(自発的切替の「接続を張り直します…」等)を通常文言へ戻す。
+    // 従来は再起動で初期化されていた分を、再構成の完了タイミングで整える
+    prefs::ROLE_NOTE_KIND.store(0, Ordering::Relaxed);
 }
 
 /// 相手(Windows)の役割切替の適用完了(RoleAck)。再起動を待っていた set_role が参照する
@@ -947,7 +549,7 @@ fn wait_role_ack(timeout: std::time::Duration) -> bool {
 fn role_menu_title() -> String {
     let peer = crate::active_peer_label();
     if crate::effective_client_role() {
-        format!("{peer} をホストにする(解除してこのMacが待ち受ける)")
+        format!("{peer} をホストにする(解除してこのPCが待ち受ける)")
     } else {
         format!("{peer} をホストにする")
     }
@@ -968,7 +570,7 @@ fn role_env_guard() -> bool {
     true
 }
 
-/// 「{相手} をホストにする」: この Mac を接続側へ切り替える(起動時に決まるため再起動で反映)
+/// 「{相手} をホストにする」: この Mac を接続側へ切り替える(接続スレッドの再構成で反映)
 unsafe extern "C" fn imp_host_role(_s: ID, _c: SEL, _n: ID) {
     if role_env_guard() {
         return;
@@ -997,13 +599,14 @@ fn confirm_role_switch() -> bool {
     unsafe {
         confirm_alert(
             "接続の方向を切り替えますか?",
-            "両方の端末でKnitが自動で再起動します。進行中のファイル転送は中止されます。",
+            "両方の端末で接続を切り、役割を入れ替えて自動で再接続します。進行中のファイル転送は中止されます。",
             &["キャンセル", "切り替える"],
         ) == 1001
     }
 }
 
-/// 役割を決める。すでにその役割なら選択表示だけ合わせ直す
+/// 役割を決める。すでにその役割なら選択表示だけ合わせ直す。
+/// プロセスは再起動せず、接続スレッドだけ張り直す(crate::reconfigure_role)
 unsafe fn set_role(next: bool) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
@@ -1013,7 +616,7 @@ unsafe fn set_role(next: bool) {
         return;
     }
     // 確認はこの1回だけ(役割切替は日常操作のため、以降の流れ(Role 送信→
-    // role_ack 待ち→再起動)は従来どおりで何も挟まない)。両端末の再起動と
+    // role_ack 待ち→再構成)は従来どおりで何も挟まない)。両端末の接続の切り替えと
     // 進行中の転送の破棄が起きるため、既定(Return)はキャンセルにする
     if !confirm_role_switch() {
         // キャンセル: ラジオの選択表示を現在の役割へ戻す(切り替わったままに見せない)
@@ -1031,17 +634,17 @@ unsafe fn set_role(next: bool) {
     }
     // 相手にも反対の役割へ合わせさせる(双方が待ち受けになってつながらないのを防ぐ)。
     // 版 15 以降の相手は適用済みの RoleAck を返すので、それを確認してから
-    // 再起動する(行き損ねで双方が同役割のまま沈黙するのを防ぐ)。旧版相手は
-    // 応答しないため、従来どおり時間経過で再起動する
+    // 接続を張り直す(行き損ねで双方が同役割のまま沈黙するのを防ぐ)。旧版相手は
+    // 応答しないため、従来どおり時間経過で切り替える
     ROLE_ACK.store(false, Ordering::Relaxed);
     // 切替の進行を設定画面の注記行へ出す(確認待ち→確認済み/タイムアウト。
     // 毎秒の sync() がこの状態を文言へ反映する)
     prefs::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
     crate::send_msg(&knit_common::proto::Msg::Role { host: !next });
     let message = if next {
-        format!("このMacを {peer}(ホスト)へ接続する側に切り替えました。Knitを再起動します")
+        format!("このPCを {peer}(ホスト)へ接続する側に切り替えました。自動で再接続します")
     } else {
-        "このMacを接続を待ち受ける側に戻しました。Knitを再起動します".to_string()
+        "このPCを接続を待ち受ける側に戻しました。自動で再接続します".to_string()
     };
     crate::notify("Knit", &message);
     std::thread::spawn(|| {
@@ -1049,10 +652,12 @@ unsafe fn set_role(next: bool) {
             eprintln!("[role] 相手の適用を確認しました");
             prefs::ROLE_NOTE_KIND.store(3, Ordering::Relaxed);
         } else {
-            eprintln!("[role] 相手の適用確認が取れないため時間経過で再起動します");
+            eprintln!("[role] 相手の適用確認が取れないため時間経過で切り替えます");
             prefs::ROLE_NOTE_KIND.store(4, Ordering::Relaxed);
         }
-        restart_now();
+        crate::reconfigure_role();
+        // 進行注記を通常文言へ戻す(従来は再起動で初期化されていた分)
+        prefs::ROLE_NOTE_KIND.store(0, Ordering::Relaxed);
     });
 }
 
@@ -1073,17 +678,6 @@ unsafe extern "C" fn imp_cmd_map(_s: ID, _c: SEL, _n: ID) {
     refresh_status();
     preferences::save();
 }
-unsafe extern "C" fn imp_spk_mute(_s: ID, _c: SEL, _n: ID) {
-    let next = !crate::SPK_MUTE.load(Ordering::Relaxed);
-    crate::SPK_MUTE.store(next, Ordering::Relaxed);
-    eprintln!(
-        "[cfg] 接続中スピーカーミュート -> {}",
-        if next { "ON" } else { "OFF" }
-    );
-    crate::send_cfg();
-    refresh_status();
-    preferences::save();
-}
 /// 「Windows の位置」ポップアップ(0=右/1=左/2=上/3=下)。Deskflow links 相当
 unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
     unsafe {
@@ -1096,36 +690,6 @@ unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
     preferences::save();
 }
 
-
-/// カーソル速度スライダ(0.2..3.0。倍率=Windows 上の移動量)
-unsafe extern "C" fn imp_mouse_scale(_s: ID, _c: SEL, sender: ID) {
-    unsafe {
-        let get: unsafe extern "C" fn(ID, SEL) -> f64 =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        let v = get(sender, sel(c"doubleValue"));
-        crate::set_mouse_scale(v);
-        // 値表示は毎秒の sync() を待たずに即座に切り替える(scroll_speed と同じ。
-        // set_label は prefs 内のヘルパのため、ここでは imp_scroll_gain と同じく
-        // setStringValue: を直接打つ)
-        let lbl = PREFS_MOUSE_SCALE_LABEL.load(Ordering::Relaxed) as ID;
-        if !lbl.is_null() {
-            msg1_void_id(
-                lbl,
-                sel(c"setStringValue:"),
-                nsstring(&prefs::mouse_scale_text(crate::mouse_scale())),
-            );
-        }
-    }
-    preferences::save();
-}
-
-/// スクロール互換モードのトグル(120 未満を無視する古いアプリ向け)
-unsafe extern "C" fn imp_scroll_compat(_s: ID, _c: SEL, _n: ID) {
-    let next = !crate::SCROLL_COMPAT.load(Ordering::Relaxed);
-    crate::SCROLL_COMPAT.store(next, Ordering::Relaxed);
-    eprintln!("[cfg] スクロール互換モード -> {next}");
-    preferences::save();
-}
 
 /// clipboardSharing トグル(Deskflow 標準オプション)
 unsafe extern "C" fn imp_clip_share(_s: ID, _c: SEL, _n: ID) {
@@ -1140,7 +704,7 @@ unsafe extern "C" fn imp_clip_share(_s: ID, _c: SEL, _n: ID) {
 unsafe extern "C" fn imp_local_history(_s: ID, _c: SEL, _n: ID) {
     let next = !crate::LOCAL_HISTORY.load(Ordering::Relaxed);
     crate::LOCAL_HISTORY.store(next, Ordering::Relaxed);
-    eprintln!("[cfg] Macのコピーを履歴に残す -> {next}");
+    eprintln!("[cfg] このPCのコピーを履歴に残す -> {next}");
     preferences::save();
 }
 
@@ -1173,21 +737,6 @@ unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
     show_layout();
 }
 
-unsafe extern "C" fn imp_scroll_flip(_s: ID, _c: SEL, _n: ID) {
-    let next = !crate::SCROLL_FLIP.load(Ordering::Relaxed);
-    crate::SCROLL_FLIP.store(next, Ordering::Relaxed);
-    // SCROLL_FLIP=true は「Windows 標準へ固定」。false(既定)は Mac の設定に合わせる
-    eprintln!(
-        "[cfg] スクロール方向 -> {}",
-        if next {
-            "Windows 標準に固定"
-        } else {
-            "Mac の設定に合わせる"
-        }
-    );
-    refresh_status();
-    preferences::save();
-}
 unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
     // 3 つのメニュー項目(▲/▼/ミュート)から送信元 tag で判別する
     let tag: isize = {
@@ -1288,7 +837,7 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
         // 共有範囲の審査は Windows 経路と ADB 経路のどちらでも必ず通す
         //(UI の無効化だけでは抜け穴になるため)
         if !knit_common::share::allow_files() {
-            crate::notify("Knit", "このMacではファイルの共有が許可されていません(KNIT_SHARE)");
+            crate::notify("Knit", "このPCではファイルの共有が許可されていません(KNIT_SHARE)");
         } else if crate::active_peer_is_android() && !crate::active_peer_is_android_app() {
             // ADB中継は大容量経路を持たないため Download へ置く。adb push は
             // ファイルごとに最大120秒待つため、メニュー操作(UI スレッド)を
@@ -1343,9 +892,9 @@ unsafe extern "C" fn uncaught_exc_handler(exc: ID) {
 pub fn show_prefs() {
     eprintln!("[prefs] enter");
     // スクロール方向は起動時の macOS 設定(自然スクロール)のスナップショットで
-    // 決まる。起動中にシステム設定で切り替えた場合に反映させるため、設定画面を
-    // 開くタイミングで再取得する(defaults read はサブプロセス呼び出しなので
-    // 設定画面を開く時に限る。手動上書き(KNIT_SCROLL_FLIP=1)中は触らない)
+    // 決まる。起動中にシステム設定で切り替えた場合も入力の向きへ反映させるため、
+    // 設定画面を開くタイミングで再取得する(defaults read はサブプロセス呼び出しな
+    // ので設定画面を開く時に限る。手動上書き(KNIT_SCROLL_FLIP=1)中は触らない)
     if !crate::SCROLL_FLIP.load(Ordering::Relaxed) {
         let fresh = crate::state::detect_natural_scroll();
         if fresh != crate::NATURAL_SCROLL.swap(fresh, Ordering::Relaxed) {
@@ -1377,11 +926,19 @@ pub fn show_prefs() {
                 eprintln!("[gui] 設定ウィンドウの生成に失敗");
                 return;
             }
+            if UI_PREVIEW.load(Ordering::Relaxed) {
+                msg1_void_id(win, sel(c"setDelegate:"), target);
+            }
             PREFS_WIN.store(win as usize, Ordering::Relaxed);
         }
         let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
         // 最小化中は makeKeyAndOrderFront だけでは戻らない(未最小化なら無害)
         msg1_void_id(win, sel(c"deminiaturize:"), std::ptr::null_mut());
+        // 開くときは必ず「接続」タブから(「その他」などのまま閉じた状態を
+        // 引き継がない)。プレビュー(--preview-page)は build が選んだページを優先する
+        if !UI_PREVIEW.load(Ordering::Relaxed) {
+            prefs::select_page(0);
+        }
         msg1_void_id(win, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
         msg0_void(win, sel(c"orderFrontRegardless"));
         // macOS 14 以降は activateIgnoringOtherApps: だけだと前面化されないことがある。
@@ -1411,6 +968,14 @@ unsafe extern "C" fn imp_close_prefs(_s: ID, _c: SEL, _n: ID) {
     }
 }
 
+/// プレビューは閉じた後に常駐させない。本番窓の delegate には設定しない。
+unsafe extern "C" fn imp_preview_window_close(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        eprintln!("[ui-check] PASS: preview window closed; process exits without a status item");
+        std::process::exit(0);
+    }
+}
+
 /// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)。
 /// 設定ウィンドウが表示されていない間は毎秒の全書き換え(50 メッセージ超/秒)を
 /// 行わず early return する: 表示の復帰は show_prefs 末尾の呼び出しで即座に
@@ -1427,6 +992,7 @@ fn sync_prefs_state() {
             return;
         }
         prefs::sync();
+        if prefs::refined::is_built() { return; }
         let set = |slot: &AtomicUsize, on: bool| {
             let b = slot.load(Ordering::Relaxed) as ID;
             if !b.is_null() {
@@ -1438,14 +1004,6 @@ fn sync_prefs_state() {
             !crate::audio::MUTED.load(Ordering::Relaxed) && knit_common::share::env_cap().audio,
         );
         set(&PREFS_CHK_CMD, crate::CMD_ALT.load(Ordering::Relaxed));
-        set(
-            &PREFS_CHK_SCROLL,
-            !crate::SCROLL_FLIP.load(Ordering::Relaxed),
-        );
-        set(
-            &PREFS_CHK_SPK,
-            crate::SPK_MUTE.load(Ordering::Relaxed) && knit_common::share::env_cap().audio,
-        );
         set(
             &PREFS_CHK_CLIP,
             crate::CLIP_SHARE.load(Ordering::Relaxed) && knit_common::share::env_cap().clip,
@@ -1807,7 +1365,7 @@ fn lay_peers() -> Vec<LayPeer> {
         out.push(LayPeer {
             idx: usize::MAX,
             id: String::new(),
-            name: "接続先".to_string(),
+            name: localization::text("接続先", "Other device").to_string(),
             rects,
             size,
             names: Vec::new(),
@@ -1842,18 +1400,7 @@ unsafe fn lay_text(s: &str, cx: f64, y: f64, size: f64, light: bool) {
             sel(c"systemFontOfSize:"),
             size,
         );
-        let color: ID = {
-            let f: unsafe extern "C" fn(ID, SEL, f64, f64, f64, f64) -> ID =
-                std::mem::transmute(crate::objc_msgSend as *const () as usize);
-            f(
-                objc_getClass(c"NSColor".as_ptr()),
-                sel(c"colorWithCalibratedRed:green:blue:alpha:"),
-                if light { 1.0 } else { 0.25 },
-                if light { 1.0 } else { 0.27 },
-                if light { 1.0 } else { 0.33 },
-                1.0,
-            )
-        };
+        let color = msg0(objc_getClass(c"NSColor".as_ptr()), sel(if light { c"whiteColor" } else { c"labelColor" }));
         let dict = msg0(
             objc_getClass(c"NSMutableDictionary".as_ptr()),
             sel(c"dictionary"),
@@ -1905,7 +1452,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
         }
         let ctx = port;
         // 背景
-        CGContextSetRGBFillColor(ctx, 0.94, 0.95, 0.98, 1.0);
+        msg0_void(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"controlBackgroundColor")), sel(c"setFill"));
         CGContextFillRect(
             ctx,
             NSRect {
@@ -1916,7 +1463,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
             },
         );
         // グリッド(Deskflow 風の薄い方眼。1px 矩形で描く)
-        CGContextSetRGBFillColor(ctx, 0.88, 0.89, 0.93, 1.0);
+        msg0_void(msg1_id_f64(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"separatorColor")), sel(c"colorWithAlphaComponent:"), 0.24), sel(c"setFill"));
         let mut gx = 40.0;
         while gx < LAY_VW {
             CGContextFillRect(
@@ -1988,7 +1535,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
                     CGContextSetRGBStrokeColor(ctx, 0.88, 0.46, 0.16, 1.0);
                     CGContextSetLineWidth(ctx, 2.0);
                 } else {
-                    CGContextSetRGBStrokeColor(ctx, 0.80, 0.82, 0.90, 1.0);
+                    msg0_void(msg1_id_f64(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"separatorColor")), sel(c"colorWithAlphaComponent:"), 0.65), sel(c"setStroke"));
                     CGContextSetLineWidth(ctx, 1.0);
                 }
                 CGContextStrokeRect(ctx, r);
@@ -2022,7 +1569,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
             CGContextStrokeRect(ctx, r);
             let label = match mac_names.get(i).filter(|n| !n.is_empty()) {
                 Some(n) => n.clone(),
-                None => format!("モニター{}", i + 1),
+                None => format!("{}{}", localization::text("モニター", "Display "), i + 1),
             };
             lay_text(&lay_fit(&label, r.w, 10.0), r.x + r.w / 2.0, r.y + r.h / 2.0 - 6.0, 10.0, is_main);
         }
@@ -2075,7 +1622,7 @@ unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
                 CGContextFillRect(ctx, r);
                 let label = match lp.names.get(i).filter(|n| !n.is_empty()) {
                     Some(n) => n.clone(),
-                    None => format!("モニター{}", i + 1),
+                    None => format!("{}{}", localization::text("モニター", "Display "), i + 1),
                 };
                 lay_text(
                     &lay_fit(&label, r.w, 10.0),
@@ -2461,6 +2008,7 @@ unsafe extern "C" fn imp_update(_s: ID, _c: SEL, _n: ID) {
 static DIAG_RESULT: Mutex<Option<String>> = Mutex::new(None);
 
 unsafe extern "C" fn imp_diag(_s: ID, _c: SEL, _n: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) { return; }
     {
         let mut g = DIAG_RESULT.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_some() {
@@ -2552,7 +2100,7 @@ fn status_line_text(
     let mode_s = if connected {
         String::new()
     } else {
-        "・このMacは操作できます".to_string()
+        "・このPCは操作できます".to_string()
     };
     let rtt_s = if connected && rtt_ms > 0 {
         format!("・遅延 {rtt_ms}ms")
@@ -2625,15 +2173,35 @@ unsafe fn update_state_item() {
 
 fn refresh_status() {
     unsafe {
+        if UI_PREVIEW.load(Ordering::Relaxed) {
+            sync_prefs_state();
+            return;
+        }
         // 診断の完了を拾って表示する(NSAlert はここ(メインスレッド)で出す)
         {
             let mut g = DIAG_RESULT.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(text) = g.take() {
                 if text == "__RUNNING__" {
                     *g = Some(text);
+                } else if prefs::refined::refined_window_visible() {
+                    // 設定画面が見えていれば接続ページ内のパネルへ出す
+                    prefs::refined::set_inline_diag(&text);
                 } else {
                     show_diag_alert(&text);
                 }
+            }
+        }
+        // 役割メニューの文言を現在の役割へ追従させる(役割切替がプロセス再起動
+        // なしで反映されるようになったため、相手からの切替指示(apply_peer_role)
+        // の後もここで揃える。毎秒呼ばれるため、変わった時だけ setTitle する)
+        {
+            let title = role_menu_title();
+            if ROLE_MENU_TITLE.lock().unwrap_or_else(|e| e.into_inner()).as_deref() != Some(&title) {
+                let item = GUI_ROLE_ITEM.load(Ordering::Relaxed) as ID;
+                if !item.is_null() {
+                    msg1_void_id(item, sel(c"setTitle:"), nsstring(&title));
+                }
+                *ROLE_MENU_TITLE.lock().unwrap_or_else(|e| e.into_inner()) = Some(title);
             }
         }
         let button = GUI_BUTTON.load(Ordering::Relaxed) as ID;
@@ -2940,21 +2508,42 @@ unsafe fn make_target() -> ID {
     //IMP は (self, _cmd, sender) の v@:@ 型
     let types = c"v@:@".as_ptr();
     let methods: &[(&std::ffi::CStr, usize)] = &[
-        (c"sdPinch:", prefs::pinch_toggle as *const () as usize),
-        (c"sdTabletNav:", prefs::navigation_toggle as *const () as usize),
         (c"sdHotkey:", prefs::hotkey as *const () as usize),
         (c"sdNavigate:", prefs::navigate as *const () as usize),
-        (
-            c"sdSwitchMethod:",
-            prefs::switch_method as *const () as usize,
-        ),
+        (c"sdLanguage:", prefs::change_language as *const () as usize),
+        (c"sdRefinedNoop:", prefs::refined::noop as *const () as usize),
+        (c"sdRefinedRole:", prefs::refined::role_changed as *const () as usize),
+        (c"sdRefinedSaveHost:", prefs::refined::save_host as *const () as usize),
+        (c"sdRefinedChanged:", prefs::refined::changed as *const () as usize),
+        (c"sdRefinedToggle:", prefs::refined::toggle_changed as *const () as usize),
+        (c"sdRefinedGain:", prefs::refined::gain_changed as *const () as usize),
+        (c"sdRefinedSensitivity:", prefs::refined::sensitivity_changed as *const () as usize),
+        (c"sdRefinedSensitivityReset:", prefs::refined::sensitivity_reset as *const () as usize),
+        (c"sdRefinedOutput:", prefs::refined::output_changed as *const () as usize),
+        (c"sdRefinedRevert:", prefs::refined::revert as *const () as usize),
+        (c"sdRefinedApply:", prefs::refined::apply as *const () as usize),
+        (c"sdRefinedManual:", prefs::refined::manual as *const () as usize),
+        (c"sdRefinedIdentify:", prefs::refined::identify as *const () as usize),
+        (c"sdRefinedRanges:", prefs::refined::ranges as *const () as usize),
+        (c"sdRefinedReconnect:", prefs::refined::reconnect as *const () as usize),
+        (c"sdRefinedFolder:", prefs::refined::folder as *const () as usize),
+        (c"sdRefinedOpenFolder:", prefs::refined::open_folder as *const () as usize),
+        (c"sdRefinedExport:", prefs::refined::export as *const () as usize),
+        (c"sdRefinedImport:", prefs::refined::import as *const () as usize),
+        (c"sdRefinedLog:", prefs::refined::log as *const () as usize),
+        (c"sdRefinedRestart:", prefs::refined::restart as *const () as usize),
+        (c"sdRefinedReset:", prefs::refined::reset as *const () as usize),
+        (c"sdRefinedTestOutput:", prefs::refined::test_output as *const () as usize),
+        (c"sdRefinedDiagClose:", prefs::refined::diag_close as *const () as usize),
+        (c"sdRefinedHistoryLimit:", prefs::refined::history_limit_changed as *const () as usize),
+        (c"sdRefinedHotkey:", prefs::refined::hotkey_changed as *const () as usize),
+        (c"sdRefinedRename:", prefs::refined::rename_peer as *const () as usize),
         (
             c"sdSwitchDelay:",
             prefs::switch_delay as *const () as usize,
         ),
         (c"sdReturnMac:", prefs::return_mac as *const () as usize),
         (c"sdEnterPeer:", prefs::enter_peer as *const () as usize),
-        (c"sdSelectPeer:", prefs::select_peer as *const () as usize),
         (c"menuWillOpen:", prefs::peer_menu_open as *const () as usize),
         (c"menuDidClose:", prefs::peer_menu_close as *const () as usize),
         (
@@ -2969,14 +2558,9 @@ unsafe fn make_target() -> ID {
             c"sdResetSettings:",
             setup::reset_all_settings as *const () as usize,
         ),
-        (c"sdOpenSettingsDir:", imp_open_settings_dir as *const () as usize),
-        (c"sdExportPrefs:", imp_export_prefs as *const () as usize),
-        (c"sdImportPrefs:", imp_import_prefs as *const () as usize),
-        (c"sdScrollSpeed:", prefs::scroll_speed as *const () as usize),
         (c"sdSwitchMode:", imp_switch_mode as *const () as usize),
         (c"sdEdgeTaps:", imp_edge_taps as *const () as usize),
         (c"sdOpenLog:", imp_open_log as *const () as usize),
-        (c"sdDiagLog:", prefs::diag_log as *const () as usize),
         (
             c"sdHistoryRestore:",
             imp_history_restore as *const () as usize,
@@ -2986,32 +2570,23 @@ unsafe fn make_target() -> ID {
         (c"sdPeerActivate:", imp_peer_activate as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
         (c"sdSaveHost:", imp_save_host as *const () as usize),
-        (c"sdSaveToken:", imp_save_token as *const () as usize),
-        (c"sdGenToken:", imp_gen_token as *const () as usize),
-        (c"sdToggleTokenSection:", imp_toggle_token_section as *const () as usize),
-        (c"sdSaveAlias:", imp_save_alias as *const () as usize),
-        (c"sdSaveOwnName:", imp_save_own_name as *const () as usize),
         (c"sdCheckUpdate:", imp_check_update as *const () as usize),
         (c"sdDiagnose:", imp_diag as *const () as usize),
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
         (c"sdAudioGain:", prefs::audio_gain as *const () as usize),
         (c"sdCmdMap:", imp_cmd_map as *const () as usize),
-        (c"sdScroll:", imp_scroll_flip as *const () as usize),
-        (c"sdSpkMute:", imp_spk_mute as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdTabletText:", text_input::show as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdClosePrefs:", imp_close_prefs as *const () as usize),
-        (c"sdScrollGain:", imp_scroll_gain as *const () as usize),
+        (c"windowWillClose:", imp_preview_window_close as *const () as usize),
         (c"sdSide:", imp_side as *const () as usize),
         (c"sdClipShare:", imp_clip_share as *const () as usize),
         (c"sdFileShare:", imp_file_share as *const () as usize),
         (c"sdLocalHistory:", imp_local_history as *const () as usize),
-        (c"sdScrollCompat:", imp_scroll_compat as *const () as usize),
         (c"sdRotateSide:", imp_rotate_side as *const () as usize),
         (c"sdLayout:", imp_show_layout as *const () as usize),
-        (c"sdMouseScale:", imp_mouse_scale as *const () as usize),
         (c"sdQuit:", imp_quit as *const () as usize),
         (c"sdHostRole:", imp_host_role as *const () as usize),
         (c"sdRole:", imp_role as *const () as usize),
@@ -3078,6 +2653,20 @@ pub fn start() -> bool {
             return false;
         }
         GUI_TARGET.store(target as usize, Ordering::Relaxed);
+
+        // 設定プレビューは NSStatusItem を作らず、入力監視タイマーも動かさない。
+        if UI_PREVIEW.load(Ordering::Relaxed) {
+            let timer = msg5_timer(
+                objc_getClass(c"NSTimer".as_ptr()),
+                sel(c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                1.0,
+                target,
+                sel(c"updateStatus:"),
+                std::ptr::null_mut(),
+                1,
+            );
+            return !timer.is_null();
+        }
 
         let menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
         if menu.is_null() {
@@ -3205,7 +2794,7 @@ pub fn start() -> bool {
                 logm,
                 sel(c"setToolTip:"),
                 nsstring(&format!(
-                    "/tmp/knit-mac.log を開きます(Macの再起動で消えることがあります)。開けない場合は、このファイルを開いてください\n経路: 本線 {} / 音声 {} / ファイル {} / 発見 {}(UDP) / 登録 {}",
+                    "/tmp/knit-mac.log を開きます(PCの再起動で消えることがあります)。開けない場合は、このファイルを開いてください\n経路: 本線 {} / 音声 {} / ファイル {} / 発見 {}(UDP) / 登録 {}",
                     knit_common::proto::PORT,
                     knit_common::proto::PORT + 1,
                     knit_common::proto::PORT + knit_common::bulk::PORT_OFFSET,
@@ -3498,7 +3087,7 @@ mod status_line_tests {
         );
         assert_eq!(
             text,
-            "未接続(設定の「端末を登録…」から相手と登録できます)・このMacは操作できます"
+            "未接続(設定の「端末を登録…」から相手と登録できます)・このPCは操作できます"
         );
         assert!(!text.contains("再試行"), "未登録に再試行は出さない: {text}");
         assert!(!text.contains("見つけられません"), "未登録に断の文言は出さない: {text}");
@@ -3524,7 +3113,7 @@ mod status_line_tests {
         );
         assert_eq!(
             text,
-            "未接続(直接つなぐで待機中)・このMacは操作できます・再試行まで 3秒"
+            "未接続(直接つなぐで待機中)・このPCは操作できます・再試行まで 3秒"
         );
         assert!(!text.contains("端末を登録"), "手動接続の待ちに登録案内は出さない: {text}");
     }
@@ -3547,7 +3136,7 @@ mod status_line_tests {
         );
         assert_eq!(
             text,
-            "未接続(直接つなぐで待機中)・このMacは操作できます\
+            "未接続(直接つなぐで待機中)・このPCは操作できます\
              ・最終接続 12:34・相手を 5分見つけられません"
         );
         assert!(!text.contains("再試行"), "断の文言が出ている間は retry を並記しない: {text}");
@@ -3571,7 +3160,7 @@ mod status_line_tests {
         );
         assert_eq!(
             text,
-            "未接続(自動で再接続します・相手側アプリの起動を確認)・このMacは操作できます\
+            "未接続(自動で再接続します・相手側アプリの起動を確認)・このPCは操作できます\
              ・最終接続 12:34・相手を 5分見つけられません"
         );
         assert!(!text.contains("再試行"), "断の文言が出ている間は retry を並記しない: {text}");
@@ -3594,7 +3183,7 @@ mod status_line_tests {
         );
         assert_eq!(
             text,
-            "未接続(自動で再接続します・相手側アプリの起動を確認)・このMacは操作できます\
+            "未接続(自動で再接続します・相手側アプリの起動を確認)・このPCは操作できます\
              ・再試行まで 3秒"
         );
     }

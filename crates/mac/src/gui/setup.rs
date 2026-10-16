@@ -11,10 +11,10 @@ unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) ->
     msg0_void(app, sel(c"finishLaunching"));
     msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
     let a = msg0(objc_getClass(c"NSAlert".as_ptr()), sel(c"new"));
-    msg1_void_id(a, sel(c"setMessageText:"), nsstring(title));
-    msg1_void_id(a, sel(c"setInformativeText:"), nsstring(body));
+    msg1_void_id(a, sel(c"setMessageText:"), nsstring(&localization::copy(title)));
+    msg1_void_id(a, sel(c"setInformativeText:"), nsstring(&localization::copy(body)));
     for button in buttons {
-        let _: ID = crate::msg1_id(a, sel(c"addButtonWithTitle:"), nsstring(button));
+        let _: ID = crate::msg1_id(a, sel(c"addButtonWithTitle:"), nsstring(&localization::copy(button)));
     }
     if let Some(key) = key {
         let f: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
@@ -35,7 +35,7 @@ unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) ->
         msg1_void_id(
             field,
             sel(c"setAccessibilityLabel:"),
-            nsstring("確認番号またはコード"),
+            nsstring(&localization::copy("確認番号またはコード")),
         );
         let font_fn: unsafe extern "C" fn(ID, SEL, f64) -> ID =
             std::mem::transmute(crate::objc_msgSend as *const () as usize);
@@ -231,7 +231,7 @@ unsafe extern "C" fn poll_pairing(_s: ID, _c: SEL, _timer: ID) {
         return;
     }
     if let Some(t) = terminal {
-        msg1_void_id(a, sel(c"setInformativeText:"), nsstring(t.line(ui.first)));
+        msg1_void_id(a, sel(c"setInformativeText:"), nsstring(&localization::copy(t.line(ui.first))));
         // Remove the expired/used code immediately; leave the result readable.
         let field = msg0(a, sel(c"accessoryView"));
         if !field.is_null() {
@@ -254,7 +254,10 @@ unsafe extern "C" fn poll_pairing(_s: ID, _c: SEL, _timer: ID) {
     // 残り時間は招待本体と同じ壁時計の期限から(同じ時刻源を参照する)
     let seconds =
         knit_common::pairing::remaining(ui.until, std::time::SystemTime::now()).as_secs();
-    let body = format!("相手の端末でKnitを開くと、このMacを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。\n\n自動で見つからない時の手入力コード：{}\n有効期限：{}分{:02}秒\n{}", ui.code, seconds / 60, seconds % 60, ui.message);
+    let body = format!("相手の端末でKnitを開くと、このPCを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。\n\n自動で見つからない時の手入力コード：{}\n有効期限：{}分{:02}秒\n{}", ui.code, seconds / 60, seconds % 60, ui.message);
+    let body = if localization::language() == localization::Language::English {
+        format!("Open Knit on your other device to discover this Mac.\nWhen a request arrives, check the number and device address before allowing it.\n\nManual code if discovery fails: {}\nExpires in {}m {:02}s\n{}", ui.code, seconds / 60, seconds % 60, localization::copy(&ui.message))
+    } else { body };
     msg1_void_id(a, sel(c"setInformativeText:"), nsstring(&body));
     msg0_void(a, sel(c"layout"));
 }
@@ -275,8 +278,8 @@ fn confirm_request(request: &knit_common::pairing::Approval) {
 fn ask_confirmation(name: &str, address: &str, sas: &str) -> bool {
     unsafe {
         alert(
-            &format!("「{}」とつなぎますか?", name),
-            &format!("相手が名乗った名前です(アドレス: {address})。\n心当たりのある端末なら、相手の画面で下の番号を選んでもらい、「許可」を押してください。"),
+            &if localization::language() == localization::Language::English { format!("Pair with “{name}”?") } else { format!("「{name}」とつなぎますか?") },
+            &if localization::language() == localization::Language::English { format!("The device provided this name (address: {address}).\nIf you recognize it, select the number below on that device, then choose Allow here.") } else { format!("相手が名乗った名前です(アドレス: {address})。\n心当たりのある端末なら、相手の画面で下の番号を選んでもらい、「許可」を押してください。") },
             &["拒否", "許可"],
             Some(sas),
         ) == 1001
@@ -288,7 +291,7 @@ fn show_invitation(token: &str, preview: bool, first: bool) {
         unsafe {
             // 確認画面だけを見たい時(KNIT_PREVIEW_CONFIRM=1)は、待ち受けの画面を飛ばす
             if std::env::var_os("KNIT_PREVIEW_CONFIRM").is_none() {
-            alert("相手の端末とつなぐ", "相手の端末でKnitを開くと、このMacを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。\n\n自動で見つからない時の手入力コード：123 456\nこれは画面確認用です。通信・保存は行いません。", &["閉じる"], None);
+            alert("相手の端末とつなぐ", "相手の端末でKnitを開くと、このPCを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。\n\n自動で見つからない時の手入力コード：123 456\nこれは画面確認用です。通信・保存は行いません。", &["閉じる"], None);
             }
             // 相手から要求が届いた時の確認画面(見本)
             let _ = ask_confirmation("もう1台のPC", "192.168.1.20", "4821");
@@ -360,7 +363,7 @@ fn show_invitation(token: &str, preview: bool, first: bool) {
             loop {
                 alert(
                     "相手の端末とつなぐ",
-                    "相手の端末でKnitを開くと、このMacを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。",
+                    "相手の端末でKnitを開くと、このPCを自動で見つけます。\n相手から要求が届いたら、番号と相手のアドレスを確かめて許可してください。",
                     &["閉じる"],
                     None,
                 );
@@ -397,31 +400,31 @@ pub(super) unsafe extern "C" fn show_registration(_s: ID, _c: SEL, _sender: ID) 
         .or_else(|| credentials::load().ok().flatten());
     match token {
         Some(token) if credentials::validate_transport_key(&token).is_ok() => show_invitation(&token, false, false),
-        // 行き止まりにしない: 登録のやり直し導線は設定「接続」の下にあることを案内
-        // する(この登録画面はメニューの「端末を登録…」からも開くため、指す先を
-        // 画面名で特定する。初期化は全端末の再登録を要するため、その旨も伝える)
-        _ => error("この接続キーでは追加登録を開始できません。既存の接続は保持されています。\n登録をやり直すには、設定「接続」の下の「すべての登録を初期化…」からやり直せます(全端末の再登録が必要になります)。"),
+        // 行き止まりにしない: 登録のやり直し導線は設定画面のサイドバー「その他」に
+        // あることを案内する(この登録画面はメニューの「端末を登録…」からも開くため、
+        // 指す先を画面名で特定する。初期化は全端末の再登録を要するため、その旨も伝える)
+        _ => error("この接続キーでは追加登録を開始できません。既存の接続は保持されています。\n登録をやり直すには、設定画面の左下「その他」の「すべての登録を初期化…」からやり直せます(全端末の再登録が必要になります)。"),
     }
 }
 
-/// 設定「接続」の「すべての登録を初期化…」。確認のうえでキーチェーンの接続キーを
-/// 削除して作り直す。接続キーは全端末で共通(共有鍵)のため、旧いキーを持つ相手は
-/// 全員つながらなくなり、再登録まで戻れない(=締め出し)。取り消しはできないため、
-/// 既定(Return)は「キャンセル」にして、失敗経路では必ず結果を案内する
+/// 設定サイドバー「その他」の「すべての登録を初期化…」。確認のうえでキーチェーンの
+/// 接続キーを削除して作り直す。接続キーは全端末で共通(共有鍵)のため、旧いキーを
+/// 持つ相手は全員つながらなくなり、再登録まで戻れない(=締め出し)。取り消しは
+/// できないため、既定(Return)は「キャンセル」にして、失敗経路では必ず結果を案内する
 pub(super) unsafe extern "C" fn reset_registration(_s: ID, _c: SEL, _sender: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
     }
     // env の KNIT_TOKEN(直接つなぐ)はキーチェーンより優先され、この初期化では
     // 消せない。誤って「初期化したのに締め出せない」状態を作らないため、ここで
-    // 止めて、通常の登録へ戻す導線(設定「接続」のトークンを空欄にして保存)へ案内する
+    // 止めて、通常の登録へ戻す導線(env の KNIT_TOKEN 行を消す)へ案内する
     if crate::envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty()) {
-        error("手動接続(共通トークン)で運用中のため、画面からは初期化できません。\n設定「接続」の「直接つなぐ(手動接続)」のトークンを空欄にして「保存して再接続」を押すと、通常の登録へ戻せます。\n(起動時の環境変数 KNIT_TOKEN として設定している場合は、設定元のスクリプトなどで外してください。「設定フォルダを開く」で ~/.config/knit を開けます)");
+        error("手動接続(共通トークン)で運用中のため、画面からは初期化できません。\n~/.config/knit/env の KNIT_TOKEN 行を消して Knitを再起動すると、通常の登録へ戻せます。\n(起動時の環境変数 KNIT_TOKEN として設定している場合は、設定元のスクリプトなどで外してください)");
         return;
     }
     let confirmed = alert(
         "すべての登録を初期化しますか?",
-        "このMacの接続キーを削除して、新しいキーを作り直します。\nいま登録済みの端末はすべて接続できなくなり、使うには再登録が必要です(接続中の相手も切断されます)。\n端末の配置と名前の保存(peer-sides.json)も消えます。\n\nこの操作は取り消せません。",
+        "このPCの接続キーを削除して、新しいキーを作り直します。\nいま登録済みの端末はすべて接続できなくなり、使うには再登録が必要です(接続中の相手も切断されます)。\n端末の配置と名前の保存(peer-sides.json)も消えます。\n\nこの操作は取り消せません。",
         &["キャンセル", "初期化"],
         None,
     );
@@ -466,7 +469,7 @@ pub(super) unsafe extern "C" fn reset_registration(_s: ID, _c: SEL, _sender: ID)
 /// manual_token=直接つなぐ(env の KNIT_TOKEN)運用中: この初期化で env の
 /// KNIT_TOKEN 行も消えるため、黙って通常の登録へ戻らないことを本文へ 1 行足す
 fn reset_all_settings_body(manual_token: bool) -> String {
-    let mut body = "このMacの設定をすべて消して、最初の状態に戻します。\n対象: 設定(preferences.json)・端末の配置と名前(peer-sides.json)・envファイルの KNIT_* 行\n履歴と端末の登録は消えません(それぞれ専用の操作があります)。".to_string();
+    let mut body = "このPCの設定をすべて消して、最初の状態に戻します。\n対象: 設定(preferences.json / desktop-settings.json)・端末の配置と名前(peer-sides.json)・感度と境界範囲(screen-settings.json)・envファイルの KNIT_* 行\n履歴と端末の登録は消えません(それぞれ専用の操作があります)。".to_string();
     if manual_token {
         body.push_str("\n直接つなぐ(手動接続)の設定も解除され、通常の登録が必要になります。");
     }
@@ -502,7 +505,7 @@ pub(super) unsafe extern "C" fn reset_all_settings(_s: ID, _c: SEL, _sender: ID)
         return;
     };
     let mut failures: Vec<String> = Vec::new();
-    for name in ["preferences.json", "peer-sides.json"] {
+    for name in ["preferences.json", "peer-sides.json", "screen-settings.json", "desktop-settings.json"] {
         let target = dir.join(name);
         // 無いファイルは素通り(初期化の冪等性。部分的に済んでいる状態からの再試行も通る)
         if target.exists() {
@@ -590,7 +593,7 @@ pub fn ensure_permission() -> bool {
             return true;
         }
         let choice = watch_trust(|| alert(
-            "このMacから操作する準備",
+            "このPCから操作する準備",
             "Knitで相手の端末を操作するには、Macのアクセシビリティ権限が必要です。\n許可すると、自動で次へ進みます。",
             &["システム設定を開く", "あとで"],
             None,

@@ -36,6 +36,14 @@ pub fn history_load() {
     }
 }
 
+/// 保存件数の上限を変更する(設定画面)。超過分は古い方から除去して保存する。
+pub fn history_set_limit(limit: usize) {
+    if let Ok(mut h) = HISTORY.lock() {
+        h.set_limit(limit);
+    }
+    history_save();
+}
+
 /// 履歴の全消去(メニューバー)。保存ファイルも消して次回起動に残さない
 pub fn history_clear() {
     if let Ok(mut h) = HISTORY.lock() {

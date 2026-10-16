@@ -93,7 +93,15 @@ struct Ident {
     name: String,
 }
 
+/// 二重起動ガード: 役割切替の再構成(spawn_role_threads)で待ち受け側に変わる
+/// たびに呼ばれるため、adb 監視ループが重複して起きないように 1 回だけ通す
+/// (クライアント→ホストへの切替でも中継が働くように、失敗時の再挑戦はしない)
+static SPAWNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn spawn(port: u16, token: String) {
+    if SPAWNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mode = envutil::get("KNIT_ANDROID").unwrap_or_default();
     if mode == "0" || mode.eq_ignore_ascii_case("off") {
         state::publish(state::Status {

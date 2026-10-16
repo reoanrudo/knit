@@ -69,6 +69,7 @@ pub fn offer(id: u64, count: usize, total: u64, position: f64) {
         && !HOTKEY_ONLY.load(Ordering::Relaxed)
         && knit_common::share::allow_files()
         && total <= bulk::MAX_TOTAL
+        && crate::conn::active_screen_settings().is_none_or(|s| crate::screen_settings::contains(s.target, position))
         && INCOMING
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -489,8 +490,12 @@ pub unsafe extern "C" fn poll(_this: ID, _sel: SEL, _timer: ID) {
         send_msg(&Msg::DragCancel { id });
         return;
     };
-    WIN_MODE.store(false, Ordering::Relaxed);
-    leave_win_mode_cursor_unlock(Some(position));
+    if !crate::tap::return_from_peer(position) {
+        delete_received(paths);
+        cancel(id);
+        send_msg(&Msg::DragCancel { id });
+        return;
+    }
     // 受信ドラッグ自身がドラッグ用ペーストボードへファイルを載せるため、
     // Windows側掴みの検出基準と混ざって偽の「掴み検出」を起こす(実測)。
     // この押下の掴み検出はここで確定して終わらせる
