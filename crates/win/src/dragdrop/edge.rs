@@ -249,6 +249,10 @@ unsafe extern "system" fn enter(
     if !allowed || keys & MK_LBUTTON == 0 || !enabled() {
         return S_OK;
     }
+    // 帯の再配置は16ms毎なので、Cfg更新直後の古いウィンドウ位置もここで拒否する。
+    let Some(position) = position_at(pt) else {
+        return S_OK;
+    };
     // 自分が回している DoDragDrop を自分の辺で受けると Mac へ DragOffer を
     // 送り返す往復が起きるため、進行中の受けドラッグは他人のものだけにする
     if DRAG_THREAD.load(Ordering::Relaxed) != 0 {
@@ -289,12 +293,6 @@ unsafe extern "system" fn enter(
     let total = bulk::entries_total(&entries);
     let count = entries.len();
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
-    let (x, y, w, h) = crate::vscreen();
-    let position = if matches!(crate::SIDE_W.load(Ordering::Relaxed), 2 | 3) {
-        (pt.x - x) as f64 / w.max(1) as f64
-    } else {
-        (pt.y - y) as f64 / h.max(1) as f64
-    };
     *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pending {
         id,
         entries,
@@ -330,11 +328,16 @@ unsafe extern "system" fn enter(
 unsafe extern "system" fn over(
     _this: *mut c_void,
     _keys: u32,
-    _pt: POINTL,
+    pt: POINTL,
     effect: *mut u32,
 ) -> HRESULT {
     if effect.is_null() {
         return E_FAIL;
+    }
+    if !enabled() || position_at(pt).is_none() {
+        *effect = DROPEFFECT_NONE;
+        cancel_current();
+        return S_OK;
     }
     *effect = if *effect & DROPEFFECT_COPY != 0
         && PENDING.lock().unwrap_or_else(|e| e.into_inner()).is_some()
@@ -355,13 +358,17 @@ unsafe extern "system" fn receive_drop(
     _this: *mut c_void,
     _data: *mut c_void,
     _keys: u32,
-    _pt: POINTL,
+    pt: POINTL,
     effect: *mut u32,
 ) -> HRESULT {
     if effect.is_null() {
         return E_FAIL;
     }
     *effect = DROPEFFECT_NONE;
+    if !enabled() || position_at(pt).is_none() {
+        cancel_current();
+        return S_OK;
+    }
     let id = {
         let mut state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -403,14 +410,48 @@ fn enabled() -> bool {
         && knit_common::share::allow_files()
 }
 
-fn rect(side: u8, x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let width = 8;
-    match side {
-        1 | 6 | 7 => (x + w - width, y, width, h),
-        2 => (x, y + h - width, w, width),
-        3 => (x, y, w, width),
-        _ => (x, y, width, h),
+fn rect(
+    side: u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    range: Option<[f64; 2]>,
+) -> Option<(i32, i32, i32, i32)> {
+    if w <= 0 || h <= 0 {
+        return None;
     }
+    let horizontal = matches!(side, 2 | 3);
+    let (start, end) = crate::state::target_pixel_span(range, if horizontal { w } else { h })?;
+    let width = 8.min(if horizontal { h } else { w });
+    Some(match side {
+        1 | 6 | 7 => (x + w - width, y + start, width, end - start),
+        2 => (x + start, y + h - width, end - start, width),
+        3 => (x + start, y, end - start, width),
+        _ => (x, y + start, width, end - start),
+    })
+}
+
+/// OLEが渡す画面座標を、現在の帯とtarget区間の両方で検査する。
+fn position_in_rect(
+    side: u8,
+    px: i32,
+    py: i32,
+    w: i32,
+    h: i32,
+    range: Option<[f64; 2]>,
+) -> Option<f64> {
+    let position = crate::state::edge_position(side, px, py, w, h)?;
+    let (x, y, rw, rh) = rect(side, 0, 0, w, h, range)?;
+    (px >= x && px < x + rw && py >= y && py < y + rh
+        && crate::state::target_range_contains(range, position))
+    .then_some(position)
+}
+
+fn position_at(pt: POINTL) -> Option<f64> {
+    let (x, y, w, h) = crate::vscreen();
+    let (side, range) = crate::state::connection_edge();
+    position_in_rect(side, pt.x - x, pt.y - y, w, h, range)
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -419,9 +460,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         // 自分のドラッグ中に帯を出すと自前 DataSource が自分の辺へ入る
         // ため、進行中(DRAG_THREAD != 0)は表示しない
         let show = enabled() && down && !committed() && DRAG_THREAD.load(Ordering::Relaxed) == 0;
-        if show {
+        let band = if show {
             let (x, y, w, h) = crate::vscreen();
-            let (x, y, w, h) = rect(crate::SIDE_W.load(Ordering::Relaxed), x, y, w, h);
+            let (side, range) = crate::state::connection_edge();
+            rect(side, x, y, w, h, range)
+        } else {
+            None
+        };
+        if let Some((x, y, w, h)) = band {
             SetWindowPos(
                 hwnd,
                 HWND_TOPMOST,
@@ -434,14 +480,19 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         } else {
             ShowWindow(hwnd, SW_HIDE);
         }
+        let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        let at_target = GetCursorPos(&mut cursor) != 0
+            && position_at(POINTL { x: cursor.x, y: cursor.y }).is_some();
         let (cancel, finish) = {
             let mut state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = state.as_mut() {
                 let cancel = (!enabled()
+                    || !at_target
                     || !down
                     || (!p.sending && p.began.elapsed() > Duration::from_secs(30)))
                     && !p.committed;
-                let finish = !cancel && p.ready && !p.committing;
+                // Cfg更新で区間外になった直後にも、マウスUpで強制確定させない。
+                let finish = !cancel && at_target && p.ready && !p.committing;
                 if finish {
                     p.committing = true;
                 }
@@ -546,10 +597,53 @@ mod tests {
     use super::*;
     #[test]
     fn edge_matches_all_four_connection_sides() {
-        assert_eq!(rect(0, -100, 20, 1000, 800), (-100, 20, 8, 800));
-        assert_eq!(rect(1, -100, 20, 1000, 800), (892, 20, 8, 800));
-        assert_eq!(rect(2, -100, 20, 1000, 800), (-100, 812, 1000, 8));
-        assert_eq!(rect(3, -100, 20, 1000, 800), (-100, 20, 1000, 8));
+        assert_eq!(rect(0, -100, 20, 1000, 800, None), Some((-100, 20, 8, 800)));
+        assert_eq!(rect(1, -100, 20, 1000, 800, None), Some((892, 20, 8, 800)));
+        assert_eq!(rect(2, -100, 20, 1000, 800, None), Some((-100, 812, 1000, 8)));
+        assert_eq!(rect(3, -100, 20, 1000, 800, None), Some((-100, 20, 1000, 8)));
+    }
+
+    #[test]
+    fn edge_band_is_limited_to_target_without_reversing_either_axis() {
+        let range = Some([0.25, 0.75]);
+        assert_eq!(rect(0, -100, 20, 1000, 800, range), Some((-100, 220, 8, 401)));
+        assert_eq!(rect(1, -100, 20, 1000, 800, range), Some((892, 220, 8, 401)));
+        assert_eq!(rect(2, -100, 20, 1000, 800, range), Some((150, 812, 501, 8)));
+        assert_eq!(rect(3, -100, 20, 1000, 800, range), Some((150, 20, 501, 8)));
+        for side in [4, 5] {
+            assert_eq!(rect(side, -100, 20, 1000, 800, range), rect(0, -100, 20, 1000, 800, range));
+        }
+        for side in [6, 7] {
+            assert_eq!(rect(side, -100, 20, 1000, 800, range), rect(1, -100, 20, 1000, 800, range));
+        }
+    }
+
+    #[test]
+    fn stale_ole_band_does_not_accept_points_outside_current_target() {
+        for side in 0..8 {
+            let point = |position| match side {
+                1 | 6 | 7 => (997, position),
+                2 => (position, 997),
+                3 => (position, 3),
+                _ => (3, position),
+            };
+            let range = Some([0.25, 0.75]);
+            for position in [250, 500, 750] {
+                let (px, py) = point(position);
+                assert_eq!(position_in_rect(side, px, py, 1000, 1000, range),
+                    Some(position as f64 / 1000.0));
+            }
+            for position in [0, 249, 751, 999] {
+                let (px, py) = point(position);
+                assert_eq!(position_in_rect(side, px, py, 1000, 1000, range), None);
+            }
+            assert_eq!(rect(side, 0, 0, 1000, 1000, Some([0.8, 0.2])), None);
+        }
+        assert_eq!(position_in_rect(0, 8, 500, 1000, 1000, None), None);
+        assert_eq!(rect(0, 0, 0, 100, 100, Some([0.251, 0.259])), None);
+        assert_eq!(rect(0, 0, 0, 0, 100, None), None);
+        assert_eq!(rect(2, 0, 0, 100, 0, None), None);
+        assert_eq!(rect(0, 0, 0, 1, 1, None), Some((0, 0, 1, 1)));
     }
     #[test]
     fn reads_paths_from_an_ole_data_object_without_clipboard() {

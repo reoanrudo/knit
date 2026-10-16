@@ -511,7 +511,7 @@ pub fn first_run(preview: bool) -> Option<String> {
         SEARCH.store(searchbutton as usize, Ordering::Relaxed);
         create(
             "STATIC",
-            "見つからない場合は、相手のIP",
+            "相手のIPアドレス(例: 192.168.1.10)",
             36,
             245,
             270,

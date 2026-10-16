@@ -33,9 +33,9 @@ pub(crate) use clipboard::{
     clipboard_seq, clipboard_write_files, history_clear, history_load, history_push_files,
     history_restore_by_id, HISTORY, LAST_SYNC_SEQ, make_hdrop_global,
 };
-pub(crate) use conn::{client_loop, last_connected_line, next_retry_line, PEER, peer_ip, server_loop};
+pub(crate) use conn::{client_loop, next_retry_line, PEER, peer_ip, server_loop};
 pub(crate) use input::{
-    BTN_W, CMD_ALT, inject_mouse_btn, refresh_vscreen, release_all_input, vscreen,
+    BTN_W, inject_mouse_btn, refresh_vscreen, release_all_input, vscreen,
 };
 #[cfg(test)]
 pub(crate) use input::{remote_mouse_button, remote_mouse_move_rel};
@@ -43,7 +43,7 @@ pub(crate) use state::{
     CONNECTED, DEBUG_KEYS, on_power_event, proto_return, RTT_MS, SIDE_W, SPK_MUTE_MODE, WTX,
 };
 pub(crate) use xfer::{
-    begin_tx, BULK, BULK_LINK, end_tx, FILES_RX, human_bytes, RX_BYTES, spawn_esc_cancel_watcher,
+    begin_tx, BULK, BULK_LINK, end_tx, human_bytes, RX_BYTES, spawn_esc_cancel_watcher,
     update_tx, win_on_bulk, xfer_line,
 };
 
@@ -204,7 +204,7 @@ fn detach_if_console() {
 
 /// 表示用のリリースバージョン(ステータス窓等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "win-20261002-190730-8e80c6b";
+const BUILD_ID: &str = "win-20261016-203438-200c41b";
 
 static JUST_REGISTERED: AtomicBool = AtomicBool::new(false);
 fn registration_authenticated(_token: &str) {
@@ -215,7 +215,29 @@ fn registration_authenticated(_token: &str) {
         );
     }
 }
+/// プロセスの DPI アウェアネスを Per-Monitor-V2(旧 OS はシステム DPI)へ設定する。
+/// 設定が無いと OS は DPI 仮想化(DPI 非対応扱い)を強制し、125%/150%
+/// スケーリングや混在 DPI の多モニターで注入座標(get_cursor_pos /
+/// set_cursor_pos / MOUSEEVENTF_ABSOLUTE)と実画面の座標系がズレる。
+/// 以前はマニフェストで宣言していたが、Rust/mingw 側の更新後に埋め込み
+/// マニフェストが Windows ローダーへ「無効な XML 構文」と判定されプロセスが
+/// 起動しなくなったため(2026-10-12)、起動直後の API 呼び出しへ移した。
+/// DPI アウェアネスは最初に成功した設定が有効になる(後から変更できない)ため、
+/// 新しい API(Per-Monitor-V2)→ 旧 API(システム DPI)の順に試す
+unsafe fn set_dpi_awareness() {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+        fn SetProcessDPIAware() -> i32;
+    }
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    if SetProcessDpiAwarenessContext(-4) == 0 {
+        // Windows 10 1703 未満、または既に設定済み。少なくとも仮想化は避ける
+        SetProcessDPIAware();
+    }
+}
 fn main() {
+    unsafe { set_dpi_awareness() };
     crate::state::init_boot_wall();
     if std::env::args().any(|a| a == "--probe-diag") {
         // 診断を stdout へ出して終わる(ssh からの実機検証・改善ループの自動化用)。
@@ -504,6 +526,7 @@ fn main() {
                 &bind,
                 port + bulk::PORT_OFFSET,
                 knit_common::net::is_allowed,
+                || false,
             )
         });
         let tk = token.clone();
@@ -513,6 +536,7 @@ fn main() {
                 port + knit_common::discover::PORT_OFFSET,
                 &tk,
                 knit_common::net::is_allowed,
+                || false,
             ) {
                 println!("[disc] 発見応答の待受に失敗: {e}(自動発見が使えません)");
             }
@@ -527,6 +551,7 @@ fn main() {
             bulk_ep,
             || peer_ip().map(|ip| std::net::SocketAddr::new(ip, port + bulk::PORT_OFFSET)),
             || CONNECTED.load(Ordering::Relaxed),
+            || false,
         )
     });
     client_loop(host, port, &token, w, h);
