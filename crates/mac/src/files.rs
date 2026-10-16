@@ -28,7 +28,7 @@ pub enum SendFilesOutcome {
 /// 掴んだまま境界を越える場合は offer_drag_to_win を使う
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
     if !knit_common::share::allow_files() {
-        notify("Knit", "このMacではファイルの共有が許可されていません(KNIT_SHARE)");
+        notify("Knit", "このPCではファイルの共有が許可されていません(KNIT_SHARE)");
         return SendFilesOutcome::Denied;
     }
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
@@ -137,7 +137,8 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                 let skip_note = skip_note(&all_skipped);
                 // 相手の受理結果を待つ(版 15 以降の相手だけ返す。旧版はタイムアウト)。
                 // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
-                match wait_xfer_ack(Duration::from_millis(2500)) {
+                let ack = wait_xfer_ack(Duration::from_millis(2500));
+                match ack {
                     Some((_, _, true)) => {
                         notify(
                             "Knit",
@@ -151,7 +152,18 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                         );
                     }
                     _ => {
-                        notify(
+                        // 読取スキップや受理未確認（旧版・Ack待ち切れ）は常時通知。
+                        // 相手が全件保存したと確認できた成功だけを抑制対象にする。
+                        let notify_done = if all_skipped.is_empty()
+                            && ack.is_some_and(|(accepted, rejected, scope)| {
+                                accepted == n && rejected == 0 && !scope
+                            })
+                        {
+                            notify_transfer
+                        } else {
+                            notify
+                        };
+                        notify_done(
                             "Knit",
                             &format!(
                                 "{n} 件({})を {peer} へ送信しました({:.1}MB/s・Ctrl+V で貼り付け){skip_note}",
@@ -539,11 +551,8 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             // 自分が載せたファイルを Windows へ送り返さない
             *LAST_SENT_FILES.lock().unwrap_or_else(|e| e.into_inner()) = mac_files_key(&paths);
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
-            let place = std::env::var_os("HOME")
-                .map(|h| std::path::Path::new(&h).join("Downloads/Knit"))
-                .filter(|p| !p.as_os_str().is_empty())
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "既定の保存先(Downloads/Knit)".to_string());
+            // 保存済み設定ではなく、今回のEndpointが実際に使っている起動時の場所。
+            let place = desktop_settings::receive_dir().display().to_string();
             // 同名衝突で「名前 (n)」へ保存した分を通知に添える(黙って別名になるのを防ぐ)
             let rename_note = rename_note(renamed);
             if ok {
@@ -551,13 +560,28 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
                 // 履歴ラベルはバッチ開始時点の端末で固定(受信中の切替で替えない)
                 history_push_files(&paths, &bulk_rx_device());
                 let total = knit_common::bulk::total_size(&paths);
-                notify(
+                // 保存失敗・拒否・同名変更の注意がある場合は設定にかかわらず通知。
+                let notify_done = if failed.is_empty() && denied == 0 && renamed == 0 {
+                    notify_transfer
+                } else {
+                    notify
+                };
+                notify_done(
                     "Knit",
                     &format!(
                         "ファイルを受信: {n} 件({}){rename_note}(⌘V で貼り付け可)。実体は {place}",
                         human_bytes(total),
                     ),
                 );
+                // 設定が有効なら受信フォルダをFinderで開く(失敗は静かに諦める)
+                if desktop_settings::snapshot().open_receive_folder {
+                    if let Err(e) = std::process::Command::new("/usr/bin/open")
+                        .arg(desktop_settings::receive_dir())
+                        .spawn()
+                    {
+                        eprintln!("[file] 受信フォルダを開けませんでした: {e}");
+                    }
+                }
             } else {
                 // 実体は保存済みだが ⌘V に載らなかった。黙っていると
                 // 「受信したのに貼り付けられない」というトラブルに見えるため伝える
@@ -623,8 +647,9 @@ fn report_failed_files(failed: &[(String, String)]) {
     notify(
         "Knit",
         &format!(
-            "{}件を保存できませんでした({reason}: {name}{more})。保存先(Downloads/Knit)の空き容量を確認してください",
-            failed.len()
+            "{}件を保存できませんでした({reason}: {name}{more})。保存先({})の空き容量を確認してください",
+            failed.len(),
+            desktop_settings::receive_dir().display()
         ),
     );
     eprintln!("[file] 保存失敗 {failed:?}");

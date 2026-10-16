@@ -101,6 +101,18 @@ pub(crate) static PEER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 // 接続の登録・切断・選択を直列化し、一覧の前詰めと送信口の所有者を一致させる。
 pub(crate) static PEER_CHANGES: Mutex<()> = Mutex::new(());
 
+/// 入力に使う選択中端末の設定。PEERS → ACTIVE_PEER の順で識別子だけを
+/// コピーしてロックを離し、保存ストアはその後で読む(writer/gen は変更しない)。
+pub(crate) fn active_screen_settings() -> Option<crate::screen_settings::PeerSettings> {
+    let (id, side) = {
+        let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+        let peer = peers.get(act)?;
+        (peer.id.clone(), peer.side)
+    };
+    Some(crate::screen_settings::get(&id, side))
+}
+
 /// my_id がいまアクティブなピアか(pong の反映先判定などに使う)。
 /// 空 id はクライアントモード(単一接続)を表し、常にアクティブ扱い
 pub(crate) fn is_active_peer(my_id: &str, generation: u64) -> bool {
@@ -412,6 +424,7 @@ fn activate_peer_locked(new: usize, reason: &str) {
     mark_connected();
     LAST_PONG_MS.store(now_ms(), Ordering::Relaxed);
     RTT_MS.store(0, Ordering::Relaxed);
+    note_rtt(0);
     // 旧相手のファイル転送経路を切る(接続側は本線の接続先へ追従して張り直す)。
     // 受信バッチの進行中は完了まで延期する: 入力の切替は即時、bulk 経路の張替は
     // 受信が終わってから(進行中に切ると FILE_END までの分しか残らず、途中で

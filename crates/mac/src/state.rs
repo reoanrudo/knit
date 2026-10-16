@@ -28,6 +28,35 @@ pub(crate) fn detect_natural_scroll() -> bool {
 }
 /// Windows との RTT(ms)。ping/pong 往復で測定(メニュー状態行の表示用)
 pub(crate) static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// RTT推移の直近サンプル(設定画面の接続ページ表示用)。最大12件。
+pub(crate) static RTT_SAMPLES: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+/// RTTサンプルの記録。0 は接続断として全サンプルをクリアする。
+pub(crate) fn note_rtt(ms: u64) {
+    let mut samples = RTT_SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+    if ms == 0 {
+        samples.clear();
+        return;
+    }
+    samples.push(ms);
+    let excess = samples.len().saturating_sub(12);
+    samples.drain(0..excess);
+}
+/// サンプルから (中央値, 最大, 件数) を返す。空なら None。
+/// 中央値は偶数件のとき中央2件の平均を四捨五入する。
+pub fn summarize_rtt(samples: &[u64]) -> Option<(u64, u64, usize)> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let median = if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2] + 1) / 2
+    };
+    Some((median, sorted[n - 1], n))
+}
 /// 相手(Windows)のプロトコル版。hello/hello_ok で更新(版による機能のON/OFFに使う)。
 /// 複数台接続では PeerEntry の版が正であり、ここには「アクティブな相手」の版だけを
 /// 反映する(activate_peer_locked / on_disconnect で管理)
@@ -71,6 +100,10 @@ pub(crate) static DIAG_MOVE_COUNT: std::sync::atomic::AtomicU64 = std::sync::ato
 pub(crate) static DIAG_KEY_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_SEND_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 更新の自動確認(設定「その他」の「更新を自動で確認」。既定 ON)。
+/// 手動の「アップデートを確認…」メニューはこの設定の影響を受けない。
+/// updater の自動確認ループが毎周回読むため、適用すると次回の確認から反映される
+pub(crate) static UPDATE_CHECK: AtomicBool = AtomicBool::new(true);
 pub(crate) static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -225,4 +258,37 @@ pub fn mouse_scale() -> f64 {
 /// カーソル速度倍率を設定(0.2..3.0 にクランプ)
 pub fn set_mouse_scale(v: f64) {
     MOUSE_SCALE.store(v.clamp(0.2, 3.0).to_bits(), Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summarize_rtt_handles_empty_odd_even_and_single() {
+        assert_eq!(summarize_rtt(&[]), None);
+        // 奇数件は中央の値
+        assert_eq!(summarize_rtt(&[30, 10, 20]), Some((20, 30, 3)));
+        // 偶数件は中央2件の平均を四捨五入
+        assert_eq!(summarize_rtt(&[10, 20, 30, 40]), Some((25, 40, 4)));
+        assert_eq!(summarize_rtt(&[10, 21]), Some((16, 21, 2)));
+        // 単一件
+        assert_eq!(summarize_rtt(&[7]), Some((7, 7, 1)));
+        // 順序は問わない
+        assert_eq!(summarize_rtt(&[40, 10, 30, 20]), Some((25, 40, 4)));
+    }
+
+    #[test]
+    fn note_rtt_clears_on_zero_and_caps_at_12() {
+        note_rtt(5);
+        note_rtt(6);
+        note_rtt(0);
+        assert!(RTT_SAMPLES.lock().unwrap().is_empty(), "0でクリア");
+        for i in 0..20u64 {
+            note_rtt(i + 1);
+        }
+        assert_eq!(RTT_SAMPLES.lock().unwrap().len(), 12);
+        assert_eq!(RTT_SAMPLES.lock().unwrap()[0], 9, "古い方から落ちる");
+        note_rtt(0);
+    }
 }

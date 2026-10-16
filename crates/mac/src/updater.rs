@@ -428,18 +428,36 @@ fn cleanup_leftovers() {
     }
 }
 
+/// 自動確認の1周回を実行するか(純粋関数・単体テストで守る)。手動の
+/// 「アップデートを確認…」(on_click)は常に可能で、この判定の影響を受けない。
+/// env_disabled は KNIT_AUTO_UPDATE=0、has_keys は署名鍵の登録、update_check は
+/// 設定「その他」の「更新を自動で確認」(preferences の update_check・既定 ON)。
+/// update_check は実行中に切り替わり得るため、ループは毎周回ここへ問い合わせる
+fn auto_check_tick(env_disabled: bool, has_keys: bool, update_check: bool) -> bool {
+    !env_disabled && has_keys && update_check
+}
+
 pub fn start_background() {
     cleanup_leftovers();
-    if crate::envutil::get("KNIT_AUTO_UPDATE").as_deref() == Some("0") || trusted_keys().is_empty() {
+    let env_disabled = crate::envutil::get("KNIT_AUTO_UPDATE").as_deref() == Some("0");
+    let has_keys = !trusted_keys().is_empty();
+    if !auto_check_tick(env_disabled, has_keys, true) {
         return;
     }
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         std::thread::sleep(FIRST_CHECK_DELAY);
         loop {
             // Failed 中も自動確認は回す: 失敗表示の解除をクリック待ちにすると、
             // 6 時間毎の確認が一度の失敗で止まってしまうため(新しい版が見つかれば
-            // Available が Failed を上書きする。エラー時は通知を増やさず何もしない)
-            if matches!(state(), State::Idle | State::Failed(_)) {
+            // Available が Failed を上書きする。エラー時は通知を増やさず何もしない)。
+            // update_check は実行中に設定画面から切り替わるため毎周回読む
+            // (オフへ戻しても即止まり、オンへ戻せば次回の確認から再開する)
+            if auto_check_tick(
+                env_disabled,
+                has_keys,
+                crate::UPDATE_CHECK.load(std::sync::atomic::Ordering::Relaxed),
+            ) && matches!(state(), State::Idle | State::Failed(_))
+            {
                 if let Ok(Some(a)) = check() {
                     let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
                     if *n != a.version {
@@ -548,5 +566,17 @@ mod tests {
         }
         assert_eq!(menu_title(), "アップデートを確認…");
         set_state(State::Idle);
+    }
+
+    /// 自動確認のゲート: 署名鍵が未登録・KNIT_AUTO_UPDATE=0・設定の
+    /// 「更新を自動で確認」オフのどれかで自動確認の周回は実行しない。
+    /// 手動確認(on_click)は常に可能のため、ここでは自動側だけを守る
+    #[test]
+    fn auto_check_tick_requires_keys_env_and_preference() {
+        assert!(auto_check_tick(false, true, true), "既定は自動確認する");
+        assert!(!auto_check_tick(true, true, true), "KNIT_AUTO_UPDATE=0 で停止");
+        assert!(!auto_check_tick(false, false, true), "署名鍵が無ければ確認しない");
+        assert!(!auto_check_tick(false, true, false), "設定オフで停止");
+        assert!(!auto_check_tick(true, false, false), "全部同時オフ");
     }
 }

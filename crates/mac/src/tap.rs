@@ -462,8 +462,8 @@ pub(crate) fn peer_at_side(d: u8) -> Option<usize> {
 ///(f64::MAX)を返す=境界は壁になる。旧実装は全体領域の端へ黙ってフォール
 /// バックしていたため、境界が知らないうちに「全画面の端」へ移動していた
 pub(crate) fn peer_gap(g: &Geo, edge_monitor: Option<usize>, side: u8, x: f64, y: f64) -> f64 {
-    // 斜め配置(4-7)の端末も、基の辺(右/左)までの距離で測る。接続できる
-    // 範囲(上半分・下半分)は LAY_RANGE が担う
+    // 斜め配置(4-7)も距離は基の辺で測る。接続範囲は呼び出し側が
+    // 端末別source(未保存ならside_lay_range)で検査する。
     let side = base_dir(side);
     let Some(mi) = edge_monitor else {
         return g.gap(side, x, y);
@@ -507,6 +507,11 @@ fn find_enter_edge(g: &Geo, x: f64, y: f64) -> (u8, Option<usize>) {
     let mut best_gap = f64::MAX;
     let mut best_idx = None;
     for (i, p) in peers.iter().enumerate() {
+        let settings = crate::screen_settings::get(&p.id, p.side);
+        let ratio = along_ratio_on(g, base_dir(p.side), p.edge_monitor, x, y);
+        if !crate::screen_settings::contains(settings.source, ratio) {
+            continue; // この端末のsource範囲外は壁。他の同辺端末も個別に調べる
+        }
         let gd = peer_gap(g, p.edge_monitor, p.side, x, y);
         if gd < best_gap {
             best_gap = gd;
@@ -543,6 +548,7 @@ pub(crate) fn set_peer_side(index: usize, side: u8, edge_monitor: Option<usize>)
     let target = match edge_monitor {
         None => "全画面".to_string(),
         Some(0) => "メインモニター".to_string(),
+        Some(MISSING_EDGE_MONITOR) => "無効(壁)".to_string(),
         Some(i) => format!("モニター{}", i + 1),
     };
     eprintln!(
@@ -627,56 +633,257 @@ pub(crate) fn remap_monitor_index(
     })
 }
 
-/// 端末ごとの画面の位置を保存する(端末 id ごと。値は {side, monitor} と
-/// monitor が指す物理モニターの識別情報(幅・高さ・相対配置・名前)、
-/// エイリアス(利用者が付けた表示名・設定があれば))。
-/// 識別情報は再構成時のリマッチ(remap_monitor_index)に使う。
-/// 旧版の数値形式(side + 4*(モニター+1))も読み替える。
-/// 接続中の切替(rematch)と全端末の退出(peers::should_save_sides_after_detach
-/// が真のとき)から呼ばれる
-pub(crate) fn save_peer_sides() {
-    let Some(dir) = knit_common::envutil::config_dir() else {
-        return;
-    };
-    let displays = geo().displays;
-    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    let map: std::collections::BTreeMap<&str, serde_json::Value> = peers
+/// 見つからない物理モニターは全画面(None)と区別し、到達不能な番号で壁にする。
+const MISSING_EDGE_MONITOR: usize = usize::MAX;
+
+/// remap_monitor_index の None=候補なしを、実行時の None=全画面へ流さない。
+/// 元から全画面なら、古いメタが付いていても全画面のままにする。
+fn rematched_edge_monitor(
+    saved_index: Option<usize>,
+    saved_meta: Option<&MonitorMeta>,
+    displays: &[MacDisplay],
+) -> Option<usize> {
+    saved_index.map(|index| {
+        remap_monitor_index(Some(index), saved_meta, displays)
+            .filter(|&mi| mi < displays.len())
+            .unwrap_or(MISSING_EDGE_MONITOR)
+    })
+}
+
+fn peer_sides_memory_only() -> bool {
+    cfg!(test) || crate::gui::UI_PREVIEW.load(Ordering::Relaxed)
+}
+
+// read→merge→atomic write を直列化する。PEER_CHANGESとは別で、Applyの呼出元が
+// PEER_CHANGESを保持していても再入しない。取得順はこのロック→PEERS。
+static PEER_SIDES_SAVE: Mutex<()> = Mutex::new(());
+
+type PeerSidesMap = serde_json::Map<String, serde_json::Value>;
+
+/// writerや接続世代を複製せずに保存/Apply用の配置だけを下書きにする。
+#[derive(Clone, Debug, PartialEq)]
+struct PeerPlacement {
+    id: String,
+    name: String,
+    alias: Option<String>,
+    side: u8,
+    edge_monitor: Option<usize>,
+}
+
+fn peer_placements(peers: &[PeerEntry]) -> Vec<PeerPlacement> {
+    peers
         .iter()
-        .map(|p| {
-            let mut v = serde_json::json!({
-                "side": p.side,
-                "monitor": p.edge_monitor.map(|m| m as i64).unwrap_or(-1),
-            });
-            // エイリアスは設定した端末だけに書く(設定していない端末の
-            // エントリは旧形式の形を保つ=将来の形式変更の影響を広げない)
-            if let Some(a) = p.alias.as_deref().filter(|a| !a.is_empty()) {
-                v["alias"] = a.into();
+        .map(|p| PeerPlacement {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            alias: p.alias.clone(),
+            side: p.side,
+            edge_monitor: p.edge_monitor,
+        })
+        .collect()
+}
+
+/// offlineエントリはそのまま保持し、liveエントリだけを置換する。
+/// alias=Noneは意図した削除なので、古いaliasをフィールド単位でmergeしない。
+fn merge_peer_sides(
+    mut map: PeerSidesMap,
+    peers: &[PeerPlacement],
+    displays: &[MacDisplay],
+) -> PeerSidesMap {
+    for p in peers {
+        // missingの実行時sentinelより元番号を優先する。メタ無し旧形式でも、
+        // 元の番号の画面が再び現れた時に従来どおり復元できるようにする。
+        let saved_monitor = p.edge_monitor.map(|mi| {
+            if mi == MISSING_EDGE_MONITOR {
+                map.get(&p.id).and_then(parse_saved_side).and_then(|(_, old, _)| old).unwrap_or(mi)
+            } else {
+                mi
             }
-            // モニター指定のときだけ識別情報を併保存する(全画面は不要)。
-            // 保存時点で displays が取れない(起動直前 等)はメタ無しで
-            // 書く=旧形式と同じ扱いになり、次回の保存で埋まる
-            if let Some(m) = p.edge_monitor.and_then(|mi| monitor_meta(&displays, mi)) {
+        });
+        let mut v = serde_json::json!({
+            "side": p.side,
+            // usize::MAXをi64へcastすると-1(全画面)になる。正のJSON整数のまま保存。
+            "monitor": saved_monitor.map(serde_json::Value::from).unwrap_or_else(|| (-1).into()),
+            "name": p.name,
+        });
+        if let Some(a) = p.alias.as_deref().filter(|a| !a.is_empty()) {
+            v["alias"] = a.into();
+        }
+        if let Some(mi) = p.edge_monitor {
+            if let Some(m) = monitor_meta(displays, mi) {
                 v["monitor_w"] = m.w.into();
                 v["monitor_h"] = m.h.into();
                 v["monitor_rel_x"] = m.rel_x.into();
                 v["monitor_rel_y"] = m.rel_y.into();
                 v["monitor_name"] = m.name.into();
+            } else if let Some(old) = map.get(&p.id) {
+                // 取り外し中の保存で物理識別情報を失うと、再接続しても復元できない。
+                // 現在の番号に別モニターのメタを付けず、元の識別情報を残す。
+                for field in [
+                    "monitor_w", "monitor_h", "monitor_rel_x", "monitor_rel_y", "monitor_name",
+                ] {
+                    if let Some(value) = old.get(field) {
+                        v[field] = value.clone();
+                    }
+                }
             }
-            (p.id.as_str(), v)
-        })
-        .collect();
-    if let Ok(json) = serde_json::to_string_pretty(&map) {
-        // 直書きだと書き込み途中の電源断で全端末の境界設定が壊れるため、
-        // 一時ファイル+rename のアトミック置換で保存する(preferences と同じ手法)
-        match knit_common::persist::write_atomic(&dir.join("peer-sides.json"), json.as_bytes()) {
-            Ok(()) => {
-                // 保存し直せたため、壊れて退避した際の案内を外す
-                // (preferences::save が PrefsFile を外すのと対称の解除導線)
-                crate::gui::clear_peer_sides_error();
-            }
-            Err(e) => eprintln!("[tap] peer-sides.json の保存に失敗: {e}"),
+        }
+        map.insert(p.id.clone(), v);
+    }
+    map
+}
+
+/// 保存側は読めない/破損/非mapを空mapと解釈しない。起動時の退避読込とは分離する。
+fn parse_peer_sides_map(text: &str) -> Result<PeerSidesMap, String> {
+    let v: serde_json::Value = serde_json::from_str(text)
+        .map_err(|e| format!("端末の配置JSONが不正です(元ファイルを保持します): {e}"))?;
+    v.as_object()
+        .cloned()
+        .ok_or_else(|| "端末の配置ファイルがオブジェクトではありません(元ファイルを保持します)".into())
+}
+
+/// PEER_SIDES_SAVE保持中に呼ぶ。成功するまで実行時の配置は変更しない。
+fn persist_peer_placements(peers: &[PeerPlacement], displays: &[MacDisplay]) -> Result<(), String> {
+    if peer_sides_memory_only() {
+        // config_dir自体が旧設定の移行を書き込むことがあるので呼ばない。
+        return Ok(());
+    }
+    let path = knit_common::envutil::config_dir()
+        .ok_or("設定フォルダを取得できません")?
+        .join("peer-sides.json");
+    let map = match std::fs::read_to_string(&path) {
+        Ok(text) => parse_peer_sides_map(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => PeerSidesMap::new(),
+        Err(e) => return Err(format!("端末の配置ファイルを読み込めません(元ファイルを保持します): {e}")),
+    };
+    let map = merge_peer_sides(map, peers, displays);
+    let bytes = serde_json::to_vec_pretty(&map)
+        .map_err(|e| format!("端末の配置を変換できません: {e}"))?;
+    knit_common::persist::write_atomic(&path, &bytes)
+        .map_err(|e| format!("端末の配置を保存できません: {e}"))?;
+    crate::gui::clear_peer_sides_error();
+    Ok(())
+}
+
+/// 接続中の端末を既存mapへmergeして保存する。切断済みの端末・名前も保持する。
+/// 書込失敗を扱う新UIはこのResult APIを使う。旧呼出元は下のwrapperを使う。
+pub(crate) fn try_save_peer_sides() -> Result<(), String> {
+    if peer_sides_memory_only() {
+        return Ok(());
+    }
+    let _save = PEER_SIDES_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let displays = geo().displays;
+    let peers = peer_placements(&PEERS.lock().unwrap_or_else(|e| e.into_inner()));
+    persist_peer_placements(&peers, &displays)
+}
+
+pub(crate) fn save_peer_sides() {
+    if let Err(error) = try_save_peer_sides() {
+        eprintln!("[tap] peer-sides.json の保存に失敗: {error}");
+        crate::gui::report_peer_sides_error(error);
+    }
+}
+
+/// 端末のエイリアス(利用者付けの表示名)を設定・削除する(設定「接続」の
+/// 「名前…」)。alias=None・空文字列・空白のみは削除(None=コンピュータ名へ戻す)。
+/// 値は hello の name と同じ規則(safe_peer_name: trim・制御文字除去・48文字)で
+/// 検査する。保存と PEERS への反映は apply_peer_placements と同じ順
+/// (PEER_SIDES_SAVE 保持下で保存成功→反映)で行う
+pub(crate) fn set_peer_alias(id: &str, alias: Option<&str>) -> Result<(), String> {
+    if id.trim().is_empty() || id.chars().any(char::is_control) {
+        return Err("端末IDが不正です".into());
+    }
+    let alias = alias
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(knit_common::proto::safe_peer_name);
+    // 取得順はこのロック→PEERS(try_save_peer_sides と同じ。逆順だとデッドロック)
+    let _save = PEER_SIDES_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let displays = geo().displays;
+    let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    if !peers.iter().any(|p| p.id == id) {
+        return Err(format!("接続先が見つかりません: {id}"));
+    }
+    // 保存用の下書きだけを先に書き換え、保存が成功したら PEERS へ反映する
+    // (失敗したら実行中の表示も変えない)
+    let mut draft = peer_placements(&peers);
+    for placement in draft.iter_mut().filter(|p| p.id == id) {
+        placement.alias = alias.clone();
+    }
+    persist_peer_placements(&draft, &displays)?;
+    for (peer, placement) in peers.iter_mut().zip(draft) {
+        peer.alias = placement.alias;
+    }
+    Ok(())
+}
+
+/// 全件検証→下書きの保存成功→配置だけ反映。保存closureの差替えで失敗経路も純粋に検証する。
+fn apply_peer_placements_with_save(
+    peers: &mut [PeerEntry],
+    displays: &[MacDisplay],
+    updates: &[(String, u8, Option<usize>)],
+    save: impl FnOnce(&[PeerPlacement]) -> Result<(), String>,
+) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    let mut draft = peer_placements(peers);
+    for (id, side, monitor) in updates {
+        if id.trim().is_empty() || id.chars().any(char::is_control) {
+            return Err("端末IDが不正です".into());
+        }
+        if !ids.insert(id.as_str()) {
+            return Err(format!("端末IDが重複しています: {id}"));
+        }
+        if *side > 7 {
+            return Err(format!("{id}: 画面の位置は0〜7で指定してください"));
+        }
+        if monitor.is_some_and(|mi| mi >= displays.len()) {
+            return Err(format!("{id}: 指定されたMacモニターが見つかりません"));
+        }
+        let mut matches = draft.iter_mut().filter(|p| p.id == *id);
+        let peer = matches.next().ok_or_else(|| format!("接続先が見つかりません: {id}"))?;
+        if matches.next().is_some() {
+            return Err(format!("接続先の端末IDが重複しています: {id}"));
+        }
+        peer.side = *side;
+        peer.edge_monitor = *monitor;
+    }
+    save(&draft)?;
+    for (peer, placement) in peers.iter_mut().zip(draft) {
+        peer.side = placement.side;
+        peer.edge_monitor = placement.edge_monitor;
+    }
+    Ok(())
+}
+
+/// 新UIの一括Apply用。呼出元がPEER_CHANGESを取得済みであること(ここでは再取得しない)。
+/// 全id/side/monitor検証→既存JSONへatomic保存→PEERS→activeの既定LAY_RANGE/Cfgの順。
+pub(crate) fn apply_peer_placements(updates: &[(String, u8, Option<usize>)]) -> Result<(), String> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let _save = PEER_SIDES_SAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let displays = geo().displays;
+    let active_side = {
+        // 保存中も一覧/配置を安定させる。失敗時はこのPEERSを一切変更しない。
+        let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        apply_peer_placements_with_save(&mut peers, &displays, updates, |draft| {
+            persist_peer_placements(draft, &displays)
+        })?;
+        let active = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+        peers.get(active)
+            .filter(|p| updates.iter().any(|(id, _, _)| *id == p.id))
+            .map(|p| p.side)
+    };
+    if let Some(side) = active_side {
+        *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()) = side_lay_range(side);
+        if !peer_sides_memory_only() {
+            send_cfg();
         }
     }
+    Ok(())
 }
 
 /// peer-sides.json の 1 エントリを (side, モニター番号, モニター識別情報) へ
@@ -701,7 +908,8 @@ fn parse_saved_side(v: &serde_json::Value) -> Option<(u8, Option<usize>, Option<
     }
     // monitor は保存側が常に書くが、手書き修正や版混在で欠けていても
     // side だけ生かす(配置がサイレントに既定へ落ちるのを防ぐ)
-    let mon = v.get("monitor").and_then(|m| m.as_i64()).unwrap_or(-1);
+    let mon = v.get("monitor").and_then(|m| m.as_u64())
+        .map(|m| usize::try_from(m).unwrap_or(MISSING_EDGE_MONITOR));
     let meta = v
         .get("monitor_w")
         .and_then(|w| w.as_i64())
@@ -723,11 +931,7 @@ fn parse_saved_side(v: &serde_json::Value) -> Option<(u8, Option<usize>, Option<
                 .unwrap_or("")
                 .to_string(),
         });
-    Some((
-        side as u8,
-        if mon < 0 { None } else { Some(mon as usize) },
-        meta,
-    ))
+    Some((side as u8, mon, meta))
 }
 
 /// peer-sides.json が壊れて退避された時の保存状態行の文言(純粋関数・単体テストで
@@ -742,6 +946,9 @@ fn peer_sides_corrupt_note() -> &'static str {
 /// 恒久喪失するため、上書き前に救出材料を残す。退避したことを GUI へも
 /// 出す(黙って初期設定で起動したように見せない=preferences.json と対称)
 fn load_peer_sides_json() -> Option<serde_json::Value> {
+    if peer_sides_memory_only() {
+        return None;
+    }
     let dir = knit_common::envutil::config_dir()?;
     let path = dir.join("peer-sides.json");
     let existed = path.exists();
@@ -763,7 +970,7 @@ fn load_peer_sides_json() -> Option<serde_json::Value> {
 fn saved_peer_side(id: &str) -> Option<(u8, Option<usize>)> {
     let v = load_peer_sides_json()?.get(id)?.clone();
     let (side, mon, meta) = parse_saved_side(&v)?;
-    Some((side, remap_monitor_index(mon, meta.as_ref(), &geo().displays)))
+    Some((side, rematched_edge_monitor(mon, meta.as_ref(), &geo().displays)))
 }
 
 /// 保存された 1 エントリからエイリアス(利用者が付けた表示名)を読む。
@@ -779,28 +986,6 @@ fn alias_from_entry(v: &serde_json::Value) -> Option<String> {
 /// 旧形式(alias フィールド無し)は None=コンピュータ名を使う従来どおり
 pub(crate) fn saved_peer_alias(id: &str) -> Option<String> {
     alias_from_entry(load_peer_sides_json()?.get(id)?)
-}
-
-/// 端末のエイリアス(表示名)を設定する(設定「接続」の「選択中の端末の名前」)。
-/// 空文字・空白のみは None=コンピュータ名(hello の name)へ戻す。
-/// peer-sides.json へ保存し、表示(active_peer_label・配置エディタ等)へ反映される
-pub(crate) fn set_peer_alias(index: usize, alias: &str) {
-    let cleaned = knit_common::proto::safe_peer_name(alias.trim());
-    let alias = (!cleaned.is_empty()).then_some(cleaned);
-    let name;
-    {
-        let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(p) = peers.get_mut(index) else {
-            return;
-        };
-        p.alias = alias.clone();
-        name = p.name.clone();
-    }
-    save_peer_sides();
-    match alias {
-        Some(a) => eprintln!("[cfg] {name} の表示名 -> {a}"),
-        None => eprintln!("[cfg] {name} の表示名をコンピュータ名へ戻しました"),
-    }
 }
 
 /// peer-sides.json に保存済みの端末配置が 1 つでもあるか。未接続時に配置
@@ -1038,13 +1223,14 @@ fn rematch_peer_edge_monitors(displays: &[MacDisplay]) {
             let Some((_, saved_mon, meta)) = parse_saved_side(v) else {
                 continue;
             };
-            let new_mon = remap_monitor_index(saved_mon, meta.as_ref(), displays);
+            let new_mon = rematched_edge_monitor(saved_mon, meta.as_ref(), displays);
             if new_mon != p.edge_monitor {
                 eprintln!(
                     "[screen] {} の境界モニターを {} へ張り直しました",
                     p.name,
                     match new_mon {
-                        None => "無効(壁)".to_string(),
+                        None => "全画面".to_string(),
+                        Some(MISSING_EDGE_MONITOR) => "無効(壁)".to_string(),
                         Some(i) => format!("モニター{}", i + 1),
                     }
                 );
@@ -1223,9 +1409,43 @@ pub(crate) fn enter_win_mode_cursor_lock() {
     }
 }
 
-/// Windows モード終了: 関連を復元し、右端の内側へカーソルを戻す。
-/// ny は Windows 側カーソルの高さ(0..1)。与えられた場合は同じ高さへ戻す(境界連続性)。
-pub(crate) fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
+/// 自動の戻り専用。target外は壁にし、位置の分からないgameモードでは推定しない。
+/// sessionのReturn受信でも、WIN_MODEを解除する前にこの関数を呼ぶ。
+/// 手動トグル/切断/緊急解放はleave_win_mode_cursor_unlockを直接使い必ず解放する。
+pub(crate) fn return_from_peer(ratio: f64) -> bool {
+    if GAME_REL.load(Ordering::Relaxed) || !ratio.is_finite() {
+        return false;
+    }
+    let settings = crate::conn::active_screen_settings();
+    let source_ratio = match settings {
+        Some(s) => {
+            let Some(mapped) = crate::screen_settings::map_target(s, ratio) else {
+                return false;
+            };
+            mapped
+        }
+        None if (0.0..=1.0).contains(&ratio) => ratio,
+        None => return false,
+    };
+    leave_win_mode_cursor_unlock_source(Some(source_ratio));
+    true
+}
+
+/// Windows モード終了: 関連を復元し、接続境界の内側へカーソルを戻す。
+/// ratioは相手の辺に沿った比率。手動/緊急解放ではtarget外でも必ず解放し、
+/// 位置だけ最寄りのsource内へ写す(自動の越境はreturn_from_peerで先に検査する)。
+pub(crate) fn leave_win_mode_cursor_unlock(ratio: Option<f64>) {
+    let mapped = ratio.filter(|r| r.is_finite()).map(|r| {
+        match crate::conn::active_screen_settings() {
+            Some(s) => crate::screen_settings::map_target(s, r.clamp(s.target.0, s.target.1))
+                .unwrap_or((s.source.0 + s.source.1) / 2.0),
+            None => r.clamp(0.0, 1.0),
+        }
+    });
+    leave_win_mode_cursor_unlock_source(mapped);
+}
+
+fn leave_win_mode_cursor_unlock_source(ny: Option<f64>) {
     // 冒頭で WIN_MODE を解除し再突入ガードを置く(WIN_MODE の解除を呼び出し元任せに
     // すると、解除を忘れた経路でイベントタップが入力を握り続ける。ガードを最初に
     // 置くことで、復帰処理の途中で再切替が割り込む競合も塞ぐ。既に解除済みの
@@ -1282,12 +1502,24 @@ pub(crate) fn leave_win_mode_cursor_unlock(ny: Option<f64>) {
         let mon = edge_monitor.and_then(|mi| g.displays.get(mi));
         let (x, y) = if let Some(d) = mon {
             let r = ny.unwrap_or(0.5).clamp(0.0, 1.0);
-            let ax = |len: f64| (r * len).clamp(20.0, (len - 20.0).max(20.0));
+            // 20pxの旧コーナー回避は狭いsource範囲の外へ飛ぶため使わない。
+            let ax = |len: f64| (r * len).clamp(0.0, (len - 1.0).max(0.0));
             match dir {
                 1 => (d.x + inset, d.y + ax(d.h)),
                 2 => (d.x + ax(d.w), d.y + inset),
                 3 => (d.x + ax(d.w), (d.y + d.h - inset).max(d.y + inset)),
                 _ => ((d.x + d.w - inset).max(d.x + inset), d.y + ax(d.h)),
+            }
+        } else if let Some(r) = ny.filter(|_| crate::conn::active_screen_settings().is_some()) {
+            // 端末別sourceは20pxの旧コーナー回避で範囲外へ飛ばさない。
+            // Geo::inside_pointは旧単一接続向けの互換挙動を保つ。
+            let (lo, hi) = g.exit_span(dir);
+            let a = (lo + r.clamp(0.0, 1.0) * (hi - lo)).clamp(lo, (hi - 1.0).max(lo));
+            match dir {
+                1 => (g.min_x + inset, a),
+                2 => (a, g.min_y + inset),
+                3 => (a, g.max_y - inset),
+                _ => (g.max_x - inset, a),
             }
         } else {
             g.inside_point(dir, inset, ny)
@@ -1317,13 +1549,14 @@ pub(crate) fn do_toggle(reason: &str) {
         enter_win_mode_cursor_lock();
     } else {
         // 戻り先の高さは Windows 側カーソルの現在高さに合わせる
+        let dir = side_dir();
         let ny = {
             let wc = *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
-            let (_ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-            if wh > 0.0 {
-                (wc.1 / wh).clamp(0.0, 1.0)
+            let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
+            if dir >= 2 {
+                (wc.0 / (ww - 2.0).max(1.0)).clamp(0.0, 1.0)
             } else {
-                0.5
+                (wc.1 / (wh - 2.0).max(1.0)).clamp(0.0, 1.0)
             }
         };
         leave_win_mode_cursor_unlock(Some(ny));
@@ -1681,15 +1914,23 @@ pub(crate) unsafe extern "C" fn tap_callback(
                 // 滞在計測は確定した境界に対してだけ行う。
                 // (デッドロック注意: side_dir は PEERS を取るため、PEERS の保持中に
                 // 呼ばない。find_enter_edge と同じ制約)
-                let boundary = {
+                let (boundary, peer_settings, enter_identity) = {
                     let active_side = side_dir();
                     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-                    boundary_of(&peers, active_side, enter_peer)
+                    let selected = enter_peer.and_then(|i| peers.get(i));
+                    (
+                        boundary_of(&peers, active_side, enter_peer),
+                        selected.map(|p| crate::screen_settings::get(&p.id, p.side)),
+                        selected.map(|p| (p.id.clone(), p.gen)),
+                    )
                 };
                 let Some((dir, boundary_mon)) = boundary else {
                     return event; // 接続のない辺は壁
                 };
-                let (lay_lo, lay_hi) = *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner());
+                // 選択中の他端末のLAY_RANGEを候補端末へ流用しない。
+                // 端末一覧を持たない旧単一接続だけ共通値を使う。
+                let (lay_lo, lay_hi) = peer_settings.map(|s| s.source)
+                    .unwrap_or_else(|| *LAY_RANGE.lock().unwrap_or_else(|e| e.into_inner()));
                 // 「切替境界までの距離」は確定した境界(モニター指定込み)で測る。
                 // 従来は全体領域の端で測っていたため、メインモニター指定の境界では
                 // 距離が 0 に届かず、逆に上・下・外部モニターの端のような接続のない
@@ -1822,12 +2063,24 @@ pub(crate) unsafe extern "C" fn tap_callback(
                     // 予告もファイルも、実際に越える端末へ送る。先に送信先を確定する。
                     // この辺に割り当てられた端末へ入力の送信先を切り替える
                     // (端末ごとの配置。複数該当時は最短の端末を優先)
-                    if let Some(idx) = enter_peer.or_else(|| peer_at_side(dir)) {
-                        let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-                        if idx != act {
-                            activate_peer(idx, "境界");
+                    if let Some((id, generation)) = enter_identity.as_ref() {
+                        // 添字は切断で前詰めされ得るためIDで切り替え、成功も確認する。
+                        // writerの待機中/切断中に別端末へ入力を誤送信しない。
+                        activate_peer_by_id(id, "境界");
+                        if !is_active_peer(id, *generation) {
+                            return event;
                         }
                     }
+                    let source_ratio = along_ratio_on(&g, dir, boundary_mon, loc.x, loc.y);
+                    let target_ratio = match peer_settings {
+                        Some(settings) => {
+                            let Some(mapped) = crate::screen_settings::map_source(settings, source_ratio) else {
+                                return event;
+                            };
+                            mapped
+                        }
+                        None => source_ratio,
+                    };
                     // 掴んだファイルは切替より先に受け付け、予告を押下より前に本線へ積む。
                     // 渡せない掴みでは境界を越えず、Mac 側のドラッグをそのまま続けさせる
                     // (越えると元のドラッグを画面端で終わらせることになる)。
@@ -1915,8 +2168,7 @@ pub(crate) unsafe extern "C" fn tap_callback(
                     //(反転なし: 画面上端同士が対応)
                     let (nx, ny) = {
                         let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-                        let r = along_ratio_on(&g, dir, boundary_mon, loc.x, loc.y);
-                        win_entry_pos(dir, (ww, wh), r)
+                        win_entry_pos(dir, (ww, wh), target_ratio)
                     };
                     send_msg(&Msg::Warp { nx, ny });
                     eprintln!("[warp] -> win ({:.2},{:.2})", nx, ny);
@@ -1957,7 +2209,9 @@ pub(crate) unsafe extern "C" fn tap_callback(
                     {
                         let (ww, wh) = *WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
                         RETURN_ARMED.store(false, Ordering::Relaxed);
-                        *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner()) = (nx * ww, ny * wh);
+                        *WIN_CUR.lock().unwrap_or_else(|e| e.into_inner()) = (
+                            nx * (ww - 2.0).max(0.0), ny * (wh - 2.0).max(0.0),
+                        );
                     }
                     enter_win_mode_cursor_lock();
                     return std::ptr::null_mut();
@@ -2170,7 +2424,12 @@ pub(crate) unsafe extern "C" fn tap_callback(
             let dx = CGEventGetIntegerValueField(event, FIELD_DELTA_X) as f64;
             let dy = CGEventGetIntegerValueField(event, FIELD_DELTA_Y) as f64;
             if dx != 0.0 || dy != 0.0 {
-                let sc = mouse_scale();
+                // 端末の感度はここで一度だけ掛ける。Androidのgain/density補正は
+                // 受け側Pointerが担当するため、ここで追加の密度倍率を掛けない。
+                let settings = crate::conn::active_screen_settings();
+                let sc = settings.map(|s| s.sensitivity)
+                    .unwrap_or_else(|| crate::screen_settings::PeerSettings::for_side(0).sensitivity);
+                let dir = side_dir();
                 if MOUSE_ABS_MODE.load(Ordering::Relaxed) && !GAME_REL.load(Ordering::Relaxed) {
                     // 絶対位置モード: Mac の加速済み delta に Windows 側の加速が
                     // 二重に乗るのを防ぎつつ、画面比率で見た目の移動距離を揃える
@@ -2179,27 +2438,35 @@ pub(crate) unsafe extern "C" fn tap_callback(
                         let g = geo();
                         (g.main_w, g.main_h)
                     };
-                    let (sx, sy) = (ww / mw, wh / mh); // 方向別スケール(改善B)
-                                                       // 重要: WIN_CUR のガードをこのブロック内で必ず解放してから
-                                                       // leave_win_mode_cursor_unlock を呼ぶ(内部で WIN_CUR を再ロック
-                                                       // するため、保持したまま呼ぶと自己デッドロックでタップが固まる)
+                    // WIN_CURのガードは復帰前に必ず離す(復帰側が再取得する)。
+                    // 切断直後などの不正な画面寸法は座標を作らず入力を握る。
+                    if !ww.is_finite() || !wh.is_finite() || ww <= 2.0 || wh <= 2.0
+                        || !mw.is_finite() || !mh.is_finite() || mw <= 0.0 || mh <= 0.0 {
+                        return std::ptr::null_mut();
+                    }
+                    let (span_x, span_y) = (ww - 2.0, wh - 2.0);
+                    let (sx, sy) = (span_x / mw, span_y / mh);
                     let (nx, ny, at_left) = {
                         let mut wc = WIN_CUR.lock().unwrap_or_else(|e| e.into_inner());
-                        wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, ww - 2.0);
-                        wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, wh - 2.0);
+                        wc.0 = (wc.0 + dx * sc * sx).clamp(0.0, span_x);
+                        wc.1 = (wc.1 + dy * sc * sy).clamp(0.0, span_y);
                         // Mac 側へ戻る辺は Windows の位置で決まる(右配置なら Windows の左端、
                         // 左配置なら右端、上配置なら下端、下配置なら上端)。旧実装は常に
                         // 左端で判定し、上下配置では Windows の左端に触れるだけで戻っていた
                         // 戻りも境界そのもの(clamp の止まり値)でのみ判定する
                         // 入った直後の位置は戻る辺ちょうど。そこから離れるまでは戻さない
-                        if abs_edge_dist(side_dir(), wc.0, wc.1, ww, wh) > EDGE_REARM_PX {
+                        if abs_edge_dist(dir, wc.0, wc.1, ww, wh) > EDGE_REARM_PX {
                             RETURN_ARMED.store(true, Ordering::Relaxed);
                         }
+                        // clampの止まり位置を1.0へ正規化し、targetの端点も到達可能にする。
+                        let ratio = if dir >= 2 { wc.0 / span_x } else { wc.1 / span_y };
+                        let in_target = settings.is_none_or(|s| crate::screen_settings::contains(s.target, ratio));
                         let at_edge = RETURN_ARMED.load(Ordering::Relaxed)
-                            && abs_edge_reached(side_dir(), wc.0, wc.1, ww, wh);
+                            && in_target
+                            && abs_edge_reached(dir, wc.0, wc.1, ww, wh);
                         (
-                            wc.0 / ww,
-                            wc.1 / wh,
+                            wc.0 / span_x,
+                            wc.1 / span_y,
                             !HOTKEY_ONLY.load(Ordering::Relaxed)
                                 && event_type == EVT_MOUSE_MOVED
                                 && at_edge
@@ -2215,8 +2482,7 @@ pub(crate) unsafe extern "C" fn tap_callback(
                     send_msg(&Msg::MouseAbs { nx, ny });
                     // 左端到達はMac内完結で即復帰(Win往復のRTT分を削減)
                     // ドラッグ中は意図しない復帰をしない(ボタン操作中の境界越えのため)
-                    if at_left {
-                        WIN_MODE.store(false, Ordering::Relaxed);
+                    if at_left && return_from_peer(if dir >= 2 { nx } else { ny }) {
                         DIAG_MODE_COUNT.fetch_add(1, Ordering::Relaxed);
                         // 診断: どの位置で戻り判定になったか(推定と実物のずれの調査用)
                         let (aww, awh) =
@@ -2231,8 +2497,7 @@ pub(crate) unsafe extern "C" fn tap_callback(
                         } else {
                             eprintln!("[mode] MAC (abs-edge)");
                         }
-                        // 境界に沿った比率: 左右の辺は縦位置、上下の辺は横位置
-                        leave_win_mode_cursor_unlock(Some(if side_dir() >= 2 { nx } else { ny }));
+                        // return_from_peerでtarget検査とsourceへの逆mapを確定済み。
                     }
                 } else {
                     // 相対移動モード(従来互換)
@@ -2389,6 +2654,50 @@ mod entry_pos_tests {
 #[cfg(test)]
 mod side_geometry_tests {
     use super::{base_dir, boundary_of, side_lay_range, PeerEntry};
+
+    #[test]
+    fn independent_peer_sources_select_the_correct_peer_and_leave_gaps_as_walls() {
+        use crate::conn::{ACTIVE_PEER, PEERS, PEERS_TEST_SERIAL};
+        use crate::screen_settings::{set_many, PeerSettings};
+        let _serial = PEERS_TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore(Vec<PeerEntry>, usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+                *peers = std::mem::take(&mut self.0);
+                *active = self.1;
+            }
+        }
+        let (mut upper, mut lower) = (peer(4), peer(5));
+        upper.id = "source-selection-upper".into();
+        lower.id = "source-selection-lower".into();
+        upper.edge_monitor = Some(0);
+        lower.edge_monitor = Some(0);
+        let settings = |source| PeerSettings { source, target: (0.3, 0.8), sensitivity: 1.2 };
+        set_many(&[(upper.id.clone(), settings((0.1, 0.3))),
+            (lower.id.clone(), settings((0.6, 0.8)))]).unwrap();
+        let _restore = {
+            let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+            Restore(std::mem::replace(&mut *peers, vec![upper, lower]),
+                std::mem::replace(&mut *active, 1))
+        };
+        let mut g = super::GEO_DEFAULT.clone();
+        g.displays = vec![super::MacDisplay { x: 50.0, y: 100.0, w: 1000.0,
+            h: 800.0, main: true, name: String::new() }];
+        // モニター自身の辺に沿う比率で判定する。選択中のlowerに依存しない。
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 260.0).1, Some(0));
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 660.0).1, Some(1));
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 500.0).1, None);
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 100.0).1, None);
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 950.0).1, None);
+        PEERS.lock().unwrap_or_else(|e| e.into_inner())[0].edge_monitor = Some(9);
+        assert_eq!(super::find_enter_edge(&g, 1050.0, 260.0).1, None);
+        // 自動Returnもtarget外/非有限では解除しない(CGの呼び出しに到達しない)。
+        assert!(!super::return_from_peer(0.2));
+        assert!(!super::return_from_peer(f64::NAN));
+    }
 
     fn peer(side: u8) -> PeerEntry {
         PeerEntry {
@@ -2705,6 +3014,236 @@ mod alias_tests {
             "monitor": -1,
         });
         assert_eq!(alias_from_entry(&without_alias), None);
+    }
+}
+
+#[cfg(test)]
+mod peer_sides_save_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn displays() -> Vec<MacDisplay> {
+        vec![
+            MacDisplay {
+                x: 0.0, y: 0.0, w: 2560.0, h: 1440.0,
+                main: true, name: "内蔵".into(),
+            },
+            MacDisplay {
+                x: 2560.0, y: 0.0, w: 1920.0, h: 1080.0,
+                main: false, name: "外付け".into(),
+            },
+        ]
+    }
+
+    fn peer(id: &str, side: u8, monitor: Option<usize>) -> PeerEntry {
+        PeerEntry {
+            id: id.into(), name: format!("{id}のPC"), alias: None,
+            ip: "127.0.0.1".parse().unwrap(), screen: (1920.0, 1080.0),
+            monitors: Vec::new(), writer: None, gen: 42, side,
+            edge_monitor: monitor, ver: knit_common::proto::VERSION,
+        }
+    }
+
+    #[test]
+    fn merge_preserves_offline_entries_and_replaces_live_alias_and_name() {
+        let original = serde_json::json!({
+            "offline": {"side": 6, "monitor": 1, "name": "切断中", "alias": "机", "future": [1, 2]},
+            "legacy-offline": 13,
+            "live": {"side": 0, "monitor": 1, "alias": "消す名前", "monitor_w": 1920},
+        }).as_object().unwrap().clone();
+        let mut live = peer("live", 5, None);
+        let merged = merge_peer_sides(original.clone(), &peer_placements(&[live]), &displays());
+        assert_eq!(merged["offline"], original["offline"]);
+        assert_eq!(merged["legacy-offline"], original["legacy-offline"]);
+        assert_eq!(merged["live"]["name"], "liveのPC");
+        assert_eq!(merged["live"]["side"], 5);
+        assert_eq!(merged["live"]["monitor"], -1);
+        assert!(merged["live"].get("alias").is_none(), "liveのalias削除は保存へ反映");
+        assert!(merged["live"].get("monitor_w").is_none(), "全画面は古いメタを残さない");
+        live = peer("live", 7, Some(1));
+        live.alias = Some("新しい名前".into());
+        let merged = merge_peer_sides(merged, &peer_placements(&[live]), &displays());
+        assert_eq!(alias_from_entry(&merged["live"]), Some("新しい名前".into()));
+        assert_eq!(merged["live"]["monitor_name"], "外付け");
+        assert_eq!(merge_peer_sides(original.clone(), &[], &[]), original,
+            "最後の切断でPEERSが空でも既存配置を消さない");
+    }
+
+    #[test]
+    fn missing_monitor_is_a_wall_and_keeps_metadata_for_reconnection() {
+        let all = displays();
+        let original = merge_peer_sides(PeerSidesMap::new(),
+            &peer_placements(&[peer("live", 4, Some(1))]), &all);
+        let old = original["live"].clone();
+        let (_, index, meta) = parse_saved_side(&old).unwrap();
+        let missing = rematched_edge_monitor(index, meta.as_ref(), &all[..1]);
+        assert_eq!(missing, Some(usize::MAX));
+        assert_eq!(remap_monitor_index(index, meta.as_ref(), &all[..1]), None,
+            "既存のpure remap APIの意味は変えない");
+        let mut g = GEO_DEFAULT.clone();
+        g.displays = all[..1].to_vec();
+        assert_eq!(peer_gap(&g, missing, 4, 2559.0, 500.0), f64::MAX);
+        let saved = merge_peer_sides(original, &peer_placements(&[peer("live", 4, missing)]), &all[..1]);
+        let bytes = serde_json::to_string(&saved).unwrap();
+        let reread = parse_peer_sides_map(&bytes).unwrap();
+        let (side, index, meta) = parse_saved_side(&reread["live"]).unwrap();
+        assert_eq!(side, 4);
+        assert_eq!(index, Some(1), "missing保存は元番号を残し、-1=全画面へ化けない");
+        for field in ["monitor_w", "monitor_h", "monitor_rel_x", "monitor_rel_y", "monitor_name"] {
+            assert_eq!(reread["live"][field], old[field], "元の物理メタを残す: {field}");
+        }
+        assert_eq!(rematched_edge_monitor(index, meta.as_ref(), &all), Some(1),
+            "接続し直せば同じ物理モニターへ戻る");
+        assert_eq!(rematched_edge_monitor(None, meta.as_ref(), &all), None,
+            "None=全画面をメタの有無で物理指定にしない");
+        assert_eq!(rematched_edge_monitor(Some(9), None, &all), Some(usize::MAX));
+        assert_eq!(rematched_edge_monitor(Some(0), None, &all), Some(0));
+        assert_eq!(rematched_edge_monitor(None, None, &[]), None);
+    }
+
+    #[test]
+    fn missing_sentinel_round_trips_and_legacy_monitor_number_is_preserved() {
+        let sentinel = peer_placements(&[peer("live", 5, Some(MISSING_EDGE_MONITOR))]);
+        let saved = merge_peer_sides(PeerSidesMap::new(), &sentinel, &[]);
+        let reread = parse_peer_sides_map(&serde_json::to_string(&saved).unwrap()).unwrap();
+        assert_eq!(parse_saved_side(&reread["live"]), Some((5, Some(usize::MAX), None)),
+            "元エントリがなくてもsentinelを正のJSON整数で往復できる");
+        let old = serde_json::json!({"live": 9}).as_object().unwrap().clone();
+        let saved = merge_peer_sides(old, &sentinel, &displays()[..1]);
+        let (side, index, meta) = parse_saved_side(&saved["live"]).unwrap();
+        assert_eq!((side, index), (5, Some(1)), "メタ無し旧形式の元番号を保持する");
+        assert_eq!(rematched_edge_monitor(index, meta.as_ref(), &displays()), Some(1));
+    }
+
+    #[test]
+    fn save_parser_rejects_corrupt_or_non_map_instead_of_empty_overwrite() {
+        for invalid in ["{ broken", "null", "[]", "1", "\"text\""] {
+            assert!(parse_peer_sides_map(invalid).is_err(), "上書きを拒否: {invalid}");
+        }
+        assert!(parse_peer_sides_map("{}").unwrap().is_empty());
+        assert_eq!(parse_saved_side(&serde_json::json!({"side": 3, "monitor": -1})),
+            Some((3, None, None)));
+        assert_eq!(parse_saved_side(&serde_json::json!({"side": 2})), Some((2, None, None)));
+    }
+
+    #[test]
+    fn apply_validates_every_update_before_save_or_memory_changes() {
+        let valid = ("a".to_string(), 4, Some(1));
+        for invalid in [
+            ("missing".into(), 1, None),
+            ("".into(), 1, None),
+            (" \t".into(), 1, None),
+            ("a\n".into(), 1, None),
+            ("b".into(), 8, None),
+            ("b".into(), 1, Some(2)),
+            ("b".into(), 1, Some(usize::MAX)),
+            ("a".into(), 1, None),
+        ] {
+            let mut peers = vec![peer("a", 0, None), peer("b", 1, Some(0))];
+            let before = peer_placements(&peers);
+            let called = Cell::new(false);
+            let result = apply_peer_placements_with_save(&mut peers, &displays(),
+                &[valid.clone(), invalid], |_| { called.set(true); Ok(()) });
+            assert!(result.is_err());
+            assert!(!called.get(), "後続の不正値も保存より先に検証する");
+            assert_eq!(peer_placements(&peers), before);
+        }
+        let mut duplicated = vec![peer("a", 0, None), peer("a", 1, None)];
+        assert!(apply_peer_placements_with_save(&mut duplicated, &displays(), &[valid],
+            |_| panic!("接続IDの重複は保存前に拒否")).is_err());
+    }
+
+    #[test]
+    fn failed_apply_keeps_all_memory_and_success_commits_after_save() {
+        let mut peers = vec![peer("a", 0, None), peer("b", 1, Some(0))];
+        peers[0].alias = Some("そのまま".into());
+        let before = peer_placements(&peers);
+        let updates = [("a".into(), 6, Some(1)), ("b".into(), 3, None)];
+        let error = apply_peer_placements_with_save(&mut peers, &displays(), &updates, |draft| {
+            assert_eq!(draft[0].side, 6);
+            assert_eq!(draft[1].edge_monitor, None);
+            Err("atomic保存失敗".into())
+        }).unwrap_err();
+        assert_eq!(error, "atomic保存失敗");
+        assert_eq!(peer_placements(&peers), before);
+        apply_peer_placements_with_save(&mut peers, &displays(), &updates, |draft| {
+            assert_eq!(draft[0].name, before[0].name);
+            assert_eq!(draft[0].alias, before[0].alias);
+            Ok(())
+        }).unwrap();
+        assert_eq!((peers[0].side, peers[0].edge_monitor), (6, Some(1)));
+        assert_eq!((peers[1].side, peers[1].edge_monitor), (3, None));
+        assert_eq!(peers[0].gen, 42, "配置以外の接続状態は変更しない");
+        assert_eq!(peers[0].alias, before[0].alias);
+        apply_peer_placements_with_save(&mut peers, &[], &[],
+            |_| panic!("空Applyは保存不要")).unwrap();
+    }
+
+    #[test]
+    fn test_build_never_reads_or_writes_real_peer_settings() {
+        assert!(peer_sides_memory_only());
+        assert!(load_peer_sides_json().is_none());
+        assert!(try_save_peer_sides().is_ok());
+        assert!(persist_peer_placements(&[], &[]).is_ok());
+    }
+
+    /// set_peer_alias(設定「接続」の「名前…」): PEERS の該当端末の alias を
+    /// 更新し、保存形式(peer-sides.json 相当の merge 結果)へ反映する。
+    /// 空・空白のみは削除(None)=保存形式から alias キーが落ちる。
+    /// 値は hello の name と同じ規則で検査される(trim・偽装文字除去)。
+    /// PEERS は共有 static のため入れ替えて必ず元へ戻す(実ファイルの書込は
+    /// peer_sides_memory_only の cfg(test) ガードが回避する)
+    #[test]
+    fn set_peer_alias_updates_memory_and_saved_shape() {
+        use crate::conn::PEERS;
+        let _serial = crate::conn::PEERS_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved = std::mem::replace(
+            &mut *PEERS.lock().unwrap_or_else(|e| e.into_inner()),
+            vec![peer("live", 1, None)],
+        );
+        let placements = || peer_placements(&PEERS.lock().unwrap_or_else(|e| e.into_inner()));
+        // 設定: 前後の空白は落ち、PEERS と保存形式の両方へ載る
+        set_peer_alias("live", Some("  事務室のPC ")).unwrap();
+        assert_eq!(
+            PEERS.lock().unwrap_or_else(|e| e.into_inner())[0]
+                .alias
+                .as_deref(),
+            Some("事務室のPC")
+        );
+        let saved_shape = merge_peer_sides(PeerSidesMap::new(), &placements(), &[]);
+        assert_eq!(saved_shape["live"]["alias"], "事務室のPC");
+        assert_eq!(alias_from_entry(&saved_shape["live"]), Some("事務室のPC".into()));
+        // 削除(空文字列): PEERS の alias と保存形式の alias キーが落ちる
+        set_peer_alias("live", Some("   ")).unwrap();
+        assert!(PEERS.lock().unwrap_or_else(|e| e.into_inner())[0]
+            .alias
+            .is_none());
+        let removed = merge_peer_sides(saved_shape, &placements(), &[]);
+        assert!(removed["live"].get("alias").is_none(), "削除は保存へ反映");
+        assert_eq!(alias_from_entry(&removed["live"]), None);
+        // None も同じく削除
+        set_peer_alias("live", Some("一時")).unwrap();
+        set_peer_alias("live", None).unwrap();
+        assert!(merge_peer_sides(removed, &placements(), &[])["live"]
+            .get("alias")
+            .is_none());
+        // 偽装文字(Bidi オーバーライド)は hello の name と同じ規則で除去
+        set_peer_alias("live", Some("A\u{202e}B")).unwrap();
+        assert_eq!(
+            PEERS.lock().unwrap_or_else(|e| e.into_inner())[0]
+                .alias
+                .as_deref(),
+            Some("AB")
+        );
+        // 存在しない端末・不正なIDはエラー(保存も表示も変えない)
+        assert!(set_peer_alias("ghost", Some("x")).is_err());
+        assert!(set_peer_alias("", Some("x")).is_err());
+        assert!(set_peer_alias("a\nb", Some("x")).is_err());
+        // 設定以外の接続状態(gen・writer の有無)は変更しない
+        assert_eq!(PEERS.lock().unwrap_or_else(|e| e.into_inner())[0].gen, 42);
+        *PEERS.lock().unwrap_or_else(|e| e.into_inner()) = saved;
     }
 }
 
