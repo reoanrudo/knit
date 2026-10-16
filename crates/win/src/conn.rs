@@ -58,7 +58,9 @@ fn note_disconnected() {
         .ok();
 }
 
-/// 最終接続の表示(ステータス窓のフッター用)
+/// 最終接続の表示(設定UI簡素化で表示場所を失ったが、診断・今後の状態行拡張の
+/// ために残す)
+#[allow(dead_code)]
 pub fn last_connected_line() -> Option<String> {
     let ms = LAST_CONNECTED_MS.load(Ordering::Relaxed);
     if ms == 0 {

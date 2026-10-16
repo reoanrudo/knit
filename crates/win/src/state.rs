@@ -13,6 +13,76 @@ pub(crate) static SPK_MUTE_MODE: std::sync::atomic::AtomicBool = std::sync::atom
 pub(crate) static RTT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Windows 画面の位置(0=Macの右/1=左/2=上/3=下)。Mac から Cfg で同期
 pub static SIDE_W: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Mac の Cfg が指定する Windows 側の接続区間。None は旧版互換の全辺。
+/// 2端点は同じロックで読み書きし、不正な Some も保持して「越境不可」にする。
+static TARGET_RANGE_W: std::sync::Mutex<Option<[f64; 2]>> = std::sync::Mutex::new(None);
+
+pub(crate) fn set_target_range(range: Option<[f64; 2]>) {
+    *TARGET_RANGE_W.lock().unwrap_or_else(|e| e.into_inner()) = range;
+}
+
+/// Cfg更新の途中に、新旧のside/targetを混ぜてOLE側へ見せない。
+pub(crate) fn set_connection_edge(side: u8, range: Option<[f64; 2]>) {
+    let mut target = TARGET_RANGE_W.lock().unwrap_or_else(|e| e.into_inner());
+    SIDE_W.store(side.min(7), std::sync::atomic::Ordering::Relaxed);
+    *target = range;
+}
+
+pub(crate) fn connection_edge() -> (u8, Option<[f64; 2]>) {
+    let target = TARGET_RANGE_W.lock().unwrap_or_else(|e| e.into_inner());
+    (SIDE_W.load(std::sync::atomic::Ordering::Relaxed), *target)
+}
+
+/// 未指定だけ全辺にする。逆順・空・非有限・0..1外は安全側(接続区間なし)。
+pub(crate) fn effective_target_range(range: Option<[f64; 2]>) -> Option<[f64; 2]> {
+    let [start, end] = range.unwrap_or([0.0, 1.0]);
+    (start.is_finite() && end.is_finite() && 0.0 <= start && start < end && end <= 1.0)
+        .then_some([start, end])
+}
+
+pub(crate) fn target_range_contains(range: Option<[f64; 2]>, position: f64) -> bool {
+    effective_target_range(range).is_some_and(|[start, end]| {
+        position.is_finite() && start <= position && position <= end
+    })
+}
+
+/// 辺に沿う既存の正規化座標。左右辺は上→下、上下辺は左→右(反転なし)。
+/// 既存 Return/DragOffer と同じく長さ w/h で割る。画面外や無効な画面は拒否。
+pub(crate) fn edge_position(side: u8, px: i32, py: i32, w: i32, h: i32) -> Option<f64> {
+    if w <= 0 || h <= 0 || px < 0 || px >= w || py < 0 || py >= h {
+        return None;
+    }
+    Some(if matches!(side, 2 | 3) {
+        px as f64 / w as f64
+    } else {
+        py as f64 / h as f64
+    })
+}
+
+/// 区間内にある実ピクセルの半開区間。包含端点と position=pixel/extent に合わせ、
+/// 内側へ丸めて範囲外のピクセルを OLE の帯に含めない。
+pub(crate) fn target_pixel_span(range: Option<[f64; 2]>, extent: i32) -> Option<(i32, i32)> {
+    if extent <= 0 {
+        return None;
+    }
+    let [start, end] = effective_target_range(range)?;
+    let mut first = (start * extent as f64).ceil() as i32;
+    let mut after = ((end * extent as f64).floor() as i64 + 1).min(extent as i64) as i32;
+    // 浮動小数点の乗算が整数境界の反対側へ丸まった場合も、contains と一致させる。
+    if first > 0 && target_range_contains(range, (first - 1) as f64 / extent as f64) {
+        first -= 1;
+    }
+    if first < extent && !target_range_contains(range, first as f64 / extent as f64) {
+        first += 1;
+    }
+    if after < extent && target_range_contains(range, after as f64 / extent as f64) {
+        after += 1;
+    }
+    if after > 0 && !target_range_contains(range, (after - 1) as f64 / extent as f64) {
+        after -= 1;
+    }
+    (first < after).then_some((first, after))
+}
 /// Windows 側で現在押下中のマウスボタン(後片付けの UP 注入を押下中のみに絞る。
 /// 押されていないボタンへの UP は通常無害だが、一部アプリで意図しない
 /// クリックとして扱われる懸念を排除する)
@@ -139,4 +209,76 @@ pub(crate) fn set_mac_pref(key: &str, value: serde_json::Value) {
     }
     let json = serde_json::json!({ key: value }).to_string();
     send_main_msg(&Msg::PrefsSet { json });
+}
+
+#[cfg(test)]
+mod target_range_tests {
+    use super::{edge_position, effective_target_range, target_pixel_span, target_range_contains};
+
+    #[test]
+    fn missing_range_is_full_edge_and_invalid_ranges_fail_closed() {
+        assert_eq!(effective_target_range(None), Some([0.0, 1.0]));
+        for position in [0.0, 0.5, 1.0] {
+            assert!(target_range_contains(None, position));
+        }
+        for range in [
+            [-0.1, 0.5], [0.5, 1.1], [0.5, 0.5], [0.8, 0.2],
+            [f64::NAN, 0.5], [0.2, f64::INFINITY], [f64::NEG_INFINITY, 0.8],
+        ] {
+            assert_eq!(effective_target_range(Some(range)), None);
+            assert!(!target_range_contains(Some(range), 0.5));
+            assert_eq!(target_pixel_span(Some(range), 1000), None);
+        }
+        for position in [f64::NAN, f64::INFINITY, -0.01, 1.01] {
+            assert!(!target_range_contains(None, position));
+        }
+        assert!(target_range_contains(Some([0.2, 0.8]), 0.2));
+        assert!(target_range_contains(Some([0.2, 0.8]), 0.8));
+        assert!(!target_range_contains(Some([0.2, 0.8]), 0.19));
+        assert!(!target_range_contains(Some([0.2, 0.8]), 0.81));
+    }
+
+    #[test]
+    fn edge_coordinates_keep_top_down_and_left_right_for_every_side() {
+        for side in [0, 1, 4, 5, 6, 7] {
+            assert_eq!(edge_position(side, 100, 250, 1000, 1000), Some(0.25));
+            assert_eq!(edge_position(side, 900, 750, 1000, 1000), Some(0.75));
+        }
+        for side in [2, 3] {
+            assert_eq!(edge_position(side, 250, 100, 1000, 1000), Some(0.25));
+            assert_eq!(edge_position(side, 750, 900, 1000, 1000), Some(0.75));
+        }
+        for (px, py, w, h) in [(-1, 0, 10, 10), (0, 10, 10, 10), (10, 0, 10, 10),
+            (0, 0, 0, 10), (0, 0, 10, -1)] {
+            assert_eq!(edge_position(0, px, py, w, h), None);
+        }
+    }
+
+    #[test]
+    fn pixel_spans_include_exact_endpoints_and_never_expand_the_range() {
+        assert_eq!(target_pixel_span(None, 1000), Some((0, 1000)));
+        assert_eq!(target_pixel_span(Some([0.25, 0.75]), 1000), Some((250, 751)));
+        assert_eq!(target_pixel_span(Some([0.251, 0.749]), 100), Some((26, 75)));
+        assert_eq!(target_pixel_span(Some([0.251, 0.259]), 100), None);
+        assert_eq!(target_pixel_span(Some([0.0, 0.5]), 1), Some((0, 1)));
+        assert_eq!(target_pixel_span(Some([0.5, 1.0]), 1), None);
+        assert_eq!(target_pixel_span(None, 0), None);
+        assert_eq!(target_pixel_span(None, -1), None);
+        // 端点がピクセルの比率と一致する/しない両方で、帯とreturn判定の同値性を検証。
+        for extent in [1, 2, 3, 7, 100, 1080, 1920] {
+            for start in 0..10 {
+                for end in start + 1..=10 {
+                    let range = Some([start as f64 / 10.0, end as f64 / 10.0]);
+                    let span = target_pixel_span(range, extent);
+                    for pixel in 0..extent {
+                        assert_eq!(
+                            span.is_some_and(|(first, after)| first <= pixel && pixel < after),
+                            target_range_contains(range, pixel as f64 / extent as f64),
+                            "extent={extent}, range={range:?}, pixel={pixel}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

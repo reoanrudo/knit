@@ -216,6 +216,25 @@ pub(crate) fn inject_key(vk: u16, up: bool) -> bool {
     inject_key_ex(vk, up, is_extended_vk(vk))
 }
 
+/// Enter キー 1 打ちの注入バッファ(VK_RETURN の keydown。scan code 付き)。
+/// ロック解除の連動で操作補助へ中継するために helper.rs から使う。
+/// InputBuf の構築はこのモジュール内に閉じる(共用体レイアウトの知識を散らさない)
+pub(crate) fn enter_key_buf() -> InputBuf {
+    extern "system" {
+        fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
+    }
+    const VK_RETURN: u16 = 0x0D;
+    let scan = unsafe { MapVirtualKeyW(VK_RETURN as u32, 0 /*MAPVK_VK_TO_VSC*/) };
+    // KEYBDINPUT の共用体先頭 u32 は「低16bit=wVk / 高16bit=wScan」
+    let vk_scan = ((scan & 0xFFFF) << 16) | (VK_RETURN as u32 & 0xFFFF);
+    InputBuf {
+        itype: INPUT_KEYBOARD,
+        _pad: 0,
+        body: [vk_scan, 0, 0, 0, 0, 0],
+        extra: 0,
+    }
+}
+
 fn inject_key_ex(vk: u16, up: bool, extended: bool) -> bool {
     // wScan を必ず付ける: 日本語 IME 等は scan code 無しのキーを無視/不安定に
     // 扱うことがある(「ー」等の OEM キーで顕著)。vk と scan の併用が最も互換性が高い

@@ -9,7 +9,7 @@ use crate::input::{
     ime_set_open_impl, inject_key, inject_scroll, is_extended_vk, refresh_vscreen,
     remote_mouse_button, remote_mouse_move_abs, remote_mouse_move_rel, vscreen,
 };
-use crate::state::{DEBUG_KEYS, log_safe, MAIN_SHUTDOWN, RTT_MS, SIDE_W, SPK_MUTE_MODE, WTX};
+use crate::state::{DEBUG_KEYS, log_safe, MAIN_SHUTDOWN, RTT_MS, SPK_MUTE_MODE, WTX};
 use crate::tray;
 use crate::xfer::{RX_BYTES, RX_DRAG};
 use knit_common::keymap::mac_kc_to_win_vk;
@@ -166,6 +166,8 @@ pub(crate) fn session(
             }
         }
     });
+    // 前の相手の区間を再接続へ持ち越さない。Cfg 省略の旧版は全辺として動作する。
+    crate::state::set_target_range(None);
     let mut mods = ModState::new();
     // マウス移動のサブピクセル残高。Mac のトラックパッドは 1px 未満の delta が
     // 連続するため、毎回 round すると遅い移動が消えてカクカクする。整数部のみ注入し
@@ -322,6 +324,7 @@ pub(crate) fn session(
                 cmd_alt,
                 spk_mute,
                 side,
+                target_range,
                 clip,
                 files,
                 listen,
@@ -332,7 +335,10 @@ pub(crate) fn session(
                 // ものを送らない・聞いていない間は音声を流さないために使う
                 FILES_SHARE_W.store(files, Ordering::Relaxed);
                 audio::LISTEN_MAC.store(listen, Ordering::Relaxed);
-                SIDE_W.store(side.min(7), Ordering::Relaxed);
+                crate::state::set_connection_edge(side, target_range);
+                if crate::state::effective_target_range(target_range).is_none() {
+                    println!("[cfg] 接続区間が不正なため Windows 側の辺からの越境を停止します");
+                }
                 println!("[cfg] ⌘キー -> {}", if cmd_alt { "Alt" } else { "Ctrl" });
                 if SPK_MUTE_MODE.swap(spk_mute, Ordering::Relaxed) != spk_mute {
                     println!(
@@ -543,6 +549,19 @@ pub(crate) fn session(
                 mods.release_everything();
                 unsafe { LockWorkStation() };
             }
+            Msg::Unlock => {
+                // Mac のロックが解除された(版 16 以降)。ロック中かつ設定が有効な
+                // ときだけ解除を試みる。DPAPI 復号とパイプ書き込みで受信ループを
+                // 塞がないよう別スレッドで行う(判定は unlock_attempt 内の純粋関数)
+                let locked = crate::tray::LOCKED_STATE.load(Ordering::Relaxed);
+                let enabled = crate::tray::unlock_enabled();
+                if locked && enabled {
+                    println!("[unlock] Mac のロック解除に合わせてこの PC の解除を試みます");
+                    std::thread::spawn(crate::helper::unlock_attempt);
+                } else {
+                    println!("[unlock] Mac のロック解除通知を受け取りました(ロック中でないか設定が無効のため何もしません)");
+                }
+            }
             Msg::Leave => {
                 dragdrop::edge::CONTROLLED.store(false, Ordering::Relaxed);
                 // Mac が制御を取り戻した: 押しっぱなしを残さず、Windows 側で
@@ -732,6 +751,21 @@ fn return_edge_hit(side: u8, px: i32, py: i32, w: i32, h: i32) -> bool {
     }
 }
 
+/// 範囲外は壁。通知とキー解放の両方に同じ判定を使う。
+fn return_edge_position(
+    side: u8,
+    px: i32,
+    py: i32,
+    w: i32,
+    h: i32,
+    range: Option<[f64; 2]>,
+) -> Option<f64> {
+    let position = crate::state::edge_position(side, px, py, w, h)?;
+    (return_edge_hit(side, px, py, w, h)
+        && crate::state::target_range_contains(range, position))
+    .then_some(position)
+}
+
 /// カーソルが Mac 側の境界(SIDE に応じた端)に達したら Mac へ復帰通知
 /// (連打防止 0.7 秒クールダウン)。境界に沿った比率も送り、Mac 側の復帰位置に
 /// 反映させる(境界の連続性)。side 0/1=縦比率、2/3=横比率を ny へ載せる
@@ -759,42 +793,57 @@ fn maybe_notify_return(
     }
     let (vx, vy, w, h) = vscreen();
     let (px, py) = (p.x - vx, p.y - vy);
-    let side = SIDE_W.load(Ordering::Relaxed);
+    let (side, range) = crate::state::connection_edge();
     if return_edge_dist(side, px, py, w, h) > 24 {
         RETURN_ARMED_W.store(true, Ordering::Relaxed);
     }
+    let Some(ny) = return_edge_position(side, px, py, w, h, range) else {
+        // Mac 側が Return を拒否しても、こちらで先に修飾キーを離してはいけない。
+        return;
+    };
     if RETURN_ARMED_W.load(Ordering::Relaxed)
-        && return_edge_hit(side, px, py, w, h)
         && last.elapsed() >= Duration::from_millis(700)
+        && wtx.send(encode(&Msg::Return { ny })).is_ok()
     {
-        let ny = match side {
-            2 | 3 => {
-                if w > 0 {
-                    (px as f64 / w as f64).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                }
-            }
-            _ => {
-                if h > 0 {
-                    (py as f64 / h as f64).clamp(0.0, 1.0)
-                } else {
-                    0.5
-                }
-            }
-        };
-        let _ = wtx.send(encode(&Msg::Return { ny }));
         *last = Instant::now();
-        // Mac へ制御を返すための後片付け: 押しっぱなしの修飾キーに加え、
-        // (a) ドラッグ中のマウスボタンを離す(選択ドラッグの残留防止)
-        // (b) Alt+Tab 変換が未確定なら確定する(スイッチャー残留防止)
+        // 区間内で復帰通知を送れた場合だけ後片付けする。
+        // Alt+Tab 変換が未確定なら確定する(スイッチャー残留防止)。
         mods.release_everything();
     }
 }
 
 #[cfg(test)]
 mod return_edge_tests {
-    use super::return_edge_hit;
+    use super::{return_edge_hit, return_edge_position};
+
+    #[test]
+    fn return_is_gated_by_target_before_cleanup_for_every_side() {
+        let range = Some([0.25, 0.75]);
+        for side in 0..8 {
+            let point = |position| match side {
+                1 | 6 | 7 => (999, position),
+                2 => (position, 999),
+                3 => (position, 0),
+                _ => (0, position),
+            };
+            for position in [250, 500, 750] {
+                let (px, py) = point(position);
+                assert_eq!(return_edge_position(side, px, py, 1000, 1000, range),
+                    Some(position as f64 / 1000.0));
+            }
+            for position in [0, 249, 751, 999] {
+                let (px, py) = point(position);
+                assert_eq!(return_edge_position(side, px, py, 1000, 1000, range), None);
+                assert!(return_edge_position(side, px, py, 1000, 1000, None).is_some(),
+                    "旧版は全辺を維持する");
+            }
+            let (px, py) = point(500);
+            assert_eq!(return_edge_position(side, px, py, 1000, 1000, Some([0.8, 0.2])), None);
+        }
+        assert_eq!(return_edge_position(0, 1, 500, 1000, 1000, range), None);
+        assert_eq!(return_edge_position(0, 0, 500, 0, 1000, range), None);
+        assert_eq!(return_edge_position(0, 0, -1, 1000, 1000, range), None);
+    }
 
     /// 境界を境に戻す回帰: 端の 1px 手前で止まった場合は戻さない
     /// (旧実装は px<=1 / py<=1 で 1px 手前でも戻っていた)

@@ -42,7 +42,9 @@ use windows_sys::Win32::System::Threading::{
     OpenProcessToken, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
     PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::SetCursorPos;
 
 const PIPE_NAME: &str = r"\\.\pipe\knit-input";
@@ -51,6 +53,12 @@ const MAGIC: &[u8; 4] = b"KNH1";
 const FRAME_INPUT: u8 = 1;
 const FRAME_CURSOR: u8 = 2;
 const FRAME_PING: u8 = 3;
+/// UTF-8 文字列の注入(ロック解除の連動で使う)。ペイロードは
+/// [長さ 4 バイト LE][UTF-8 バイト列]
+const FRAME_TEXT: u8 = 4;
+/// FRAME_TEXT 1 回の長さ上限(バイト)。平文 256 文字分より十分大きい余裕。
+/// 超過は不正なクライアントとして接続を切る
+const FRAME_TEXT_MAX: usize = 4096;
 const TASK_NAME: &str = "knit_input";
 const HELPER_EXE: &str = "knit-win-input.exe";
 const ALLOWED_FILE: &str = "allowed-client.txt";
@@ -163,6 +171,103 @@ pub(crate) fn send_cursor(x: i32, y: i32) -> bool {
     frame[1..5].copy_from_slice(&x.to_le_bytes());
     frame[5..9].copy_from_slice(&y.to_le_bytes());
     send_frame(&frame)
+}
+
+/// 文字列(UTF-8)の注入を操作補助へ依頼する。ロック解除の連動で使い、
+/// ロック画面(winlogon の入力デスクトップ)への入力も helper が担う。
+/// 平文はこのローカルパイプ(DACL で対話ユーザーと SYSTEM に限定)でのみ流れる
+pub(crate) fn send_text_frame(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.is_empty() || bytes.len() > FRAME_TEXT_MAX {
+        return false;
+    }
+    let mut frame = Vec::with_capacity(1 + 4 + bytes.len());
+    frame.push(FRAME_TEXT);
+    frame.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    frame.extend_from_slice(bytes);
+    send_frame(&frame)
+}
+
+/// Enter キー 1 打ちを操作補助へ送る(VK_RETURN+scan の注入バッファは
+/// input::enter_key_buf が組む)。パスワード無し運用のロック解除用
+fn send_enter_key() -> bool {
+    send_input(&crate::input::enter_key_buf())
+}
+
+/// ロック解除の計画(純粋関数)。Msg::Unlock 受信時の挙動を条件から決める
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockPlan {
+    /// 何もしない(ロック中でない、または設定がオフ)
+    None,
+    /// パスワード無し運用: Enter のみ送る
+    EnterOnly,
+    /// 保存したパスワードを打って Enter
+    TypeSecret,
+    /// 操作補助が未導入・未接続(注入手段が無いためログのみ)
+    HelperMissing,
+}
+
+pub(crate) fn unlock_plan(locked: bool, enabled: bool, has_secret: bool, helper_up: bool) -> UnlockPlan {
+    if !locked || !enabled {
+        return UnlockPlan::None;
+    }
+    if !helper_up {
+        return UnlockPlan::HelperMissing;
+    }
+    if has_secret {
+        UnlockPlan::TypeSecret
+    } else {
+        UnlockPlan::EnterOnly
+    }
+}
+
+/// Mac からの Msg::Unlock 対応: この PC のロック画面へ入力を注入して解除を試みる。
+/// ユーザー権限の SendInput はロック画面へ届かないため操作補助(SYSTEM)経由のみ。
+/// 未導入なら通知せずログだけ(導入していない環境がある)。パスワードの平文は
+/// この関数のローカルでのみ存在し、ログへ出さない
+pub(crate) fn unlock_attempt() {
+    let plan = unlock_plan(
+        crate::tray::LOCKED_STATE.load(Ordering::Relaxed),
+        crate::tray::unlock_enabled(),
+        crate::tray::unlock_secret_stored(),
+        is_connected(),
+    );
+    match plan {
+        UnlockPlan::None => {
+            if crate::tray::unlock_enabled() {
+                println!("[unlock] ロック中でないため解除要求を無視しました");
+            } else {
+                println!("[unlock] ロック解除の連動は無効のため何もしません");
+            }
+        }
+        UnlockPlan::HelperMissing => {
+            println!(
+                "[unlock] 操作補助が未導入のためロック解除を試みられません(トレイの「UAC・管理者アプリの操作を有効にする…」から導入できます)"
+            );
+        }
+        UnlockPlan::EnterOnly => {
+            if send_enter_key() {
+                println!("[unlock] ロック解除の Enter を送りました(パスワード無し運用)");
+            } else {
+                println!("[unlock] ロック解除の Enter を送れませんでした");
+            }
+        }
+        UnlockPlan::TypeSecret => match crate::tray::unlock_secret_plain() {
+            Some(secret) => {
+                // パスワード + Enter。平文はここで組み立ててパイプへ出すだけ
+                let mut text = secret;
+                text.push('\r');
+                if send_text_frame(&text) {
+                    println!("[unlock] ロック解除のパスワード入力を送りました");
+                } else {
+                    println!("[unlock] ロック解除のパスワード入力を送れませんでした");
+                }
+            }
+            None => println!(
+                "[unlock] 保存したパスワードを復号できなかったため何もしません(設定でパスワードを入れ直してください)"
+            ),
+        },
+    }
 }
 
 // ======================================================================
@@ -350,11 +455,71 @@ fn serve(pipe: *mut c_void) {
                 desk.follow();
                 unsafe { SetCursorPos(x, y) };
             }
+            FRAME_TEXT => {
+                let mut lb = [0u8; 4];
+                if !read_exact(pipe, &mut lb) {
+                    return;
+                }
+                let len = u32::from_le_bytes(lb) as usize;
+                // 長さ 0・上限超えは不正なクライアント。切り捨てず接続を切る
+                if len == 0 || len > FRAME_TEXT_MAX {
+                    println!("[helper] 不正な文字列長 {len}。接続を切ります");
+                    return;
+                }
+                let mut b = vec![0u8; len];
+                if !read_exact(pipe, &mut b) {
+                    return;
+                }
+                let Ok(text) = String::from_utf8(b) else {
+                    println!("[helper] 文字列が UTF-8 ではありません。接続を切ります");
+                    return;
+                };
+                // 現在の入力デスクトップ(ロック中は winlogon)へ切り替えてから打つ。
+                // 内容はログへ出さない(パスワードが流れるため)
+                desk.follow();
+                let chars = text.chars().count();
+                for ch in text.chars() {
+                    send_unicode_pair(ch);
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                hlog(&format!("FRAME_TEXT {chars} 文字を注入 desk={}", desk.name));
+            }
             FRAME_PING => {}
             other => {
                 println!("[helper] 不明なフレーム {other}。接続を切ります");
                 return;
             }
+        }
+    }
+}
+
+/// 1 文字を KEYEVENTF_UNICODE の keydown/keyup 対で注入する。BMP 外の文字は
+/// UTF-16 サロゲートペアとして各ユニットを順に送る(SendInput の UNICODE 注入の
+/// 定式)。VK は 0(wScan のみ)で、レイアウトに依存しない文字入力になる
+fn send_unicode_pair(ch: char) {
+    let mut units = [0u16; 2];
+    let events: Vec<INPUT> = ch
+        .encode_utf16(&mut units)
+        .iter()
+        .flat_map(|&u| {
+            let mk = |flags: u32| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: 0,
+                        wScan: u,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: 0,
+                    },
+                },
+            };
+            [mk(KEYEVENTF_UNICODE), mk(KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]
+        })
+        .collect();
+    unsafe {
+        for ev in &events {
+            SendInput(1, ev, std::mem::size_of::<INPUT>() as i32);
         }
     }
 }
@@ -579,4 +744,33 @@ pub(crate) fn uninstall() -> i32 {
     }
     println!("INPUT_HELPER_UNINSTALLED");
     0
+}
+
+#[cfg(test)]
+mod unlock_plan_tests {
+    use super::{UnlockPlan, unlock_plan};
+
+    /// ロック中・有効・操作補助接続済みが前提。パスワードの有無で打ち分ける
+    #[test]
+    fn plans_typing_or_enter_by_secret_presence() {
+        assert_eq!(unlock_plan(true, true, true, true), UnlockPlan::TypeSecret);
+        assert_eq!(unlock_plan(true, true, false, true), UnlockPlan::EnterOnly);
+    }
+
+    /// ロック中でない・設定オフは何もしない(誤爆防止の本体)
+    #[test]
+    fn does_nothing_when_not_locked_or_disabled() {
+        assert_eq!(unlock_plan(false, true, true, true), UnlockPlan::None);
+        assert_eq!(unlock_plan(false, true, false, true), UnlockPlan::None);
+        assert_eq!(unlock_plan(true, false, true, true), UnlockPlan::None);
+        assert_eq!(unlock_plan(true, false, false, true), UnlockPlan::None);
+        assert_eq!(unlock_plan(false, false, false, false), UnlockPlan::None);
+    }
+
+    /// 操作補助が無いと注入手段が無いためログのみ(ロック中+有効でも)
+    #[test]
+    fn helper_missing_takes_precedence_over_secret_choice() {
+        assert_eq!(unlock_plan(true, true, true, false), UnlockPlan::HelperMissing);
+        assert_eq!(unlock_plan(true, true, false, false), UnlockPlan::HelperMissing);
+    }
 }
