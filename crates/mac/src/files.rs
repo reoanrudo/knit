@@ -1,4 +1,5 @@
 use crate::*;
+use knit_common::drag;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -273,22 +274,44 @@ pub(crate) fn drag_offer_link_ok(link_up: bool, ms_since_switch: Option<u64>) ->
     matches!(ms_since_switch, Some(ms) if ms < DRAG_LINK_REBUILD_WINDOW_MS)
 }
 
+/// 掴み渡しの拒否を出したときのログ行(ユーザーには見えないが診断レポートに出る)。
+/// 文言は現行のまま。どの理由にどの行を出すかだけをここで決める
+fn refusal_log(reason: &drag::Refusal, raw: Option<&str>) -> Option<String> {
+    use drag::Refusal::*;
+    Some(match reason {
+        // 現行も通知のみでログ行を出さない
+        TooMany => return None,
+        LinkDown => "[drag] mac->win 対象外: ファイル経路が未接続".to_string(),
+        CollectStale => "[drag] mac->win 対象外: 集計条件が変わっています".to_string(),
+        CollectPending => "[drag] mac->win 対象外: 集計結果の準備が間に合っていません".to_string(),
+        CollectFailed { label } => {
+            // 現行は生のエラーを出していた(通知は label)。生が無い場合だけ label へ落とす
+            let e = raw.unwrap_or(label.as_str());
+            format!("[drag] mac->win 対象外: {e}")
+        }
+        NothingToSend => "[drag] mac->win 対象外: 渡れるものが無い".to_string(),
+        Busy => "[drag] mac->win 送信中のため受け付けません".to_string(),
+    })
+}
+
+/// 掴み渡しを断る(ログ → 通知の順は現行のまま)。本文は値(`Refusal`)が持つ。
+/// 戻り値は常に None(呼び出し元は境界を越えず、Mac 側のドラッグを続ける)
+fn refuse_drag(reason: drag::Refusal, raw: Option<&str>) -> Option<u64> {
+    if let Some(line) = refusal_log(&reason, raw) {
+        eprintln!("{line}");
+    }
+    notify("Knit", &reason.notice_body());
+    None
+}
+
 /// 掴んだまま境界を越えたファイルを Windows へ渡す準備。本線の予告(DragOffer)と
 /// ファイル転送に同じ受け渡しIDを付け、Windows は越えてきた押下が続いている間に
 /// 届いた場合だけ OLE ドラッグを始める(離した後の転送を別の操作に混ぜない)。
 /// 予告は押下より前に本線へ積む。受け付けなければ None を返し、呼び出し元は
 /// 境界を越えない。tap スレッドから呼ぶため、ファイル情報の読み出しは 1 回にする
 pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
-    if paths.is_empty() || paths.len() > knit_common::drag::MAX_FILES {
-        notify(
-            "Knit",
-            &format!(
-                "掴んだまま渡せるのは {} フォルダ/ファイルまでです",
-                knit_common::drag::MAX_FILES
-            ),
-        );
-        return None;
-    }
+    // 件数と経路は集計を待つ前に断る(順序も文言も現行のまま。I1 で値にした)
+    let mut link_ok = true;
     // 越境を確定する前にファイル経路が張れていることを確かめる(M7)。
     // 張り直し中に越えると元のドラッグは合成 Up で終わるのに転送が届かず、
     // 「どこにも渡らない」結果になるため、拒んで Mac 側のドラッグを続けさせる。
@@ -299,16 +322,19 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     if !BULK_LINK.is_up_fast() {
         let switched_at = BULK_SWITCHED_AT_MS.load(Ordering::Relaxed);
         let ms_since_switch = (switched_at > 0).then(|| now_ms().saturating_sub(switched_at));
-        if !drag_offer_link_ok(false, ms_since_switch) {
-            eprintln!("[drag] mac->win 対象外: ファイル経路が未接続");
-            notify(
-                "Knit",
-                "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください",
-            );
-            return None;
+        link_ok = drag_offer_link_ok(false, ms_since_switch);
+        if link_ok {
+            eprintln!("[drag] 経路張替直後のため、再接続を待って転送します(切替から約{}ms)",
+                ms_since_switch.unwrap_or(0));
         }
-        eprintln!("[drag] 経路張替直後のため、再接続を待って転送します(切替から約{}ms)",
-            ms_since_switch.unwrap_or(0));
+    }
+    if let drag::Verdict::Refused(reason) = drag::verdict_for(&drag::Signals {
+        path_count: paths.len(),
+        link_ok,
+        busy: false,
+        collect: drag::Collect::Pending,
+    }) {
+        return refuse_drag(reason, None);
     }
     // 相手の版が持つ機能(フォルダ=版 14 以降・空フォルダ=版 15 以降)
     let f = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
@@ -318,7 +344,10 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // この tap スレッドでのフォルダ走査を省く(M6)。版が変わって集計条件が
     // 異なる結果は使い回せない(版 14 相手に版 15 用の空フォルダ入りが流れると
     // サイズ 0 の空ファイルとして実体化してしまう)
-    let mut cached_entries: Option<std::io::Result<bulk::CollectResult>> = None;
+    let mut cached: Option<bulk::CollectResult> = None;
+    // 失敗したときのログ行に使う生のエラー文言(通知は label を使う)
+    let mut collect_raw_err: Option<String> = None;
+    let mut collect = drag::Collect::Pending;
     for attempt in 0..15u32 {
         let got = DRAG_ENTRIES_CACHE
             .lock()
@@ -329,77 +358,75 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
                 && c.allow_dirs == allow_dirs
                 && c.keep_empty_dirs == keep_empty_dirs =>
             {
-                cached_entries = Some(c.result);
+                match c.result {
+                    Ok(cr) => {
+                        collect = drag::Collect::Done {
+                            entry_count: cr.entries.len(),
+                        };
+                        cached = Some(cr);
+                    }
+                    Err(e) => {
+                        collect_raw_err = Some(e.to_string());
+                        collect = drag::Collect::Failed {
+                            label: knit_common::bulk::send_error_label(&e),
+                        };
+                    }
+                }
                 break;
             }
             Some(_) => {
                 // 保存済みだが条件が違う(接続先の版が変わった等)。ここで走査し直すと
                 // tap スレッドを長く止めるため、越境を断って掴み直してもらう
-                eprintln!("[drag] mac->win 対象外: 集計条件が変わっています");
-                notify(
-                    "Knit",
-                    "接続の状態が変わったため、ファイルをもう一度掴み直してください",
-                );
-                return None;
+                collect = drag::Collect::Stale;
+                break;
             }
             None => {
                 // 集計スレッドがまだ書いていない: 少しだけ待つ(合計 150ms 未満。
                 // ここで同期走査に落とすと深いフォルダで CGEventTap がタイムアウト
-                // し、Mac 全体の入力が瞬断する)
+                // し、Mac 全体の入力が瞬断する)。**待つのはここ(mac 側)**に残す
                 if attempt < 14 {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
         }
     }
-    let result = match cached_entries {
-        Some(e) => e,
-        None => {
-            eprintln!("[drag] mac->win 対象外: 集計結果の準備が間に合っていません");
+    if matches!(collect, drag::Collect::Pending) {
+        collect = drag::Collect::Expired;
+    }
+    // リンク等で送れない項目は展開後の件数に含まれない。件数が合っているように
+    // 見えて黙って欠けるのを防ぐため、skipped があれば越境のタイミングで通知する。
+    // **これは拒否ではない**(通知したうえで渡せる分を渡す)ので、判定より先に出す
+    if let Some(cr) = &cached {
+        let skip_note = skip_note(&cr.skipped);
+        if !skip_note.is_empty() {
             notify(
                 "Knit",
-                "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください",
+                &format!("{}{skip_note}", drag::SKIPPED_NOTICE),
             );
-            return None;
         }
-    };
-    let cr = match result {
-        Ok(cr) => cr,
-        Err(e) => {
-            eprintln!("[drag] mac->win 対象外: {e}");
-            // ラベルに実際の値と上限が入る(通常送信と同じ文言生成を使う)
-            notify(
-                "Knit",
-                &format!(
-                    "掴んだまま渡せません({})",
-                    knit_common::bulk::send_error_label(&e)
-                ),
-            );
-            return None;
-        }
+    }
+    let verdict = drag::verdict_for(&drag::Signals {
+        path_count: paths.len(),
+        link_ok,
+        // 予約は下の swap が行う(load は「今どう見えるか」だけ。競合窓を作らない)
+        busy: FILE_TX_BUSY.load(Ordering::Relaxed),
+        collect,
+    });
+    let cr = match verdict {
+        drag::Verdict::Refused(reason) => return refuse_drag(reason, collect_raw_err.as_deref()),
+        // 集計中のまま戻ることは無い(上のループで Expired にする)。念のため断る
+        drag::Verdict::Wait => return refuse_drag(drag::Refusal::CollectPending, None),
+        drag::Verdict::Ready { count } => match cached {
+            Some(cr) if cr.entries.len() == count => cr,
+            // 判定と集計結果が食い違う(設計上あり得ない)。無言にせず同じ理由で断る
+            _ => return refuse_drag(drag::Refusal::CollectPending, None),
+        },
     };
     let entries = cr.entries;
-    // リンク等で送れない項目は展開後の件数に含まれない。件数が合っているように
-    // 見えて黙って欠けるのを防ぐため、skipped があれば越境のタイミングで通知する
-    let skip_note = skip_note(&cr.skipped);
-    if !skip_note.is_empty() {
-        notify(
-            "Knit",
-            &format!("掴んだまま渡せるのは通常のファイルとフォルダだけです{skip_note}"),
-        );
-    }
-    if entries.is_empty() {
-        eprintln!("[drag] mac->win 対象外: 渡れるものが無い");
-        notify("Knit", "掴んだ項目の中に送れるものがありません");
-        return None;
-    }
+    // 送信枠の取得は値ではなく swap で行う(load してから swap するまでの間に
+    // 別の転送が始まっても二重送信にしない。現行と同じ atomic の使い方)
     if FILE_TX_BUSY.swap(true, Ordering::Relaxed) {
-        eprintln!("[drag] mac->win 送信中のため受け付けません");
-        notify(
-            "Knit",
-            "前のファイルを転送中です。完了後にもう一度掴んでください",
-        );
-        return None;
+        return refuse_drag(drag::Refusal::Busy, None);
     }
     // Windows 側が自分で採番する受け渡しIDと重ならないよう最上位ビットを立てる。
     // 採番は NEXT_TX_ID に一本化(独立カウンタだと通常送信と同じ ID を振り得る)
