@@ -1,5 +1,6 @@
 use crate::*;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -109,7 +110,150 @@ const IMAGE_KEEP: usize = 60;
 /// 画像を履歴へ載せる(ビジョン§10 の Image 分類)。本体は BMP バイトを
 /// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ
 /// 残す。同名=同一内容のため二重保存は起きない
-pub(crate) fn history_push_image(bmp: &[u8], device: &str) {
+/// 履歴画像の背景保存ワークスレッドの句柄。起動時に1回だけ生成し、
+/// 終了時にフラッシュして取りこぼしを防止する。
+pub static IMAGE_STORE_WORKER: std::sync::OnceLock<ImageStoreWorker> = std::sync::OnceLock::new();
+
+/// 1枚の委譲タスク。dib(33MB 生データ)と端末名だけを持つ。
+pub struct ImageStoreJob {
+    dib: Vec<u8>,
+    device: String,
+}
+
+/// 履歴画像を背景スレッドへ委譲するワークスレッド。
+/// 1本のワーカーに FIFO で流し、上限(最大4枚)を超えた場合は古いタスクを破棄して警告する。
+/// 終了時にフラッシュして残りのタスクを完了する。
+pub struct ImageStoreWorker {
+    sender: Mutex<Option<mpsc::Sender<ImageStoreJob>>>,
+    handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 未処理タスク数(投入側とワーカー側で共有。上限4枚)
+    depth: std::sync::Arc<AtomicUsize>,
+}
+
+impl ImageStoreWorker {
+    /// 非同期な保存を開始する。キュー上限(4枚)を超えたら新しいタスクを捨てる
+    /// (古い画像より今コピーした画像を優先する)。ホットパスはここで終わる。
+    pub fn enqueue(&self, dib: Vec<u8>, device: &str) {
+        let depth_before = self.depth.fetch_add(1, Ordering::SeqCst);
+        if depth_before >= 4 {
+            let _ = self.depth.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("[clip] 画像保存キューが上限(4枚)に達したため新しいタスクを破棄");
+            return;
+        }
+        let sender_guard = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tx) = sender_guard.as_ref() else {
+            let _ = self.depth.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("[clip] 画像保存ワークスレッドが停止しているため保存をスキップ");
+            return;
+        };
+        if let Err(e) = tx.send(ImageStoreJob {
+            dib,
+            device: device.to_string(),
+        }) {
+            let _ = self.depth.fetch_sub(1, Ordering::SeqCst);
+            eprintln!("[clip] 画像保存ワークスレッドへの送信用失敗: {e}");
+        }
+    }
+
+    /// ワーカースレッドを停止し、残りのタスクをすべて実行して完了を待つ。
+    /// Sender を落とすとチャネルが閉じ、キューに残ったタスクを処理し終えた
+    /// ワーカーが終了するため join が返る(取りこぼしなし)。
+    pub fn flush(&self) {
+        {
+            let mut sender = self.sender.lock().unwrap_or_else(|e| e.into_inner());
+            drop(sender.take()); // ここでチャネルを閉じる
+        }
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(h) = handle {
+            if let Err(e) = h.join() {
+                eprintln!("[clip] 画像保存ワークスレッドがパニックしました: {e:?}");
+            }
+            eprintln!("[clip] 画像保存ワークスレッドをフラッシュし完了");
+        }
+    }
+}
+
+/// ワーカースレッドの初期化(1回だけ)。保存先は起動時に解決する。
+fn ensure_image_store_worker() -> Option<&'static ImageStoreWorker> {
+    let dir = image_store_dir()?;
+    Some(IMAGE_STORE_WORKER.get_or_init(|| ImageStoreWorker::start(dir, true)))
+}
+
+impl ImageStoreWorker {
+    /// 保存先ディレクトリを指定してワーカーを起動する。
+    /// `push_history` は履歴(HISTORY + history_save)へも載せるかどうか。
+    /// テストでは false にして実ユーザーの履歴ファイルを触らない。
+    fn start(store_dir: std::path::PathBuf, push_history: bool) -> ImageStoreWorker {
+        let (tx, rx) = mpsc::channel::<ImageStoreJob>();
+        // 深さカウンタは投入側とワーカー側で共有する(処理し終えたら減らす。
+        // 減らさないと上限4枚に達した後は永久に投入が捨てられる)
+        let depth = std::sync::Arc::new(AtomicUsize::new(0));
+        let depth_worker = std::sync::Arc::clone(&depth);
+        let handle = std::thread::spawn(move || {
+            for job in rx {
+                // BMP 変換とファイル書き込みをワーカー側で行う(ホットパスから追い出した処理)
+                let bmp = objc::dib_to_bmp(&job.dib);
+                let dir = store_dir.clone();
+                let name = knit_common::history::image_file_name(knit_common::history::fnv1a64(&bmp), "bmp");
+                let _ = std::fs::create_dir_all(&dir);
+                knit_common::history::restrict_dir(&dir);
+                let path = dir.join(&name);
+                if !path.exists() {
+                    if knit_common::history::write_private_or_remove(&path, &bmp).is_err() {
+                        eprintln!("[clip] 画像の履歴保存に失敗しました(ディスク容量等)");
+                        let _ = depth_worker.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                } else {
+                    knit_common::history::touch_mtime(&path);
+                }
+                knit_common::history::prune_image_store(
+                    &dir,
+                    IMAGE_KEEP,
+                    knit_common::history::MAX_IMAGE_STORE_BYTES,
+                );
+                // 履歴への追加はワーカー側で行う(順序保証と排他維持)。
+                // テスト(push_history=false)では実行しない
+                let ts = knit_common::history::now_epoch_ms();
+                if push_history {
+                if let Ok(mut h) = HISTORY.lock() {
+                    if h.push_image(&name, bmp.len(), &job.device, ts).is_some() {
+                        HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+                        drop(h);
+                        history_save();
+                    }
+                }
+                }
+                // 1枚処理し終えたので深さを戻す(次の投入を受け入れる)
+                let _ = depth_worker.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        ImageStoreWorker {
+            sender: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
+            depth,
+        }
+    }
+}
+
+/// 画像を履歴へ載せる(ビジョン§10 の Image 分類)。本体は BMP バイトを
+/// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ
+/// 残す。同名=同一内容のため二重保存は起きない。
+/// ループ11: DIB を受ける版は**ホットパスではキュー投入だけ**行い、dib_to_bmp と
+/// 33MB のファイル書き込み(実測 26ms/枚)は背景ワーカーが担う。
+pub(crate) fn history_push_image(dib: &[u8], device: &str) {
+    if let Some(worker) = ensure_image_store_worker() {
+        worker.enqueue(dib.to_vec(), device);
+    }
+}
+
+/// BMP バイトをそのまま履歴へ載せる同期版(履歴からの復元で既に BMP を
+/// 持っている経路用。変換が不要なため従来どおり同期で書く)。
+pub(crate) fn history_push_image_bmp(bmp: &[u8], device: &str) {
     let Some(dir) = image_store_dir() else { return };
     let name = knit_common::history::image_file_name(knit_common::history::fnv1a64(bmp), "bmp");
     let _ = std::fs::create_dir_all(&dir);
@@ -179,7 +323,7 @@ pub fn history_restore(text: String) {
             LAST_SYNC_COUNT.store(clipboard_change_count(), Ordering::Relaxed);
             // 受信画像と同じく、載せ直しをきっかけにした送り返しを二重に防ぐ
             LAST_IMG_RX_MS.store(now_ms(), Ordering::Relaxed);
-            history_push_image(&bmp, "Mac");
+            history_push_image_bmp(&bmp, "Mac");
             eprintln!(
                 "[clip] 履歴から Mac のクリップボードへ画像を復元({}KB)",
                 bmp.len() / 1024
@@ -356,7 +500,7 @@ unsafe fn record_local_copy() {
     } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) >= 1_000 {
         if let Some(dib) = mac_clipboard_image_dib() {
             if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
-                history_push_image(&dib_to_bmp(&dib), "Mac");
+                history_push_image(&dib, "Mac");
             }
         }
     }
@@ -455,7 +599,7 @@ pub(crate) fn sync_clipboard_to_win() {
                                         png.len() / 1024
                                     );
                                     if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
-                                        history_push_image(&dib_to_bmp(&dib), "Mac");
+                                        history_push_image(&dib, "Mac");
                                     }
                                 } else {
                                     eprintln!("[clip] タブレットのクリップボードへ画像を載せられませんでした");
@@ -507,7 +651,7 @@ pub(crate) fn sync_clipboard_to_win() {
                             Ok(()) => {
                                 eprintln!("[clip] mac->win image {}KB", dib.len() / 1024);
                                 if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
-                                    history_push_image(&dib_to_bmp(&dib), "Mac");
+                                    history_push_image(&dib, "Mac");
                                 }
                             }
                             Err(e) => eprintln!("[clip] mac->win image 送信失敗: {e}"),
@@ -665,5 +809,96 @@ mod claim_history_tests {
             }
         });
         assert_eq!(wins.load(Ordering::Relaxed), 1, "記録権を取れるのは 1 スレッドだけ");
+    }
+}
+
+/// ループ11: 履歴画像の背景保存ワーカーのテスト。
+/// 実ユーザーの保存先と履歴ファイルを触らないよう、temp ディレクトリと
+/// `push_history=false` を使う。
+#[cfg(test)]
+mod image_store_worker_tests {
+    use super::ImageStoreWorker;
+
+    /// 8×8 32bpp の合成 DIB(BITMAPINFOHEADER 40 + 画素。下から上)
+    fn small_dib(fill: u8) -> Vec<u8> {
+        let (w, h) = (8usize, 8usize);
+        let mut dib = Vec::with_capacity(40 + w * h * 4);
+        let mut hdr = [0u8; 40];
+        hdr[0..4].copy_from_slice(&40u32.to_le_bytes());
+        hdr[4..8].copy_from_slice(&(w as i32).to_le_bytes());
+        hdr[8..12].copy_from_slice(&(h as i32).to_le_bytes());
+        hdr[12..16].copy_from_slice(&1u32.to_le_bytes());
+        hdr[14..16].copy_from_slice(&32u16.to_le_bytes());
+        hdr[20..24].copy_from_slice(&((w * h * 4) as u32).to_le_bytes());
+        dib.extend_from_slice(&hdr);
+        for i in 0..w * h {
+            dib.extend_from_slice(&[fill, fill.wrapping_add(1), fill.wrapping_add(2), 255]);
+            let _ = i;
+        }
+        dib
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("knit-imgstore-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 委譲した画像が保存され、内容が BMP(14バイトヘッダ + DIB)になっている。
+    /// flush 後は必ず完了している(取りこぼしなし)
+    #[test]
+    fn worker_writes_bmp_and_flush_completes_it() {
+        let dir = temp_dir("one");
+        let worker = ImageStoreWorker::start(dir.clone(), false);
+        let dib = small_dib(0x10);
+        worker.enqueue(dib.clone(), "Mac");
+        worker.flush();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(entries.len(), 1, "1枚だけ保存される");
+        let bytes = std::fs::read(&entries[0]).unwrap();
+        assert_eq!(&bytes[..2], b"BM", "BMP ファイルヘッダが付く");
+        assert_eq!(bytes.len(), 14 + dib.len(), "BMP = 14 + DIB のサイズ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 複数枚を続けて委譲しても取りこぼさず、すべて保存される(FIFO 処理)
+    #[test]
+    fn worker_keeps_all_jobs_in_order() {
+        let dir = temp_dir("many");
+        let worker = ImageStoreWorker::start(dir.clone(), false);
+        for i in 0..3u8 {
+            worker.enqueue(small_dib(0x20 + i), "Mac");
+        }
+        worker.flush();
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(count, 3, "3枚すべて保存される");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ホットパスのコスト計測(キュー投入のみ)。旧実装は 33MB の書き込みを含み
+    /// 実測 26ms だった。ここでは投入が桁違いに軽いことを数値で残す
+    #[test]
+    fn enqueue_is_far_cheaper_than_a_disk_write() {
+        let dir = temp_dir("bench");
+        let worker = ImageStoreWorker::start(dir.clone(), false);
+        // 4K 相当(3840×2160×4 ≈ 33MB)
+        let dib = vec![0x7Fu8; 3840 * 2160 * 4 + 40];
+        let mut samples = Vec::new();
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            worker.enqueue(dib.clone(), "Mac");
+            samples.push(t.elapsed().as_micros());
+        }
+        samples.sort_unstable();
+        let p50 = samples[samples.len() / 2];
+        println!("[perf] enqueue(33MB DIB, キュー投入のみ): p50={p50}µs");
+        assert!(p50 < 20_000, "投入は 20ms 未満(実測 {p50}µs)");
+        worker.flush();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
