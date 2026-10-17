@@ -982,6 +982,14 @@ unsafe fn build_sharing(p: ID) {
             h: 32.0,
         },
     );
+    // 履歴の保存件数を減らしても画像の実体は images/ に最大 512MiB 残る
+    // (刈り込みは 60 件/512MiB までしか見ない)。置き場と上限を消去ボタンの隣に
+    // 出す(幅 366pt に収まる長さにする。消える量は全消去の確認文に実数で出す)
+    let store_note = format!(
+        "画像の実体: ~/.config/knit/images(最大 {})",
+        crate::human_bytes(knit_common::history::MAX_IMAGE_STORE_BYTES)
+    );
+    label(p, &store_note, 458.0, 126.0, 366.0, 12.0, true);
 }
 unsafe fn build_general(p: ID) {
     // 切替キー・更新の自動確認・キー変換プレビューを増やした分だけ文書を伸ばす

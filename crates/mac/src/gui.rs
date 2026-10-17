@@ -281,21 +281,38 @@ unsafe fn mark_destructive(button: ID) {
     }
 }
 
+/// 「履歴をすべて消す…」の確認文。実際に消える件数を入れる(取り消せない操作の
+/// 前に、何がどれだけ消えるかを数字で見せる)。画像の実体(images/)も消えるため、
+/// 1 件以上のときだけ件数と合計サイズを添える。文言は純粋関数にして固定する
+fn history_clear_body(entries: usize, images: usize, bytes: u64) -> String {
+    if images == 0 {
+        format!("履歴 {entries} 件が消え、元に戻せません。")
+    } else {
+        format!(
+            "履歴 {entries} 件と画像の実体 {images} 件({})が消え、元に戻せません。",
+            crate::human_bytes(bytes)
+        )
+    }
+}
+
 /// 履歴メニューの「すべて消す…」クリック。全履歴が戻せずに消えるため確認を挟む
-/// (既定=キャンセル)。プレビュー中は本物の履歴ファイルを触らない
+/// (既定=キャンセル)。画像の実体(images/)も消えることを件数とサイズで示す。
+/// プレビュー中は本物の履歴ファイルを触らない
 unsafe extern "C" fn imp_history_clear(_s: ID, _c: SEL, _n: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         return;
     }
+    let (images, bytes) = crate::image_store_usage();
+    let body = history_clear_body(crate::history_len(), images, bytes);
     let confirmed = confirm_alert(
         "履歴をすべて消しますか?",
-        "履歴すべて(最大50件)が消え、元に戻せません。",
+        &body,
         &["キャンセル", "消す"],
     );
     if confirmed != 1001 {
         return;
     }
-    crate::history_clear();
+    let _ = crate::history_clear();
     crate::HISTORY_LAST_ID.store(0, Ordering::Relaxed);
 }
 
@@ -3033,6 +3050,41 @@ mod history_menu_title_tests {
             history_menu_title(50),
             "クリップボード履歴(新しい順10件・全50件)",
             "保存上限いっぱいのとき"
+        );
+    }
+}
+
+/// 「履歴をすべて消す…」の確認文: 消える件数を固定文言ではなく実際の件数で示し、
+/// 画像の実体(images/)も消えるときは件数と合計サイズを添える
+#[cfg(test)]
+mod history_clear_body_tests {
+    use super::history_clear_body;
+
+    #[test]
+    fn body_names_the_exact_entry_count() {
+        assert_eq!(
+            history_clear_body(50, 0, 0),
+            "履歴 50 件が消え、元に戻せません。",
+            "画像が無いときは履歴の件数だけを示す"
+        );
+        assert_eq!(history_clear_body(0, 0, 0), "履歴 0 件が消え、元に戻せません。");
+        assert_eq!(
+            history_clear_body(200, 0, 0),
+            "履歴 200 件が消え、元に戻せません。",
+            "保存上限を 200 にした利用者にも固定文言ではなく実際の件数を出す"
+        );
+    }
+
+    #[test]
+    fn body_adds_image_count_and_size_when_store_is_not_empty() {
+        assert_eq!(
+            history_clear_body(3, 2, 33 * 1024 * 1024),
+            "履歴 3 件と画像の実体 2 件(33.0 MB)が消え、元に戻せません。",
+            "画像の実体も消えることを件数とサイズで示す"
+        );
+        assert_eq!(
+            history_clear_body(1, 1, 2048),
+            "履歴 1 件と画像の実体 1 件(2 KB)が消え、元に戻せません。"
         );
     }
 }
