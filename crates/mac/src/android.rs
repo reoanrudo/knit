@@ -1080,6 +1080,39 @@ pub fn push_files(paths: &[std::path::PathBuf]) -> Option<usize> {
     (ok > 0).then_some(ok)
 }
 
+/// 監査9: 一時ファイル(`Knit-*.png`)の残骸を掃除する。強制終了やクラッシュで
+/// 残った画像を放置しない。1時間より新しいものは他インスタンスが送信中かもしれない
+/// ため触らない
+pub fn cleanup_stale_temp_images_in(dir: &std::path::Path, max_age: std::time::Duration) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("Knit-") && (name.ends_with(".png") || name.ends_with(".bmp"))) {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().map(|age| age > max_age).unwrap_or(false))
+            .unwrap_or(false);
+        if stale && std::fs::remove_file(e.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// 起動時に呼ぶ版(一時ディレクトリを対象にする)
+pub fn cleanup_stale_temp_images() -> usize {
+    cleanup_stale_temp_images_in(
+        &std::env::temp_dir(),
+        std::time::Duration::from_secs(60 * 60),
+    )
+}
+
 /// 端末のクリップボードへ画像を載せる(scrcpy のサーバー部品と同じ方式で
 /// app_process から動かすヘルパー経由)。手順: 画像を /sdcard/Pictures/Knit へ
 /// adb push すると MediaStore に自動登録されるので、その _id を content query で
@@ -1106,7 +1139,8 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
         return false;
     }
     let local = std::env::temp_dir().join(&name);
-    if std::fs::write(&local, data).is_err() {
+    // 監査4: 共有 Mac の他ユーザーに読まれないよう 0600 で書く
+    if knit_common::history::write_private(&local, data).is_err() {
         return false;
     }
     let dev = format!("/sdcard/Pictures/Knit/{name}");
@@ -1375,8 +1409,13 @@ mod tests {
         assert!(total_ms < 2000, "合計が 2 秒(2000ms)未満であること");
     }
 
+    /// スタブ adb を使うテストは PUSH_TARGET と PREPARED_DIRS という
+    /// プロセス共有の状態を触るため、必ずこのロックで直列化する
+    static STUB_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn android_clipboard_image_stub_timings_and_call_count() {
+        let _serial = STUB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join("knit-android-stub");
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("adb.log");
@@ -1430,6 +1469,119 @@ mod tests {
             elapsed < Duration::from_millis(200) && elapsed2 < Duration::from_millis(200),
             "所要時間が 200ms 未満であること (実際 {elapsed:?} / {elapsed2:?})"
         );
+    }
+
+    /// スタブ adb を作って push 先を差し替える。戻り値は(ログのパス, 作業ディレクトリ, 元の登録)
+    fn stub_setup(dir_name: &str, script: &str) -> (std::path::PathBuf, std::path::PathBuf, Option<(PathBuf, String, String)>) {
+        let tmp = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("adb.log");
+        let stub = tmp.join("adb");
+        std::fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        {
+            let mut prepared = PREPARED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            prepared.remove("stub-serial");
+        }
+        let orig = PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()).take();
+        register_push_target(&stub, "stub-serial", "Stub");
+        (log, tmp, orig)
+    }
+
+    fn stub_teardown(tmp: &std::path::Path, orig: Option<(PathBuf, String, String)>) {
+        *PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = orig;
+        {
+            let mut prepared = PREPARED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            prepared.remove("stub-serial");
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// 監査2: 端末が居なければ adb は get-state の1回だけで即 false。
+    /// 以前は接続の無い端末へ push(60秒)とヘルパー(60秒)を投げていた
+    #[test]
+    fn clipboard_image_returns_fast_when_device_is_offline() {
+        let _serial = STUB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do if [ \"$a\" = \"get-state\" ]; then echo offline; exit 0; fi; done\nexit 0\n";
+        let (log, tmp, orig) = stub_setup("knit-android-offline", script);
+        let t0 = std::time::Instant::now();
+        let ok = set_clipboard_image("image/png", "t.png", &[1u8, 2, 3, 4]);
+        let elapsed = t0.elapsed();
+        let calls = std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        println!("[audit2] offline: ok={ok} adb_calls={calls} elapsed={elapsed:?}");
+        stub_teardown(&tmp, orig);
+        assert!(!ok, "端末が居なければ false");
+        assert_eq!(calls, 1, "get-state の1回だけで止まる(実際 {calls})");
+        // 目安は「押した瞬間に戻る」こと。テストは並列実行されるため、
+        // 他の重いテスト(画像計測など)と重なると数百ms になることがある。
+        // 以前は接続の無い端末へ push とヘルパーを投げて最大2分待っていたので、
+        // 2秒未満なら「待っていない」ことは十分に示せる
+        assert!(elapsed < std::time::Duration::from_secs(2), "待たずに戻る (実際 {elapsed:?})");
+    }
+
+    /// 監査2: push が失敗したら query やヘルパーへ進まない
+    #[test]
+    fn clipboard_image_stops_when_push_fails() {
+        let _serial = STUB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"get-state\" ]; then echo device; exit 0; fi\n  if [ \"$a\" = \"push\" ]; then echo \"push failed\" 1>&2; exit 1; fi\ndone\nexit 0\n";
+        let (log, tmp, orig) = stub_setup("knit-android-pushfail", script);
+        let ok = set_clipboard_image("image/png", "t.png", &[1u8, 2, 3, 4]);
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        println!("[audit2] pushfail: ok={ok} calls={}", text.lines().count());
+        stub_teardown(&tmp, orig);
+        assert!(!ok, "push 失敗なら false");
+        assert!(!text.contains("query"), "push が失敗したら query しない");
+        assert!(!text.contains("app_process"), "ヘルパーも呼ばない");
+    }
+
+    /// 監査4: 名前に "/" や ".." が混ざっても、端末側の置き場所は
+    /// ファイル名だけを使う(temp の外へ書かない)
+    #[test]
+    fn clipboard_image_sanitizes_the_file_name() {
+        let _serial = STUB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"get-state\" ]; then echo device; exit 0; fi\n  if [ \"$a\" = \"query\" ]; then echo \"Row: 0 _id=7, _display_name=x.png\"; exit 0; fi\n  if [ \"$a\" = \"app_process\" ]; then echo ok; exit 0; fi\ndone\nexit 0\n";
+        let (log, tmp, orig) = stub_setup("knit-android-name", script);
+        let ok = set_clipboard_image("image/png", "../../evil.png", &[1u8, 2, 3, 4]);
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        stub_teardown(&tmp, orig);
+        assert!(ok, "送信は成功する");
+        assert!(text.contains("/sdcard/Pictures/Knit/evil.png"), "端末側はファイル名だけ: {text}");
+        assert!(!text.contains(".."), "親ディレクトリ参照を渡さない: {text}");
+    }
+
+    /// 監査4/9: 一時ファイルは 0600 で作られ、古い残骸だけが掃除される
+    #[test]
+    fn temp_images_are_private_and_stale_ones_are_cleaned() {
+        let dir = std::env::temp_dir().join(format!("knit-temp-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // write_private は 0600 で作る
+        let fresh = dir.join("Knit-fresh.png");
+        knit_common::history::write_private(&fresh, b"x").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "所有者のみ読める (実際 {mode:o})");
+        }
+        // 2時間前の残骸を作る
+        let old = dir.join("Knit-old.png");
+        std::fs::write(&old, b"x").unwrap();
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60);
+        let f = std::fs::OpenOptions::new().write(true).open(&old).unwrap();
+        f.set_modified(two_hours_ago).unwrap();
+        drop(f);
+        // 対象外の名前は触らない
+        let other = dir.join("memo.txt");
+        std::fs::write(&other, b"x").unwrap();
+
+        let removed = cleanup_stale_temp_images_in(&dir, std::time::Duration::from_secs(60 * 60));
+        println!("[audit9] removed={removed}");
+        assert_eq!(removed, 1, "古い1件だけ消す");
+        assert!(fresh.exists() && other.exists() && !old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
