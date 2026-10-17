@@ -332,6 +332,27 @@ impl Drop for Invitation {
     }
 }
 #[allow(clippy::too_many_arguments)] // 登録の1接続に必要な状態をまとめて渡す
+/// コードを一度も試さずに切れた接続(候補確認の probe・ポート走査)を、呼び出し側が
+/// 試行に数えない種別へ写す。相手が FIN で閉じるか RST で切るかはタイミング次第で、
+/// UnexpectedEof / ConnectionReset / BrokenPipe のどれでも返りうる。そのため種類では
+/// なく「1 バイトも届いていないこと」で判定する。1 バイトでも届いていれば、途中で
+/// 切れた正当なクライアントや不正なフレームなので、そのまま返して試行に数えさせる
+fn untried_connection(e: io::Error, received_anything: bool) -> io::Error {
+    if !received_anything
+        && matches!(
+            e.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+        )
+    {
+        io::Error::new(io::ErrorKind::ConnectionAborted, "probe-only connection")
+    } else {
+        e
+    }
+}
+
 fn serve_one(
     s: TcpStream,
     peer: SocketAddr,
@@ -346,19 +367,15 @@ fn serve_one(
     ask: &AskFn,
 ) -> io::Result<()> {
     let mut wire = Wire::new(s, stop, until)?;
-    wire.send(id.as_bytes())?;
     // 最初のフレーム(SPAKE2/SAS の開始)を1つも送らずに切った相手は候補確認の
     // probe 等。通常の失敗試行(保存失敗で途中切断する正当なクライアント)と
     // 区別できるよう、専用の種別で返す(呼び出し側は試行に数えない)
+    if let Err(e) = wire.send(id.as_bytes()) {
+        return Err(untried_connection(e, wire.received != 0));
+    }
     let incoming = match wire.receive() {
         Ok(v) => v,
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "probe-only connection",
-            ));
-        }
-        Err(e) => return Err(e),
+        Err(e) => return Err(untried_connection(e, wire.received != 0)),
     };
     if incoming.starts_with(SAS_MARK) {
         return serve_sas(wire, &incoming, peer, id, token, port, stop, session_until, server_name, ask);
@@ -701,6 +718,9 @@ struct Wire<'a> {
     socket: TcpStream,
     cancelled: &'a AtomicBool,
     until: Instant,
+    /// 相手から届いたバイト数。コードを試す前に切れた接続(候補確認の probe・
+    /// ポート走査)を、途中で切れた正当なクライアントと見分けるために数える
+    received: usize,
 }
 impl<'a> Wire<'a> {
     fn new(socket: TcpStream, cancelled: &'a AtomicBool, until: Instant) -> io::Result<Self> {
@@ -710,6 +730,7 @@ impl<'a> Wire<'a> {
             socket,
             cancelled,
             until,
+            received: 0,
         })
     }
     /// ワイヤの IO 期限(Instant)とキャンセルの判定。招待・承認の期限(壁時計)とは
@@ -734,7 +755,10 @@ impl<'a> Wire<'a> {
                         "enrollment peer closed",
                     ))
                 }
-                Ok(n) => offset += n,
+                Ok(n) => {
+                    offset += n;
+                    self.received += n;
+                }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10))
                 }
@@ -1108,13 +1132,61 @@ mod tests {
         // 通常は 0.3 秒ほどで届く。全テストを並列に走らせるとマシンが混むため
         // 余裕を持たせる(2秒だと手元の並列実行でも落ちることがあった。CI の
         // ランナーはさらに遅い)。届かないこと自体は従来どおり失敗にする
-        assert!(matches!(
-            i.events
-                .recv_timeout(Duration::from_secs(10))
-                .expect("登録イベントが届くこと"),
-            Event::Registered(_)
-        ));
+        let event = i.events
+            .recv_timeout(Duration::from_secs(10))
+            .expect("登録イベントが届くこと");
+        assert!(
+            matches!(event, Event::Registered(_)),
+            "登録イベントが届くこと(受信: {event:?})"
+        );
         assert!(enroll(addr, &i.code, |_, _| panic!("must not save twice")).is_err());
+    }
+
+    /// 候補確認の probe は接続だけして id フレームを読まずに切る(本番の
+    /// tcp_port_open と同じ形)。コードを一度も送っていないので試行に数えては
+    /// ならない。相手が FIN で閉じるか RST で切るかはタイミング次第で、返る
+    /// 種別が UnexpectedEof / ConnectionReset / BrokenPipe と揺れる。probe が
+    /// 1 回でも数えられていれば、続く誤コードの残り回数がずれる(イベント列の
+    /// 最後が AttemptFailed(2) でなくなる)ので、それで検出する
+    #[test]
+    fn silent_candidate_probes_never_consume_enrollment_attempts() {
+        let (i, addr, _) = invitation(Duration::from_secs(10));
+        for _ in 0..6 {
+            assert!(tcp_port_open(addr, Duration::from_secs(2)));
+        }
+        let wrong = if i.code == "000000" { "111111" } else { "000000" };
+        assert!(enroll(addr, wrong, |_, _| panic!("wrong code must not save")).is_err());
+        // probe 分の AttemptFailed が混ざっていれば最後のイベントが変わる
+        let mut last = None;
+        while let Ok(event) = i.events.recv_timeout(Duration::from_millis(300)) {
+            last = Some(event);
+        }
+        // コードを試したのは 1 回だけ = MAX_ATTEMPTS(3) - 1 = 残り 2 回
+        assert_eq!(last, Some(Event::AttemptFailed(2)));
+    }
+
+    #[test]
+    fn a_connection_that_sent_nothing_is_never_counted_as_an_attempt() {
+        // FIN / RST / 途中の切断はタイミングで種別が変わる。どれも試行に数えない
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+        ] {
+            let e = untried_connection(io::Error::from(kind), false);
+            assert_eq!(e.kind(), io::ErrorKind::ConnectionAborted, "{kind:?}");
+        }
+        // 1 バイトでも届いていれば通常の失敗(不正フレーム・途中切断)として数える
+        assert_eq!(
+            untried_connection(io::Error::from(io::ErrorKind::ConnectionReset), true).kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        // 期限切れ・キャンセルは probe ではない
+        assert_eq!(
+            untried_connection(io::Error::from(io::ErrorKind::Interrupted), false).kind(),
+            io::ErrorKind::Interrupted
+        );
     }
     #[test]
     fn existing_key_enrollment_preserves_bytes_without_changing_desktop_import() {
