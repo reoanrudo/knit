@@ -1,6 +1,13 @@
 //! 「今離すとどうなるか」の予報(I2)。**表示はこの値の写像にすぎない**ので、
 //! 文言や判断を UI 側に書かない。入力は観測できる事実だけに限り、分からない
 //! ことは `Unknown` にして成功語を出さない(調査 M2・M3 / 摩擦 F2・F3)
+//!
+//! 申し送り(次の増分で扱うこと):
+//! 1. `peer_lazy` は相手の**能力**であって「今回の遅延提供が受理されたか」ではない。
+//!    受理の事実を扱う増分(I8)で `ForecastInput` に受理状態を足すこと。
+//! 2. 残り時間(`eta_ms`)と相手の残り我慢(`deadline_ms`)の比較は**表示側の仕事**。
+//!    ETA が期限より長いときに「あと◯秒」と言うと嘘になる(I4 で比較する)。
+//! 3. `speed_samples` は呼び出し側の自己申告。実測を渡す責任は呼び出し側にある。
 use super::Refusal;
 
 /// 押下と転送完了の前後関係。相手(Windows)は「押下が続いている間に届いた
@@ -46,7 +53,7 @@ pub enum Forecast {
         percent: Option<u8>,
         /// 完了までの目安。総量が分かり、速度の実測が2件以上あるときだけ
         eta_ms: Option<u64>,
-        /// 相手が待つのをやめるまでの残り(0 = 期限が不明)
+        /// 相手が待つのをやめるまでの残り(None = 期限が不明。Some(0) は期限ちょうど)
         deadline_ms: Option<u64>,
     },
     /// 今離しても渡らない
@@ -74,7 +81,9 @@ pub struct ForecastInput {
     pub save_dir: Option<String>,
 }
 
-/// 完了までの目安。**総量が分かり、速度の実測が2件以上あるときだけ**出す
+/// 完了までの目安。**総量が分かり、速度の実測が2件以上あるときだけ**出す。
+/// `total <= sent` は現在の呼び出し元(未完の待ち状態)からは到達しないが、
+/// 将来ここを別の状態から呼んでも 0 や負を作らないための防御として残す
 fn eta_ms(sent: u64, total: u64, elapsed_ms: u64, speed_samples: u32) -> Option<u64> {
     if speed_samples < 2 || sent == 0 || elapsed_ms == 0 || total <= sent {
         return None;
@@ -297,5 +306,54 @@ mod tests {
             ..base()
         };
         assert_eq!(forecast_for(&over), Forecast::WillPlace);
+    }
+
+    /// 実際の流れ: 50% で離す → Mac は送信を続ける → 届き終える。ここで「離した順序」
+    /// より「完了」を先に見ると **置けていないのに「置けた」と言う**(F5 の嘘の再発)。
+    /// 到達可能な入力で順序を固定する(変異 m8 が生き残っていた穴)
+    #[test]
+    fn releasing_early_stays_save_only_even_after_the_bytes_arrive() {
+        let finished_after_release = ForecastInput {
+            phase: CarryPhase::ReleasedEarly,
+            sent: 10_000,
+            total: 10_000,
+            ..base()
+        };
+        assert_eq!(
+            forecast_for(&finished_after_release),
+            Forecast::WillSaveOnly { dir: None },
+            "完了前に離したら、後から届き終えても置けてはいない"
+        );
+        // 差が「離した順序」の1点だけで決まることを固定する
+        let released_after_complete = ForecastInput {
+            phase: CarryPhase::ReleasedAfterComplete,
+            ..finished_after_release.clone()
+        };
+        assert_eq!(forecast_for(&released_after_complete), Forecast::WillPlace);
+        // 保存先が分からない場合も「保存のみ」であることは言い切れる
+        assert!(matches!(
+            forecast_for(&finished_after_release),
+            Forecast::WillSaveOnly { dir: None }
+        ));
+    }
+
+    /// 相手の期限が不明(None)のときは、残り我慢を数字で出さない(嘘を作らない)
+    #[test]
+    fn an_unknown_deadline_is_not_shown_as_a_number() {
+        let no_deadline = ForecastInput {
+            peer_deadline_ms: 0,
+            ..base()
+        };
+        let Forecast::WaitingForPeer {
+            deadline_ms,
+            percent,
+            eta_ms,
+        } = forecast_for(&no_deadline)
+        else {
+            panic!("未完の押下中は待ち");
+        };
+        assert_eq!(deadline_ms, None, "期限が不明なら数字を出さない");
+        assert_eq!(percent, Some(10), "% は総量から出せる");
+        assert_eq!(eta_ms, Some(9_000), "残り時間も総量と速度から出せる");
     }
 }

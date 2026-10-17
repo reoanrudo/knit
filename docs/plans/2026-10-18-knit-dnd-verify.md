@@ -82,6 +82,28 @@ $ git rev-parse --short HEAD                                  -> a3f9512
 **申告されていた 548 passed / 0 failed は事実と一致した**(設計 §2 AC6 の基準値を自分で確認できた)。
 増分の判定は `548 + 新規テスト数` を期待値とし、**`ignored` の増加も検出する**(基準は 4)。
 
+#### 【訂正】計器の走査範囲(2026-10-18 I2 検証時に発見・修正)
+
+初版の抽出器は `crates/mac/src` と `crates/common/src` だけを走査しており、
+**統合テスト(`crates/common/tests/`・`crates/mac/tests/`)が漏れていた**。
+§1.1 で「テストの assert メッセージも含む」と書いた以上、これは計器の欠陥である
+(I1 の検証時には気づかず、I2 の検証で気づいた)。走査対象を4ディレクトリに広げて再基準化した。
+
+| 指標 | 初版(production のみ) | **訂正後(src + tests)** |
+|---|---|---|
+| `occurrences` | 2494 | **2567** |
+| `unique_text` | 1926 | **1990** |
+| `unique_filetext` | 2233 | **2299** |
+| `H_multiset`(基準 `a3f9512`) | `8ecdd626…670a3`(旧・以後使わない) | **`7719419478265c1eebef0cc07c06d51b66feaad34b040555389addd9a58cbbe7`** |
+| `H_filetext`(基準 `a3f9512`) | `15aa5902…861f67`(旧) | **`12dbe9ebdce0f466d7130ff0122a8ab3eb51b4bebfe2763578a2a616684c4e12`** |
+
+上の §1.2 の表(2494/1926/2233)は**初版の値**であり、この訂正表が現在の基準である。
+**I1 の結論は変わらない**: 拡張スキャンで `a3f9512 → 43de2e2` を再比較した結果、
+production 側の変化は L6 のリテラル分割1件のみで、残りの差分はすべて
+`crates/common/tests/drag_handoff.rs` に足されたテスト期待値・assert メッセージだった。
+**教訓**: 計器の走査範囲は「ユーザー可視の文言が現れ得る場所」と一致させる。
+`crates/common/tests/` を外したままでは、テスト側で文言を書き換えても検出できなかった。
+
 ### 1.3 Tier A: 掴み経路のユーザー可視文言(逐語・`files.rs` 行番号は `a3f9512`)
 
 I1 が触る範囲。**この表の文字列が1文字でも変われば I1 は不合格**(設計 §4 I1)。
@@ -143,7 +165,7 @@ import re,os,sys,hashlib,subprocess,collections
 ROOT="/Users/taguchireo/Documents/八幡平市地域おこし協力隊/05_個人/knit"
 os.chdir(ROOT)
 REV=sys.argv[1] if len(sys.argv)>1 else None
-DIRS=["crates/mac/src","crates/common/src"]
+DIRS=["crates/mac/src","crates/common/src","crates/mac/tests","crates/common/tests"]
 tag0=(sys.argv[1] if len(sys.argv)>1 else "worktree")
 JP=re.compile(r'[ぁ-んァ-ヴー一-龯、。「」『』（）〈〉・…：？！％〜／]')
 CTX=re.compile(r'notify\(|confirm_alert|set_?[Tt]itle|menu_item|setMenuItem|tooltip|ToolTip|balloon|toast|\.text\(|label:|title:|body:|message')
@@ -429,6 +451,11 @@ B6: Refusal ではなく Ready{note} 相当か(§2 T1)
 
 検証日: 2026-10-18 / 検証 rev: **`43de2e2`**(HEAD、申告どおり)
 
+**再検証(計器の走査範囲を統合テストへ拡張した後)**: `H_multiset` = `3e26aae0…085f6c9`。
+拡張スキャンでの `a3f9512 → 43de2e2` の差分は、production 側が **L6 のリテラル分割1件のみ**で、
+残りは `crates/common/tests/drag_handoff.rs` に足されたテスト期待値(7理由の本文)と assert メッセージ。
+**判定(合格)に変更はない。**
+
 **C1 対象の確定**
 
 ```
@@ -573,13 +600,120 @@ eprintln!(files.rs 全体: a3f9512 = 27  ->  43de2e2 = 22   (-5)
 - 目視・実機の確認はしていない(通知の実表示、HUD は I3 以降)。
 - `crates/win` は対象外。
 
+### a420d11: I1 の指摘3件の修正 / 判定: **合格**
+
+検証日: 2026-10-18 / rev **`a420d11`**
+
+- ビルド・テスト: `cargo test` = **549 passed / 0 failed / 4 ignored**(43de2e2 と同数。追記のみでテスト件数は増えない)
+- 文言: `diff multiset_43de2e2 multiset_a420d11` = **追加2件のみ**、いずれも統合テスト内の文字列
+  (` ※読めない・リンク等の 2 件をスキップ: a.txt ほか1件` と、その連結結果)。**production の文言は不変**。
+- **指摘1(網羅 assert)を変異で実証**: `Refusal` に `MutantProbe` を足すと
+  `error[E0004]: non-exhaustive patterns: &Refusal::MutantProbe not covered --> crates/common/src/drag.rs:36:15`
+  でコンパイルが止まる(exit 101)。
+  **ただし効いているのは `notice_body` の match であり、テスト側の網羅 match ではない**
+  (lib がコンパイルできないので統合テストの match まで到達しない)。
+  テスト側の match は「`notice_body` に将来ワイルドカードが入った場合」の二重の網として価値がある、が正確な整理。
+- **指摘2(連結の固定)を変異で実証**: `skipped_notice` を `format!("{SKIPPED_NOTICE} {skip_note}")`(空白1文字)に
+  変えると `refusal_reason_covers_every_reject_branch` が赤(exit 101、`assertion left == right failed`)。
+  連結が common の1箇所に集約され、**私の golden list では検出できない種類の退行が塞がれた**。
+- **指摘3(改名)**: `grep -rn CollectPending crates/` = **0件**。`Collect::Pending` は残り、
+  doc コメントで「`Verdict::Wait` とは別物」と明記されている ✓
+
+### I2: 「今離すとどうなるか」の予報を値にする / 判定: **合格**(テスト欠落2件・doc 1件の欠陥。挙動は正しい)
+
+検証日: 2026-10-18 / rev **`da6129c`**
+
+- 差分: `crates/common/src/drag/forecast.rs`(新規 301行)と `drag.rs`(+4:
+  `pub mod forecast;` と**明示的な**再エクスポート `pub use forecast::{forecast_for, CarryPhase, FailReason, Forecast, ForecastInput, Why};`)。
+  **consumer はまだ無い**(mac の配線は設計どおり I4)。値だけを先に置く増分。
+- `cargo build` exit 0(警告行 10 = 基準と同数)/ `cargo test` = **556 passed / 0 failed / 4 ignored**(549+7、申告どおり)
+- 文言: `diff multiset_a420d11 multiset_da6129c` = **追加4件のみ**、すべて `forecast.rs` の module テスト内
+  (`panic!`/assert メッセージ)。**production のユーザー可視文言は1文字も増減していない**。
+  (`H_multiset`: a420d11 `381e462e…8f46a6` → da6129c `3fd54fd4…309d1f`)
+- 設計 §4 I2 の検証項目 (a)〜(e) はすべて表テストで固定 ✓
+  (a) `total==0` → ETA を出さない / (b) 期限超過 → `WillFail{PeerTimeout}` / (c) 完了前の離し → `WillSaveOnly` /
+  (d) `peer_lazy` → `WillPlace` 側 / (e) 材料不足 → `Unknown`。出力の型も設計より精緻(`WillFail{reason: FailReason}`)。
+- 表テストの置き場所が設計の想定(統合テスト)と違い module 内だが、`cargo test -p knit-common` で走る点は同じ。
+- **行数の目安 140 に対し実測 301 行**(`#[cfg(test)]` は `:140` なのでテスト約161行)。
+  設計 §4 前文の「150行を超える場合は増分を分割」に字面上は抵触する(判定には影響させないが記録する)。
+
+**lead の重点4点への回答**
+
+1. **`WillPlace` で「実際には置けないのに置ける」と言う経路** — 実装の順序は正しいが、穴が2つある。
+   - `peer_lazy == true` → `WillPlace`(`forecast.rs:116-118`)は**能力**だけを見ており、
+     **今回の遅延提供が受理されたか**を見ていない(`ForecastInput` に受理状態が無い)。
+     `peer_lazy` は I7 の版ゲートで決まる能力フラグなので「相手が lazy 対応」=「今この掴みを置ける」ではない。
+     現在は `peer_lazy=false` が既定なので実害は無いが、I7/I8 以降で I8 の `Accepted` を入力に足す必要がある。
+   - **「離した後に届き終えた」場合の順序がテストで固定されていない**(下の欠陥1)。
+2. **`WillSaveOnly{dir: None}`** — 型は `Option<String>` で表現できる ✓。ただし (a) consumer がまだ無い、
+   (b) テストは `dir: Some("Downloads/Knit")` の1ケースのみで **`None` の経路が未固定**(欠陥2)。
+   I5 のコンポーザへ「保存先が不明」を表現できることの申し送り。
+3. **期限の境界** — `elapsed_ms > peer_deadline_ms` で期限切れ、`==` は待てる ✓
+   (`forecast.rs:127`)。摩擦doc `:51` の引用(現行 Windows は `!p.sending && p.began.elapsed() > 30s` で取消)と
+   **同じ「超えたら」**で整合 ✓。テストも両側(30_001 → `WillFail` / 30_000 → `WaitingForPeer`)で固定 ✓。
+   ただし **`elapsed_ms` の起点は呼び出し側が `began` に合わせる必要がある**(I4 の申し送り。I2 では検証不能)。
+   また「完了を期限より先に見る」判断(`forecast.rs:124-126`)は、摩擦doc の `!p.sending` 条件が
+   **完了後も成立し得る**ため、「完了したから置ける」が偽り得る余地がある。crates/win を読めないので
+   **未検証の前提**として残す(設計 §9-6 と同じ扱い)。
+4. **変異テスト**(私の手で実施。`/tmp` の detached worktree = `git worktree add --detach` で行い、
+   本体の作業ツリーは汚していない。最後に `git worktree remove` と `git status --porcelain` が空を確認):
+
+| 変異 | 内容 | 結果 |
+|---|---|---|
+| m1 | `eta_ms` の `total <= sent` → `total < sent`(lead 例) | **生存**(258 passed) |
+| m2 | `speed_samples < 2` → `< 1` | 赤(`no_eta_without_two_speed_samples_or_a_known_total`) |
+| m3 | `ReleasedEarly` 分岐を削除(lead 例) | 赤(`releasing_before_completion_saves_instead_of_placing`) |
+| m4 | 拒否の早期 return を削除 | 赤(`a_refusal_beats_even_lazy_delivery`)= X8 の防御が実効 |
+| m5 | 期限 `>` → `>=` | 赤(`a_deadline_that_has_passed_means_the_peer_gives_up`) |
+| m6 | 完了判定を `if false` で無効化 | 赤(3件) |
+| m7 | `Unknown` の理由 `TotalUnknown` → `NoTransferStarted` | 赤(X9 の理由の区別が実効) |
+| **m8** | `ReleasedEarly && sent < total` に条件を狭める(私の追加) | **生存**(258 passed)← **欠陥1** |
+| m9 | 完了の境界 `>=` → `>`(私の追加) | 赤(2件) |
+| m10 | `Refusal` にバリアント追加(指摘1の実効性。**a420d11 で実施**) | コンパイルエラー(exit 101)✓ |
+| m11 | `skipped_notice` に空白を1文字追加(指摘2の実効性。**a420d11 で実施**) | 赤 ✓ |
+
+   **m1 が生存したのは「テストの盲点」ではなく「到達不能なガード」(等価変異)**。
+   `eta_ms` は最後の `WaitingForPeer` からしか呼ばれず、そこへ来るのは `sent < total` のときだけなので
+   `total <= sent` は決して真にならない(冗長なガード。削るか「到達しない」とコメントするのが良い)。
+
+**見つけた欠陥**
+
+1. **[テスト欠落・重要] 「完了前に離した後で、転送が届き終えた」入力が未固定。**
+   実装は `ReleasedEarly` を `sent >= total` より先に見るので**正しい**
+   (保存のみだったものを「置けた」と言わない)。しかしこの順序を崩しても
+   (条件を `ReleasedEarly && sent < total` に狭めても) **全テストが緑のまま** = m8 が生存。
+   現実の流れでは**必ずこの入力が来る**: ユーザーが 50% で離す → Mac は送信を続ける → `sent >= total` になる。
+   ここで順序が崩れると **F5 の嘘(保存のみを「置けます」)が無言で再発**する。
+   再現: `ForecastInput { phase: ReleasedEarly, peer_lazy: false, sent: 10_000, total: 10_000, .. }` を
+   テストに足す(期待は `WillSaveOnly`)。現状このケースが無い。
+2. **[テスト欠落・軽微] `WillSaveOnly{dir: None}` が未固定**(重点2)。`save_dir: None` のとき
+   表示側が「保存先が分からない」と言えることを保証するテストが無い。
+3. **[doc/型・軽微] `deadline_ms` のコメントが表現と矛盾。** `forecast.rs:49` は
+   `/// 相手が待つのをやめるまでの残り(0 = 期限が不明)` だが、型は `Option<u64>` で
+   **不明は `None`**、`Some(0)` は「期限ちょうど」を意味する(実装 `:135-136` も不明に `None` を返す)。
+   同じ「0 = 不明」という言い回しが `ForecastInput::peer_deadline_ms`(`:69`、u64 の番兵)にも使われており、
+   I4 の実装者が `unwrap_or(0)` で両者を混同し得る。→「不明は None(0 ではない)」と書き分けるべき。
+4. **[観察] `WaitingForPeer{deadline_ms: None}`(`peer_deadline_ms == 0`)の経路が未テスト。**
+5. **[観察・I4 への申し送り] ETA と残り期限の突き合わせが値に無い。** 残り期限 5 秒・ETA 9 秒のとき、
+   値としては「あと9秒」と「5秒で相手が諦める」が並ぶだけで、**HUD が「あと9秒」とだけ言えば嘘になる**。
+   材料は揃っているので表示層で比較できるが、値の層に「間に合わない」という表現が無い。
+6. **[観察] `speed_samples` は呼び出し側の自己申告**で、値の層では検証できない(I4 の配線時に確認する)。
+7. **[観察] `eta_ms` の `saturating_mul` は桁溢れで黙って巨大な値を返す**(panic はしない)。
+   `percent` の `.min(100)` と同様、実入力では到達しない防御。新規コードに `unwrap`/`panic!` 経路は無い。
+
+**未検証の点**
+
+- mac 側の配線が無いので、**実入力での予報の正しさは検証できない**(I4 の検証項目に送る)。
+- `crates/win` は対象外。したがって「完了後も 30 秒取消が成立し得るか」は未検証の前提のまま。
+- 目視・実機は未実施。
+
 ### I1〜I3 の状態
 
 | 増分 | 依頼 | 判定 | 備考 |
 |---|---|---|---|
-| I1 | 受領(43de2e2) | **合格** | 欠陥3件は軽微(テストの網羅・描画固定・命名)。挙動の退行なし |
-| I2 | 未受領 | — | X8(拒否より `peer_lazy` を優先しない)・X9(total==0 の ETA)を突く |
-| I3 | 未受領 | — | §6 の `TooMany` 粒度、HUD と通知の同一値性、tap スレッド UI を突く |
+| I1 | 受領(43de2e2)→ 指摘修正(a420d11) | **合格** | 3件の指摘はすべて修正され、修正自体も変異(m10/m11)で実効性を確認 |
+| I2 | 受領(da6129c) | **合格** | 欠陥は「テスト欠落2件・doc 1件」で挙動は正しい。X8/X9 は変異で実効を確認 |
+| I3 | 未受領 | — | §7-5 の `TooMany` 粒度、HUD と通知の同一値性、tap スレッド UI を突く |
 
 ---
 
