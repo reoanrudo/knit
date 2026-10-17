@@ -129,14 +129,19 @@ pub(crate) fn history_push_image(dib: &[u8], device: &str) {
     }
     // 刈り込みは if の外: 同じ画像の再コピー(実体の新規保存が無い)の間も
     // バイト総量上限(512MiB)へ収め続ける。件数とバイトの両方で頭打ちにする
-    knit_common::history::prune_image_store(
+    let removed = knit_common::history::prune_image_store(
         &dir,
         IMAGE_KEEP,
         knit_common::history::MAX_IMAGE_STORE_BYTES,
     );
     let ts = knit_common::history::now_epoch_ms();
     if let Ok(mut h) = HISTORY.lock() {
+        // 監査1: 消した実体を参照する履歴項目も取り除く(Mac 側と対称)
+        let mut changed = h.remove_image_entries(&removed) > 0;
         if h.push_image(&name, dib.len(), device, ts).is_some() {
+            changed = true;
+        }
+        if changed {
             drop(h);
             history_save();
         }
@@ -147,11 +152,21 @@ pub(crate) fn history_push_image(dib: &[u8], device: &str) {
 /// 画像が届いた時しか走らないため、起動をまたぐと総量超過が残り続くのを防ぐ
 pub fn prune_image_store_now() {
     let Some(dir) = image_store_dir() else { return };
-    knit_common::history::prune_image_store(
+    let removed = knit_common::history::prune_image_store(
         &dir,
         IMAGE_KEEP,
         knit_common::history::MAX_IMAGE_STORE_BYTES,
     );
+    // 監査1: 起動時の刈り込みでも、消した実体を参照する履歴項目を取り除く
+    if removed.is_empty() {
+        return;
+    }
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.remove_image_entries(&removed) > 0 {
+            drop(h);
+            history_save();
+        }
+    }
 }
 
 /// 履歴の全消去(トレイメニュー)。保存ファイルも消して次回起動に残さない

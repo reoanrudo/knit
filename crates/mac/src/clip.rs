@@ -211,7 +211,7 @@ impl ImageStoreWorker {
                 } else {
                     knit_common::history::touch_mtime(&path);
                 }
-                knit_common::history::prune_image_store(
+                let removed = knit_common::history::prune_image_store(
                     &dir,
                     IMAGE_KEEP,
                     knit_common::history::MAX_IMAGE_STORE_BYTES,
@@ -220,13 +220,19 @@ impl ImageStoreWorker {
                 // テスト(push_history=false)では実行しない
                 let ts = knit_common::history::now_epoch_ms();
                 if push_history {
-                if let Ok(mut h) = HISTORY.lock() {
-                    if h.push_image(&name, bmp.len(), &job.device, ts).is_some() {
-                        HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
-                        drop(h);
-                        history_save();
+                    if let Ok(mut h) = HISTORY.lock() {
+                        // 監査1: 実体を消した画像を参照する履歴項目も一緒に消す。
+                        // 残すと「押しても復元できない項目」が履歴に溜まる
+                        let mut changed = h.remove_image_entries(&removed) > 0;
+                        if h.push_image(&name, bmp.len(), &job.device, ts).is_some() {
+                            changed = true;
+                        }
+                        if changed {
+                            HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+                            drop(h);
+                            history_save();
+                        }
                     }
-                }
                 }
                 // 1枚処理し終えたので深さを戻す(次の投入を受け入れる)
                 let _ = depth_worker.fetch_sub(1, Ordering::SeqCst);
@@ -293,11 +299,22 @@ pub(crate) fn history_push_image_bmp(bmp: &[u8], device: &str) {
 /// 画像が届いた時しか走らないため、起動をまたぐと総量超過が残り続くのを防ぐ
 pub(crate) fn prune_image_store_now() {
     let Some(dir) = image_store_dir() else { return };
-    knit_common::history::prune_image_store(
+    let removed = knit_common::history::prune_image_store(
         &dir,
         IMAGE_KEEP,
         knit_common::history::MAX_IMAGE_STORE_BYTES,
     );
+    // 監査1: 起動時の刈り込みでも、消した実体を参照する履歴項目を取り除く
+    if removed.is_empty() {
+        return;
+    }
+    if let Ok(mut h) = HISTORY.lock() {
+        if h.remove_image_entries(&removed) > 0 {
+            HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
+            drop(h);
+            history_save();
+        }
+    }
 }
 
 /// 履歴から Mac のクリップボードへ復元する。受信ループ防止のため
