@@ -259,6 +259,30 @@ pub fn set_gain(v: f64) {
 /// 診断カウンタ(受信/再生バイト数)。10秒毎にログへ出す
 static RX_BYTES: AtomicU64 = AtomicU64::new(0);
 static PLAY_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 直近に音声データ/キープアライブを受信した時刻(epoch ms)。0 は未受信。
+/// 状態行の「音声 停止中」判定が読む(送信側は無音期間も 1 秒毎に送る)
+static LAST_RX_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 受信の刻印(ネットワーク経路のフレーム/キープアライブと Android 中継の供給)
+fn mark_rx() {
+    LAST_RX_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// 直近の受信からの経過 ms(未受信は 0=接続直後の誤警報を避ける)
+pub fn rx_idle_ms() -> u64 {
+    let last = LAST_RX_MS.load(Ordering::Relaxed);
+    if last == 0 {
+        return 0;
+    }
+    now_ms().saturating_sub(last)
+}
 /// 再生リングバッファ(音声スレッド→AudioQueue コールバック)。
 /// 溢れたら古い方を捨てる。実効的な滞留は aq_callback の 2 段階クリップで
 /// 「目標 ≈83ms・上限 333ms」に保つ(下記定数参照)
@@ -1452,6 +1476,7 @@ pub fn start(token: String, port: u16) {
                 if len == 0 {
                     // キープアライブ(無音期間の死活監視用)。
                     // 無音期間はここがループの唯一の出口のため diag も出す
+                    mark_rx();
                     diag_log(&mut last_diag, rate);
                     continue;
                 }
@@ -1486,6 +1511,7 @@ pub fn start(token: String, port: u16) {
                 if frame.is_empty() {
                     continue;
                 }
+                mark_rx();
                 RX_BYTES.fetch_add(len as u64, Ordering::Relaxed);
                 if !MUTED.load(Ordering::Relaxed) && output_permitted() {
                     let mut ring = RING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1534,6 +1560,7 @@ pub fn feed_s16(rate: u32, pcm_s16: &[u8]) {
     if frame.is_empty() {
         return;
     }
+    mark_rx();
     RX_BYTES.fetch_add(pcm_s16.len() as u64, Ordering::Relaxed);
     if !MUTED.load(Ordering::Relaxed) && output_permitted() {
         let mut ring = RING_B.lock().unwrap_or_else(|e| e.into_inner());
