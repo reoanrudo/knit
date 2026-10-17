@@ -506,7 +506,109 @@ fn rotate_log_at(path: &std::path::Path, backup: &std::path::Path, max_bytes: u6
     if std::fs::copy(path, backup).is_err() {
         eprintln!("[log] ローテーションの退避に失敗しました({})", backup.display());
     }
+    // 切り詰める直前(= 退避と同時)に永続域のコピーも更新する。テストが
+    // 一時パスで呼ぶときは HOME に触らない
+    if path == std::path::Path::new(TMP_LOG_PATH) {
+        persist_log_now();
+    }
     std::fs::write(path, b"").is_ok()
+}
+
+/// ローテーションと永続コピーの対象パス(1 箇所にまとめる)
+const TMP_LOG_PATH: &str = "/tmp/knit-mac.log";
+
+/// `src` を `dir/knit-mac.log` へ上書きコピーする(1 世代でよい)。
+/// `src` が無ければ何もせず Ok(()) を返す(起動時に静かに継続するため)
+fn persist_log_copy(src: &std::path::Path, dir: &std::path::Path) -> std::io::Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::copy(src, dir.join("knit-mac.log"))?;
+    Ok(())
+}
+
+/// 永続域 `~/Library/Logs/knit`。HOME が取れなければ None
+fn persist_log_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(|home| std::path::Path::new(&home).join("Library/Logs/knit"))
+}
+
+/// /tmp のログを永続域へ今すぐコピーする。macOS は再起動や一定期間で /tmp を
+/// 消すため、後から障害を調べられるよう 1 世代を残す(失敗しても静かに継続)
+fn persist_log_now() {
+    if let Some(dir) = persist_log_dir() {
+        let _ = persist_log_copy(std::path::Path::new(TMP_LOG_PATH), &dir);
+    }
+}
+
+#[cfg(test)]
+mod persist_log_tests {
+    use super::persist_log_copy;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "knit-persist-log-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn copies_the_source_content_into_the_persistent_dir() {
+        let root = temp_dir("copy");
+        let src = root.join("knit-mac.log");
+        let dir = root.join("Library/Logs/knit");
+        std::fs::write(&src, "diagnostic line\n").unwrap();
+
+        // コピー先が無くても create_dir_all される
+        persist_log_copy(&src, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("knit-mac.log")).unwrap(),
+            "diagnostic line\n"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repeated_copies_overwrite_without_breaking() {
+        let root = temp_dir("overwrite");
+        let src = root.join("knit-mac.log");
+        let dir = root.join("out");
+        std::fs::write(&src, "first\n").unwrap();
+        persist_log_copy(&src, &dir).unwrap();
+
+        std::fs::write(&src, "second, longer content\n").unwrap();
+        persist_log_copy(&src, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("knit-mac.log")).unwrap(),
+            "second, longer content\n",
+            "2 回目は上書きされる"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&src).unwrap(),
+            "second, longer content\n",
+            "コピーであり元ファイルは消えない"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_source_is_ok_and_creates_nothing() {
+        let root = temp_dir("missing");
+        let dir = root.join("out");
+        assert!(persist_log_copy(&root.join("nope.log"), &dir).is_ok());
+        assert!(!dir.exists(), "コピー元が無い起動では何も作らない");
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn instance_lock_required(args: &[String]) -> bool {
