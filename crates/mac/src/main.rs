@@ -523,6 +523,19 @@ fn persist_log_copy(src: &std::path::Path, dir: &std::path::Path) -> std::io::Re
     if !src.exists() {
         return Ok(());
     }
+    // 空のログで、既にある中身入りの永続コピーを上書きしない。
+    // 起動時にログが 5MB を超えていた場合、rotate_tmp_log が「退避+永続コピー」を
+    // した直後に切り詰めで /tmp が空になり、その直後の persist_log_now が空を
+    // コピーしてしまう(監査8のレビューで判明)。次のローテーションまで障害時の
+    // ログが失われるため、ここで守る
+    let src_empty = std::fs::metadata(src).map(|m| m.len() == 0).unwrap_or(true);
+    if src_empty {
+        let dst = dir.join("knit-mac.log");
+        let dst_has_content = std::fs::metadata(&dst).map(|m| m.len() > 0).unwrap_or(false);
+        if dst_has_content {
+            return Ok(());
+        }
+    }
     std::fs::create_dir_all(dir)?;
     std::fs::copy(src, dir.join("knit-mac.log"))?;
     Ok(())
@@ -544,6 +557,37 @@ fn persist_log_now() {
 #[cfg(test)]
 mod persist_log_tests {
     use super::persist_log_copy;
+
+    /// 監査8のレビュー: 空になった /tmp のログで、中身のある永続コピーを潰さない
+    #[test]
+    fn empty_source_does_not_clobber_a_good_persisted_copy() {
+        let src_dir = temp_dir("src-empty");
+        let dst_dir = temp_dir("dst-empty");
+        let src = src_dir.join("knit-mac.log");
+
+        // 1) 中身のあるログを永続域へコピー
+        std::fs::write(&src, b"important line\n").unwrap();
+        persist_log_copy(&src, &dst_dir).unwrap();
+        let dst = dst_dir.join("knit-mac.log");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"important line\n");
+
+        // 2) ローテーションで src が空になる → 空で上書きしない
+        std::fs::write(&src, b"").unwrap();
+        persist_log_copy(&src, &dst_dir).unwrap();
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"important line\n",
+            "空のログで中身を失わない"
+        );
+
+        // 3) 新しい内容が入れば更新する
+        std::fs::write(&src, b"newer line\n").unwrap();
+        persist_log_copy(&src, &dst_dir).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"newer line\n");
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
