@@ -49,6 +49,7 @@ fn send_action(generation: u64, action: knit_common::proto::TabletAction) {
     if let Some(tx) = TX.get() {
         let _ = tx.send(outgoing::Queued {
             generation,
+            is_mouse_abs: false,
             line: encode(&Msg::TabletGesture { action }),
         });
     }

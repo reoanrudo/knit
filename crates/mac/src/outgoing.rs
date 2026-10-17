@@ -3,6 +3,8 @@ use std::sync::mpsc::Receiver;
 pub(crate) struct Queued {
     pub generation: u64,
     pub line: String,
+    /// mouse_abs 行か否か。batch() の文字列走査を排除するために持たせる。
+    pub is_mouse_abs: bool,
 }
 
 impl Queued {
@@ -16,7 +18,7 @@ pub(crate) fn batch(
     receiver: &Receiver<Queued>,
     pending: &mut Option<Queued>,
 ) -> Queued {
-    let moves = first.line.starts_with("{\"t\":\"mouse_abs\"");
+    let moves = first.is_mouse_abs;
     for _ in 0..32 {
         if first.line.len() > 256 * 1024 {
             break;
@@ -26,9 +28,10 @@ pub(crate) fn batch(
             *pending = Some(next);
             break;
         }
-        if moves && next.line.starts_with("{\"t\":\"mouse_abs\"") {
+        if moves && next.is_mouse_abs {
             first.line = next.line;
         } else {
+            first.line.reserve(next.line.len());
             first.line.push_str(&next.line);
             if moves {
                 break;
@@ -44,6 +47,7 @@ mod tests {
     fn queued(generation: u64, line: &str) -> Queued {
         Queued {
             generation,
+            is_mouse_abs: line.starts_with("{\"t\":\"mouse_abs\""),
             line: line.into(),
         }
     }

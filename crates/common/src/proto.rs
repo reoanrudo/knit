@@ -446,9 +446,15 @@
         true
     }
 
+    pub fn encode_into(msg: &Msg, out: &mut String) {
+        out.clear();
+        out.push_str(serde_json::to_string(msg).unwrap_or_default().as_str());
+        out.push('\n');
+    }
+
     pub fn encode(msg: &Msg) -> String {
-        let mut s = serde_json::to_string(msg).unwrap_or_default();
-        s.push('\n');
+        let mut s = String::new();
+        encode_into(msg, &mut s);
         s
     }
 

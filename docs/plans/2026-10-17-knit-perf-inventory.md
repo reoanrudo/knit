@@ -23,6 +23,14 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 | 機能 | 主要コード | ボトルネック仮説 | 優先度 | 割当 |
 |---|---|---|---|---|
 | 入力レイテンシ | `mac/outgoing.rs`・`win/input.rs`・`mac/tap.rs` | 物理→共有→再注入の往復 RTT + 暗号化(Noise)+ 暗号化パケットの頻度。serde_json 自体は軽いが、パケット単位で毎回シリアル/デシリアライズ+暗号化の固定コストが積まる | 高 | ループ3 |
+
+### 入力レイテンシ ループ3(2026-10-17)
+| 計測 | p50 | 合計 |
+|---|---|---|
+| proto::encode MouseAbs x100000 | 167 ns | 18 ms |
+| proto::decode MouseAbs x100000 | 125 ns | 13 ms |
+
+変更: `Queued` に `is_mouse_abs: bool` を追加し batch() の prefix 文字列走査2箇所をフラグ判定に置換(文字列走査排除)。`push_str` 前に `reserve` を挿入(再確保抑制)。`encode_into` を追加し `encode` をそれで書き直し(wire形式・呼び出し側変更なし)。
 | 音声 | `mac/audio.rs`・`win/audio.rs` | 音声ストリーミングのバッファリング・サンプルレート変換・GCD が遅延を生む可能性 | 高 | ループ4 |
 | 音声混音(混声) | `mac/audio.rs` の mix | 複数入力の混音処理・リサンプル・キューのバックログ | 中 | ループ5 |
 | ドラッグ・掴み | `mac/file_drag.rs`/`incoming_drag.rs`・`win/dragdrop.rs` | 大型ファイルのドラッグで、データコピー(1MB+ clone)+ 暗号化+ LAN転送が重なる | 高 | ループ6 |

@@ -58,3 +58,26 @@
 
 ### コミットハッシュ
 - (本コミットを参照)
+
+## ループ3 実行記録(2026-10-17)
+### 対象
+- 入力レイテンシ(Mac→Windows 入力イベント送信経路)
+
+### 変更点(挙動不変・wire形式不変・新規依存なし)
+- 新規: `crates/common/examples/perf-input.rs`(proto::encode/decode p50・合計計測)
+- `mac/outgoing.rs`: `Queued` に `is_mouse_abs: bool` を追加。batch() の prefix 文字列走査2箇所をフラグ判定に置換。`push_str` 前に `reserve` を挿入(再確保抑制)
+- `mac/main.rs`・`mac/trackpad.rs`: 構築箇所でフラグを設定(main.rs は `matches!(msg, Msg::MouseAbs{..})`、trackpad.rs は false)
+- `common/proto.rs`: `encode_into` を追加し `encode` をそれで書き直し(呼び出し側変更なし)
+
+### 計測値(cargo run --release --example perf-input)
+| 計測 | p50 | 合計 |
+|---|---|---|
+| encode MouseAbs x100000 | 167 ns | 18 ms |
+| decode MouseAbs x100000 | 125 ns | 13 ms |
+
+### テスト結果
+- knit-common: 209 passed / 0 failed
+- knit-mac: 20 passed + 5 passed / 0 failed
+
+### 考察
+- encode/decode は p50 167ns/125ns と 1µs 以下。バッチ経路の文字列走査排除と容量予約は定数削減で、実測上の顕著な変化は小さい。
