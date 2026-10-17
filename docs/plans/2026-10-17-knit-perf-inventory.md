@@ -38,6 +38,7 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 - before(a VecDeque インデックス): p50=750 ns, 合計=1,512,780 ns(4096B×2000ブロック)
 - after(b drain→Vec+chunks_exact(4)): p50=500 ns, 合計=993,281 ns(約34%短縮)
 - 変更: 1122〜1130 を `tmp.extend(rb.drain(..take))` + `tmp.chunks_exact(4)` に置換(挙動不変・ゼロ埋め・filled更新・ソフト飽和式・take の &!3 維持)。
+- 音声(ループ8 2026-10-17): 適応プリロールにより再生開始遅延を固定 42.7ms から通常 10.7ms へ(音切れ時最大 42.7ms まで段階的に拡大)。
 | 音声混音(混声) | `mac/audio.rs` の mix | 複数入力の混音処理・リサンプル・キューのバックログ | 中 | ループ5 |
 | ドラッグ・掴み | `mac/file_drag.rs`/`incoming_drag.rs`・`win/dragdrop.rs` | 大型ファイルのドラッグで、データコピー(1MB+ clone)+ 暗号化+ LAN転送が重なる | 高 | ループ6 |
 | ファイル転送 | `mac/files.rs`/`win/xfer.rs`・`common/bulk.rs` | 1MB+ のデータ転送で、clone/暗号化/UDP/TCP のいずれかがボトルネック | 高 | ループ5(前倒し: ループ4で音声混音の内側ループを改善済み、ファイル転送は高優先度未着手) |

@@ -274,11 +274,44 @@ const RING_CAP: usize = 48 * 1024;
 /// プリロール量(48kHz f32/stereo で ≈42ms)。ストリーム開始/ミュート明けに
 /// これだけ溜まるまで再生を始めない。ネットワークの到着むら(バースト)を
 /// このクッションで吸収し、RING 空による断続音(モールス音)を防ぐ。
-/// 低遅延を優先して 42ms とする(旧 83ms は体感の遅延が大きかった)
+/// 低遅延を優先して 42ms とする(旧 83ms は体感の遅延が大きかった)。
+/// ループ8(適応プリロール): 第2レーン(PRIMED_B)と緊急クリップは固定値、
+/// 第1レーンの PRE_ROLL は preroll::MIN から始め、音切れ時だけ段階的に MAX へ
 const RING_PRE_ROLL: usize = 16 * 1024;
-/// プリロール量(再生開始までの溜め)。接続先の種別によらず同じ値を使う
+
+/// 適応プリロール(ループ8): 再生開始遅延を体感 42.7ms から通常 10.7ms へ。
+/// MIN から始め、音切れ(PRIMED 中の供給枯れ)で倍化し、健康な再生は
+/// 1KB ずつ MIN へ戻す。MIN 未満へは戻さず MAX を超えない(安全側:
+/// 音切れが曖昧なときは大きいクッションを選ぶ)。
+pub(crate) mod preroll {
+    pub const MIN: usize = 4 * 1024; // ≈10.7ms
+    pub const MAX: usize = super::RING_PRE_ROLL; // ≈42.7ms(現行値を上限)
+    const STEP: usize = 1024;
+
+    /// 音切れ(供給枯れ)のたびに倍増(上限 MAX)
+    pub fn on_starve(cur: usize) -> usize {
+        (cur * 2).min(MAX).max(MIN)
+    }
+
+    /// 音切れ無しが続く間の健康な再生のたびに 1KB ずつ MIN へ戻す
+    pub fn on_healthy(cur: usize) -> usize {
+        cur.saturating_sub(STEP).max(MIN)
+    }
+
+    /// byte 分の在庫が 48kHz/stereo f32 で何 ms 遅延か
+    pub fn latency_ms(bytes: usize) -> f64 {
+        bytes as f64 / (48000.0 * 8.0) * 1000.0
+    }
+}
+
+/// プリロール量(再生開始までの溜め)。ループ8で適応化: 初期値 MIN(≈10.7ms)、
+/// 音切れ時 MAX(≈42.7ms) へ段階的に拡大
 static PRE_ROLL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(RING_PRE_ROLL);
+    std::sync::atomic::AtomicUsize::new(preroll::MIN);
+/// 健康な再生の累計(コールバック数)。音切れ検出は PRIMED 中の供給枯れで、
+/// 健康な間はこのカウントで on_healthy を間隔(1.2秒≒30回)で適用する
+static PREROLL_HEALTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// プリロール完了状態(開始/ミュート明けごとにやり直す)
 static PRIMED: AtomicBool = AtomicBool::new(false);
 /// ソフト追い込みの目標滞留(≈42ms=プリロール量と同値)。これを超えたら
@@ -1095,6 +1128,36 @@ unsafe extern "C" fn aq_callback(
                 }
                 filled = take;
             }
+            // 適応プリロール(ループ8): 音切れ/健康判定は RING 単体の在庫不足
+            // (第2レーンの加算は別経路、第2レーン変更しないため)で行う。
+            // 音切れ: PRIMED 中の在庫不足(=供給が尽きた合図)で PRE_ROLL を
+            // on_starve で更新し、PRIMED=false に戻して次のプリロールで新しい
+            // 目標(大きいクッション)を溜める。健康: 音切れ無しの間、約 1.2 秒
+            // (30 コールバック≒1.2秒)に 1KB ずつ MIN へ戻す。
+            // 安全側: 音切れ検出が曖昧なときは大きいクッションを選ぶ。
+            if filled < cap {
+                if PRIMED.load(Ordering::Relaxed) {
+                    // 音切れ: 在庫不足。PRE_ROLL を倍化して次プリロールで
+                    // 大きいクッションを溜める。PRIMED=false で次プリロールから
+                    // 新しい目標でゼロ埋めを待つ。
+                    let cur = PRE_ROLL.load(Ordering::Relaxed);
+                    PRE_ROLL.store(preroll::on_starve(cur), Ordering::Relaxed);
+                    PRIMED.store(false, Ordering::Relaxed);
+                }
+            } else {
+                // 健康な再生(音切れ無し)。約 1.2 秒(30 コールバック)に 1KB
+                // ずつ MIN へ戻す。PRIMED=false の間(プリロール待ち)はカウント
+                // リセットせず、PRIMED=true に戻ったときリセット。
+                if PRIMED.load(Ordering::Relaxed) {
+                    let n = PREROLL_HEALTH.fetch_add(1, Ordering::Relaxed);
+                    if n % 30 == 29 {
+                        let cur = PRE_ROLL.load(Ordering::Relaxed);
+                        PRE_ROLL.store(preroll::on_healthy(cur), Ordering::Relaxed);
+                    }
+                } else {
+                    PREROLL_HEALTH.store(0, Ordering::Relaxed);
+                }
+            }
         }
         // 第2レーン(Android タブレット)を加算して「全部の音を重ねる」。
         // 同じ 48kHz のためサンプル位置は 1:1 で足せる。加算はソフト飽和付き。
@@ -1746,5 +1809,45 @@ mod output_tests {
         );
         assert_eq!(CURRENT_DEVICE, 0x6171_6364);
         assert_eq!(DEFAULT_OUTPUT, 0x644f_7574);
+    }
+
+    // -- 適応プリロール(ループ8) --
+    #[test]
+    fn preroll_initial_value_is_min() {
+        assert_eq!(PRE_ROLL.load(std::sync::atomic::Ordering::Relaxed), preroll::MIN);
+    }
+
+    #[test]
+    fn preroll_on_starve_clamps_to_max() {
+        let mut cur = preroll::MIN;
+        for _ in 0..10 {
+            cur = preroll::on_starve(cur);
+        }
+        assert_eq!(cur, preroll::MAX);
+    }
+
+    #[test]
+    fn preroll_on_healthy_returns_to_min() {
+        let mut cur = preroll::MAX;
+        while cur > preroll::MIN {
+            cur = preroll::on_healthy(cur);
+        }
+        assert_eq!(cur, preroll::MIN);
+    }
+
+    #[test]
+    fn preroll_latency_ms_values() {
+        let ms_4kb = preroll::latency_ms(4 * 1024);
+        let ms_16kb = preroll::latency_ms(16 * 1024);
+        let target_4kb = 10.7;
+        let target_16kb = 42.7;
+        assert!(
+            (ms_4kb - target_4kb).abs() / target_4kb < 0.01,
+            "4KB latency {} ms, expected {} ±1%", ms_4kb, target_4kb
+        );
+        assert!(
+            (ms_16kb - target_16kb).abs() / target_16kb < 0.01,
+            "16KB latency {} ms, expected {} ±1%", ms_16kb, target_16kb
+        );
     }
 }
