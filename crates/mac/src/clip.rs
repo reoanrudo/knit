@@ -107,15 +107,51 @@ pub fn history_set_limit(limit: usize) {
     history_save();
 }
 
-/// 履歴の全消去(メニューバー)。保存ファイルも消して次回起動に残さない
-pub fn history_clear() {
-    if let Ok(mut h) = HISTORY.lock() {
-        h.clear();
-    }
+/// 履歴の全消去(メニューバー)。保存ファイルも消して次回起動に残さない。
+/// 画像の実体(images/)も一緒に消す: 実体は履歴から参照されなくなっても
+/// IMAGE_KEEP(60 件)/512MiB まで残り続けるため、全消去では残さない。
+/// 戻り値は (消した履歴の件数, 消した画像の件数, そのバイト数)。
+/// 注意: 保存ワーカーが処理中の 1 枚はこの後に書き込まれ得る(flush すると
+/// ワーカーが永久に停止するため待たない)。次に全消去すれば消える
+pub fn history_clear() -> (usize, usize, u64) {
+    let entries = match HISTORY.lock() {
+        Ok(mut h) => {
+            let n = h.entries().len();
+            h.clear();
+            n
+        }
+        Err(poisoned) => {
+            // ロックが毒されていても消去は続ける(保存側と同じ方針)
+            let mut h = poisoned.into_inner();
+            let n = h.entries().len();
+            h.clear();
+            n
+        }
+    };
     if let Some(path) = history_path() {
         let _ = std::fs::remove_file(path);
     }
-    eprintln!("[clip] 履歴を消しました");
+    let (images, bytes) = image_store_dir()
+        .map(|dir| knit_common::history::clear_image_store(&dir))
+        .unwrap_or((0, 0));
+    eprintln!("[clip] 履歴を消しました(履歴 {entries} 件・画像 {images} 件/{bytes} バイト)");
+    (entries, images, bytes)
+}
+
+/// 履歴の件数(全消去の確認文に「何件消えるか」を出すため。ロックが毒されて
+/// いても読める)
+pub fn history_len() -> usize {
+    match HISTORY.lock() {
+        Ok(h) => h.entries().len(),
+        Err(poisoned) => poisoned.into_inner().entries().len(),
+    }
+}
+
+/// images/ の使用量 (件数, 合計バイト)。確認文・設定画面の表示用
+pub fn image_store_usage() -> (usize, u64) {
+    image_store_dir()
+        .map(|dir| knit_common::history::image_store_usage(&dir))
+        .unwrap_or((0, 0))
 }
 
 pub(crate) fn history_push(text: &str, device: &str) {

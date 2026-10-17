@@ -736,19 +736,17 @@ pub fn touch_mtime(path: &std::path::Path) {
 /// 古い画像から消える)
 pub const MAX_IMAGE_STORE_BYTES: u64 = 512 * 1024 * 1024;
 
-/// 画像保存ディレクトリの刈り込み。新しい mtime 順に「keep 件」かつ「総量
-/// max_bytes バイト」に収まる分を残して古い実体から削除する(履歴上限 50 に
-/// 対し少し余裕を持たせた件数を呼び出し側が渡す)。履歴から追い出された画像の
-/// 実体が居座り続けるのを防ぐ。最新の 1 つはサイズに関わらず必ず残す
-/// (今保存した画像をこの刈り込み自身が消さないようにするため)
-/// 戻り値は**削除した実体のファイル名**(監査1)。呼び出し側はこの名前を参照する
-/// 履歴項目も消す。放っておくと「履歴には残るが押しても復元できない項目」になる
-pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) -> Vec<String> {
+/// 画像保存ディレクトリの実体(保存名の規則に合う .bmp/.dib のみ)を
+/// (パス, mtime, バイト数) で列挙する。刈り込み・使用量・全消去が同じ対象を
+/// 見るよう、対象判定(拡張子 + is_image_store_name)はここだけに置く。
+/// 読めないディレクトリは空(呼び出し側は 0 件として扱う)
+fn image_store_entries(
+    dir: &std::path::Path,
+) -> Vec<(std::path::PathBuf, std::time::SystemTime, u64)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut items: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = rd
-        .flatten()
+    rd.flatten()
         .filter(|e| {
             let n = e.file_name();
             let n = n.to_string_lossy();
@@ -759,7 +757,46 @@ pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) -> 
             let mtime = meta.modified().ok()?;
             Some((e.path(), mtime, meta.len()))
         })
-        .collect();
+        .collect()
+}
+
+/// 画像保存ディレクトリの使用量 (件数, 合計バイト)。履歴の保存件数を減らしても
+/// 実体は keep 件/512MiB まで残るため、「今どれだけ残っているか」を画面に出せる
+/// ようにする(全消去で何がどれだけ消えるかの提示に使う)
+pub fn image_store_usage(dir: &std::path::Path) -> (usize, u64) {
+    let items = image_store_entries(dir);
+    let bytes = items
+        .iter()
+        .fold(0u64, |acc, (_, _, size)| acc.saturating_add(*size));
+    (items.len(), bytes)
+}
+
+/// 画像保存ディレクトリの実体をすべて削除する(履歴の全消去から呼ぶ)。対象は
+/// 保存名の規則に合う .bmp/.dib だけで、それ以外のファイルには触れない。
+/// 履歴から参照されなくなった実体は刈り込みまで残り続けるため、全消去では
+/// 待たずにここで消す。戻り値は (削除した件数, 削除したバイト数)。
+/// 存在しないディレクトリは (0, 0) で panic しない
+pub fn clear_image_store(dir: &std::path::Path) -> (usize, u64) {
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for (path, _, size) in image_store_entries(dir) {
+        if std::fs::remove_file(&path).is_ok() {
+            count += 1;
+            bytes = bytes.saturating_add(size);
+        }
+    }
+    (count, bytes)
+}
+
+/// 画像保存ディレクトリの刈り込み。新しい mtime 順に「keep 件」かつ「総量
+/// max_bytes バイト」に収まる分を残して古い実体から削除する(履歴上限 50 に
+/// 対し少し余裕を持たせた件数を呼び出し側が渡す)。履歴から追い出された画像の
+/// 実体が居座り続けるのを防ぐ。最新の 1 つはサイズに関わらず必ず残す
+/// (今保存した画像をこの刈り込み自身が消さないようにするため)
+/// 戻り値は**削除した実体のファイル名**(監査1)。呼び出し側はこの名前を参照する
+/// 履歴項目も消す。放っておくと「履歴には残るが押しても復元できない項目」になる
+pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) -> Vec<String> {
+    let mut items = image_store_entries(dir);
     items.sort_by_key(|a| std::cmp::Reverse(a.1)); // 新しい順
     let mut total = 0u64;
     let mut removed = Vec::new();
@@ -1645,6 +1682,66 @@ mod prune_and_entry_removal_tests {
 
         // 何も消えていなければ何もしない
         assert_eq!(h.remove_image_entries(&[]), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 「履歴をすべて消す」で画像の実体も消せるようにするための使用量取得と全消去。
+/// 履歴の保存件数を減らしても実体は keep 件(60)/512MiB まで残るため、
+/// 消える量を数字で示せることを固定する
+#[cfg(test)]
+mod image_store_usage_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("knit-usage-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn usage_counts_only_store_shaped_images() {
+        let dir = temp_dir("usage");
+        std::fs::write(dir.join(image_file_name(1, "bmp")), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join(image_file_name(2, "dib")), vec![0u8; 24]).unwrap();
+        // 名前が規則外・拡張子違い・画像以外は数えない(消さない)
+        std::fs::write(dir.join("img-nothex.bmp"), b"xxxx").unwrap();
+        std::fs::write(dir.join(image_file_name(3, "png")), b"xxxx").unwrap();
+        std::fs::write(dir.join("readme.txt"), b"xxxx").unwrap();
+        assert_eq!(
+            image_store_usage(&dir),
+            (2, 1024),
+            "保存名の規則に合う .bmp/.dib の 2 件だけを数える"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_directory_is_zero_and_clear_does_not_panic() {
+        let dir = std::env::temp_dir().join(format!("knit-usage-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(image_store_usage(&dir), (0, 0), "無いディレクトリは 0 件");
+        assert_eq!(clear_image_store(&dir), (0, 0), "無いディレクトリでも panic しない");
+    }
+
+    #[test]
+    fn clear_removes_only_store_shaped_images_and_reports_size() {
+        let dir = temp_dir("clear");
+        let other = dir.join("readme.txt");
+        let png = dir.join(image_file_name(9, "png"));
+        std::fs::write(dir.join(image_file_name(1, "bmp")), vec![0u8; 512]).unwrap();
+        std::fs::write(dir.join(image_file_name(2, "dib")), vec![0u8; 512]).unwrap();
+        std::fs::write(dir.join("img-nothex.bmp"), b"x").unwrap();
+        std::fs::write(&other, b"x").unwrap();
+        std::fs::write(&png, b"x").unwrap();
+
+        assert_eq!(clear_image_store(&dir), (2, 1024), "消した件数とバイト数を返す");
+        assert_eq!(image_store_usage(&dir), (0, 0), "全消去で使用量は 0 になる");
+        assert_eq!(clear_image_store(&dir), (0, 0), "2 回目は消すものが無い");
+        assert!(other.exists(), "画像以外のファイルは残す");
+        assert!(png.exists(), "拡張子違いは残す");
+        assert!(dir.join("img-nothex.bmp").exists(), "名前が規則外なら残す");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
