@@ -1,5 +1,6 @@
 use crate::*;
 use knit_common::drag;
+use knit_common::notice;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -428,7 +429,9 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     }
     // Windows 側が自分で採番する受け渡しIDと重ならないよう最上位ビットを立てる。
     // 採番は NEXT_TX_ID に一本化(独立カウンタだと通常送信と同じ ID を振り得る)
-    let id = (1 << 63) | NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+    let id = DRAG_ID_BIT | NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
+    // 新しい掴みが始まったので「途中で離した」の記録を消す(I5)
+    DRAG_RELEASED_EARLY.store(false, Ordering::Relaxed);
     let count = entries.len();
     let total = bulk::entries_total(&entries);
     // 展開結果をそのまま送る(予告の件数・合計と厳密に一致させる)
@@ -468,6 +471,8 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
         // 同内容の ⌘C が黙って止まり、二度と同期されない: 9/28 レビュー M4 の再発)
         let t0 = std::time::Instant::now();
         let total = bulk::entries_total(&entries);
+        // 失敗の通知に件数を出す(I5)。entries はこの後も参照で使う
+        let count = entries.len();
         begin_xfer(id, total, &entries[0].name);
         guard.arm(id);
         let peer = crate::active_peer_label();
@@ -512,21 +517,44 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 rep.sent,
                 total as f64 / 1024.0 / 1024.0 / t0.elapsed().as_secs_f64().max(0.001)
                 );
+                // 結果を3状態で言い切る(I5)。渡し終わる前に離していたら、相手は
+                // ネイティブのドラッグを始められないので「置けた」とは言わない
+                let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed);
+                let outcome = notice::DeliveryOutcome {
+                    peer: peer.clone(),
+                    count: rep.sent,
+                    result: if early {
+                        notice::DeliveryResult::SavedOnly {
+                            why: notice::SaveWhy::ReleasedEarly,
+                        }
+                    } else {
+                        notice::DeliveryResult::Placed
+                    },
+                };
+                let n = notice::compose_notice(&outcome);
+                match n.kind {
+                    notice::NoticeKind::Always => notify(&n.title, &n.body),
+                    notice::NoticeKind::Suppressible => notify_transfer(&n.title, &n.body),
+                }
             }
             Err(e) => {
                 eprintln!("[drag] mac->win {id} 転送失敗: {e}");
                 // 相手側の待ち状態(Pending・Carried)を確実に解く
                 send_msg(&Msg::DragCancel { id });
                 if e.kind() == std::io::ErrorKind::Interrupted {
+                    // 利用者の中止は「結果」ではないので、現行の文言のまま出す
                     notify("Knit", "ファイル転送を中止しました");
                 } else {
-                    notify(
-                        "Knit",
-                        &format!(
-                            "{peer} へファイルを渡せませんでした({}。接続を確認してもう一度掴んでください)",
-                            knit_common::bulk::send_error_label(e)
-                        ),
-                    );
+                    let n = notice::compose_notice(&notice::DeliveryOutcome {
+                        peer: peer.clone(),
+                        count,
+                        result: notice::DeliveryResult::Failed {
+                            reason: knit_common::bulk::send_error_label(e),
+                            retryable: notice::retryable_error(e),
+                            saved_count: 0,
+                        },
+                    });
+                    notify(&n.title, &n.body);
                 }
             }
         }
@@ -720,6 +748,23 @@ struct Xfer {
     began: std::time::Instant,
 }
 static XFER: Mutex<Option<Xfer>> = Mutex::new(None);
+/// 掴みドラッグの受け渡しIDに立てる最上位ビット(通常送信のIDと区別する)
+const DRAG_ID_BIT: u64 = 1 << 63;
+/// 掴みドラッグの転送を「渡し終わる前に離した」か(I5)。相手がネイティブのドラッグを
+/// 始められるかは**離した順序**で決まるため、離した瞬間に確定させて結果に反映する
+/// (渡し終わってから離した = 置けた / 途中で離した = 相手の受信フォルダに保存のみ)
+static DRAG_RELEASED_EARLY: AtomicBool = AtomicBool::new(false);
+
+/// tap の離し(EVT_LEFT_UP)から呼ぶ: 進行中の掴みドラッグ転送が未完なら記録する。
+/// 通常送信(メニュー・⌘C)は対象外(ドロップの成否に関係しない)
+pub(crate) fn note_press_release() {
+    let g = XFER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = g.as_ref() {
+        if x.id & DRAG_ID_BIT != 0 && x.sent < x.total {
+            DRAG_RELEASED_EARLY.store(true, Ordering::Relaxed);
+        }
+    }
+}
 /// 掴みドラッグの送信内容。予告(DragOffer)時点で展開したものと同じ内容を送る
 ///(件数・合計が予告と厳密に一致するようにするため)
 static DRAG_TX: Mutex<Option<(u64, Vec<bulk::OutFile>)>> = Mutex::new(None);
