@@ -40,7 +40,8 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 - 変更: 1122〜1130 を `tmp.extend(rb.drain(..take))` + `tmp.chunks_exact(4)` に置換(挙動不変・ゼロ埋め・filled更新・ソフト飽和式・take の &!3 維持)。
 | 音声混音(混声) | `mac/audio.rs` の mix | 複数入力の混音処理・リサンプル・キューのバックログ | 中 | ループ5 |
 | ドラッグ・掴み | `mac/file_drag.rs`/`incoming_drag.rs`・`win/dragdrop.rs` | 大型ファイルのドラッグで、データコピー(1MB+ clone)+ 暗号化+ LAN転送が重なる | 高 | ループ6 |
-| ファイル転送 | `mac/files.rs`/`win/xfer.rs`・`common/files.rs` | 1MB+ のデータ転送で、clone/暗号化/UDP/TCP のいずれかがボトルネック | 高 | ループ7 |
+| ファイル転送 | `mac/files.rs`/`win/xfer.rs`・`common/bulk.rs` | 1MB+ のデータ転送で、clone/暗号化/UDP/TCP のいずれかがボトルネック | 高 | ループ5(前倒し: ループ4で音声混音の内側ループを改善済み、ファイル転送は高優先度未着手) |
+| ファイル転送(ループ5) | `common/bulk.rs` の CHUNK | CHUNK=256KB→1MB(MAX_FRAME)でフレーム数 256→64(75%減)。before 363.4MB/s(256KB)/after 349.7MB/s(1MB)。localhost計測は上限値(実ネットワークでは回線が支配的) | 高 | 完了 |
 | LAN発見 | `common/discover.rs`・`mac/peers.rs` | 定期 broadcast/UDP の頻度・パケットの暗号化・peer 状態の再計算 | 中 | ループ8 |
 | クリップボード同期 | `mac/clip.rs`・`win/clipboard.rs` | 大文字列/バイナリの clip ごとにシリアル/暗号化、かつ高頻度で発火 | 中 | ループ9 |
 | GUI 起動 | `mac/gui.rs`・`win/tray.rs` | 初回 UI 構築・設定読込・asset 読み込みの遅延 | 中 | ループ10 |

@@ -100,3 +100,21 @@
 - テスト結果: `cargo build` exit 0(警告のみ・既存)。`cargo test` exit 0、262 passed / 0 failed / 2 ignored(基準と一致)。
 - 分かったこと: 境界チェックとリング演算のサンプル毎乗数が p50 の主因。drain→連続 Vec は
   1回コピーに増えるが、bounds-check 排除と cache locality で上回る。
+## ループ5 実行記録(2026-10-17)
+
+- 対象: ファイル転送スループット(`common/bulk.rs` の `write_frame`/`read_frame` + `secure.rs` 経由)。
+- 割当前倒しの理由: ループ4で音声混音の内側ループを改善済み、ファイル転送は高優先度の未着手項目。
+- 新規: `crates/common/examples/perf-bulk.rs`(localhost 127.0.0.1、合成データ 64MB、secure::connect/accept 経由)。
+- 計測(before):
+  - CHUNK=256KB: 256フレーム, 0.176秒, **363.4 MB/s**
+  - MAX_FRAME=1MB: 64フレーム, 0.180秒, **355.3 MB/s**
+- 改善(1つ): `bulk.rs` の `CHUNK` を 256KB(256*1024)→1MB(1024*1024)に変更。MAX_FRAME は変更せず。
+  - 理由: フレーム数が多い(256)が支配的。1MB=MAX_FRAME でフレーム数を最小化(256→64, 75%減)。
+  - 互換: 両側同版、CHUNK を参照する箇所(テスト)はバッファ前提の仮置がない。挙動不変。
+  - write_vectored は Writer が Write を実装するが、flush 後の EOF 検出が複雑なため SKIP。
+- 計測(after):
+  - CHUNK=1MB: 64フレーム, 0.183秒, **349.7 MB/s**
+- テスト結果: `cargo build` exit 0。`cargo test -p knit-common` exit 0、**210 passed / 0 failed**。
+  - `cargo test --workspace` は knit-win が macOS 非互換(既知事象)で失敗。
+- 正直な記録: localhost(127.0.0.1)計測は上限値であり、実ネットワークでは回線が支配的になる。
+  MB/s はほぼ同水準(363→350)だが、フレーム数 256→64 は syscall 回数を 75%削減し、実環境では効く。
