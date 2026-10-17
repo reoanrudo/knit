@@ -1988,13 +1988,66 @@ unsafe fn make_prefs_window(target: ID) -> ID {
     prefs::build(target)
 }
 
+/// 「Knitを終了」の確認文。転送中だけ Some を返し、転送していない通常の終了には
+/// 確認を出さない(メニューバー常駐アプリのため、普段の終了に摩擦を足さない)。
+/// 送信はこちらの測れる進捗(xfer_line)を、タブレット送信は残り件数を、受信は
+/// 事実だけを示す(受信の進捗はこちらから測れない)。exit(0) は送信スレッドを
+/// そのまま切るため、何が失われるかを本文に書く。文言は純粋関数にして固定する
+fn quit_confirm(line: Option<&str>, adb_remaining: usize, receiving: bool) -> Option<String> {
+    let mut what: Vec<String> = Vec::new();
+    if let Some(line) = line {
+        what.push(format!("ファイルを送信中({line})"));
+    }
+    if adb_remaining > 0 {
+        what.push(format!("タブレットへ送信中(残り {adb_remaining} 件)"));
+    }
+    if receiving {
+        what.push("ファイルを受信中".to_string());
+    }
+    if what.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}。終了すると中止され、相手側でも中途半端なままになります。",
+        what.join("、")
+    ))
+}
+
 unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
+    // 転送中は先に確認する(既定=キャンセル)。転送していない通常の終了は今までどおり
+    // 無確認で終わる。プレビュー(UI_PREVIEW)は画面の写し取り用なので確認を出さない
+    if !UI_PREVIEW.load(Ordering::Relaxed) {
+        let sending = crate::xfer_line();
+        let body = quit_confirm(
+            sending.as_deref(),
+            crate::android::PUSH_REMAINING.load(Ordering::Relaxed),
+            knit_common::bulk::rx_active(),
+        );
+        if let Some(body) = body {
+            let answer =
+                confirm_alert("ファイル転送中です", &body, &["キャンセル", "中止して終了"]);
+            if answer != 1001 {
+                return;
+            }
+        }
+    }
     eprintln!("[gui] メニューから終了しました");
     // Windows 画面を操作したまま終了すると、カーソルの関連切断・非表示が
     // システムへ残る。正規の leave(カーソル復帰+Windows 側の後片付け)を
     // 経由してから終了する
     if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
         crate::leave_win_mode_cursor_unlock(None);
+    }
+    // 再起動(restart_now)と同じ後始末: 送信は中止要求を出し、受信は bulk 経路を
+    // 切って一時ファイルの後始末(Receiver の Drop)を待つ。exit(0) は Drop を
+    // 飛ばすため、ここで待たないと受信の半端なファイルがそのまま残る
+    if crate::cancel_active_xfer() {
+        eprintln!("[gui] 終了前に進行中のファイル送信を中止します");
+    }
+    if knit_common::bulk::rx_active() {
+        eprintln!("[gui] 終了前に受信中の転送を切断して後始末します");
+        crate::BULK_LINK.clear();
+        std::thread::sleep(std::time::Duration::from_millis(400));
     }
     // 直前の画像コピーを取りこぼさない(レビュー指摘)
     crate::clip::flush_image_store();
@@ -3051,6 +3104,54 @@ mod history_menu_title_tests {
             "クリップボード履歴(新しい順10件・全50件)",
             "保存上限いっぱいのとき"
         );
+    }
+}
+
+/// 「Knitを終了」の確認文: 転送中だけ確認を出し、通常の終了は無確認のままにする。
+/// 送信中は測れる進捗をそのまま本文へ写し、タブレット送信は残り件数を示す
+#[cfg(test)]
+mod quit_confirm_tests {
+    use super::quit_confirm;
+
+    #[test]
+    fn no_confirm_when_nothing_is_transferring() {
+        assert_eq!(
+            quit_confirm(None, 0, false),
+            None,
+            "転送していない通常の終了には確認を出さない"
+        );
+    }
+
+    #[test]
+    fn sending_shows_the_measured_progress() {
+        let body = quit_confirm(Some("転送中 43%・12.0 MB/s・movie.mov"), 0, false)
+            .expect("送信中は確認する");
+        assert!(
+            body.contains("ファイルを送信中(転送中 43%・12.0 MB/s・movie.mov)"),
+            "実測の進捗をそのまま本文に残す: {body}"
+        );
+        assert!(body.contains("中止"), "終了で何が起きるかを書く: {body}");
+    }
+
+    #[test]
+    fn tablet_send_names_the_remaining_count() {
+        let body = quit_confirm(None, 12, false).expect("タブレット送信中も確認する");
+        assert!(body.contains("タブレットへ送信中(残り 12 件)"), "{body}");
+    }
+
+    #[test]
+    fn receiving_is_named_without_progress() {
+        let body = quit_confirm(None, 0, true).expect("受信中は確認する");
+        assert!(body.contains("ファイルを受信中"), "{body}");
+    }
+
+    #[test]
+    fn overlapping_transfers_are_all_listed() {
+        let body = quit_confirm(Some("転送中 5%・1 KB/s・a.bin"), 3, true)
+            .expect("送受信が重なっても確認する");
+        assert!(body.contains("ファイルを送信中(転送中 5%・1 KB/s・a.bin)"), "{body}");
+        assert!(body.contains("タブレットへ送信中(残り 3 件)"), "{body}");
+        assert!(body.contains("ファイルを受信中"), "{body}");
     }
 }
 
