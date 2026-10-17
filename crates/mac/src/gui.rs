@@ -2066,6 +2066,39 @@ unsafe fn show_diag_alert(text: &str) {
     }
 }
 
+/// 音声の無受信を「停止中」とみなす閾値(ms)。送信側は無音期間も 1 秒毎に
+/// キープアライブを送り、受信ループの read timeout は 12 秒(audio.rs)なので、
+/// 3 秒の沈黙は「相手が送っていない/経路が切れた」を意味する。
+const AUDIO_IDLE_MS: u64 = 3000;
+
+/// 状態行へ出す音声の語(純粋関数・単体テストで守る)。音声が env で禁じられて
+/// いる間・未接続の間・自分で切っている(MUTED)間は出さない: 自分の意思で止めた
+/// 人に「停止中」を見せても直しようがない。ただし出力失効(output_status)だけは
+/// MUTED でも出す: 失効は Knit 側が鳴らせなくなった状態で、隠すと無音の原因が
+/// 画面から消えるため(復帰は設定の「共有」で出力先を選び直す)。
+/// idle_ms は未受信を 0 で返す(audio::rx_idle_ms)=接続直後の誤警報を避ける。
+fn audio_word(
+    enabled: bool,
+    muted: bool,
+    connected: bool,
+    idle_ms: u64,
+    output_status: Option<&str>,
+) -> Option<String> {
+    if !enabled || !connected {
+        return None;
+    }
+    if output_status.is_some() {
+        return Some("音声 停止(出力先を再選択)".to_string());
+    }
+    if muted {
+        return None;
+    }
+    if idle_ms > AUDIO_IDLE_MS {
+        return Some("音声 停止中(相手側の音声共有を確認)".to_string());
+    }
+    Some("音声 オン".to_string())
+}
+
 /// メニューバー状態行の本文(純粋関数・単体テストで守る)。sync() が毎秒組み立てて
 /// いた連結をここへ切り出した: 並びと接続語(・)が変わらないことをテストで保証する。
 /// retry/not_found(再試行までの残り秒・見つけられない継続)は「未接続かつ登録済み」
@@ -2083,12 +2116,15 @@ unsafe fn show_diag_alert(text: &str) {
 /// トークン不一致に気づけない)。登録への案内は !manual && !paired の間だけ:
 /// 手動接続は登録と無関係に待つため、接続歴が無い(paired_registered=false)人に
 /// 「端末を登録…」を出すと設定画面と食い違う導線になる。
+/// audio は音声の語(audio_word が条件を決める)。出す位置は経路(route)の直後:
+/// 接続の事実(接続済み・遅延・経路)を先に読ませ、その後に状態語を足す。
 fn status_line_text(
     connected: bool,
     manual: bool,
     paired: bool,
     rtt_ms: u64,
     route: &str,
+    audio: Option<&str>,
     xfer: Option<&str>,
     xfer_extra: Option<&str>,
     last_connected: Option<&str>,
@@ -2119,6 +2155,10 @@ fn status_line_text(
     } else {
         String::new()
     };
+    let audio_s = match audio {
+        Some(a) => format!("・{a}"),
+        None => String::new(),
+    };
     let xfer_s = match xfer.or(xfer_extra) {
         Some(x) => format!("・{x}"),
         None => String::new(),
@@ -2138,7 +2178,7 @@ fn status_line_text(
     } else {
         String::new()
     };
-    format!("{conn}{mode_s}{rtt_s}{route_s}{xfer_s}{last_s}{wait_s}")
+    format!("{conn}{mode_s}{rtt_s}{route_s}{audio_s}{xfer_s}{last_s}{wait_s}")
 }
 
 /// メニューバーの状態行へ本文を反映する(refresh_status と閉じた時の 1 回反映で
@@ -2155,6 +2195,14 @@ unsafe fn update_state_item() {
         return;
     }
     let manual = crate::envutil::get("KNIT_TOKEN").is_some_and(|t| !t.is_empty());
+    // 可視条件は設定→共有の音量行と同じ(材料を集めるだけ・判定は audio_word)
+    let audio = audio_word(
+        knit_common::share::env_cap().audio && !crate::active_peer_is_android_app(),
+        crate::audio::MUTED.load(Ordering::Relaxed),
+        crate::CONNECTED.load(Ordering::Relaxed),
+        crate::audio::rx_idle_ms(),
+        crate::audio::output_status().as_deref(),
+    );
     let text = status_line_text(
         crate::CONNECTED.load(Ordering::Relaxed),
         manual,
@@ -2165,6 +2213,7 @@ unsafe fn update_state_item() {
         ),
         crate::RTT_MS.load(Ordering::Relaxed),
         crate::route_label(),
+        audio.as_deref(),
         crate::xfer_line().as_deref(),
         crate::xfer_extra_line(
             crate::android::PUSH_REMAINING.load(Ordering::Relaxed),
@@ -3074,7 +3123,7 @@ mod lay_side_center_tests {
 /// ・履歴の件数は出さない(履歴サブメニューの見出しが既に出すため二重)
 #[cfg(test)]
 mod status_line_tests {
-    use super::status_line_text;
+    use super::{audio_word, status_line_text};
 
     /// 未登録の未接続: 登録への導線だけを出し、retry/not_found が入っていても
     /// 連結しない(登録が無ければ再試行の相手が存在しないため)
@@ -3086,6 +3135,7 @@ mod status_line_tests {
             false,
             0,
             "",
+            None,
             None,
             None,
             None,
@@ -3115,6 +3165,7 @@ mod status_line_tests {
             None,
             None,
             None,
+            None,
             Some("再試行まで 3秒"),
             None,
         );
@@ -3135,6 +3186,7 @@ mod status_line_tests {
             false,
             0,
             "",
+            None,
             None,
             None,
             Some("最終接続 12:34"),
@@ -3161,6 +3213,7 @@ mod status_line_tests {
             "",
             None,
             None,
+            None,
             Some("最終接続 12:34"),
             Some("再試行まで 3秒"),
             Some("相手を 5分見つけられません"),
@@ -3182,6 +3235,7 @@ mod status_line_tests {
             true,
             0,
             "",
+            None,
             None,
             None,
             None,
@@ -3207,6 +3261,7 @@ mod status_line_tests {
             "LAN 直",
             None,
             None,
+            None,
             Some("最終接続 12:34"),
             Some("再試行まで 3秒"),
             Some("相手を 5分見つけられません"),
@@ -3225,6 +3280,7 @@ mod status_line_tests {
             true,
             0,
             "",
+            None,
             Some("転送 42%(3/7)"),
             Some("ADB 送信 残り 2件"),
             None,
@@ -3240,6 +3296,7 @@ mod status_line_tests {
             0,
             "",
             None,
+            None,
             Some("ADB 送信 残り 2件"),
             None,
             None,
@@ -3249,5 +3306,67 @@ mod status_line_tests {
         for t in [main, extra] {
             assert!(!t.contains("履歴"), "状態行に履歴件数は出さない: {t}");
         }
+    }
+
+    /// 音声の語: 無効(env で不可・Androidアプリ版相手)・未接続・自分でミュートの
+    /// 間は出さない(自分の意思で止めた人に「停止中」を見せない)。出力失効だけは
+    /// MUTED でも出す(隠すと無音の原因が画面から消える)
+    #[test]
+    fn audio_word_hidden_when_off_or_disconnected() {
+        assert_eq!(audio_word(false, false, true, 0, None), None, "音声が無効なら出さない");
+        assert_eq!(audio_word(true, false, false, 0, None), None, "未接続なら出さない");
+        assert_eq!(audio_word(true, true, true, 0, None), None, "自分のミュート中は出さない");
+        assert_eq!(
+            audio_word(true, true, true, 0, Some("出力先の構成が変更されました。")),
+            Some("音声 停止(出力先を再選択)".to_string()),
+            "失効は MUTED でも出す(無音の原因を隠さない)"
+        );
+    }
+
+    /// 無受信 3 秒で「停止中」へ切り替える(閾値はキープアライブ間隔 1 秒より大きく
+    /// read timeout 12 秒より小さい)。失効(出力先)は無受信より優先する
+    #[test]
+    fn audio_word_switches_to_stopped_after_idle_threshold() {
+        assert_eq!(super::AUDIO_IDLE_MS, 3000);
+        assert_eq!(
+            audio_word(true, false, true, 3000, None),
+            Some("音声 オン".to_string()),
+            "閾値ちょうどは異常とみなさない"
+        );
+        assert_eq!(
+            audio_word(true, false, true, 3001, None),
+            Some("音声 停止中(相手側の音声共有を確認)".to_string())
+        );
+        assert_eq!(
+            audio_word(true, false, true, 60_000, Some("失効")),
+            Some("音声 停止(出力先を再選択)".to_string()),
+            "失効は無受信より優先する"
+        );
+    }
+
+    /// 音声の語は経路(route)の直後・転送の前に入る 1 語だけ(位置の回帰防止)。
+    /// audio=None は引数追加前と同じ文字列(他の 7 テストが固定する)
+    #[test]
+    fn audio_word_sits_between_route_and_transfer() {
+        let text = status_line_text(
+            true,
+            false,
+            true,
+            12,
+            "LAN 直",
+            Some("音声 停止(出力先を再選択)"),
+            Some("転送 42%(3/7)"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            text,
+            "接続済み・遅延 12ms・LAN 直・音声 停止(出力先を再選択)・転送 42%(3/7)"
+        );
+        let no_audio =
+            status_line_text(true, false, true, 12, "LAN 直", None, None, None, None, None, None);
+        assert_eq!(no_audio, "接続済み・遅延 12ms・LAN 直");
     }
 }
