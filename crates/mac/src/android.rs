@@ -1465,9 +1465,12 @@ mod tests {
             calls2 < calls,
             "2 回目は mkdir をキャッシュして起動回数が減ること (1回目 {calls} → 2回目 {calls2})"
         );
+        // 時間の判定は「待たされずに戻る」ことの確認に留める。テストは並列実行
+        // されるため、重い計測テストと重なると数百msになる(手元でも360msを観測)。
+        // 本来のシグナルは上の起動回数(5回/4回)で、そちらは厳密に判定している
         assert!(
-            elapsed < Duration::from_millis(200) && elapsed2 < Duration::from_millis(200),
-            "所要時間が 200ms 未満であること (実際 {elapsed:?} / {elapsed2:?})"
+            elapsed < Duration::from_secs(2) && elapsed2 < Duration::from_secs(2),
+            "待たされずに戻ること (実際 {elapsed:?} / {elapsed2:?})"
         );
     }
 
