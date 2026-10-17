@@ -164,11 +164,34 @@ fn perf_image_bmp_disk_write() {
 #[test]
 fn perf_image_rgba_conversion() {
     let dib = synth_dib(3840, 2160);
-    // A: DIB→RGBA 変換のみ( objc.rs の切り出し関数と同じロジックのローカル実装)
+    // A: DIB→RGBA 変換のみ。生産コード objc.rs の rows_to_rgba と同一ロジック。
+    // 注意(リード検証 2026-10-17): 以前はここで dib_to_png 全体を呼んでおり、
+    // B と同じ測定になっていた(A は変換単体を測れていなかった)。
     bench("A dib_to_rgba 4K", || {
-        // 変換のみを測るため、dib_to_png の変換部を呼ぶ(ローカル実装で同一ロジック)
-        let _ = dib_to_png(&dib);
+        let _ = rgba_only(&dib);
     });
+}
+
+/// 変換のみ(生産コード objc.rs の rows_to_rgba と同じロジック)。
+/// 32bpp の 4K 入力だけを対象にした計測用の写し。
+fn rgba_only(dib: &[u8]) -> Vec<u8> {
+    let header_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
+    let w = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]) as usize;
+    let h_raw = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
+    let top_down = h_raw < 0;
+    let h = h_raw.unsigned_abs() as usize;
+    let bpp = 32usize;
+    let stride = (w * bpp / 8 + 3) & !3usize;
+    let px = &dib[header_size..];
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for row in 0..h {
+        let src_row = if top_down { row } else { h - 1 - row };
+        let line = &px[src_row * stride..src_row * stride + w * bpp / 8];
+        for p in line.as_chunks::<4>().0 {
+            rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
+        }
+    }
+    rgba
 }
 
 #[test]
