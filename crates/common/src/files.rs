@@ -369,16 +369,32 @@
     /// 相手が指定した異常に大きな値では加算がオーバーフローして panic するため、
     /// 範囲外の値は無視する
     pub fn set_mtime(path: &Path, unix_secs: u64) {
-        if unix_secs == 0 {
-            return;
-        }
-        let Some(t) = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(unix_secs))
-        else {
+        let Some(t) = mtime_from_unix(unix_secs) else {
             return;
         };
         if let Ok(f) = std::fs::File::options().write(true).open(path) {
             let _ = f.set_modified(t);
         }
+    }
+
+    /// 既に開いているハンドルへ更新日時を設定する。受信側は一時ファイルを閉じる
+    /// 直前にこれを呼ぶので、`set_mtime` の「open + futimens + close」の往復
+    /// (パスを渡すための開き直し)が 1 ファイルにつき 1 回減る。
+    /// 書き込みが終わった fd に対して呼ぶこと(以後に書き込むと OS が更新日時を
+    /// 上書きするため、受信側は最後の DATA の後に呼んでいる)
+    pub fn set_mtime_file(f: &std::fs::File, unix_secs: u64) {
+        let Some(t) = mtime_from_unix(unix_secs) else {
+            return;
+        };
+        let _ = f.set_modified(t);
+    }
+
+    /// unix 秒 → SystemTime。0(未指定)と加算がオーバーフローする異常値は None
+    fn mtime_from_unix(unix_secs: u64) -> Option<std::time::SystemTime> {
+        if unix_secs == 0 {
+            return None;
+        }
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(unix_secs))
     }
 
 #[cfg(test)]
