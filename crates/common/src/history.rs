@@ -274,6 +274,25 @@ impl History {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// 実体が消えた画像を参照する履歴項目を取り除く(監査1)。
+    /// 戻り値は取り除いた件数。画像以外の項目と、実体が残っている画像は触らない
+    pub fn remove_image_entries(&mut self, removed: &[String]) -> usize {
+        if removed.is_empty() {
+            return 0;
+        }
+        let before = self.entries.len();
+        self.entries.retain(|e| {
+            if e.kind != Kind::Image {
+                return true;
+            }
+            match parse_image_entry(&e.text) {
+                Some((name, _)) => !removed.iter().any(|r| r == &name),
+                None => true,
+            }
+        });
+        before - self.entries.len()
+    }
+
     /// 変化検知用の世代(最後の項目 id。空なら 0)
     pub fn last_id(&self) -> u64 {
         self.entries.last().map(|e| e.id).unwrap_or(0)
@@ -722,9 +741,11 @@ pub const MAX_IMAGE_STORE_BYTES: u64 = 512 * 1024 * 1024;
 /// 対し少し余裕を持たせた件数を呼び出し側が渡す)。履歴から追い出された画像の
 /// 実体が居座り続けるのを防ぐ。最新の 1 つはサイズに関わらず必ず残す
 /// (今保存した画像をこの刈り込み自身が消さないようにするため)
-pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) {
+/// 戻り値は**削除した実体のファイル名**(監査1)。呼び出し側はこの名前を参照する
+/// 履歴項目も消す。放っておくと「履歴には残るが押しても復元できない項目」になる
+pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) -> Vec<String> {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
     let mut items: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = rd
         .flatten()
@@ -741,13 +762,19 @@ pub fn prune_image_store(dir: &std::path::Path, keep: usize, max_bytes: u64) {
         .collect();
     items.sort_by_key(|a| std::cmp::Reverse(a.1)); // 新しい順
     let mut total = 0u64;
+    let mut removed = Vec::new();
     for (i, (path, _, size)) in items.iter().enumerate() {
         if i > 0 && (i >= keep || total.saturating_add(*size) > max_bytes) {
-            let _ = std::fs::remove_file(path);
+            if std::fs::remove_file(path).is_ok() {
+                if let Some(name) = path.file_name() {
+                    removed.push(name.to_string_lossy().into_owned());
+                }
+            }
         } else {
             total = total.saturating_add(*size);
         }
     }
+    removed
 }
 
 /// UI の 1 行へ差し込む動的な名前の切り詰め(共通・文字数上限)。エイリアスや
@@ -1570,6 +1597,54 @@ mod tests {
         // 消した後は再保存できる(次回の exists チェックが正しく働く)
         write_private_or_remove(&path, b"retry").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"retry");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// 監査1: 実体を刈り込んだときに「どの履歴項目を消すか」を呼び出し側が
+/// 判断できることを検証する(消えた実体を参照する項目だけを消す)。
+#[cfg(test)]
+mod prune_and_entry_removal_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("knit-prune-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn prune_returns_removed_names_and_entries_follow() {
+        let dir = temp_dir("entries");
+        // 古い順に 3 枚置く(mtime の差を作るため少し待つ)
+        let names: Vec<String> = (0..3).map(|i| image_file_name(0x1000 + i, "bmp")).collect();
+        for n in &names {
+            std::fs::write(dir.join(n), vec![0u8; 1024]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(12));
+        }
+        let mut h = History::new(50);
+        h.push_text("ふつうのテキスト", "Mac", 1);
+        for (i, n) in names.iter().enumerate() {
+            h.push_image(n, 1024, "Mac", 10 + i as u64).unwrap();
+        }
+        assert_eq!(h.entries().len(), 4, "テキスト1+画像3");
+
+        // keep=2 で最も古い 1 枚だけが消える
+        let removed = prune_image_store(&dir, 2, MAX_IMAGE_STORE_BYTES);
+        assert_eq!(removed, vec![names[0].clone()], "消えた実体の名前を返す");
+        assert!(!dir.join(&names[0]).exists(), "実体は消えている");
+        assert_eq!(prune_image_store(&dir, 2, MAX_IMAGE_STORE_BYTES), Vec::<String>::new(), "2回目は消えない");
+
+        // 消えた実体を参照する項目だけを取り除く
+        let dropped = h.remove_image_entries(&removed);
+        assert_eq!(dropped, 1, "参照が消えた画像項目だけを落とす");
+        assert_eq!(h.entries().len(), 3, "テキストと残った画像2枚は残る");
+        assert!(h.entries().iter().any(|e| e.text == "ふつうのテキスト"));
+        assert!(h.entries().iter().all(|e| parse_image_entry(&e.text).map(|(n, _)| n) != Some(names[0].clone())));
+
+        // 何も消えていなければ何もしない
+        assert_eq!(h.remove_image_entries(&[]), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

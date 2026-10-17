@@ -16,6 +16,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude knit-win
+      # 性能の壊滅的な回帰(10倍級)だけを検出する。閾値はマシン差を吸収するため
+      # 緩い下限/上限にしてある(数十%の比較は同じマシンで前後を測ること)
+      - name: benchmarks (regression guard)
+        run: bash scripts/bench.sh --check
   windows:
     runs-on: windows-latest
     steps:

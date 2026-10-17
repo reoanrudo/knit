@@ -1089,7 +1089,23 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
     else {
         return false;
     };
-    let local = std::env::temp_dir().join(name);
+    // 監査2: 端末が居なければ即 false。以前は接続の無い端末へ push(60秒)と
+    // ヘルパー(60秒)を投げて、コピー処理が最大2分止まることがあった
+    let state = adb_run(&adb, &["-s", &serial, "get-state"], Duration::from_secs(2));
+    if !state.is_some_and(|(ok, out)| ok && out.trim() == "device") {
+        eprintln!("[android] 画像送信をスキップ: 端末 {serial} は接続されていません");
+        return false;
+    }
+    // 名前は保存先のファイル名だけを使う(呼び出し側が "/" を含む名前を渡しても
+    // temp の外へ書かない)
+    let name = std::path::Path::new(name)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return false;
+    }
+    let local = std::env::temp_dir().join(&name);
     if std::fs::write(&local, data).is_err() {
         return false;
     }
@@ -1110,7 +1126,7 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
     let pushed = adb_run(
         &adb,
         &["-s", &serial, "push", &local.to_string_lossy(), &dev],
-        Duration::from_secs(60),
+        Duration::from_secs(20),
     );
     let _ = std::fs::remove_file(&local);
     if !pushed.is_some_and(|(ok, _)| ok) {
@@ -1170,7 +1186,7 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
             &format!("content://media/external/images/media/{id}"),
             mime,
         ],
-        Duration::from_secs(60),
+        Duration::from_secs(10),
     ) {
         Some((true, out)) if out.starts_with("ok") => true,
         Some((_, out)) => {
@@ -1368,7 +1384,7 @@ mod tests {
         let stub = tmp.join("adb");
         // query には MediaStore の行、app_process(クリップボード設定ヘルパー)には
         // "ok" を返す(成功条件が starts_with("ok") のため必須)。それ以外は即終了
-        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"query\" ]; then echo \"Row: 0 _id=7, _display_name=t.png\"; exit 0; fi\n  if [ \"$a\" = \"app_process\" ]; then echo ok; exit 0; fi\ndone\nexit 0\n";
+        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"get-state\" ]; then echo device; exit 0; fi\n  if [ \"$a\" = \"query\" ]; then echo \"Row: 0 _id=7, _display_name=t.png\"; exit 0; fi\n  if [ \"$a\" = \"app_process\" ]; then echo ok; exit 0; fi\ndone\nexit 0\n";
         std::fs::write(&stub, script).unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
@@ -1405,7 +1421,7 @@ mod tests {
         }
         let _ = std::fs::remove_file(&log);
         assert!(ok && ok2, "戻り値が true であること");
-        assert!(calls <= 4, "adb 起動回数が改善前(5+)より少ないこと (実際 {calls})");
+        assert!(calls <= 5, "adb 起動回数が改善前(5+)と同程度以下であること (実際 {calls})");
         assert!(
             calls2 < calls,
             "2 回目は mkdir をキャッシュして起動回数が減ること (1回目 {calls} → 2回目 {calls2})"
