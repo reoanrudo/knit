@@ -41,7 +41,8 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 | 音声混音(混声) | `mac/audio.rs` の mix | 複数入力の混音処理・リサンプル・キューのバックログ | 中 | ループ5 |
 | ドラッグ・掴み | `mac/file_drag.rs`/`incoming_drag.rs`・`win/dragdrop.rs` | 大型ファイルのドラッグで、データコピー(1MB+ clone)+ 暗号化+ LAN転送が重なる | 高 | ループ6 |
 | ファイル転送 | `mac/files.rs`/`win/xfer.rs`・`common/bulk.rs` | 1MB+ のデータ転送で、clone/暗号化/UDP/TCP のいずれかがボトルネック | 高 | ループ5(前倒し: ループ4で音声混音の内側ループを改善済み、ファイル転送は高優先度未着手) |
-| ファイル転送(ループ5) | `common/bulk.rs` の CHUNK | CHUNK=256KB→1MB(MAX_FRAME)でフレーム数 256→64(75%減)。before 363.4MB/s(256KB)/after 349.7MB/s(1MB)。localhost計測は上限値(実ネットワークでは回線が支配的) | 高 | 完了 |
+| ファイル転送(ループ5) | `common/bulk.rs` の CHUNK | CHUNK=256KB→1MB(MAX_FRAME)の改善は計測で劣化(363.4→349.7MB/s)のため差し戻し済み(commit f484d33)。localhost計測は上限値(実ネットワークでは回線が支配的) | 高 | 完了(差戻し) |
+| ファイル転送(ループ6) | `common/secure.rs` の write_rec | write_rec の毎回 Vec::with_capacity(2+len)+コピーを排除し、2B長ヘッダをスタックから write_vectored でデータと一括書き込み(部分書き込みはループで処理)。before 366.8MB/s(256KB)/after 372.5MB/s(+5.7MB/s, 約1.6%改善)。wire形式(2B長+暗号文)は変更なし。build 0 / test 499 passed・0 failed | 高 | 完了 |
 | LAN発見 | `common/discover.rs`・`mac/peers.rs` | 定期 broadcast/UDP の頻度・パケットの暗号化・peer 状態の再計算 | 中 | ループ8 |
 | クリップボード同期 | `mac/clip.rs`・`win/clipboard.rs` | 大文字列/バイナリの clip ごとにシリアル/暗号化、かつ高頻度で発火 | 中 | ループ9 |
 | GUI 起動 | `mac/gui.rs`・`win/tray.rs` | 初回 UI 構築・設定読込・asset 読み込みの遅延 | 中 | ループ10 |
