@@ -2095,6 +2095,23 @@ mod shortcut_tests {
             tr(123, false, true, false, false),
             Some((123, false, false, true, false))
         );
+        // ⌥Delete / ⌥前方Delete = 単語削除(Ctrl+Backspace / Ctrl+Delete)。
+        // 訳さないと Windows では Alt+Backspace / Alt+Delete になる
+        assert_eq!(
+            tr(51, false, true, false, false),
+            Some((51, false, false, true, false))
+        );
+        // ⌥⇧Delete は Shift 透過(単語の選択削除)
+        assert_eq!(
+            tr(51, false, true, false, true),
+            Some((51, false, false, true, true))
+        );
+        assert_eq!(
+            tr(117, false, true, false, false),
+            Some((117, false, false, true, false))
+        );
+        // 素の Delete は翻訳しない(⌥ 無しはそのまま渡る)
+        assert_eq!(tr(51, false, false, false, false), None);
         // 翻訳対象外: 素の A、⌘A(そのまま渡る)、⌥A
         assert_eq!(tr(0, false, false, false, false), None);
         assert_eq!(tr(0, false, false, true, false), None);
