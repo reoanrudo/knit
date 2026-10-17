@@ -1862,6 +1862,9 @@ pub(crate) unsafe extern "C" fn tap_callback(
             // 次回押下で上書きされるが、非ドラッグ時に古い位置を使わない保険として消す
             *PRESS_POS.lock().unwrap_or_else(|e| e.into_inner()) = None;
             FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).end();
+            // 離した順序で結果が変わる(置けた/保存のみ)。掴みドラッグの転送が
+            // 未完のまま離されたら記録する(I5)
+            crate::files::note_press_release();
             BTN_DOWN[0].store(false, Ordering::Relaxed);
         }
         EVT_RIGHT_DOWN => BTN_DOWN[1].store(true, Ordering::Relaxed),
