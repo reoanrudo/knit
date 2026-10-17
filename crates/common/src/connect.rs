@@ -89,10 +89,47 @@
                 }
             }
         }
+        retain_allowed(&mut candidates);
+        candidates
+    }
+
+    /// Tailscale 経路は許可時(KNIT_ALLOW_TS=1)だけ候補に残す: 拒否時に試すと
+    /// 遠隔の相手が受け入れ拒否へ延々と再試行し続けることになる
+    fn retain_allowed(candidates: &mut Vec<SocketAddr>) {
         if !crate::net::tailscale_allowed() {
             candidates.retain(|a| !crate::net::is_tailscale(a.ip()));
         }
-        candidates
+    }
+
+    /// LAN 発見の満了(seek_first_lan の 600ms)を待たずにダイヤルできる既知候補。
+    /// 優先順位と絞り込みは resolve と同じ(指定 → 保存済みピア、Tailscale は許可時のみ)
+    pub fn known_candidates(hosts: Option<&str>, port: u16) -> Vec<SocketAddr> {
+        let mut addrs = match hosts {
+            Some(h) => parse_hosts(h, port),
+            None => Vec::new(),
+        };
+        // 指定があるときは保存済みピアを混ぜない(resolve と同じ規則)
+        if hosts.is_none() {
+            if let Some(peer) = crate::credentials::load_peer() {
+                if !addrs.contains(&peer) {
+                    addrs.push(peer);
+                }
+            }
+        }
+        retain_allowed(&mut addrs);
+        addrs
+    }
+
+    /// 1 候補へ繋ぎ、成功したら channel へ流す(first_reachable と connect_first の共通部分)
+    fn dial(
+        addr: SocketAddr,
+        timeout: Duration,
+        tx: &std::sync::mpsc::Sender<(TcpStream, SocketAddr)>,
+    ) {
+        if let Ok(s) = TcpStream::connect_timeout(&addr, timeout) {
+            crate::net::tune_tcp(&s);
+            let _ = tx.send((s, addr));
+        }
     }
 
     pub fn first_reachable(
@@ -102,13 +139,46 @@
         let (tx, rx) = std::sync::mpsc::channel();
         for a in addrs.iter().copied() {
             let tx = tx.clone();
+            std::thread::spawn(move || dial(a, timeout, &tx));
+        }
+        drop(tx);
+        rx.recv_timeout(timeout + Duration::from_millis(500)).ok()
+    }
+
+    /// 既知候補のダイヤルを LAN 発見へ僅かに道を譲る時間。LAN 内なら発見の応答は
+    /// 数 ms で返るため、これだけ待っても従来どおり LAN 直が選ばれる
+    const KNOWN_DIAL_HEAD_START: Duration = Duration::from_millis(100);
+
+    /// 既知候補(known_candidates: KNIT_HOST・保存済みピア)へのダイヤルと LAN 発見を
+    /// 並行に走らせ、最初に確立した 1 本を返す。従来は resolve が発見の満了(600ms)まで
+    /// 待ってから最初のダイヤルを撃っていたため、発見が応答しない環境(Tailscale・
+    /// AP 隔離・サブネット越え・相手が再起動中)では再接続 1 回ごとにその 600ms を
+    /// 捨てていた。ここでは既知候補のダイヤルを先に始め、LAN 発見は並行して走らせる。
+    /// 全滅した場合は送信側が全て消えるため、timeout を待たずに None を返す
+    pub fn connect_first(
+        known: &[SocketAddr],
+        port: u16,
+        token: &str,
+        timeout: Duration,
+    ) -> Option<(TcpStream, SocketAddr)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let tx = tx.clone();
+            let token = token.to_string();
             std::thread::spawn(move || {
-                if let Ok(s) = TcpStream::connect_timeout(&a, timeout) {
-                    crate::net::tune_tcp(&s);
-                    let _ = tx.send((s, a));
+                if let Some(ip) = crate::discover::seek_first_lan(port, &token) {
+                    dial(SocketAddr::new(ip, port), timeout, &tx);
                 }
             });
         }
+        for a in known.iter().copied() {
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(KNOWN_DIAL_HEAD_START);
+                dial(a, timeout, &tx);
+            });
+        }
+        // 送信側を手放す: 全滅(発見の満了を含む)なら recv が即座に Err を返す
         drop(tx);
         rx.recv_timeout(timeout + Duration::from_millis(500)).ok()
     }
@@ -154,6 +224,46 @@ mod tests {
         assert_eq!(
             validate_host_input("::1, bad! , 10.0.0.5").unwrap_err(),
             "bad!"
+        );
+    }
+
+    /// 既知候補(KNIT_HOST)があれば、LAN 発見の満了(600ms)を待たずに繋がること。
+    /// 従来の resolve → first_reachable では発見が応答しない環境で 604ms かかっていた
+    #[test]
+    fn connect_first_dials_known_candidates_without_waiting_for_lan_discovery() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let known = known_candidates(Some(&addr.to_string()), addr.port());
+        assert_eq!(known, vec![addr], "指定したアドレスがそのまま既知候補になる");
+        let t = std::time::Instant::now();
+        let (stream, picked) = connect_first(&known, addr.port(), "probe-token", Duration::from_secs(3))
+            .expect("既知候補へは接続できる");
+        assert_eq!(picked, addr);
+        assert!(
+            t.elapsed() < Duration::from_millis(300),
+            "LAN 発見の満了待ちで遅れた: {:?}",
+            t.elapsed()
+        );
+        drop(stream);
+    }
+
+    /// どの候補も繋がらず LAN 発見も空なら、connect の timeout(3 秒)を待たずに
+    /// None を返す(全滅時は送信側が消えるため即座に返る性質を固定する)
+    #[test]
+    fn connect_first_gives_up_when_every_candidate_is_dead() {
+        let port = {
+            // bind してすぐ閉じる=確実に誰も待ち受けていないポート
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let known = vec![SocketAddr::from(([127, 0, 0, 1], port))];
+        let t = std::time::Instant::now();
+        let got = connect_first(&known, port, "probe-token", Duration::from_secs(5));
+        assert!(got.is_none(), "誰もいなければ None");
+        assert!(
+            t.elapsed() < Duration::from_millis(2500),
+            "全滅時に timeout まで待った: {:?}",
+            t.elapsed()
         );
     }
 }

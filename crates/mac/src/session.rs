@@ -821,26 +821,25 @@ pub(crate) fn client_thread(
             eprintln!("[conn] 接続試行を終了しました(役割の切り替え・世代 {generation})");
             return;
         }
-        let addrs = knit_common::connect::resolve(host.as_deref(), port, &token);
-        let delay = if addrs.is_empty() {
-            // 候補が空なら first_reachable を呼ばない(Windows 側と同じ: 3.5 秒の空待ち防止)
-            eprintln!("[conn] 接続先が見つかりません");
-            backoff.next_delay()
-        } else {
-            let t0 = std::time::Instant::now();
-            match knit_common::connect::first_reachable(&addrs, Duration::from_secs(3)) {
-                Some((s, a)) => {
-                    eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
-                    *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
-                    match client_attempt(s, &token, screen_w, screen_h) {
-                        Ok(()) => backoff.reset(),
-                        Err(e) => eprintln!("[conn] {e}"),
-                    }
+        // 既知候補(KNIT_HOST・保存済みピア)へのダイヤルを LAN 発見と並行に始める:
+        // 発見が応答しない環境(Tailscale・AP 隔離・相手が再起動中)では、従来は
+        // 発見の満了 600ms を待ってから最初のダイヤルを撃っていた
+        let known = knit_common::connect::known_candidates(host.as_deref(), port);
+        let t0 = std::time::Instant::now();
+        match knit_common::connect::connect_first(&known, port, &token, Duration::from_secs(3)) {
+            Some((s, a)) => {
+                eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
+                *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
+                match client_attempt(s, &token, screen_w, screen_h) {
+                    Ok(()) => backoff.reset(),
+                    Err(e) => eprintln!("[conn] {e}"),
                 }
-                None => eprintln!("[conn] どの接続先にも繋がりません: {:?}", host),
             }
-            backoff.next_delay()
-        };
+            // 既知候補が無く LAN 発見も空: 待っても無駄なので次の周回まで眠る
+            None if known.is_empty() => eprintln!("[conn] 接続先が見つかりません"),
+            None => eprintln!("[conn] どの接続先にも繋がりません: {:?}", host),
+        }
+        let delay = backoff.next_delay();
         // 次の試行時刻を状態表示へ(未接続が続くときの「あと何秒」の見える化。
         // WAKE で待機を飛ばした場合は実際より長く出るが、過剰表示で害は無い)
         NEXT_RETRY_AT_MS.store(
