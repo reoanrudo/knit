@@ -17,8 +17,9 @@ pub enum Refusal {
     LinkDown,
     /// 集計結果が古い(接続先の版が変わった等)
     CollectStale,
-    /// 集計が待ち時間内に終わらなかった
-    CollectPending,
+    /// 集計が待ち時間内に終わらなかった(呼び出し側が待ち切った)。
+    /// 「まだ集計中」を表す `Collect::Pending`(→ `Verdict::Wait`、断らない)とは別物
+    CollectTimeout,
     /// 集計そのものが失敗した。label は `bulk::send_error_label` の文言
     CollectFailed { label: String },
     /// 送れる項目が1つも無い
@@ -40,7 +41,7 @@ impl Refusal {
             Refusal::CollectStale => {
                 "接続の状態が変わったため、ファイルをもう一度掴み直してください".to_string()
             }
-            Refusal::CollectPending => {
+            Refusal::CollectTimeout => {
                 "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください"
                     .to_string()
             }
@@ -56,6 +57,13 @@ impl Refusal {
 /// リンク等で送れない項目があったときの前置き。**拒否ではない**: 通知したうえで
 /// 渡せる分だけ渡す(現行の挙動を値として固定する)
 pub const SKIPPED_NOTICE: &str = "掴んだまま渡せるのは通常のファイルとフォルダだけです";
+
+/// 前置きと内訳を連結する**唯一の場所**。連結そのものをテストで固定する
+/// (区切りや空白を足しても文言ゴールデンリストの多重集合には現れないため、
+/// ここに集約しないと誰も気づけない)
+pub fn skipped_notice(skip_note: &str) -> String {
+    format!("{SKIPPED_NOTICE}{skip_note}")
+}
 
 /// フォルダ展開(集計)の状態。**待つのは呼び出し側**に残す: ここへ sleep を移すと
 /// 入力経路(CGEventTap)が最大 150ms 止まる
@@ -108,7 +116,7 @@ pub fn verdict_for(s: &Signals) -> Verdict {
     match &s.collect {
         Collect::Stale => Verdict::Refused(Refusal::CollectStale),
         Collect::Pending => Verdict::Wait,
-        Collect::Expired => Verdict::Refused(Refusal::CollectPending),
+        Collect::Expired => Verdict::Refused(Refusal::CollectTimeout),
         Collect::Failed { label } => Verdict::Refused(Refusal::CollectFailed {
             label: label.clone(),
         }),

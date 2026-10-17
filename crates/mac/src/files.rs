@@ -283,7 +283,7 @@ fn refusal_log(reason: &drag::Refusal, raw: Option<&str>) -> Option<String> {
         TooMany => return None,
         LinkDown => "[drag] mac->win 対象外: ファイル経路が未接続".to_string(),
         CollectStale => "[drag] mac->win 対象外: 集計条件が変わっています".to_string(),
-        CollectPending => "[drag] mac->win 対象外: 集計結果の準備が間に合っていません".to_string(),
+        CollectTimeout => "[drag] mac->win 対象外: 集計結果の準備が間に合っていません".to_string(),
         CollectFailed { label } => {
             // 現行は生のエラーを出していた(通知は label)。生が無い場合だけ label へ落とす
             let e = raw.unwrap_or(label.as_str());
@@ -399,10 +399,8 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     if let Some(cr) = &cached {
         let skip_note = skip_note(&cr.skipped);
         if !skip_note.is_empty() {
-            notify(
-                "Knit",
-                &format!("{}{skip_note}", drag::SKIPPED_NOTICE),
-            );
+            // 連結は common の1箇所(区切りを足しても golden list では検出できないため)
+            notify("Knit", &drag::skipped_notice(&skip_note));
         }
     }
     let verdict = drag::verdict_for(&drag::Signals {
@@ -415,11 +413,11 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     let cr = match verdict {
         drag::Verdict::Refused(reason) => return refuse_drag(reason, collect_raw_err.as_deref()),
         // 集計中のまま戻ることは無い(上のループで Expired にする)。念のため断る
-        drag::Verdict::Wait => return refuse_drag(drag::Refusal::CollectPending, None),
+        drag::Verdict::Wait => return refuse_drag(drag::Refusal::CollectTimeout, None),
         drag::Verdict::Ready { count } => match cached {
             Some(cr) if cr.entries.len() == count => cr,
             // 判定と集計結果が食い違う(設計上あり得ない)。無言にせず同じ理由で断る
-            _ => return refuse_drag(drag::Refusal::CollectPending, None),
+            _ => return refuse_drag(drag::Refusal::CollectTimeout, None),
         },
     };
     let entries = cr.entries;
