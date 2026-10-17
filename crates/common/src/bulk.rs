@@ -15,8 +15,10 @@
     const LABEL: &[u8] = b"knit-bulk";
     /// 1 フレームの本体上限(DATA は CHUNK、その他は小さなメタ情報のみ)
     pub const MAX_FRAME: usize = 1024 * 1024;
-    /// ファイル・画像データを分割する単位(1MB = MAX_FRAME でフレーム数を最小化)
-    pub const CHUNK: usize = 1024 * 1024;
+    /// ファイル・画像データを分割する単位。
+    /// ループ5 で 1MB(=MAX_FRAME)化を試したが、localhost 計測でスループットは
+    /// 256KB と同等(誤差)だったため差し戻した。小さい方が受信側の待ちとメモリが小さい。
+    pub const CHUNK: usize = 256 * 1024;
     /// 1 回の一括送信の合計上限
     pub const MAX_TOTAL: u64 = crate::files::MAX_FILE;
     /// UI の表示も実際の制限値から作る(バイト数は 2 進単位)

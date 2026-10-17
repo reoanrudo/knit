@@ -6,7 +6,7 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Instant;
 
-use knit_common::bulk::{read_frame, write_frame, CHUNK, MAX_FRAME};
+use knit_common::bulk::{read_frame, write_frame, MAX_FRAME};
 use knit_common::secure::{accept, connect};
 
 const TOTAL: u64 = 64 * 1024 * 1024; // 64MB
@@ -62,6 +62,8 @@ fn run_once(size: usize, label: &str) -> f64 {
 
 fn main() {
     println!("bulkスループット計測(localhost上限値・合成データ)");
-    let _a = run_once(CHUNK, "CHUNK=256KB");
-    let _b = run_once(MAX_FRAME, "MAX_FRAME=1MB");
+    // CHUNK 定数に依存せず、明示サイズで真の A/B を取る(定数を書き換えると両ケースが
+    // 同じサイズになり比較が成立しないため)。ループ5 のリード検証で修正。
+    let _a = run_once(256 * 1024, "256KB");
+    let _b = run_once(MAX_FRAME, "1MB");
 }
