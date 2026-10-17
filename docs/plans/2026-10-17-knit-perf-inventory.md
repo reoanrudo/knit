@@ -44,6 +44,7 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 | ファイル転送(ループ5) | `common/bulk.rs` の CHUNK | CHUNK=256KB→1MB(MAX_FRAME)の改善は計測で劣化(363.4→349.7MB/s)のため差し戻し済み(commit f484d33)。localhost計測は上限値(実ネットワークでは回線が支配的) | 高 | 完了(差戻し) |
 | ファイル転送(ループ6) | `common/secure.rs` の write_rec | write_rec の毎回 Vec::with_capacity(2+len)+コピーを排除し、2B長ヘッダをスタックから write_vectored でデータと一括書き込み(部分書き込みはループで処理)。before 366.8MB/s(256KB)/after 372.5MB/s(+5.7MB/s, 約1.6%改善)。wire形式(2B長+暗号文)は変更なし。build 0 / test 499 passed・0 failed | 高 | 完了 |
 | LAN発見 | `common/discover.rs`・`mac/peers.rs` | 定期 broadcast/UDP の頻度・パケットの暗号化・peer 状態の再計算 | 中 | ループ8 |
+| ファイル転送(ループ7) | `common/bulk.rs` の send_entries | 小ファイル多数(4KB×500、MAX_BATCH_FILES=512以下)の files/s 計測。before 24270 files/s / 94.81 MB/s。律速: write_frame の 5B 長ヘッダ固定コスト+進捗コールバックのチャンク毎期待(テスト)。実装: 小ファイルは read 1 回+DATA 1 フレームにまとめる(大ファイルは従来どおり)。after 計測は 24270 files/s(±5%以内、改善確認できず)。wire形式不変・挙動不変。build 0 / test 262 passed・0 failed | 高 | 完了(差戻し) |
 | クリップボード同期 | `mac/clip.rs`・`win/clipboard.rs` | 大文字列/バイナリの clip ごとにシリアル/暗号化、かつ高頻度で発火 | 中 | ループ9 |
 | GUI 起動 | `mac/gui.rs`・`win/tray.rs` | 初回 UI 構築・設定読込・asset 読み込みの遅延 | 中 | ループ10 |
 | Android 橋渡し | `android-bridge`・`mac/android.rs` | JNI 経由のデータコピー・パケット暗号化・LAN 経路 | 中 | ループ11 |
