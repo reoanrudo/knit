@@ -6,6 +6,126 @@ pub const MAX_FILES: usize = 64;
 /// 展開後の件数で送るため、受け側もこの上限まで受け付ける
 pub const MAX_BATCH_FILES: usize = 512;
 
+/// 掴み渡しを断る理由(I1)。**文言はここに1箇所だけ置き、表示側は値を写すだけ**に
+/// する。通知の出し方・タイミングを変えずに、理由を値として取り出せるようにした
+/// もので、判定条件そのものは現行の `offer_drag_to_win` と同じ
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// 掴んだ件数が多すぎる。現行は 0 件も同じ文言で扱う(挙動を変えないため維持)
+    TooMany,
+    /// ファイル経路がまだ張れていない(切替直後の猶予窓も過ぎた)
+    LinkDown,
+    /// 集計結果が古い(接続先の版が変わった等)
+    CollectStale,
+    /// 集計が待ち時間内に終わらなかった
+    CollectPending,
+    /// 集計そのものが失敗した。label は `bulk::send_error_label` の文言
+    CollectFailed { label: String },
+    /// 送れる項目が1つも無い
+    NothingToSend,
+    /// 直前の転送がまだ終わっていない
+    Busy,
+}
+
+impl Refusal {
+    /// ユーザーに見せる本文。**現行 files.rs の通知文言を1文字も変えずに移した**
+    pub fn notice_body(&self) -> String {
+        match self {
+            Refusal::TooMany => {
+                format!("掴んだまま渡せるのは {} フォルダ/ファイルまでです", MAX_FILES)
+            }
+            Refusal::LinkDown => {
+                "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください".to_string()
+            }
+            Refusal::CollectStale => {
+                "接続の状態が変わったため、ファイルをもう一度掴み直してください".to_string()
+            }
+            Refusal::CollectPending => {
+                "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください"
+                    .to_string()
+            }
+            Refusal::CollectFailed { label } => format!("掴んだまま渡せません({})", label),
+            Refusal::NothingToSend => "掴んだ項目の中に送れるものがありません".to_string(),
+            Refusal::Busy => {
+                "前のファイルを転送中です。完了後にもう一度掴んでください".to_string()
+            }
+        }
+    }
+}
+
+/// リンク等で送れない項目があったときの前置き。**拒否ではない**: 通知したうえで
+/// 渡せる分だけ渡す(現行の挙動を値として固定する)
+pub const SKIPPED_NOTICE: &str = "掴んだまま渡せるのは通常のファイルとフォルダだけです";
+
+/// フォルダ展開(集計)の状態。**待つのは呼び出し側**に残す: ここへ sleep を移すと
+/// 入力経路(CGEventTap)が最大 150ms 止まる
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collect {
+    /// まだ集計中
+    Pending,
+    /// 待ち時間内に終わらなかった
+    Expired,
+    /// 条件が変わった古い結果
+    Stale,
+    /// 集計に失敗した(上限超過など)。label は `bulk::send_error_label` の文言
+    Failed { label: String },
+    /// 展開後の件数が確定した
+    Done { entry_count: usize },
+}
+
+/// 判定の入力。**mac 側で観測できる事実だけ**を持ち、推定や表示を混ぜない
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Signals {
+    /// 掴んだまま渡そうとしている件数(フォルダは1件として数える)
+    pub path_count: usize,
+    /// 越境してよい経路があるか(現行の `is_up_fast` と猶予窓の判定結果)
+    pub link_ok: bool,
+    /// 直前の転送が進行中か(実際の予約は `swap` で行う)
+    pub busy: bool,
+    /// 集計の状態
+    pub collect: Collect,
+}
+
+/// 判定の結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// 渡せる(件数は展開後)
+    Ready { count: usize },
+    /// まだ決まらない(集計中)。呼び出し側が待って再判定する
+    Wait,
+    Refused(Refusal),
+}
+
+/// 掴み渡しの判定(純関数)。順序は現行 `offer_drag_to_win` と同じ:
+/// 件数 → 経路 → 集計(古い/間に合わない/失敗/空) → 送信枠
+pub fn verdict_for(s: &Signals) -> Verdict {
+    if s.path_count == 0 || s.path_count > MAX_FILES {
+        return Verdict::Refused(Refusal::TooMany);
+    }
+    if !s.link_ok {
+        return Verdict::Refused(Refusal::LinkDown);
+    }
+    match &s.collect {
+        Collect::Stale => Verdict::Refused(Refusal::CollectStale),
+        Collect::Pending => Verdict::Wait,
+        Collect::Expired => Verdict::Refused(Refusal::CollectPending),
+        Collect::Failed { label } => Verdict::Refused(Refusal::CollectFailed {
+            label: label.clone(),
+        }),
+        // 空の判定は送信枠より先(現行と同じ順序)。空なら枠は取らない
+        Collect::Done { entry_count: 0 } => Verdict::Refused(Refusal::NothingToSend),
+        Collect::Done { entry_count } => {
+            if s.busy {
+                Verdict::Refused(Refusal::Busy)
+            } else {
+                Verdict::Ready {
+                    count: *entry_count,
+                }
+            }
+        }
+    }
+}
+
 struct Pending {
     id: u64,
     count: usize,

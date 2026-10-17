@@ -141,3 +141,36 @@ fn older_hello_disables_only_the_new_drag_capability() {
         matches!(proto::decode(&proto::encode(&offer)),Some(Msg::DragOffer {id:9,count:2,total:1234,position}) if position==0.4)
     );
 }
+
+/// I1: 掴み渡しの判断は理由つきの値(drag::Refusal)で決まり、通知の文言は現行
+/// mac 側のまま(characterization)。8つ目の枝(スキップ警告)は拒否ではないので
+/// 値にせず、文言だけ common に固定する。分岐や文言を足すときはこの表も足す
+#[test]
+fn refusal_reason_covers_every_reject_branch() {
+    use knit_common::drag::{verdict_for, Collect, Refusal, Signals, Verdict, MAX_FILES, SKIPPED_NOTICE};
+    let label = "上限を超えています";
+    let s = |path_count, link_ok, busy, collect| Signals { path_count, link_ok, busy, collect };
+    let cases: [(Signals, Refusal, &str); 8] = [
+        (s(0, true, false, Collect::Pending), Refusal::TooMany, "掴んだまま渡せるのは 64 フォルダ/ファイルまでです"),
+        (s(MAX_FILES + 1, true, false, Collect::Pending), Refusal::TooMany, "掴んだまま渡せるのは 64 フォルダ/ファイルまでです"),
+        (s(1, false, false, Collect::Pending), Refusal::LinkDown, "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください"),
+        (s(1, true, false, Collect::Stale), Refusal::CollectStale, "接続の状態が変わったため、ファイルをもう一度掴み直してください"),
+        // 集計が待ち時間内に終わらなかった場合。集計中(Pending)は Wait で断らない
+        (s(1, true, false, Collect::Expired), Refusal::CollectPending, "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください"),
+        (s(1, true, false, Collect::Failed { label: label.into() }), Refusal::CollectFailed { label: label.into() }, "掴んだまま渡せません(上限を超えています)"),
+        (s(1, true, false, Collect::Done { entry_count: 0 }), Refusal::NothingToSend, "掴んだ項目の中に送れるものがありません"),
+        (s(1, true, true, Collect::Done { entry_count: 2 }), Refusal::Busy, "前のファイルを転送中です。完了後にもう一度掴んでください"),
+    ];
+    for (signals, reason, body) in &cases {
+        assert_eq!(verdict_for(signals), Verdict::Refused(reason.clone()), "{signals:?}");
+        assert_eq!(reason.notice_body(), *body, "{reason:?}");
+    }
+    // 表が全理由を覆っている(理由を足したら表も足す)
+    let all = [Refusal::TooMany, Refusal::LinkDown, Refusal::CollectStale,
+        Refusal::CollectPending, Refusal::CollectFailed { label: label.into() },
+        Refusal::NothingToSend, Refusal::Busy];
+    assert!(all.iter().all(|r| cases.iter().any(|(_, c, _)| c == r)), "表に無い理由がある");
+    assert_eq!(SKIPPED_NOTICE, "掴んだまま渡せるのは通常のファイルとフォルダだけです");
+    assert_eq!(verdict_for(&s(1, true, false, Collect::Pending)), Verdict::Wait, "集計待ちは断らない");
+    assert_eq!(verdict_for(&s(MAX_FILES, true, false, Collect::Done { entry_count: 3 })), Verdict::Ready { count: 3 });
+}
