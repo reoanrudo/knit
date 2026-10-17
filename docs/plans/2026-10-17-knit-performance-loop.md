@@ -36,3 +36,25 @@
 - 次(ループ2)は性能ボトルネック棚卸し・計測を行う。
 - knit-win のテスト検証は Windows 実機または CI の Windows ラナーで行う必要がある。
 - 本計画ドキュメント自体はコミット(f)群に含まれておらず、未追跡。必要に応じて次ループで追跡対象に含めること。
+
+## ループ2 実行記録(2026-10-17)
+
+### 成果物
+- 新規: `crates/common/examples/perf-baseline.rs`(std::time のみで計測)
+- 新規: `docs/plans/2026-10-17-knit-perf-inventory.md`(機能別ボトルネック棚卸し+計測結果+ループ3〜22の割当)
+
+### 計測値(cargo run --release --example perf-baseline)
+| 計測 | p50 | 合計 |
+|---|---|---|
+| serde_json roundtrip x10000 | 166 ns | 1 ms |
+| clone 64KB Vec<u8> x1000 | 834 ns | 0 ms |
+| clone 1MB Vec<u8> x1000 | 19292 ns | 19 ms |
+| string format x10000 | 167 ns | 1 ms |
+
+### 考察
+- serde_json roundtrip と string format は 1µs 以下で、通信レイテンシのボトルネックにはなり得ない。
+- 1MB clone は ~19µs/回と、1MB+ データの繰り返しコピーで有意なコストになる。
+- clone 計測は black_box による最適化抑制で取得(なしでは 0 ns に最適化される)。
+
+### コミットハッシュ
+- (本コミットを参照)
