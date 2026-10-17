@@ -1852,6 +1852,9 @@ pub(crate) unsafe extern "C" fn tap_callback(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .begin(baseline);
+            // 押下を監視スレッドへ即座に知らせる。これを怠ると、押下してから
+            // 次の確認まで最大 IDLE_POLL 待ち、素早いドラッグを取りこぼす。
+            file_drag::wake_watcher();
             BTN_DOWN[0].store(true, Ordering::Relaxed);
         }
         EVT_LEFT_DRAGGED => FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).moved(),

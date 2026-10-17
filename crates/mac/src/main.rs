@@ -1342,36 +1342,47 @@ fn main() {
 
     // 基準値はMouseDownで取得済み。重いURL読み出しはタップの外で行う。
     // 取得中に離す・押し直す・越境する場合は、世代の異なる結果を捨てる。
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(16));
-        let probe = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).probe();
-        let Some(probe) = probe else { continue };
-        with_pool(|| unsafe {
-            let pb = drag_pasteboard();
-            if pb.is_null() {
-                return;
-            }
-            let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
-            if cnt == probe.baseline {
-                return;
-            }
-            if let Some(files) = pb_files(pb) {
-                if msg0_isize(pb, sel_registerName(c"changeCount".as_ptr())) != cnt {
+    std::thread::spawn(|| {
+        // 押下中だけ 16ms、押していない間は 200ms で待つ。待機中の押下は
+        // tap 側の wake_watcher() が unpark で即座に起こすため、検出は遅れない。
+        // (16ms 固定では、操作していない間も毎秒 62.5 回起き続けていた)
+        file_drag::register_watcher();
+        loop {
+            let interval = FILE_DRAG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poll_interval();
+            // 起床の取りこぼしがあっても永久に眠らないよう、timeout は保険として残す
+            std::thread::park_timeout(interval);
+            let probe = FILE_DRAG.lock().unwrap_or_else(|e| e.into_inner()).probe();
+            let Some(probe) = probe else { continue };
+            with_pool(|| unsafe {
+                let pb = drag_pasteboard();
+                if pb.is_null() {
                     return;
                 }
-                let n = files.len();
-                let precompute = files.clone();
-                if FILE_DRAG
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .complete(probe, cnt, files)
-                {
-                    eprintln!("[file] ファイル掴み検出: {n} 件");
-                    // 越境までの間に、越境時(tap スレッド)で必要になる集計を先に済ませる(M6)
-                    precompute_drag_entries(precompute);
+                let cnt = msg0_isize(pb, sel_registerName(c"changeCount".as_ptr()));
+                if cnt == probe.baseline {
+                    return;
                 }
-            }
-        });
+                if let Some(files) = pb_files(pb) {
+                    if msg0_isize(pb, sel_registerName(c"changeCount".as_ptr())) != cnt {
+                        return;
+                    }
+                    let n = files.len();
+                    let precompute = files.clone();
+                    if FILE_DRAG
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .complete(probe, cnt, files)
+                    {
+                        eprintln!("[file] ファイル掴み検出: {n} 件");
+                        // 越境までの間に、越境時(tap スレッド)で必要になる集計を先に済ませる(M6)
+                        precompute_drag_entries(precompute);
+                    }
+                }
+            });
+        }
     });
 
     // WIN モード中のカーソル固定監視(改善ループ4):

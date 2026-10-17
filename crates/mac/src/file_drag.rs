@@ -1,5 +1,30 @@
 //! 物理的な押下ごとに、ドラッグ用ペーストボードの変化と読み出し結果を結びつける。
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::thread::Thread;
+use std::time::Duration;
+
+/// 押下中の確認間隔。掴みの可能性がある間だけ細かく見る。
+pub(crate) const PRESSED_POLL: Duration = Duration::from_millis(16);
+/// 押下していない間の確認間隔。押下は tap 側の wake_watcher() で即座に起こされるため、
+/// この長さは「通知を取り逃した場合の保険」の意味しか持たない。
+pub(crate) const IDLE_POLL: Duration = Duration::from_millis(200);
+
+/// 監視スレッド。押下の瞬間に待機を解除するために保持する。
+static WATCHER: OnceLock<Thread> = OnceLock::new();
+
+/// 監視スレッド自身がループ開始時に呼ぶ。
+pub(crate) fn register_watcher() {
+    let _ = WATCHER.set(std::thread::current());
+}
+
+/// 押下状態が変わり得る操作の直後に呼ぶ。未登録なら何もしない。
+/// unpark は相手を待たないため、入力経路(タップ)から呼んでも止まらない。
+pub(crate) fn wake_watcher() {
+    if let Some(thread) = WATCHER.get() {
+        thread.unpark();
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Probe {
@@ -29,6 +54,16 @@ impl FileDrag {
         Self {
             generation: 0,
             phase: Phase::Idle,
+        }
+    }
+
+    /// 次の確認までの待ち時間。押下中だけ細かく、それ以外は粗く。
+    /// 押下の開始は tap 側の wake_watcher() が待機を解除するので、
+    /// IDLE_POLL の長さが押下の検出を遅らせることはない。
+    pub(crate) fn poll_interval(&self) -> Duration {
+        match self.phase {
+            Phase::Pressed { .. } => PRESSED_POLL,
+            _ => IDLE_POLL,
         }
     }
 
@@ -204,5 +239,52 @@ mod tests {
         drag.end();
         assert!(!drag.ready());
         assert!(drag.take().is_none());
+    }
+
+    #[test]
+    fn polls_fast_only_while_the_button_is_down() {
+        let mut drag = FileDrag::new();
+        assert_eq!(drag.poll_interval(), IDLE_POLL, "押していない間は粗く見る");
+        drag.begin(None); // 基準値を取れない押下(Windowsモード・未接続など)
+        assert_eq!(
+            drag.poll_interval(),
+            IDLE_POLL,
+            "掴みになり得ない押下では起こしても無駄なので速くしない"
+        );
+        drag.begin(Some(5));
+        assert_eq!(drag.poll_interval(), PRESSED_POLL, "押下中は細かく見る");
+        drag.moved();
+        assert_eq!(drag.poll_interval(), PRESSED_POLL, "押下中は動いても細かく");
+        let probe = drag.probe().unwrap();
+        assert!(drag.complete(probe, 6, files()));
+        assert_eq!(drag.poll_interval(), IDLE_POLL, "読み出しが済めば粗くてよい");
+        assert!(drag.take().is_some());
+        assert_eq!(drag.poll_interval(), IDLE_POLL, "引き渡し後も粗くてよい");
+        drag.refuse();
+        assert_eq!(drag.poll_interval(), IDLE_POLL, "拒否後も粗くてよい");
+        drag.end();
+        assert_eq!(drag.poll_interval(), IDLE_POLL, "離せば待機に戻る");
+    }
+
+    #[test]
+    fn a_press_wakes_the_parked_watcher() {
+        // 押下を最大 IDLE_POLL 待つと、素早いドラッグを取りこぼす。
+        // 待機中の監視スレッドは unpark で即座に起きる必要がある。
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let watcher = std::thread::spawn(move || {
+            register_watcher();
+            ready_tx.send(()).unwrap();
+            let started = std::time::Instant::now();
+            // 起こされなければ 2 秒眠る(保険の timeout)
+            std::thread::park_timeout(IDLE_POLL * 10);
+            started.elapsed()
+        });
+        ready_rx.recv().unwrap();
+        wake_watcher();
+        let waited = watcher.join().unwrap();
+        assert!(
+            waited < IDLE_POLL * 2,
+            "押下で待機が解除される (実際に待った時間 {waited:?})"
+        );
     }
 }
