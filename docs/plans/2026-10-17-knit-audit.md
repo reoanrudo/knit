@@ -141,6 +141,6 @@ Android タブレットを「もう1台の画面」として使う経路もあ�
 - **6(Windows のテスト)**: このMacには `rustup` が無く(Homebrew版 rustc)、Windows ターゲットの
   std を入れられないため、**Windows コードはローカルでコンパイルすらできない**。
   無検証のテストを足すとかえって CI を壊すため、**CI(`windows-latest`)か実機での作業として残す**。
-- **8(ログの永続化)**: 未着手(`/tmp` のログを `~/Library/Logs/knit/` へ診断時にコピーする案)。
+- **8(ログの永続化)**: **対応済み** — `main.rs` に `persist_log_copy` / `persist_log_now` を追加し、起動時の `rotate_tmp_log()` 直後と `rotate_log_at` の切り詰め直前に `/tmp/knit-mac.log` を `~/Library/Logs/knit/knit-mac.log` へ上書きコピー(1世代、src 無し/HOME 無しは静かに何もしない)。検証: `cargo build` 終了コード0、`cargo test` 全体 **520 passed / 0 failed**、新テスト3件(内容一致コピー・2回上書き・src 無しで Ok かつ何も作らない)。
 - **10(巨大ファイル分割)**: 未着手(振る舞いを変えない移動だけの作業として残す)。
 - **Windows 側の監査1(履歴の画像と項目)**: 同じ形で配線済みだが、上記の理由で**CI/実機確認が必要**。
