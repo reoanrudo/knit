@@ -23,8 +23,18 @@ pub fn history_save() {
     // push スレッド同士の同時保存で tmp の書き途中を rename しない(壊れた JSON の防止)
     static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _g = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Ok(h) = HISTORY.lock() {
-        h.save_to(&path);
+    // ループ9: 直列化だけ HISTORY のロック内で行い、ファイル書き込み(tmp へ書いて
+    // rename、最大 50×8KB 前後)はロックを離した後に実行する。ロック保持中に
+    // ディスク I/O をしないため、クリップボード操作(push)の待ち時間が短くなる。
+    // 保存形式・権限・アトミック性は従来(save_to)と同一。
+    // ロックが毒されている場合は従来どおり保存しない。
+    let bytes = if let Ok(h) = HISTORY.lock() {
+        h.to_bytes()
+    } else {
+        None
+    };
+    if let Some(bytes) = bytes {
+        knit_common::history::save_bytes_to(&path, &bytes);
     }
 }
 

@@ -282,21 +282,20 @@ impl History {
     /// 履歴を JSON ファイルへ保存する。書けない場合も静かに失敗する
     /// (履歴が消えるだけで操作は止めない)
     pub fn save_to(&self, path: &std::path::Path) {
+        if let Some(bytes) = self.to_bytes() {
+            save_bytes_to(path, &bytes);
+        }
+    }
+
+    /// 保存用の JSON バイト列を作る(ファイルへは書かない)。
+    /// 呼び出し側がロックを保持したまま直列化だけ行い、書き込みをロック外へ
+    /// 出したいときに使う(ループ9)。保存形式は save_to と完全に同一。
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
         // entries は借り参照のまま書き出す(clone は保存の都度全件複製になる)
         let data = PersistedRef {
             entries: &self.entries,
         };
-        if let Ok(json) = serde_json::to_string(&data) {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-                restrict_dir(parent);
-            }
-            // まず一時ファイルへ書いて差し替える(書きかけの破損を避ける)
-            let tmp = path.with_extension("json.tmp");
-            if write_private(&tmp, json.as_bytes()).is_ok() {
-                let _ = std::fs::rename(&tmp, path);
-            }
-        }
+        serde_json::to_string(&data).ok().map(String::into_bytes)
     }
 
     /// JSON ファイルから履歴を復元する。上限を超えた分は古い方から落とす。
@@ -422,6 +421,23 @@ fn element_ends(text: &str, array_start: usize) -> Vec<usize> {
 /// ~/.config 下は既定 umask(022)だと他ユーザーに読める(644)ため、
 /// トークン設定(~/.config/knit/env=600)と同じ土俵へ揃える。
 /// Windows はプロファイル直下の既定 ACL に任せる(何もしない)
+/// 直列化済みバイト列をアトミックに保存する(tmp へ書いて rename)。
+/// ループ9: 呼び出し側が `History::to_bytes()` を HISTORY のロック内で作り、
+/// この関数を**ロックを離した後**に呼ぶことで、ファイル I/O 中にロックを
+/// 保持しない(クリップボード操作の待ち時間を短縮)。保存形式・権限は
+/// `History::save_to` と同一。
+pub fn save_bytes_to(path: &std::path::Path, bytes: &[u8]) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+        restrict_dir(parent);
+    }
+    // まず一時ファイルへ書いて差し替える(書きかけの破損を避ける)
+    let tmp = path.with_extension("json.tmp");
+    if write_private(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     // 作成時点から所有者のみにする(既定 644 で作ってから chmod する間に、
     // 共有 Mac の別ユーザーへ本文が読まれる窓を残さない)
@@ -1132,6 +1148,24 @@ mod tests {
             Kind::File,
             "ファイル種別は保存・復元を通る"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn to_bytes_matches_save_to_output() {
+        let dir = std::env::temp_dir().join(format!("knit-history-bytes-{}", std::process::id()));
+        let path = dir.join("history.json");
+        let mut h = History::new(5);
+        h.push_text("hello world", "Mac", 1);
+        h.push_files(&[std::path::PathBuf::from("/tmp/a.txt")], "Mac", 2);
+        let bytes = h.to_bytes().expect("直列化できる");
+        h.save_to(&path);
+        let on_disk = std::fs::read(&path).expect("保存できる");
+        assert_eq!(bytes, on_disk, "to_bytes と save_to の出力は同一");
+        let mut loaded = History::new(5);
+        loaded.entries.clear();
+        loaded.load_from(&path);
+        assert_eq!(loaded.entries().len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
