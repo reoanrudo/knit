@@ -148,3 +148,20 @@
 - 検証: `cargo build` exit 0 / `cargo test --workspace` **499 passed / 0 failed**。
 - 判断: 改善が誤差以下(約1.6%)でも、固定コスト(確保+コピー)排除は正当な理由。
   計測が劣化方向(回帰)でないことも確認し、**変更を残す**。
+
+## ループ7 実行記録(2026-10-17)
+
+- 対象: 小ファイル多数(4KB×500、MAX_BATCH_FILES=512以下)の転送スループット。
+  新規計測器 `crates/common/examples/perf-smallfiles.rs` を作成。
+  secure::accept/connect + bulk::send_files/Receiver で files/s と MB/s を計測。
+- 事前計測: before = 24270 files/s / 94.81 MB/s(elapsed 0.021s, 500 files)。
+- 律速特定: send_entries 内の小ファイル(CHUNK以下)は 1 回の read で全体が取得され、
+  write_frame の 5B 長ヘッダ書き込みが DATA フレームに固定コストとして乗る。
+  1 回分の read 漏れも進捗コールバックがチャンク毎に呼ばれる前提(テストの期待)と
+  衝突するため、wire形式不変・挙動不変の制約で実改善余地が計測誤差以内(±5%)。
+- 実装(1つ): 小ファイルは read 1 回+DATA 1 フレーム+write_frame 1 回にまとめる。
+  大ファイルは従来どおりチャンク分割。
+- 事後計測: 実測は 24270 files/s と同値(計測誤差以内、改善確認できない)。
+  検証: cargo build exit 0 / cargo test 262 passed・0 failed(差分なし)。
+- 判断: 改善が計測で確認できない(±5%以内)。変更を**差し戻す**。
+  計測器(perf-smallfiles.rs)と本記録は残す。
