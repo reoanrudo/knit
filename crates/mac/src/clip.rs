@@ -29,10 +29,14 @@ pub fn history_save() {
     // ディスク I/O をしないため、クリップボード操作(push)の待ち時間が短くなる。
     // 保存形式・権限・アトミック性は従来(save_to)と同一。
     // ロックが毒されている場合は従来どおり保存しない。
-    let bytes = if let Ok(h) = HISTORY.lock() {
-        h.to_bytes()
-    } else {
-        None
+    // 監査3: ロックが毒されていても保存を続ける(以前は無言でスキップし、
+    // 以後その実行の間ずっと履歴が保存されなくなっていた)
+    let bytes = match HISTORY.lock() {
+        Ok(h) => h.to_bytes(),
+        Err(poisoned) => {
+            eprintln!("[clip] 履歴のロックが壊れていますが保存を続けます");
+            poisoned.into_inner().to_bytes()
+        }
     };
     if let Some(bytes) = bytes {
         knit_common::history::save_bytes_to(&path, &bytes);
@@ -220,7 +224,7 @@ impl ImageStoreWorker {
                 // テスト(push_history=false)では実行しない
                 let ts = knit_common::history::now_epoch_ms();
                 if push_history {
-                    if let Ok(mut h) = HISTORY.lock() {
+                    if let Ok(mut h) = HISTORY.lock().map_err(|e| e.into_inner()) {
                         // 監査1: 実体を消した画像を参照する履歴項目も一緒に消す。
                         // 残すと「押しても復元できない項目」が履歴に溜まる
                         let mut changed = h.remove_image_entries(&removed) > 0;
@@ -308,7 +312,7 @@ pub(crate) fn prune_image_store_now() {
     if removed.is_empty() {
         return;
     }
-    if let Ok(mut h) = HISTORY.lock() {
+    if let Ok(mut h) = HISTORY.lock().map_err(|e| e.into_inner()) {
         if h.remove_image_entries(&removed) > 0 {
             HISTORY_LAST_ID.store(h.last_id(), Ordering::Relaxed);
             drop(h);
