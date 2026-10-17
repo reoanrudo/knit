@@ -625,7 +625,9 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             if ok {
                 // 履歴ラベルは他の bulk 受信(ファイル)と同じくバッチ開始時点の
                 // アクティブ端末(エイリアス優先。未受信の間は汎用の「端末」)
-                history_push_image(&bmp, &bulk_rx_device());
+                // ここは既に BMP を作っているので BMP 版を使う(DIB 版に渡すと
+                // ワーカー側で二重変換になり壊れた実体を保存する。レビューで判明)
+                history_push_image_bmp(&bmp, &bulk_rx_device());
             }
             eprintln!(
                 "[clip] win->mac image {}KB {}",

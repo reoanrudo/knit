@@ -472,7 +472,11 @@ fn restart_now() {
         .process_group(0)
         .spawn()
     {
-        Ok(_) => std::process::exit(0),
+        Ok(_) => {
+            // 直前の画像コピーを取りこぼさない(レビュー指摘: exit は run_app から戻らない)
+            crate::clip::flush_image_store();
+            std::process::exit(0)
+        }
         Err(e) => {
             // 失敗時はプロセスが続くため、保存止めを解く(このままでは利用者の
             // 設定変更が一切保存されず、黙って捨てられる状態が続いてしまう)。
@@ -972,6 +976,7 @@ unsafe extern "C" fn imp_close_prefs(_s: ID, _c: SEL, _n: ID) {
 unsafe extern "C" fn imp_preview_window_close(_s: ID, _c: SEL, _n: ID) {
     if UI_PREVIEW.load(Ordering::Relaxed) {
         eprintln!("[ui-check] PASS: preview window closed; process exits without a status item");
+        crate::clip::flush_image_store();
         std::process::exit(0);
     }
 }
@@ -1974,6 +1979,8 @@ unsafe extern "C" fn imp_quit(_s: ID, _c: SEL, _n: ID) {
     if crate::WIN_MODE.swap(false, Ordering::Relaxed) {
         crate::leave_win_mode_cursor_unlock(None);
     }
+    // 直前の画像コピーを取りこぼさない(レビュー指摘)
+    crate::clip::flush_image_store();
     std::process::exit(0);
 }
 unsafe extern "C" fn imp_check_update(_s: ID, _c: SEL, _n: ID) {

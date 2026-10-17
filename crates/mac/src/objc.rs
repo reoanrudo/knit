@@ -252,7 +252,7 @@ pub(crate) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// DIB の画素列(ヘッダ・パレット・マスクを除いた本体)を RGBA(上から下)へ展開する。
-/// `dib_to_png` と計測用の `dib_rows_to_rgba` が共有する唯一の実装。
+/// `dib_to_png` が使う唯一の実装(計測用テストは同じロジックの写しを持つ)。
 fn rows_to_rgba(
     px: &[u8],
     w: usize,
@@ -280,36 +280,6 @@ fn rows_to_rgba(
         }
     }
     rgba
-}
-
-/// DIB を RGBA(上から下)へ展開する純関数(計測・バイト同一性検証用)。
-/// `dib_to_png` の変換部と同一のロジックを切り出している。
-/// biSize=40 の BI_BITFIELDS(3) のカラーマスク(12B)とパレットを飛ばす
-pub fn dib_rows_to_rgba(dib: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    if dib.len() < 40 {
-        return None;
-    }
-    let header_size = u32::from_le_bytes([dib[0], dib[1], dib[2], dib[3]]) as usize;
-    let w = i32::from_le_bytes([dib[4], dib[5], dib[6], dib[7]]);
-    let h_raw = i32::from_le_bytes([dib[8], dib[9], dib[10], dib[11]]);
-    let bpp = u16::from_le_bytes([dib[14], dib[15]]) as usize;
-    let comp = u32::from_le_bytes([dib[16], dib[17], dib[18], dib[19]]);
-    if (comp != 0 && comp != 3) || (bpp != 24 && bpp != 32) || w <= 0 || h_raw == 0 {
-        return None;
-    }
-    let top_down = h_raw < 0;
-    let (w, h) = (w as usize, h_raw.unsigned_abs() as usize);
-    let masks = if comp == 3 && header_size == 40 { 12 } else { 0 };
-    let clr_used = u32::from_le_bytes([dib[32], dib[33], dib[34], dib[35]]) as usize;
-    let palette = if clr_used > 0 { clr_used * 4 } else if bpp == 8 { 1024 } else { 0 };
-    let off = header_size + palette + masks;
-    let stride = (w * bpp / 8 + 3) & !3usize;
-    let px = dib.get(off..)?;
-    if px.len() < stride * h {
-        return None;
-    }
-    // 変換は生産コードと同じ rows_to_rgba を共有する(二重実装の排除)
-    Some((w, h, rows_to_rgba(px, w, h, bpp, stride, top_down)))
 }
 
 /// BMP 画像を Mac のクリップボードへ TIFF として書き込む(Windows→Mac 画像同期)

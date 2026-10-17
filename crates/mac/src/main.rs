@@ -52,6 +52,8 @@ fn request_quit_for_update() {
     if WIN_MODE.swap(false, Ordering::Relaxed) {
         leave_win_mode_cursor_unlock(None);
     }
+    // 直前の画像コピーを取りこぼさない(レビュー指摘: exit は run_app から戻らない)
+    clip::flush_image_store();
     std::process::exit(0);
 }
 
