@@ -899,7 +899,6 @@ fn main() {
     prune_image_store_now();
     start_local_history();
     eprintln!("[info] 操作ガイド: カーソルを画面端へ動かすと Windows へ移ります。メニューバーにクリップボード履歴があります");
-
     // 送信チャネル + 書き込みストリームスロット(接続が変わるたび差し替え)
     let (tx, rx) = std::sync::mpsc::channel::<outgoing::Queued>();
     let _ = TX.set(tx);
@@ -1371,8 +1370,16 @@ fn main() {
             gui::SHOW_AT_START.store(true, Ordering::Relaxed);
         }
         unsafe { gui::run_app() }; // NSApp.run(戻らない。終了はメニューから)
+        // 終了前に画像保存ワークスレッドの残りをフラッシュして取りこぼしを防止する
+        if let Some(worker) = IMAGE_STORE_WORKER.get() {
+            worker.flush();
+        }
     } else {
         unsafe { CFRunLoopRun() };
+        // 終了前に画像保存ワークスレッドの残りをフラッシュして取りこぼしを防止する
+        if let Some(worker) = IMAGE_STORE_WORKER.get() {
+            worker.flush();
+        }
     }
 }
 #[cfg(test)]
