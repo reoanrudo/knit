@@ -81,3 +81,8 @@
 
 ### 考察
 - encode/decode は p50 167ns/125ns と 1µs 以下。バッチ経路の文字列走査排除と容量予約は定数削減で、実測上の顕著な変化は小さい。
+
+### 追記(リード検証 2026-10-17)
+- `proto::encode_into` は `serde_json::to_string` で一時 String を作ってから `out` へコピーする二重確保で、`encode` 自体が改悪されていた(割当2回)。呼び出し元も `encode` のみだったため撤去し、`encode` を1回割当の元実装へ戻した。
+- 実測(同一環境・`cargo run --release --example perf-input`): encode p50 **167ns → 84ns**、decode 125ns は不変。
+- `cargo test`: **262 passed / 0 failed / 2 ignored**(回帰なし)。`cargo build --workspace` は knit-win が macOS非互換API(`as_raw_handle` 等)で失敗するが、これは変更前からの既知の制約(Windows専用crate)。検証は `cargo build` / `cargo test`(default members)で行う。

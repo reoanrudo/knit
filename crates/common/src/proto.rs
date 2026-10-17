@@ -446,15 +446,11 @@
         true
     }
 
-    pub fn encode_into(msg: &Msg, out: &mut String) {
-        out.clear();
-        out.push_str(serde_json::to_string(msg).unwrap_or_default().as_str());
-        out.push('\n');
-    }
-
     pub fn encode(msg: &Msg) -> String {
-        let mut s = String::new();
-        encode_into(msg, &mut s);
+        // 1 メッセージ = 1 String の単純な経路。encode_into 方式は一時 String を作って
+        // さらにコピーする二重確保になり、実測で不利だったため採用しない(ループ3 レビュー指摘)。
+        let mut s = serde_json::to_string(msg).unwrap_or_default();
+        s.push('\n');
         s
     }
 
