@@ -482,6 +482,61 @@ fn set_mtime_ignores_absurd_values() {
     knit_common::files::set_mtime(&p, 1_700_000_000);
 }
 
+/// 受信側は一時ファイルを閉じる前の fd へ更新日時を設定する(開き直しをやめた)。
+/// 閉じた後・リネーム後にも宣言された値が残ることを、固定値で確認する
+#[test]
+fn receiver_restores_declared_mtime_through_the_open_handle() {
+    let temp = Temp::new("mtimefd");
+    let dst = temp.0.join("received");
+    let mut rx = bulk::Receiver::new(&dst);
+    let mtime = 1_700_000_000u64; // 2023-11-14T22:13:20Z
+    let data = b"body";
+    let head = format!(r#"{{"name":"m.txt","size":{},"mtime":{mtime}}}"#, data.len());
+    assert!(rx.feed(bulk::FILE_BEGIN, head.as_bytes()).is_none());
+    assert!(rx.feed(bulk::DATA, data).is_none());
+    assert!(rx.feed(bulk::FILE_END, &[]).is_none());
+    let got = std::fs::metadata(dst.join("m.txt"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(got, mtime, "宣言された更新日時が保存後も残る");
+    // mtime 未指定(0)のファイルは今の時刻のままにする
+    let head0 = format!(r#"{{"name":"n.txt","size":{},"mtime":0}}"#, data.len());
+    assert!(rx.feed(bulk::FILE_BEGIN, head0.as_bytes()).is_none());
+    assert!(rx.feed(bulk::DATA, data).is_none());
+    assert!(rx.feed(bulk::FILE_END, &[]).is_none());
+    let now = std::fs::metadata(dst.join("n.txt"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(now > mtime, "0 のときは現在時刻のまま: {now}");
+}
+
+/// 開いている fd 版も異常に大きな値を無視する(panic しない)
+#[test]
+fn set_mtime_file_ignores_absurd_values() {
+    let temp = Temp::new("mtimefd-absurd");
+    let p = temp.0.join("t.txt");
+    let f = std::fs::File::create(&p).unwrap();
+    knit_common::files::set_mtime_file(&f, u64::MAX);
+    knit_common::files::set_mtime_file(&f, 0);
+    drop(f);
+    let got = std::fs::metadata(&p)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(got > 1_700_000_000, "異常値では更新日時を触らない: {got}");
+}
+
 /// strict=false の collect: サブフォルダが読み取れないときもバッチ全体を
 /// 落とさず、そのフォルダを skipped へ報告する(空フォルダとしても送らない)
 #[cfg(unix)]

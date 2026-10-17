@@ -917,15 +917,17 @@
                         } else {
                             let digest: [u8; 32] = hasher.finalize().into();
                             let hash_ok = body.len() != 32 || digest.as_slice() == body;
+                            // 検証に通ったファイルだけ、閉じる前の fd へ更新日時を
+                            // 設定する(パス経由の set_mtime は開き直しになる)
+                            if hash_ok {
+                                crate::files::set_mtime_file(&f, mtime);
+                            }
                             drop(f); // リネームの前に閉じる
                             if !hash_ok {
                                 let _ = std::fs::remove_file(&tmp);
                                 self.paths.pop();
                                 self.failed.push((rel, "内容の検証に失敗".into()));
                             } else {
-                                if mtime > 0 {
-                                    crate::files::set_mtime(&tmp, mtime);
-                                }
                                 crate::files::mark_untrusted(&tmp);
                                 let desired = self.paths.last().cloned();
                                 match desired.and_then(|d| crate::files::publish(&tmp, &d).ok()) {
