@@ -237,6 +237,30 @@ pub(crate) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
     if px.len() < stride * h {
         return None;
     }
+    // 変換は rows_to_rgba に一本化(ループ11: 二重実装によるドリフト防止。
+    // 以前は本関数内に同じループを抱えていた)
+    let rgba = rows_to_rgba(px, w, h, bpp, stride, top_down);
+    let mut out = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().ok()?;
+        writer.write_image_data(&rgba).ok()?;
+    }
+    Some(out)
+}
+
+/// DIB の画素列(ヘッダ・パレット・マスクを除いた本体)を RGBA(上から下)へ展開する。
+/// `dib_to_png` と計測用の `dib_rows_to_rgba` が共有する唯一の実装。
+fn rows_to_rgba(
+    px: &[u8],
+    w: usize,
+    h: usize,
+    bpp: usize,
+    stride: usize,
+    top_down: bool,
+) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(w * h * 4);
     for row in 0..h {
         // DIB は下から上(top-down のみ上から下)
@@ -255,15 +279,7 @@ pub(crate) fn dib_to_png(dib: &[u8]) -> Option<Vec<u8>> {
             }
         }
     }
-    let mut out = Vec::new();
-    {
-        let mut enc = png::Encoder::new(&mut out, w as u32, h as u32);
-        enc.set_color(png::ColorType::Rgba);
-        enc.set_depth(png::BitDepth::Eight);
-        let mut writer = enc.write_header().ok()?;
-        writer.write_image_data(&rgba).ok()?;
-    }
-    Some(out)
+    rgba
 }
 
 /// DIB を RGBA(上から下)へ展開する純関数(計測・バイト同一性検証用)。
@@ -292,24 +308,8 @@ pub fn dib_rows_to_rgba(dib: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     if px.len() < stride * h {
         return None;
     }
-    let mut rgba = Vec::with_capacity(w * h * 4);
-    for row in 0..h {
-        let src_row = if top_down { row } else { h - 1 - row };
-        let line = &px[src_row * stride..src_row * stride + w * bpp / 8];
-        match bpp {
-            32 => {
-                for p in line.as_chunks::<4>().0 {
-                    rgba.extend_from_slice(&[p[2], p[1], p[0], p[3]]);
-                }
-            }
-            _ => {
-                for p in line.as_chunks::<3>().0 {
-                    rgba.extend_from_slice(&[p[2], p[1], p[0], 0xFF]);
-                }
-            }
-        }
-    }
-    Some((w, h, rgba))
+    // 変換は生産コードと同じ rows_to_rgba を共有する(二重実装の排除)
+    Some((w, h, rows_to_rgba(px, w, h, bpp, stride, top_down)))
 }
 
 /// BMP 画像を Mac のクリップボードへ TIFF として書き込む(Windows→Mac 画像同期)
