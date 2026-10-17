@@ -308,10 +308,14 @@ pub(crate) mod preroll {
 /// 音切れ時 MAX(≈42.7ms) へ段階的に拡大
 static PRE_ROLL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(preroll::MIN);
-/// 健康な再生の累計(コールバック数)。音切れ検出は PRIMED 中の供給枯れで、
-/// 健康な間はこのカウントで on_healthy を間隔(1.2秒≒30回)で適用する
-static PREROLL_HEALTH: std::sync::atomic::AtomicUsize =
+/// 健康な再生で流れた音声バイトの累計。この値が HEALTHY_BYTES_PER_STEP に
+/// 達するごとにプリロールを 1KB 戻す(音切れ時は 0 にリセット)。
+/// コールバック回数ではなく音声量で測るので、バッファ長が変わっても周期が変わらない。
+static PREROLL_HEALTH_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// プリロールを 1KB 戻すまでの健康な音声量(48kHz/stereo f32 で 5 秒分 = 約1.92MB)。
+/// 短すぎると 4KB↔16KB の振動で周期的な音切れを招くため 5 秒とした
+const HEALTHY_BYTES_PER_STEP: usize = 48_000 * 8 * 5;
 /// プリロール完了状態(開始/ミュート明けごとにやり直す)
 static PRIMED: AtomicBool = AtomicBool::new(false);
 /// ソフト追い込みの目標滞留(≈42ms=プリロール量と同値)。これを超えたら
@@ -1132,8 +1136,13 @@ unsafe extern "C" fn aq_callback(
             // (第2レーンの加算は別経路、第2レーン変更しないため)で行う。
             // 音切れ: PRIMED 中の在庫不足(=供給が尽きた合図)で PRE_ROLL を
             // on_starve で更新し、PRIMED=false に戻して次のプリロールで新しい
-            // 目標(大きいクッション)を溜める。健康: 音切れ無しの間、約 1.2 秒
-            // (30 コールバック≒1.2秒)に 1KB ずつ MIN へ戻す。
+            // 目標(大きいクッション)を溜める。
+            // 健康: 音切れ無しの音声が HEALTHY_BYTES_PER_STEP(約5秒分)流れるごとに
+            // 1KB ずつ MIN へ戻す。コールバック周期ではなく「流れた音声量」で測るため
+            // バッファ長に依存しない(リード検証 2026-10-17: 当初の 30 コールバック
+            // は 4096B バッファで約 320ms しかなく、記載の 1.2 秒と不一致だった。
+            // また減衰が速すぎると 4KB↔16KB の振動で周期的な音切れを招くため、
+            // 5 秒分(=約 470 コールバック)へ緩めた)。
             // 安全側: 音切れ検出が曖昧なときは大きいクッションを選ぶ。
             if filled < cap {
                 if PRIMED.load(Ordering::Relaxed) {
@@ -1143,19 +1152,20 @@ unsafe extern "C" fn aq_callback(
                     let cur = PRE_ROLL.load(Ordering::Relaxed);
                     PRE_ROLL.store(preroll::on_starve(cur), Ordering::Relaxed);
                     PRIMED.store(false, Ordering::Relaxed);
+                    PREROLL_HEALTH_BYTES.store(0, Ordering::Relaxed);
                 }
             } else {
-                // 健康な再生(音切れ無し)。約 1.2 秒(30 コールバック)に 1KB
-                // ずつ MIN へ戻す。PRIMED=false の間(プリロール待ち)はカウント
-                // リセットせず、PRIMED=true に戻ったときリセット。
+                // 健康な再生(音切れ無し)。一定量の音声が流れるごとに 1KB ずつ
+                // MIN へ戻す。PRIMED=false の間(プリロール待ち)はカウントを戻す。
                 if PRIMED.load(Ordering::Relaxed) {
-                    let n = PREROLL_HEALTH.fetch_add(1, Ordering::Relaxed);
-                    if n % 30 == 29 {
+                    let n = PREROLL_HEALTH_BYTES.fetch_add(cap, Ordering::Relaxed) + cap;
+                    if n >= HEALTHY_BYTES_PER_STEP {
+                        PREROLL_HEALTH_BYTES.fetch_sub(HEALTHY_BYTES_PER_STEP, Ordering::Relaxed);
                         let cur = PRE_ROLL.load(Ordering::Relaxed);
                         PRE_ROLL.store(preroll::on_healthy(cur), Ordering::Relaxed);
                     }
                 } else {
-                    PREROLL_HEALTH.store(0, Ordering::Relaxed);
+                    PREROLL_HEALTH_BYTES.store(0, Ordering::Relaxed);
                 }
             }
         }
