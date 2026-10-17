@@ -29,7 +29,7 @@ use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, LazyLock};
 use std::time::{Duration, Instant};
 
 /// 端末へ送り込むサーバー部品の置き場所(scrcpy 本体と重ならない名前にする)
@@ -392,10 +392,18 @@ fn adb_run(adb: &Path, args: &[&str], timeout: Duration) -> Option<(bool, String
         s
     });
     let start = Instant::now();
+    // ループ12: 50ms 固定のポーリングは、短命な adb 呼び出し(1枚の画像で4回起動する)
+    // ごとに最大50ms を上乗せし、実測 4 回で約600ms になっていた。最初は 2ms 刻みで
+    // 見て、長引く呼び出し(adb push は最大120秒)では 50ms まで間隔を広げる。
+    // 短い呼び出しは即座に返り、長い呼び出しは従来どおり低負荷で待つ。
+    let mut poll = Duration::from_millis(2);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
-            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) if start.elapsed() < timeout => {
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(50));
+            }
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1016,6 +1024,10 @@ fn audio_thread(sock: TcpStream, name: &str) {
 /// 送り先(操作中のセッションが登録する): adb の場所、シリアル、端末の表示名
 static PUSH_TARGET: Mutex<Option<(PathBuf, String, String)>> = Mutex::new(None);
 
+/// mkdir を一度成功したシリアルの集合(再登録はしない)。プロセス内のフラグ
+static PREPARED_DIRS: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// adb push で送信中の残り件数(0=送信なし)。adb push はファイルごとに最大120秒
 /// 待つため、複数件の送り込みは長時間音無しになりがち。中止はできないが
 /// 「今どれだけ残っているか」をメニューの状態行へ出すためのフラグ
@@ -1033,6 +1045,12 @@ fn unregister_push_target(serial: &str) {
     if t.as_ref().is_some_and(|(_, s, _)| s == serial) {
         *t = None;
     }
+}
+
+/// MediaStore の反映待ちで使うバックオフ列。先頭は 0(即時)、以降は指数増、
+/// 合計は 2 秒未満。単体テストでこの性質を検証する
+pub(crate) fn scan_delays() -> Vec<Duration> {
+    [0u64, 50, 100, 200, 400, 800].iter().map(|d| Duration::from_millis(*d)).collect()
 }
 
 /// 選択されたファイルを端末の Download へ置く。成功した件数(未接続は None)
@@ -1076,12 +1094,19 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
         return false;
     }
     let dev = format!("/sdcard/Pictures/Knit/{name}");
-    // フォルダを用意して画像を置く(MediaStore への自動登録が走る)
-    let _ = adb_run(
-        &adb,
-        &["-s", &serial, "shell", "mkdir", "-p", "/sdcard/Pictures/Knit"],
-        Duration::from_secs(10),
-    );
+    // フォルダの mkdir は同じシリアルで一度成功した後は再実行しない(多重起動の削減)
+    let mut prepared = PREPARED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    if !prepared.contains(&serial) {
+        let dir_ok = adb_run(
+            &adb,
+            &["-s", &serial, "shell", "mkdir", "-p", "/sdcard/Pictures/Knit"],
+            Duration::from_secs(10),
+        )
+        .is_some_and(|(ok, _)| ok);
+        if dir_ok {
+            prepared.insert(serial.to_string());
+        }
+    }
     let pushed = adb_run(
         &adb,
         &["-s", &serial, "push", &local.to_string_lossy(), &dev],
@@ -1096,8 +1121,12 @@ pub fn set_clipboard_image(mime: &str, name: &str, data: &[u8]) -> bool {
     // 二重引用符に囲まれる形で渡す。無いと SQL のトークンとして壊れる)
     let mut id = None;
     let cond = format!("\"_display_name='{name}'\"");
-    for _ in 0..12 {
-        std::thread::sleep(Duration::from_millis(500));
+    // MediaStore のスキャン反映を待って _id を引く。固定500msの待ちは廃止し、
+    // 先頭は即時・以降は指数バックオフで合計2秒未満に収める(詳細は scan_delays)
+    for d in scan_delays() {
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
         if let Some((true, out)) = adb_run(
             &adb,
             &[
@@ -1321,6 +1350,71 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_delays_first_is_zero_and_total_under_two_seconds() {
+        let d = scan_delays();
+        assert!(d[0] == Duration::from_millis(0), "先頭が 0ms であること");
+        let total_ms: u128 = d.iter().map(|x| x.as_millis()).sum::<u128>();
+        assert!(total_ms < 2000, "合計が 2 秒(2000ms)未満であること");
+    }
+
+    #[test]
+    fn android_clipboard_image_stub_timings_and_call_count() {
+        let tmp = std::env::temp_dir().join("knit-android-stub");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let log = tmp.join("adb.log");
+        let _ = std::fs::remove_file(&log);
+        let stub = tmp.join("adb");
+        // query には MediaStore の行、app_process(クリップボード設定ヘルパー)には
+        // "ok" を返す(成功条件が starts_with("ok") のため必須)。それ以外は即終了
+        let script = "#!/bin/sh\nLOG=$(dirname \"$0\")/adb.log\nprintf '%s\\n' \"$*\" >> \"$LOG\"\nfor a in \"$@\"; do\n  if [ \"$a\" = \"query\" ]; then echo \"Row: 0 _id=7, _display_name=t.png\"; exit 0; fi\n  if [ \"$a\" = \"app_process\" ]; then echo ok; exit 0; fi\ndone\nexit 0\n";
+        std::fs::write(&stub, script).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let serial = "stub-serial";
+        // 注意(リード検証): ガードを保持したまま set_clipboard_image を呼ぶと
+        // 同一 Mutex の再取得でデッドロックする。スコープを切ってから呼ぶこと
+        {
+            let mut prepared = PREPARED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            prepared.remove(serial);
+        }
+        let orig = PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()).take();
+        register_push_target(&stub, serial, "Stub");
+        let data = vec![1u8, 2, 3, 4];
+        // 1 回目(mkdir も走る)
+        let t0 = std::time::Instant::now();
+        let ok = set_clipboard_image("image/png", "t.png", &data);
+        let elapsed = t0.elapsed();
+        let calls = std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        // 2 回目: mkdir は同一シリアルでキャッシュされるため起動回数が減る。
+        // 登録を戻す前に呼ぶこと(戻すと PUSH_TARGET が空になり即 false になる)
+        let _ = std::fs::remove_file(&log);
+        let t1 = std::time::Instant::now();
+        let ok2 = set_clipboard_image("image/png", "t2.png", &data);
+        let elapsed2 = t1.elapsed();
+        let calls2 = std::fs::read_to_string(&log).unwrap_or_default().lines().count();
+        println!(
+            "[loop12-stub] 1回目 ok={ok} adb_calls={calls} elapsed={elapsed:?} / 2回目 ok={ok2} adb_calls={calls2} elapsed={elapsed2:?}"
+        );
+        // 検証の前に状態を戻す(失敗経路でも他テストへ影響を残さない)
+        *PUSH_TARGET.lock().unwrap_or_else(|e| e.into_inner()) = orig;
+        {
+            let mut prepared = PREPARED_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+            prepared.remove(serial);
+        }
+        let _ = std::fs::remove_file(&log);
+        assert!(ok && ok2, "戻り値が true であること");
+        assert!(calls <= 4, "adb 起動回数が改善前(5+)より少ないこと (実際 {calls})");
+        assert!(
+            calls2 < calls,
+            "2 回目は mkdir をキャッシュして起動回数が減ること (1回目 {calls} → 2回目 {calls2})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200) && elapsed2 < Duration::from_millis(200),
+            "所要時間が 200ms 未満であること (実際 {elapsed:?} / {elapsed2:?})"
+        );
+    }
 
     #[test]
     fn encrypted_gestures_release_fingers_and_navigation_keys() {
