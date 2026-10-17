@@ -236,7 +236,11 @@ diff /tmp/dndverify/filetext_a3f9512.txt /tmp/dndverify/filetext_$V.txt   # 移�
 - `multiset` の差分が `>`(追加)のみで、そのすべてが **まだ表示経路に繋がっていない値**(例: `Refusal` の
   `next_step`)である場合に限り、「表示文言は不変」と判定してよい。**判定には追加文字列ごとの根拠
   (その文字列を表示する呼び出しが同じコミットに無いこと)を `grep` で示す。**
-- `multiset` に `<`(削除)や置換が出たら、**その時点で I1 は不合格**として差分を提示する。
+- `multiset` に `<`(削除)や置換が出たら、**原則は不合格**として差分を提示する。
+- **例外(2026-10-18 追記。I1 の検証で実際に踏んだ)**: リテラルの**分割**であり、元の式と新しい式を
+  両方引用して**描画結果がバイト一致**することを示せる場合は「文言不変」と判定してよい。
+  補間(`{skip_note}`)をリテラルから書式引数へ移す変更がこれに当たる。判定には必ず
+  「元の式 / 新しい式 / 同一である理由」を記録する(推測で通してはいけない)。
 
 ### 1.5 検証環境の再現性(毎回自分で確認する)
 
@@ -421,13 +425,161 @@ B6: Refusal ではなく Ready{note} 相当か(§2 T1)
 - 未検証の点: <目視・実機・crates/win など>
 ```
 
+### I1: 掴み判定を理由つきの値にする / 判定: **合格**(軽微な欠陥3件・挙動の退行は検出できず)
+
+検証日: 2026-10-18 / 検証 rev: **`43de2e2`**(HEAD、申告どおり)
+
+**C1 対象の確定**
+
+```
+$ git rev-parse --short HEAD            -> 43de2e2
+$ git status --porcelain                -> (空。作業ツリーはコミットと一致)
+$ git diff --stat a3f9512 43de2e2
+ crates/common/src/drag.rs                | 120 ++++++++
+ crates/common/tests/drag_handoff.rs      |  33 +++
+ crates/mac/src/files.rs                  | 165 ++++++-----
+ docs/plans/2026-10-18-knit-dnd-verify.md | 471 +++++++++++++++++++++++
+```
+製品コードは3ファイルのみ。**`tap.rs`・`file_drag.rs`・`gui.rs`・`incoming_drag.rs`・`bulk.rs`・`proto.rs` は無変更**
+(§6-1 掴み判定の条件 / §6-8 中止項目 / §6-9 進捗の契約 / §6-15 一時ファイル作法 が構造的に守られている)。
+
+**C2 ビルド / C3 テスト**(自分で実行)
+
+```
+$ cargo build > /tmp/verify_build_i1.log 2>&1; echo $?      -> 0
+$ grep -c '^warning' /tmp/verify_build_i1.log               -> 10(基準 10 と同数)
+$ cargo test  > /tmp/verify_test_i1.log  2>&1; echo $?      -> 0
+$ grep -E "^test result" ... | awk '{p+=$4;f+=$6;i+=$8}'
+passed_total=549 failed_total=0 ignored_total=4 binaries=11
+```
+基準 548 / 0 / 4 → **+1 passed、failed 0、ignored 4(増加なし)**。申告(549)と一致。
+
+**C4 文言**(golden list の機械照合)
+
+```
+$ python3 /tmp/dndverify/golden.py a3f9512 | grep H_multiset -> 8ecdd626…670a3
+$ python3 /tmp/dndverify/golden.py 43de2e2 | grep H_multiset -> dcd9eba1…536af
+$ diff multiset_a3f9512.txt multiset_43de2e2.txt
+1814c1814
+< 掴んだまま渡せるのは通常のファイルとフォルダだけです{skip_note}
+---
+> 掴んだまま渡せるのは通常のファイルとフォルダだけです
+```
+**差分は1件のみ。** これは §1.4 の「例外」に該当する(下の「文言の同一性の証明」)。
+`filetext` の差分は **8件の files.rs → drag.rs 移動のみ**(files.rs 70→62 / drag.rs 12→20)。
+**同一テキストが両ファイルに残る「二重管理」は無い**(X7 ✓)。
+
+**文言の同一性の証明(推測ではなく式の引用)**
+
+| | 式 |
+|---|---|
+| 基準 `a3f9512`(`files.rs:388`) | `&format!("掴んだまま渡せるのは通常のファイルとフォルダだけです{skip_note}")` |
+| I1 `43de2e2`(`files.rs:404`) | `&format!("{}{skip_note}", drag::SKIPPED_NOTICE)` |
+| 定数(`drag.rs:58`) | `pub const SKIPPED_NOTICE: &str = "掴んだまま渡せるのは通常のファイルとフォルダだけです";` |
+
+Rust の inline format args は書式指定が無ければ `Display`、`{}` と `{skip_note}` の間に区切り文字は無い。
+したがって描画結果は `SKIPPED_NOTICE ++ skip_note` の**バイト一致**で、基準と同じ文字列になる。
+
+**C5 差分の読解**(値と表示の分離)
+
+- 判定は `crates/common/src/drag.rs:101 verdict_for(&Signals) -> Verdict` の**純関数のみ**。
+  分岐順は基準と同じ「件数 → 経路 → 集計(古い/待ち切れ/失敗/空) → 送信枠」。
+- 文言は `Refusal::notice_body()`(`drag.rs:32`)に**1箇所だけ**。mac 側は値を受けて
+  ログと通知を出すだけ(`files.rs:299 refuse_drag`)。**同じ理由が2箇所で別文言になる経路は無い**(X1・X2 ✓)。
+- 副作用(送信枠の予約)は値ではなく従来どおり `swap`(`files.rs:428`)。判定は `load`(`drag.rs:118` の `s.busy`)。
+- 集計待ちの `sleep` は mac 側に残っている(`files.rs:388`、ループは `:351`。基準 `:349-351`)。**B4 の懸念(T4)は解消**。
+
+**C8 8分岐の追跡(すべて値を通った)**
+
+| # | 基準での条件 | I1 での値 | 本文/ログ | 判定 |
+|---|---|---|---|---|
+| B1 | 0件 or >64 | `Refusal::TooMany`(`drag.rs:13,35`) | L1 / ログなし(基準どおり) | 値 ✓ |
+| B2 | 経路未接続・猶予窓外 | `Refusal::LinkDown` | L2 / 基準どおりのログ | 値 ✓ |
+| B3 | 集計条件が古い | `Collect::Stale` → `Refusal::CollectStale` | L3 / 同 | 値 ✓ |
+| B4 | 集計が間に合わない | ループ中 `Collect::Pending` → **`Verdict::Wait`**(断らない)、ループ後 `Expired` → `Refusal::CollectPending` | L4 / 同 | 値 ✓ |
+| B5 | `collect` が `Err` | `Collect::Failed{label}` + `raw` → `Refusal::CollectFailed` | L5(引数は `bulk::send_error_label`) / ログは**基準どおり生のエラー**(`refusal_log` の `raw`) | 値 ✓ |
+| **B6** | スキップ警告 | **値にしない**(`SKIPPED_NOTICE` の定数のみ)。`files.rs:399-406` で通知後、**そのまま越境して `Some(id)` を返す** | L6 | **拒否になっていない ✓(挙動退行なし)** |
+| B7 | 送れる物が無い | `Collect::Done{0}` → `Refusal::NothingToSend`(`drag.rs:116`) | L7 / 同 | 値 ✓ |
+| B8 | 前の転送中 | `busy` → `Refusal::Busy`、予約は `swap`(`files.rs:428`)。`load` 後に他スレッドが取った場合も同じ理由で断る | L8 / 同 | 値 ✓ |
+
+**通知とログの数が差分の説明と厳密に一致**(取りこぼし・二重通知が無いことの構造的な裏取り):
+
+```
+notify(  files.rs 全体:  a3f9512 = 21  ->  43de2e2 = 15   (-6)
+    内訳: 基準の関数内 8箇所(L1..L8) -> 新: refuse_drag 1 + スキップ 1 = 2。8-2 = -6 ✓
+eprintln!(files.rs 全体: a3f9512 = 27  ->  43de2e2 = 22   (-5)
+    内訳: 基準の関数内 7箇所(拒否6+猶予窓1) -> 新: refusal_log の eprintln 1 + 猶予窓 1 = 2。7-2 = -5 ✓
+#[test] files.rs = 7 / drag.rs = 10 / drag_handoff.rs = 5 -> 6(既存テストの削除・骨抜きなし)
+```
+
+**C9 §6(影響する項目のみ)**
+
+| # | 項目 | 結果 |
+|---|---|---|
+| 1 | 掴み誤爆の条件 | `file_drag.rs` 無変更 ✓ |
+| 4 | 経路確認と10秒の猶予窓 | `drag_offer_link_ok` 本体・既存テストとも無変更 ✓ |
+| 5 | スキップを名前つきで通知 | B6 が `Some` のまま ✓(`skip_note` 関数も無変更) |
+| 9 | 進捗%の契約 | `files.rs:814-852` の既存テスト無変更で緑 ✓ |
+| 12 | `TxGuard` | 新経路なし(無変更) ✓ |
+| 14 | 1GiB の注意 | 無変更 ✓ |
+
+**反例探索の結果**
+
+| # | 探した反例 | 結果 |
+|---|---|---|
+| X1 | 理由と表示の食い違い | 7理由すべて 1:1。表テストが**リテラル期待値**で固定(`drag_handoff.rs:149-176`)✓ |
+| X2 | 同じ理由が2箇所で別文言 | 8文字列が drag.rs へ移動し、files.rs に残存なし(filetext diff)✓ |
+| X3 | テストが実装の写し | `assert_eq!(reason.notice_body(), *body)` の右辺は**リテラル** ✓(写しではない) |
+| X4 | 分岐の取りこぼし | B1〜B8 すべて値または定数を通る。B6 は非拒否のまま ✓ |
+| X5 | 副作用の順序 | `take()` → sleep → `swap` の順序・回数は基準どおり。`swap` が予約を担う点も維持 ✓ |
+| X6 | 死んだ値 | `Verdict`/`Refusal` は全て読まれる。新規コードに `unwrap`/`panic!` 経路なし ✓ |
+| X7 | 文言の二重管理 | multiset の出現数に増加なし ✓ |
+
+**見つけた欠陥(いずれも挙動の退行ではない。重要度順)**
+
+1. **[軽微] 網羅 assert が手書き配列に依存している。** `drag_handoff.rs:169-172` の
+   `let all = [...]` は手で並べた7理由で、`Refusal` に**新しいバリアントを足してもテストは落ちない**
+   (コメント「理由を足したら表も足す」が唯一の防波堤)。網羅はコンパイラに守らせるべき:
+   テスト側で `match r { Refusal::TooMany => .., ... }` の**網羅 match** を書けば、新バリアント追加時に
+   コンパイルエラーになる。再現: `Refusal` に `pub enum Refusal { …, Foo }` を足して
+   `cargo test -p knit-common refusal_reason_covers_every_reject_branch` → **緑のまま**(落ちない)。
+2. **[軽微] スキップ通知の「描画」を固定するテストが無い。** テストは
+   `assert_eq!(SKIPPED_NOTICE, "…だけです")`(定数)だけを固定しており、
+   `format!("{}{skip_note}", SKIPPED_NOTICE)`(連結)は固定していない。
+   仮に `format!("{SKIPPED_NOTICE} {skip_note}")` のように区切りを足しても**テストは緑のまま**で、
+   ユーザーに見える文だけが1文字変わる(そして multiset の差分にすら現れない=検出できない)。
+   → 今回の「描画は同一」という判定は**コード読解に依存**している(私の証明は §C4 のとおりだが、
+   回帰を止める仕組みは無い)。提案: files.rs 側ではなく common 側に
+   `pub fn skipped_notice(skip_note: &str) -> String` を置き、`assert_eq!(skipped_notice(" ※…"), "…だけです ※…")`
+   のように**連結結果**を固定する。
+3. **[軽微] 命名と意味の食い違い: `Refusal::CollectPending` は「待ち切れ(Expired)」を意味する。**
+   `Collect::Pending`(まだ集計中 → `Verdict::Wait` で断らない)と名前が衝突しており、
+   `notice_body` の文言も「まだ終わっていません」なので、読み手は「集計中」と誤読する。
+   I3 の HUD がこの値を読むとき、`Wait`(断らない)と `CollectPending`(断る)を取り違える事故が起きやすい。
+   → `Refusal::CollectTimeout` などへの改名を推奨(文言は変えずに済む)。
+4. **[観察] `Verdict::Ready` の整合チェック(`files.rs:419-423`)は到達不能。**
+   `count` は同じ `cached` から作られるため食い違いは起こり得ず、この分岐はテストで叩けない。
+   「無言にしない」という要求は満たしているが、守っている不変条件は **mac 側だけ**にある
+   (`verdict_for` は `Signals` に実体が無いので `Ready{count}` の正しさを検証できない)。
+5. **[I3 への持ち越し] `Refusal::TooMany` は「0件」も同じ理由・同じ文言で扱う**(基準の挙動を維持)。
+   I3 でカーソル近傍に理由を出すと、**0件の掴みに対して「64件まで」と表示される**経路が表面化する。
+   I1 では文言を変えてはいけないので正しい判断だが、I3 の受入(AC3「拒否の理由が読める」)では
+   理由の粒度が問われる。I3 の検証時に必ず突く。
+
+**未検証の点**
+
+- `refusal_log`(mac 私有関数)と `refuse_drag` の**ログ行そのもの**はユニットテストで固定されていない。
+  私の確認は `git show` の読解と `notify`/`eprintln!` の出現数照合までで、実行時のログ出力は見ていない。
+- 目視・実機の確認はしていない(通知の実表示、HUD は I3 以降)。
+- `crates/win` は対象外。
+
 ### I1〜I3 の状態
 
 | 増分 | 依頼 | 判定 | 備考 |
 |---|---|---|---|
-| I1 | 未受領 | — | 第1段階の基準のみ整備済み |
-| I2 | 未受領 | — | — |
-| I3 | 未受領 | — | — |
+| I1 | 受領(43de2e2) | **合格** | 欠陥3件は軽微(テストの網羅・描画固定・命名)。挙動の退行なし |
+| I2 | 未受領 | — | X8(拒否より `peer_lazy` を優先しない)・X9(total==0 の ETA)を突く |
+| I3 | 未受領 | — | §6 の `TooMany` 粒度、HUD と通知の同一値性、tap スレッド UI を突く |
 
 ---
 

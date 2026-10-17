@@ -156,7 +156,7 @@ fn refusal_reason_covers_every_reject_branch() {
         (s(1, false, false, Collect::Pending), Refusal::LinkDown, "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください"),
         (s(1, true, false, Collect::Stale), Refusal::CollectStale, "接続の状態が変わったため、ファイルをもう一度掴み直してください"),
         // 集計が待ち時間内に終わらなかった場合。集計中(Pending)は Wait で断らない
-        (s(1, true, false, Collect::Expired), Refusal::CollectPending, "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください"),
+        (s(1, true, false, Collect::Expired), Refusal::CollectTimeout, "ファイルの確認がまだ終わっていません。少し待ってからもう一度境界へ動かしてください"),
         (s(1, true, false, Collect::Failed { label: label.into() }), Refusal::CollectFailed { label: label.into() }, "掴んだまま渡せません(上限を超えています)"),
         (s(1, true, false, Collect::Done { entry_count: 0 }), Refusal::NothingToSend, "掴んだ項目の中に送れるものがありません"),
         (s(1, true, true, Collect::Done { entry_count: 2 }), Refusal::Busy, "前のファイルを転送中です。完了後にもう一度掴んでください"),
@@ -167,10 +167,28 @@ fn refusal_reason_covers_every_reject_branch() {
     }
     // 表が全理由を覆っている(理由を足したら表も足す)
     let all = [Refusal::TooMany, Refusal::LinkDown, Refusal::CollectStale,
-        Refusal::CollectPending, Refusal::CollectFailed { label: label.into() },
+        Refusal::CollectTimeout, Refusal::CollectFailed { label: label.into() },
         Refusal::NothingToSend, Refusal::Busy];
     assert!(all.iter().all(|r| cases.iter().any(|(_, c, _)| c == r)), "表に無い理由がある");
+    // 手書きの配列だけでは、理由を足してもテストは緑のまま。**網羅 match(ワイルドカード
+    // 無し)**にして、バリアントを増やしたらコンパイラがここで止めるようにする
+    for r in &all {
+        match r {
+            Refusal::TooMany
+            | Refusal::LinkDown
+            | Refusal::CollectStale
+            | Refusal::CollectTimeout
+            | Refusal::CollectFailed { .. }
+            | Refusal::NothingToSend
+            | Refusal::Busy => {}
+        }
+    }
     assert_eq!(SKIPPED_NOTICE, "掴んだまま渡せるのは通常のファイルとフォルダだけです");
+    // **連結**も固定する(区切りや空白を足しても golden list の多重集合には現れないため)
+    assert_eq!(
+        knit_common::drag::skipped_notice(" ※読めない・リンク等の 2 件をスキップ: a.txt ほか1件"),
+        "掴んだまま渡せるのは通常のファイルとフォルダだけです ※読めない・リンク等の 2 件をスキップ: a.txt ほか1件"
+    );
     assert_eq!(verdict_for(&s(1, true, false, Collect::Pending)), Verdict::Wait, "集計待ちは断らない");
     assert_eq!(verdict_for(&s(MAX_FILES, true, false, Collect::Done { entry_count: 3 })), Verdict::Ready { count: 3 });
 }
