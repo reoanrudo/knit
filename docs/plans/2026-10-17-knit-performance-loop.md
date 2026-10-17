@@ -86,3 +86,17 @@
 - `proto::encode_into` は `serde_json::to_string` で一時 String を作ってから `out` へコピーする二重確保で、`encode` 自体が改悪されていた(割当2回)。呼び出し元も `encode` のみだったため撤去し、`encode` を1回割当の元実装へ戻した。
 - 実測(同一環境・`cargo run --release --example perf-input`): encode p50 **167ns → 84ns**、decode 125ns は不変。
 - `cargo test`: **262 passed / 0 failed / 2 ignored**(回帰なし)。`cargo build --workspace` は knit-win が macOS非互換API(`as_raw_handle` 等)で失敗するが、これは変更前からの既知の制約(Windows専用crate)。検証は `cargo build` / `cargo test`(default members)で行う。
+
+## ループ4 実行記録(2026-10-17)
+
+- 対象: 音声(Mac側ミックス再生経路)・`mac/audio.rs` 1122〜1144 の第2レーン(Android)ミックス。
+- 変更点: サンプル毎の `rb[i*4+k]` インデックス(rb.len()境界・リング演算)を排除し、
+  `let mut tmp = Vec::with_capacity(take); tmp.extend(rb.drain(..take));` から
+  `tmp.chunks_exact(4)` で f32 変換・加算・ソフト飽和(dst_f への書き込みは従来通り)。
+  ゼロ埋め・filled 更新・ソフト飽和式・take の &!3 は維持。挙動不変。
+- 計測値(perf-audio-mix, 4096B×2000ブロック, release):
+  - a(VecDeque インデックス): p50=750 ns, 合計=1,512,780 ns
+  - b(Vec drain+chunks_exact(4)): p50=500 ns, 合計=993,281 ns → 約34%短縮
+- テスト結果: `cargo build` exit 0(警告のみ・既存)。`cargo test` exit 0、262 passed / 0 failed / 2 ignored(基準と一致)。
+- 分かったこと: 境界チェックとリング演算のサンプル毎乗数が p50 の主因。drain→連続 Vec は
+  1回コピーに増えるが、bounds-check 排除と cache locality で上回る。

@@ -32,6 +32,12 @@ serde_json roundtrip と string format は 1µs 以下と、通信レイテン�
 
 変更: `Queued` に `is_mouse_abs: bool` を追加し batch() の prefix 文字列走査2箇所をフラグ判定に置換(文字列走査排除)。`push_str` 前に `reserve` を挿入(再確保抑制)。`encode_into` を追加し `encode` をそれで書き直し(wire形式・呼び出し側変更なし)。
 | 音声 | `mac/audio.rs`・`win/audio.rs` | 音声ストリーミングのバッファリング・サンプルレート変換・GCD が遅延を生む可能性 | 高 | ループ4 |
+
+#### 音声(ループ4 2026-10-17)
+- 対象: `mac/audio.rs` 1122〜1144、第2レーン(Android)ミックスの実ホットパス。
+- before(a VecDeque インデックス): p50=750 ns, 合計=1,512,780 ns(4096B×2000ブロック)
+- after(b drain→Vec+chunks_exact(4)): p50=500 ns, 合計=993,281 ns(約34%短縮)
+- 変更: 1122〜1130 を `tmp.extend(rb.drain(..take))` + `tmp.chunks_exact(4)` に置換(挙動不変・ゼロ埋め・filled更新・ソフト飽和式・take の &!3 維持)。
 | 音声混音(混声) | `mac/audio.rs` の mix | 複数入力の混音処理・リサンプル・キューのバックログ | 中 | ループ5 |
 | ドラッグ・掴み | `mac/file_drag.rs`/`incoming_drag.rs`・`win/dragdrop.rs` | 大型ファイルのドラッグで、データコピー(1MB+ clone)+ 暗号化+ LAN転送が重なる | 高 | ループ6 |
 | ファイル転送 | `mac/files.rs`/`win/xfer.rs`・`common/files.rs` | 1MB+ のデータ転送で、clone/暗号化/UDP/TCP のいずれかがボトルネック | 高 | ループ7 |
