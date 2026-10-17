@@ -59,6 +59,12 @@ pub(crate) fn mac_shortcut_translation(
         let t = match kc {
             123 => Some((123, false, false, true, shift)),
             124 => Some((124, false, false, true, shift)),
+            // ⌥Delete / ⌥前方Delete = 単語削除(Ctrl+Backspace / Ctrl+Delete)。
+            // 訳さないと Windows では Alt+Backspace / Alt+Delete になり、単語削除に
+            // ならない(Alt+Backspace を Undo に割り当てたアプリでは直前の編集が
+            // 取り消される)。Shift は透過(単語の選択削除)
+            51 => Some((51, false, false, true, shift)),
+            117 => Some((117, false, false, true, shift)),
             _ => None,
         };
         return t;
