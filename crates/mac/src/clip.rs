@@ -7,6 +7,54 @@ use std::time::Duration;
 /// 最後に Windows と同期したクリップボードの changeCount
 pub(crate) static LAST_SYNC_COUNT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 
+/// 同一 changeCount の画像 DIB 変換を 1 回に集約する単一スロットのキャッシュ。
+/// mac_clipboard_image_dib() は NSBitmapImageRep の BMP エンコード(4K で 33MB の
+/// 直列化)を含み、同じ 1 回のコピーに対して履歴経路(record_local_copy)と
+/// 越境経路(sync_clipboard_to_win)がそれぞれ呼ぶため 2 回走っていた。
+/// changeCount が一致する間だけ変換結果(Arc)を共有して 1 回にする。
+/// 鍵は changeCount のみ。Knit 自身がクリップボードへ書く経路(Windows からの
+/// 受信・履歴からの復元)は必ず changeCount を進めるため古い実体は返らない
+/// (changeCount が単調増加である前提は claim_history / LAST_SYNC_COUNT と同じ)。
+pub(crate) struct DibCache {
+    slot: Mutex<Option<(isize, std::sync::Arc<Vec<u8>>)>>,
+}
+
+impl DibCache {
+    pub(crate) const fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+        }
+    }
+
+    /// cnt が前回と同じなら変換せず前回の実体を共有して返す。違えば convert を
+    /// 呼んで差し替える。変換失敗(None)はキャッシュしない(次回に再試行できる)。
+    /// 変換はロック内で行う: 履歴スレッドと越境スレッドが同じ cnt を同時に処理しても
+    /// 変換が重複しない(convert はクリップボード読み出しだけで再入しない)。
+    pub(crate) fn get_or_convert(
+        &self,
+        cnt: isize,
+        convert: impl FnOnce() -> Option<Vec<u8>>,
+    ) -> Option<std::sync::Arc<Vec<u8>>> {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, dib)) = slot.as_ref() {
+            if *cached == cnt {
+                return Some(std::sync::Arc::clone(dib));
+            }
+        }
+        let dib = std::sync::Arc::new(convert()?);
+        *slot = Some((cnt, std::sync::Arc::clone(&dib)));
+        Some(dib)
+    }
+}
+
+/// 製品コードが使う単一スロット(保持は最新 1 枚分のみ。上限は bulk::MAX_IMAGE = 64MB)
+static DIB_CACHE: DibCache = DibCache::new();
+
+/// 同一 changeCount の間は変換結果を共有する(mac_clipboard_image_dib の薄い包み)
+fn clipboard_image_dib_cached(cnt: isize) -> Option<std::sync::Arc<Vec<u8>>> {
+    DIB_CACHE.get_or_convert(cnt, || unsafe { mac_clipboard_image_dib() })
+}
+
 // ---------- クリップボード履歴(Universal Clipboard History) ----------
 /// 送信・受信したテキストの履歴。メニューバーから選んで Mac のクリップボードへ
 /// 復元できる。機密判定(smartguard)と秘匿指定は送信側で弾くため、履歴へは届かない
@@ -529,7 +577,8 @@ unsafe fn record_local_copy() {
             history_push_files(&files, "Mac");
         }
     } else if now_ms().saturating_sub(LAST_IMG_RX_MS.load(Ordering::Relaxed)) >= 1_000 {
-        if let Some(dib) = mac_clipboard_image_dib() {
+        // 越境経路と同じ changeCount なら変換は共有される(2 回目の変換をしない)
+        if let Some(dib) = clipboard_image_dib_cached(cnt) {
             if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
                 history_push_image(&dib, "Mac");
             }
@@ -612,7 +661,8 @@ pub(crate) fn sync_clipboard_to_win() {
                     // 受信画像の載せ直後に来た同期: 送り返しの恐れがあるため見送る
                     eprintln!("[clip] 画像受信直後のため同期を控えます");
                     return;
-                } else if let Some(dib) = mac_clipboard_image_dib() {
+                } else if let Some(dib) = clipboard_image_dib_cached(cnt) {
+                    // 履歴経路が同じ changeCount を先に変換していればその実体を共有する
                     if active_peer_is_android() && !active_peer_is_android_app() {
                         // 端末のクリップボードへ画像を載せる: 画像は MediaStore の
                         // Pictures/Knit へ保存され、その URI がクリップボードに入る
@@ -794,6 +844,98 @@ mod defer_sync_rollback_tests {
             "自分の書いた値のまま以外は触らない"
         );
         LAST_SYNC_COUNT.store(saved, Ordering::Relaxed);
+    }
+}
+
+/// 画像 DIB 変換の単一スロットキャッシュ(同一 changeCount の 2 経路で 1 回に集約)
+#[cfg(test)]
+mod dib_cache_tests {
+    use super::DibCache;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// 履歴経路と越境経路が同じ changeCount を処理しても変換は 1 回で、
+    /// 同じ実体(Arc)を共有する = 33MB の再変換も再確保もしない
+    #[test]
+    fn same_change_count_converts_once_and_shares_one_buffer() {
+        let cache = DibCache::new();
+        let calls = AtomicUsize::new(0);
+        let first = cache
+            .get_or_convert(7, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(vec![1u8, 2, 3])
+            })
+            .expect("1回目は変換できる");
+        let second = cache
+            .get_or_convert(7, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(vec![9u8, 9, 9])
+            })
+            .expect("2回目はキャッシュから返る");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "同一 changeCount の変換は 1 回だけ(現行は 2 回走っていた)"
+        );
+        assert_eq!(
+            Arc::as_ptr(&first),
+            Arc::as_ptr(&second),
+            "同じ実体を共有する(複製しない)"
+        );
+        assert_eq!(&*second, &vec![1u8, 2, 3], "2回目の変換結果は使われない");
+    }
+
+    /// changeCount が進めば作り直し、戻ってきた count では古い実体を返さない
+    /// (Knit 自身のクリップボード書き込みは必ず count を進める)
+    #[test]
+    fn change_count_change_reconverts_and_replaces_the_slot() {
+        let cache = DibCache::new();
+        let a = cache.get_or_convert(1, || Some(vec![1])).unwrap();
+        assert_eq!(&*a, &vec![1u8]);
+        let b = cache.get_or_convert(2, || Some(vec![2])).unwrap();
+        assert_eq!(&*b, &vec![2u8], "changeCount が変われば作り直す");
+        let back = cache.get_or_convert(1, || Some(vec![3])).unwrap();
+        assert_eq!(&*back, &vec![3u8], "戻った count では古い実体を返さない");
+    }
+
+    /// 変換失敗(None)はキャッシュしない。キャッシュすると非対応形式の画像が
+    /// 以後ずっと「変換できない」まま固定される
+    #[test]
+    fn conversion_failure_is_not_cached_so_it_is_retried() {
+        let cache = DibCache::new();
+        assert!(cache.get_or_convert(5, || None).is_none());
+        let calls = AtomicUsize::new(0);
+        let retried = cache.get_or_convert(5, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some(vec![4u8])
+        });
+        assert!(retried.is_some(), "失敗はキャッシュされず次回に再試行される");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "再試行では変換が走る");
+    }
+
+    /// 履歴スレッドと越境スレッドが同時に同じ count を処理しても変換は 1 回
+    /// (結果は実行順に依存せず、常に「変換 1 回・全員が同じ実体」になる)
+    #[test]
+    fn concurrent_callers_with_the_same_change_count_convert_once() {
+        let cache = Arc::new(DibCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                let (cache, calls) = (Arc::clone(&cache), Arc::clone(&calls));
+                std::thread::spawn(move || {
+                    cache.get_or_convert(11, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Some(vec![7u8; 8])
+                    })
+                })
+            })
+            .collect();
+        let ptrs: Vec<_> = hs
+            .into_iter()
+            .map(|h| Arc::as_ptr(&h.join().unwrap().unwrap()))
+            .collect();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "同時でも変換は 1 回");
+        assert!(ptrs.windows(2).all(|w| w[0] == w[1]), "全員が同じ実体を得る");
     }
 }
 
