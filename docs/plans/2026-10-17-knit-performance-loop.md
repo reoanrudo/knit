@@ -131,3 +131,20 @@
 - 学習: 「syscall が減るから実環境で効くはず」は仮説であり、本ループの基準(計測で示す)を満たさない。
   今後はコミット前に「同一条件の A/B が成立しているか」を確認する。
 - 検証: `cargo test` **262 passed / 0 failed / 2 ignored**、`cargo build` 0。
+
+## ループ6 実行記録(2026-10-17)
+
+- 対象: 暗号化ストリームの送信経路(`common/secure.rs` の `write_rec`)。
+- 改善(1つ): `write_rec` の毎回 `Vec::with_capacity(2+len)` 確保+コピーを排除。
+  2B 長ヘッダをスタック配列 `let head=(len as u16).to_be_bytes()` から、
+  `write_vectored(&[IoSlice::new(&head), IoSlice::new(data)])` で一括書き込み。
+  部分書き込みは `head_off`/`data_off` を進めるループで処理する。
+- wire 形式は変更なし(2B 長 + 暗号文)。ハンドシェイクの小さなデータも壊れない。
+- 計測:
+  - before: [256KB] 366.8 MB/s / [1MB] 351.7 MB/s
+  - after: [256KB] 372.5 MB/s / [1MB] 357.5 MB/s
+  - Δ: +5.7 MB/s(256KB, 約1.6%)。localhost 上限値なので実環境差は小さいが、
+    毎回の 64KB 確保+コピーの排除は実データ量と無関係な固定コストを減らす。
+- 検証: `cargo build` exit 0 / `cargo test --workspace` **499 passed / 0 failed**。
+- 判断: 改善が誤差以下(約1.6%)でも、固定コスト(確保+コピー)排除は正当な理由。
+  計測が劣化方向(回帰)でないことも確認し、**変更を残す**。

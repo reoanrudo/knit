@@ -3,7 +3,7 @@
     //! ハンドシェイクが成立し(トークン自体は回線に流れない)、接続ごとの使い捨て鍵で
     //! 暗号化する(前方秘匿性)。旧方式は平文 TCP にトークンを平文で載せ、
     //! 盗聴・改ざん耐性を Tailscale に全面依存していた
-    use std::io::{self, Read, Write};
+    use std::io::{self, IoSlice, Read, Write};
     use std::net::TcpStream;
     use std::sync::Arc;
 
@@ -51,10 +51,28 @@
     }
 
     fn write_rec(w: &mut TcpStream, data: &[u8]) -> io::Result<()> {
-        let mut out = Vec::with_capacity(2 + data.len());
-        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
-        out.extend_from_slice(data);
-        w.write_all(&out)
+        let head = (data.len() as u16).to_be_bytes();
+        // 毎回 Vec 確保+コピーを排除: 2バイト長ヘッダ(スタック)とデータを
+        // write_vectored で一括書き込み。部分書き込みはループで処理する。
+        let mut head_off = 0usize;
+        let mut data_off = 0usize;
+        while head_off < 2 || data_off < data.len() {
+            let mut slices: [std::io::IoSlice<'_>; 2] = [
+                IoSlice::new(&head[head_off..]),
+                IoSlice::new(&data[data_off..]),
+            ];
+            let n_slices = if head_off >= 2 { 1 } else { 2 };
+            let n = w.write_vectored(&mut slices[..n_slices])?;
+            // 先頭スライス(ヘッダ)が先に消費される: n のうち min(2-head_off, ...) はヘッダ
+            let taken_head = (2 - head_off).min(n);
+            head_off += taken_head;
+            let taken_data = n - taken_head;
+            data_off += taken_data;
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::Other, "write_vectored が 0 を返した"));
+            }
+        }
+        Ok(())
     }
 
     fn read_rec(r: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<()> {
