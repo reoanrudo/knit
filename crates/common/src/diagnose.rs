@@ -347,16 +347,43 @@ fn advice_for(cause: Cause, f: &Facts, os: Os) -> String {
     }
 }
 
-/// ログの注意行([error]/[warn]/[fatal] で始まる行)か
+/// 接頭辞を付けずに書かれた失敗行を拾うための語彙。Knit 自身が実際に出す
+/// 言い回しだけを並べる(実測: /tmp/knit-mac.log 3612 行は [error]/[warn]/[fatal]
+/// の接頭辞行が 0 行で、失敗語彙を含む行が 229 行)。増やすときは
+/// `grep -rhoE '"[^"]*(失敗|切れました|拒否|…)[^"]*"' crates/mac/src crates/common/src`
+/// で実在の文言を確認してから足す
+const ATTENTION_WORDS: &[&str] = &[
+    "失敗",
+    "切れました",
+    "拒否",
+    "不一致",
+    "できません",
+    "見つかりません",
+    "read error",
+    "lost.",
+    "UnexpectedEof",
+    "WouldBlock",
+    "timed out",
+    "refused",
+    "handshake failed",
+];
+
+/// ログの注意行(困ったときの手掛かりになる行)か。
+/// 接頭辞([error]/[warn]/[fatal])を付ける書き手と、日本語で失敗を書く書き手の
+/// 両方に効かせる
 fn is_attention_line(line: &str) -> bool {
     let t = line.trim_start();
-    t.starts_with("[error]") || t.starts_with("[warn]") || t.starts_with("[fatal]")
+    t.starts_with("[error]")
+        || t.starts_with("[warn]")
+        || t.starts_with("[fatal]")
+        || ATTENTION_WORDS.iter().any(|w| t.contains(w))
 }
 
 /// 診断レポート末尾に付ける「直近ログ」の行選択(純粋関数)。
 /// 末尾 `tail` 行を基本とし、その範囲に含まれない直近の注意行([error]/[warn]/
-/// [fatal])を `attention` 行まで遡って先頭側へ足す。障害直前のエラーが末尾の
-/// 通常行に埋もれるのを防ぐためのもの。行の並びは元のログの順序を保つ
+/// [fatal] の接頭辞行、および ATTENTION_WORDS を含む行)を `attention` 行まで
+/// 遡って先頭側へ足す。障害直前のエラーが末尾の通常行に埋もれるのを防ぐための
+/// もの。行の並びは元のログの順序を保つ
 pub fn log_tail_lines<'a>(lines: &[&'a str], tail: usize, attention: usize) -> Vec<&'a str> {
     if lines.len() <= tail {
         return lines.to_vec();
@@ -385,7 +412,7 @@ pub fn log_tail_lines<'a>(lines: &[&'a str], tail: usize, attention: usize) -> V
 
 /// 診断レポートに連結するログの末尾行数(報告材料として十分な量)
 const LOG_TAIL_LINES: usize = 30;
-/// 末尾範囲の外から遡って拾う注意行([error]/[warn]/[fatal])の上限
+/// 末尾範囲の外から遡って拾う注意行(接頭辞行・ATTENTION_WORDS を含む行)の上限
 const LOG_ATTENTION_LINES: usize = 10;
 
 /// ログファイルの直近抜粋(報告材料)をレポート末尾へ付け足す形の文字列で返す。
@@ -426,7 +453,7 @@ pub fn log_tail_section(path: &std::path::Path) -> String {
         return String::new();
     }
     let extra = if picked.len() > LOG_TAIL_LINES.min(lines.len()) {
-        "・古い [error]/[warn] 行を含む"
+        "・古い異常行を含む"
     } else {
         ""
     };
@@ -697,6 +724,44 @@ mod tests {
         assert!(picked.contains(&"[error] in-tail-1"), "末尾側の注意行も当然含む");
     }
 
+    /// 実ログ(Mac 側)は [error]/[warn]/[fatal] の接頭辞を付けず、日本語で失敗を
+    /// 書く(実測: /tmp/knit-mac.log 3612 行に接頭辞行は 0 行、失敗語彙を含む行は
+    /// 229 行)。語彙でも注意行として拾えることを、実ログに出た形の行で固定する
+    #[test]
+    fn log_tail_lines_picks_knit_failure_lines_without_prefix() {
+        for line in [
+            "[conn] read error: Resource temporarily unavailable (os error 35)(kind=WouldBlock)",
+            "[bulk] 受信経路が切れました",
+            "[conn] lost. waiting for reconnect...",
+            "[conn] read error: failed to fill whole buffer(kind=UnexpectedEof)",
+            "[conn] 暗号化ハンドシェイク失敗 (192.168.0.23:52318): handshake failed (token mismatch?)",
+            "[audio] 出力先監視の解除に失敗 (device=102, status=560947818)",
+            "[file] 送信拒否: 相手が未接続",
+            "[conn] 接続先が見つかりません",
+            "[error] boom",
+        ] {
+            assert!(is_attention_line(line), "注意行として拾う: {line}");
+        }
+        // 健全な行・通常行は拾わない(誤検出でレポートを薄めない)
+        for line in [
+            "[audio] diag rx=0KB played=22646KB queued=0KB lag=0ms drop=0KB",
+            "[conn] established: DESKTOP-ONRCS5Q (id=1202cd7b8f5a55cd) 画面 1920x1080",
+            "[bulk] listening on 0.0.0.0:24902",
+            "[lock] Mac がロックされました",
+            "",
+        ] {
+            assert!(!is_attention_line(line), "通常行は拾わない: {line}");
+        }
+        // 末尾 30 行の外にある接頭辞なしの失敗行を、遡って先頭側へ足す
+        let mut lines: Vec<String> = (0..40).map(|i| format!("line{i}")).collect();
+        lines[3] = "[conn] 暗号化ハンドシェイク失敗 (192.168.0.23:52318): handshake failed".into();
+        let lines: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let picked = log_tail_lines(&lines, 30, 10);
+        assert_eq!(picked.len(), 31, "末尾 30 行 + 遡り 1 行");
+        assert_eq!(picked.first().copied(), Some(lines[3]), "先頭側へ足す");
+        assert_eq!(picked[1], "line10", "通常の末尾行が続く");
+    }
+
     /// ログファイルが無い・空のときは空文字列(初回起動で落ちない)。あるときは
     /// 見出しと末尾行を含む
     #[test]
@@ -730,7 +795,7 @@ mod tests {
         std::fs::write(&path, body).unwrap();
         let section = log_tail_section(&path);
         assert!(section.starts_with("\n\n直近のログ("), "見出しで始まる: {section}");
-        assert!(section.contains("古い [error]/[warn] 行を含む"), "注意行を拾った旨");
+        assert!(section.contains("古い異常行を含む"), "注意行を拾った旨");
         assert!(section.contains("[error] boom"), "末尾範囲外のエラー行を含む");
         assert!(section.contains("line39"), "末尾行を含む");
         assert!(!section.contains("line5\n"), "古い通常行は含めない");
