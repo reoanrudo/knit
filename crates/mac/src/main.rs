@@ -431,7 +431,13 @@ pub fn send_msg_reported(msg: &Msg) -> bool {
     if !CONNECTED.load(Ordering::Relaxed) { return false; }
     DIAG_SEND_COUNT.fetch_add(1, Ordering::Relaxed);
     match TX.get() {
-        Some(tx) => tx.send(outgoing::Queued { generation, line: encode(msg) }).is_ok(),
+        Some(tx) => tx
+            .send(outgoing::Queued {
+                generation,
+                is_mouse_abs: matches!(msg, Msg::MouseAbs { .. }),
+                line: encode(msg),
+            })
+            .is_ok(),
         None => false,
     }
 }
