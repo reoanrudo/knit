@@ -180,6 +180,8 @@ const COPY: &[(&str, &str)] = &[
     ("接続の方向を切り替えますか?", "Change the connection direction?"),
     ("両方の端末で接続を切り、役割を入れ替えて自動で再接続します。進行中のファイル転送は中止されます。", "Both devices will disconnect, exchange roles, and reconnect automatically. Any file transfer in progress will be cancelled."),
     ("キャンセル", "Cancel"),
+    ("ファイル転送中です", "Transfer in Progress"),
+    ("中止して終了", "Cancel Transfer and Quit"),
     ("切り替える", "Change Direction"),
     ("グレー：Mac／ブルー：接続先(各モニターに機種名)。ドラッグで配置(斜めも可)", "Mac in gray. Other devices in blue. Drag to arrange, including diagonally."),
     ("クリックで操作する端末を選べます・Macの上へ戻すと全画面の端になります", "Click to select a device. Drop onto the Mac to use the edge of all displays."),
