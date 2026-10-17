@@ -1,6 +1,10 @@
 //! 本線の操作と、別接続で届くファイルを受け渡しIDで結びつける。
 use std::path::PathBuf;
 
+/// 「今離すとどうなるか」の予報(I2)。表示は値の写像にすぎないので UI 側に判断を書かない
+pub mod forecast;
+pub use forecast::{forecast_for, CarryPhase, FailReason, Forecast, ForecastInput, Why};
+
 pub const MAX_FILES: usize = 64;
 /// フォルダ展開後の件数上限(版 14 で導入)。掴みドラッグの予告(DragOffer)は
 /// 展開後の件数で送るため、受け側もこの上限まで受け付ける
