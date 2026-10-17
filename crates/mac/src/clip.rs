@@ -111,6 +111,15 @@ fn image_store_dir() -> Option<std::path::PathBuf> {
 /// images/ に残す実体の上限。履歴 cap(50)より少し余裕を持たせた件数
 const IMAGE_KEEP: usize = 60;
 
+/// 画像保存ワーカーの残りを書き切ってから終了する(終了経路から呼ぶ)。
+/// ワーカーが起動していなければ何もしない。プロセス終了前に呼ばないと、
+/// 直前にコピーした画像が実体・履歴の両方で失われる(レビューで判明)
+pub(crate) fn flush_image_store() {
+    if let Some(worker) = IMAGE_STORE_WORKER.get() {
+        worker.flush();
+    }
+}
+
 /// 画像を履歴へ載せる(ビジョン§10 の Image 分類)。本体は BMP バイトを
 /// 内容ハッシュ名で images/ へ保存し、履歴には「ファイル名\tバイト数」だけ
 /// 残す。同名=同一内容のため二重保存は起きない
@@ -135,8 +144,9 @@ pub struct ImageStoreWorker {
 }
 
 impl ImageStoreWorker {
-    /// 非同期な保存を開始する。キュー上限(4枚)を超えたら新しいタスクを捨てる
-    /// (古い画像より今コピーした画像を優先する)。ホットパスはここで終わる。
+    /// 非同期な保存を開始する。キュー上限(4枚)を超えたら**新しいタスクを捨てる**
+    /// (古いタスクを捨てるにはチャネルを空にする必要があり、その間ホットパスが
+    /// 止まるため。捨てたことはログに残す)。ホットパスはここで終わる。
     pub fn enqueue(&self, dib: Vec<u8>, device: &str) {
         let depth_before = self.depth.fetch_add(1, Ordering::SeqCst);
         if depth_before >= 4 {

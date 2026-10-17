@@ -52,24 +52,41 @@
 
     fn write_rec(w: &mut TcpStream, data: &[u8]) -> io::Result<()> {
         let head = (data.len() as u16).to_be_bytes();
-        // 毎回 Vec 確保+コピーを排除: 2バイト長ヘッダ(スタック)とデータを
-        // write_vectored で一括書き込み。部分書き込みはループで処理する。
+        write_all_vectored(&head, data, |slices| w.write_vectored(slices))
+    }
+
+    /// 2バイト長ヘッダと本体を `write_vectored` で順に書き切る。
+    /// 部分書き込み(短書き)に対応し、0 が返ったらエラーにする。
+    /// 書き込み関数を差し替えられる形にしてあるのは、短書きの分岐を
+    /// テストで再現するため(レビューで境界のバグが見つかった)。
+    fn write_all_vectored(
+        head: &[u8],
+        data: &[u8],
+        mut write: impl FnMut(&mut [std::io::IoSlice<'_>]) -> io::Result<usize>,
+    ) -> io::Result<()> {
         let mut head_off = 0usize;
         let mut data_off = 0usize;
-        while head_off < 2 || data_off < data.len() {
+        while head_off < head.len() || data_off < data.len() {
             let mut slices: [std::io::IoSlice<'_>; 2] = [
                 IoSlice::new(&head[head_off..]),
                 IoSlice::new(&data[data_off..]),
             ];
-            let n_slices = if head_off >= 2 { 1 } else { 2 };
-            let n = w.write_vectored(&mut slices[..n_slices])?;
-            // 先頭スライス(ヘッダ)が先に消費される: n のうち min(2-head_off, ...) はヘッダ
-            let taken_head = (2 - head_off).min(n);
+            // ヘッダを書き終えていたら**本体だけ**を渡す(以前は空になったヘッダ側を
+            // 渡してしまい、0 が返って接続を切っていた)
+            let n = if head_off >= head.len() {
+                write(&mut slices[1..])?
+            } else {
+                write(&mut slices[..2])?
+            };
+            // 先頭スライス(ヘッダ)が先に消費される: n のうち min(残りヘッダ, n) はヘッダ
+            let taken_head = (head.len() - head_off).min(n);
             head_off += taken_head;
-            let taken_data = n - taken_head;
-            data_off += taken_data;
+            data_off += n - taken_head;
             if n == 0 {
-                return Err(io::Error::new(io::ErrorKind::Other, "write_vectored が 0 を返した"));
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write_vectored が 0 を返した",
+                ));
             }
         }
         Ok(())
@@ -275,6 +292,32 @@
         /// フィンガープリントは同じ鍵で同じ値・異なる鍵で異なる値。トークンの
         /// 本文を含まない(鍵を画面に出さない前提の確認手段だから)
         #[test]
+        /// レビュー指摘: 短書き(部分書き込み)でもヘッダ+本体が順に書き切られること。
+        /// 1バイトずつしか書けない書き込み関数で、ヘッダを書き終えた後に本体が
+        /// 残る状況を作る(以前は空のヘッダ側を渡して 0 を返し、接続を切っていた)
+        #[test]
+        fn vectored_write_survives_partial_writes() {
+            let (head, data) = (b"\x00\x05", b"hello");
+            let mut seen: Vec<u8> = Vec::new();
+            write_all_vectored(head, data, |slices| {
+                let mut wrote = 0usize;
+                for s in slices.iter() {
+                    if let Some(b) = s.first() {
+                        seen.push(*b);
+                        wrote += 1;
+                        break;
+                    }
+                }
+                Ok(wrote)
+            })
+            .unwrap();
+            assert_eq!(seen, b"\x00\x05hello", "ヘッダも本体も順に書き切る");
+
+            // 0 を返す書き込みはエラー(無限ループにしない)
+            let err = write_all_vectored(b"\x00\x01", b"x", |_| Ok(0)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
+        }
+
         fn fingerprint_is_stable_distinct_and_hides_the_token() {
             let token = "7f".repeat(32);
             let a = fingerprint(&token);
