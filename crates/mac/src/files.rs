@@ -565,7 +565,6 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 // 結果を待つ間ぶん `FILE_TX_BUSY` を握ったままだと、次の転送を最大2.2秒
                 // 待たせてしまう。**離しの記録を先に読み**、後始末を済ませてから待つ
                 let released_early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed);
-                DRAG_UNFINISHED.store(false, Ordering::Relaxed);
                 drop(guard); // 転送は完了している。ここから先は判定だけ
                 let accepted = wait_lazy_accepted(id, Duration::from_millis(1000));
                 let done = accepted.then(|| wait_drag_done(id, Duration::from_millis(1200)));
@@ -946,6 +945,8 @@ pub(crate) fn note_rx_begin() {
 
 pub(crate) fn note_rx_bytes(n: u64) {
     RX_BYTES.store(n, Ordering::Relaxed);
+    // 受け取り待ちの表示の期限を延ばす(停滞して初めて切る)
+    crate::incoming_drag::note_progress_seen();
 }
 
 /// 受け取り待ちの表示1行(純関数)。合計が分からなければ割合は出さない(0% と偽らない)
