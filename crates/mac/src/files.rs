@@ -456,6 +456,9 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     DRAG_UNFINISHED.store(true, Ordering::Relaxed);
     let count = entries.len();
     let total = bulk::entries_total(&entries);
+    // 遅延提供(版 17)の目録は、entries を DRAG_TX へ move する前に作る
+    // (中身は読まない。名前・サイズ・種別だけ)
+    let manifest = peer_features_lazy().then(|| bulk::manifest_of(&entries));
     // 展開結果をそのまま送る(予告の件数・合計と厳密に一致させる)
     *DRAG_TX.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, entries));
     send_msg(&Msg::DragOffer {
@@ -468,6 +471,18 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
         "[drag] mac->win offer {id}: {count} 件 / 合計 {}KB",
         total / 1024
     );
+    // 遅延提供(版 17)が使える相手には、**データを流す前に目録を渡す**。
+    // 相手は目録だけで OLE ドラッグを開始でき、押下保持が転送量の関数にならない
+    // (実測: Wi-Fi 実効 30MB/s で 1GB=34秒・10GB=5分41秒 を押し続ける問題への答え)
+    if let Some(files) = manifest {
+        send_msg(&Msg::Manifest {
+            id,
+            count,
+            total,
+            files,
+        });
+        eprintln!("[drag] mac->win manifest {id}: {count} 件(遅延提供)");
+    }
     Some(id)
 }
 
@@ -883,6 +898,12 @@ pub(crate) fn open_receive_dir() {
     {
         notify("Knit", "受信フォルダを開けませんでした");
     }
+}
+
+/// 相手が遅延提供(版 17)に対応しているか。**版ゲートに一本化**する
+/// (呼び出し側に閾値リテラルを書かない。既存の `peer_features` と同じ方針)
+fn peer_features_lazy() -> bool {
+    knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed)).lazy
 }
 
 /// 掴みドラッグの受け渡しIDに立てる最上位ビット(通常送信のIDと区別する)

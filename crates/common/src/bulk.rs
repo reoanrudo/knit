@@ -97,6 +97,19 @@
         pub is_dir: bool,
     }
 
+    /// 遅延提供(版 17)の目録を送信対象から作る。**名前・サイズ・種別だけ**を先に渡し、
+    /// 相手はこれだけでネイティブドラッグを開始できる(内容は後から流す)
+    pub fn manifest_of(entries: &[OutFile]) -> Vec<crate::proto::ManifestEntry> {
+        entries
+            .iter()
+            .map(|e| crate::proto::ManifestEntry {
+                rel: e.name.clone(),
+                size: e.size,
+                kind: if e.is_dir { 1 } else { 0 },
+            })
+            .collect()
+    }
+
     fn mtime_of(meta: &std::fs::Metadata) -> u64 {
         meta.modified()
             .ok()

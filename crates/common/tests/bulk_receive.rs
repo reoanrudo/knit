@@ -798,3 +798,33 @@ fn receiver_reports_overlong_names_as_too_long() {
         failed[0].1
     );
 }
+
+/// 遅延提供(版 17)の目録: 名前・サイズ・種別だけを先に渡す。
+/// **中身を読まずに作れる**こと(送信前にディスクを舐めない)が要点
+#[test]
+fn manifest_carries_names_sizes_and_kinds_without_reading_contents() {
+    use knit_common::bulk::OutFile;
+    let entries = vec![
+        OutFile {
+            src: std::path::PathBuf::from("/tmp/a.txt"),
+            name: "資料/a.txt".to_string(),
+            size: 1234,
+            mtime: 1_700_000_000,
+            is_dir: false,
+        },
+        OutFile {
+            src: std::path::PathBuf::from("/tmp/empty"),
+            name: "資料/空".to_string(),
+            size: 0,
+            mtime: 0,
+            is_dir: true,
+        },
+    ];
+    let m = knit_common::bulk::manifest_of(&entries);
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].rel, "資料/a.txt", "名前はそのまま");
+    assert_eq!((m[0].size, m[0].kind), (1234, 0), "ファイルは種別 0");
+    assert_eq!((m[1].size, m[1].kind), (0, 1), "フォルダは種別 1");
+    // 空でも壊れない
+    assert!(knit_common::bulk::manifest_of(&[]).is_empty());
+}
