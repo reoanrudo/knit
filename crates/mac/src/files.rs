@@ -452,6 +452,7 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // 新しい掴みが始まったので、前回の記録を消して進行中を立てる(I5)。
     // begin_xfer より前(指紋計算・集計の間)に離される窓も「未完」に含める
     DRAG_RELEASED_EARLY.store(false, Ordering::Relaxed);
+    LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed); // 前の受理を引き継がない
     DRAG_IN_FLIGHT.store(true, Ordering::Relaxed);
     DRAG_UNFINISHED.store(true, Ordering::Relaxed);
     let count = entries.len();
@@ -558,7 +559,9 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 // 結果を3状態で言い切る(I5)。判断は common の純関数にあり、ここは
                 // 「離した順序」を渡すだけ(配線にロジックを置かない)
                 DRAG_UNFINISHED.store(false, Ordering::Relaxed);
-                let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed);
+                // 遅延提供で**受理済み**なら、途中で離しても相手は置ける(保存のみではない)。
+                // 受理していない場合だけ「渡し終わる前に離した」=保存のみとする
+                let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed) && !lazy_accepted(id);
                 let outcome = notice::DeliveryOutcome {
                     peer: peer.clone(),
                     count: rep.sent,
@@ -914,6 +917,21 @@ static DRAG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 指紋計算・集計の間)も true にする: この窓で離す「フリックして離す」操作を取りこぼすと、
 /// 相手は保存のみなのに「置けた」と言ってしまう
 static DRAG_UNFINISHED: AtomicBool = AtomicBool::new(false);
+/// 遅延提供の受理(相手が**実際に**ドロップを先に受理した事実)。
+/// 版(能力)ではなく受理の事実で判断する: 相手が `KNIT_LAZY=1` で動いていなければ
+/// 受理は来ないので、「能力があるのに待たされる」を嘘と言わずに済む
+static LAZY_ACCEPTED_ID: AtomicU64 = AtomicU64::new(0);
+
+/// 相手から受理(DragAccept)が届いた(自分発の掴みドラッグのみ)
+pub(crate) fn note_lazy_accepted(id: u64) {
+    LAZY_ACCEPTED_ID.store(id, Ordering::Relaxed);
+}
+
+/// この掴みが受理済みか(受理済みなら、離すタイミングを待たなくてよい)
+pub(crate) fn lazy_accepted(id: u64) -> bool {
+    id != 0 && LAZY_ACCEPTED_ID.load(Ordering::Relaxed) == id
+}
+
 /// 掴みドラッグの転送を「渡し終わる前に離した」か(I5)。相手がネイティブのドラッグを
 /// 始められるかは**離した順序**で決まるため、離した瞬間に確定させて結果に反映する
 /// (渡し終わってから離した = 置けた / 途中で離した = 相手の受信フォルダに保存のみ)
