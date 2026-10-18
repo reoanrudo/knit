@@ -81,6 +81,62 @@ pub fn descriptor_count(bytes: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// 遅延提供で受け取るファイルの置き場を決める(1件分)。
+/// **相対名をそのまま連結しない**: `..`・絶対パス・ドライブ名・空要素は受けない
+/// (受信側の既存の無害化と同じ方針。ここを通った名前だけを staging 配下に作る)
+pub fn staged_path(root: &std::path::Path, rel: &str) -> Option<std::path::PathBuf> {
+    let normalized = rel.replace('\\', "/");
+    if normalized.is_empty() || normalized.starts_with('/') || normalized.contains(':') {
+        return None;
+    }
+    let mut out = root.to_path_buf();
+    for part in normalized.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return None;
+        }
+        out.push(part);
+    }
+    Some(out)
+}
+
+/// 「このファイルは受け取り終わったか」。フォルダ(kind=1)は存在だけでよい。
+/// 途中の大きさでも読めるようにするのは IStream 側の役目で、ここは完了判定だけ
+pub fn is_ready(path: &std::path::Path, want: u64, kind: u8) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            if kind == 1 {
+                m.is_dir()
+            } else if want == 0 {
+                // 0 バイトのファイルは「存在すれば完了」(空ファイルは成長しない)
+                m.is_file()
+            } else {
+                m.is_file() && m.len() >= want
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// 受け取り完了まで待つ(期限つき)。**呼び出し側のスレッドを長時間止めない**ため、
+/// 期限を必ず入れる(IStream の Read から呼ぶ)
+pub fn wait_ready(
+    path: &std::path::Path,
+    want: u64,
+    kind: u8,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if is_ready(path, want, kind) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +210,61 @@ mod tests {
         let mut bad = vec![9u8, 0, 0, 0];
         bad.extend(std::iter::repeat(0u8).take(FILEDESCRIPTORW_SIZE));
         assert_eq!(descriptor_count(&bad), None, "件数と長さの不一致を弾く");
+    }
+
+    #[test]
+    fn staged_paths_reject_escapes_and_accept_nested_names() {
+        let root = std::path::Path::new("C:\\stage");
+        let ok = staged_path(root, "資料/sub/a.txt").expect("入れ子は通す");
+        assert_eq!(ok, root.join("資料").join("sub").join("a.txt"));
+        // 区切りはどちらでも受ける(目録は `/`、Windows の実パスは `\`)
+        assert_eq!(
+            staged_path(root, "a\\b.txt").unwrap(),
+            root.join("a").join("b.txt")
+        );
+        for bad in ["", "/etc/passwd", "C:/Windows/x", "..", "a/../../b", "a//b", "./a"] {
+            assert!(staged_path(root, bad).is_none(), "受けない: {bad}");
+        }
+    }
+
+    #[test]
+    fn readiness_follows_the_declared_size() {
+        let dir = std::env::temp_dir().join(format!("knit-lazy-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("grow.bin");
+        let _ = std::fs::remove_file(&f);
+        // まだ無い
+        assert!(!is_ready(&f, 4, 0));
+        std::fs::write(&f, b"ab").unwrap();
+        assert!(!is_ready(&f, 4, 0), "宣言より小さいうちは未完了");
+        std::fs::write(&f, b"abcd").unwrap();
+        assert!(is_ready(&f, 4, 0), "宣言に達したら完了(超過も可)");
+        // 0 バイト宣言は存在だけで完了(空ファイルは成長しない)
+        let empty = dir.join("empty.txt");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(is_ready(&empty, 0, 0), "空ファイルで待ち続けない");
+        // フォルダは存在だけでよい
+        let sub = dir.join("folder");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(is_ready(&sub, 0, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn waiting_gives_up_at_the_deadline_instead_of_hanging() {
+        let dir = std::env::temp_dir().join(format!("knit-lazy-wait-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("never.bin");
+        let _ = std::fs::remove_file(&f);
+        let started = std::time::Instant::now();
+        let ok = wait_ready(&f, 10, 0, std::time::Duration::from_millis(60));
+        assert!(!ok, "来なければ false");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(50), "期限まで待つ");
+        // 途中で現れれば true
+        let f2 = dir.join("appears.bin");
+        std::fs::write(&f2, b"0123456789").unwrap();
+        assert!(wait_ready(&f2, 10, 0, std::time::Duration::from_millis(50)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

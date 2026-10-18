@@ -13,6 +13,8 @@ pub mod edge;
 mod host;
 /// 遅延提供(版 17)の純粋部分。**既定は無効**(KNIT_LAZY=1 で有効)
 pub mod lazy;
+/// 遅延提供の COM 面(目録だけでドラッグを開始し、内容を IStream で返す)
+pub mod lazy_com;
 pub use host::{relay_cancel, relay_move, relay_up};
 #[cfg(test)]
 mod live_tests;
@@ -545,6 +547,72 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 };
 
 // ---- 起動 ----
+
+/// 遅延提供(版 17)で OLE ドラッグを開始する。**データの到着を待たない**:
+/// 目録(名前とサイズ)だけで始め、内容は Explorer が要求した時点で staging から読む。
+/// `staging` は `entries` と同じ並びの (実パス, サイズ, kind) を渡す。
+/// 戻り値は DROPEFFECT(DRAGDROP_S_DROP なら置けた)
+pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], staging: &[String]) {
+    if !lazy::lazy_enabled() {
+        return; // 既定は無効(現行方式のまま)
+    }
+    if entries.is_empty() || entries.len() != rel.len() {
+        eprintln!("[drag] 遅延提供: 目録と staging の件数が合いません");
+        return;
+    }
+    let manifest: Vec<knit_common::proto::ManifestEntry> = rel
+        .iter()
+        .zip(entries.iter())
+        .map(|(r, (_, size, kind))| knit_common::proto::ManifestEntry {
+            rel: r.clone(),
+            size: *size,
+            kind: *kind,
+        })
+        .collect();
+    let descriptor = lazy::descriptor_bytes(&manifest);
+    let files: Vec<(std::path::PathBuf, u64, u8, String)> = entries
+        .iter()
+        .zip(rel.iter())
+        .map(|((path, size, kind), r)| (path.clone(), *size, *kind, r.clone()))
+        .collect();
+    let staging_note = staging.join("; ");
+    std::thread::spawn(move || unsafe {
+        let hr_init = OleInitialize(std::ptr::null());
+        if hr_init != S_OK && hr_init != S_FALSE {
+            println!("[drag] 遅延提供: OleInitialize 失敗(0x{hr_init:08x})");
+            return;
+        }
+        let Some(host) = host::Host::create() else {
+            OleUninitialize();
+            return;
+        };
+        DRAG_THREAD.store(
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            Ordering::Relaxed,
+        );
+        let ds = lazy_com::LazySource::new(descriptor, files);
+        let ds = Box::into_raw(ds) as *mut c_void;
+        let src = Box::into_raw(Box::new(DropSource {
+            vtbl: &SRC_VTBL,
+            refs: AtomicU32::new(1),
+        })) as *mut c_void;
+        let (dfmt, cfmt) = lazy_com::ensure_formats();
+        println!(
+            "[drag] 遅延提供で DoDragDrop 開始(formats {dfmt}/{cfmt}, staging {staging_note})"
+        );
+        let mut effect: u32 = DROPEFFECT_NONE;
+        let _hr = DoDragDrop(ds, src, DROPEFFECT_COPY, &mut effect);
+        DRAG_THREAD.store(0, Ordering::Relaxed);
+        lazy_com::release(ds);
+        src_release(src);
+        drop(host);
+        println!(
+            "[drag] 遅延提供のドラッグ終了: effect={effect} ({})",
+            if effect == DROPEFFECT_COPY { "置けた" } else { "置けず" }
+        );
+        OleUninitialize();
+    });
+}
 
 /// 受信済みファイル群で OLE ドラッグを開始する(別スレッド。呼び出し元の
 /// 受信ループは DoDragDrop のモーダルループの影響を受けない)。
