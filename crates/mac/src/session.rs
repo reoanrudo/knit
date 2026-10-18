@@ -102,6 +102,10 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                         Msg::DragAccept { id } if id >> 63 == 1 => {
                             crate::files::note_lazy_accepted(id)
                         }
+                        // 相手がドロップを受け取ったか(W4)。自分発の掴みドラッグのみ
+                        Msg::DragDone { id, copied } if id >> 63 == 1 => {
+                            crate::files::note_drag_done(id, copied)
+                        }
                         // 相手が自発的に止めた場合と、こちらの送信中ドラッグの中止要求
                         Msg::DragCancel { id } => {
                             incoming_drag::cancel(id);

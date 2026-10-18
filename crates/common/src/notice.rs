@@ -23,13 +23,19 @@ pub enum NoticeKind {
 pub enum SaveWhy {
     /// 渡し終わる前に離した(相手はネイティブのドラッグを始められない)
     ReleasedEarly,
+    /// 相手がドロップを受け取らなかった(置き場所が無い・取消など)。
+    /// 相手から結果(`DragDone`)が届いたときだけ分かる**事実**
+    PeerDidNotPlace,
 }
 
 /// 転送の結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryResult {
-    /// 相手の画面に置けた(ドロップとして成立した)
+    /// 転送が終わった(置けたかは相手の結果を待たずに知らせる場合の慎重な表現)
     Placed,
+    /// **相手が実際に置いた**(相手からの結果 `DragDone{copied:true}` が届いた事実)。
+    /// ここだけは「置けました」と言い切ってよい
+    PlacedOnScreen,
     /// 置けず、相手側の受信フォルダに入った
     SavedOnly { why: SaveWhy },
     /// 渡らなかった
@@ -114,11 +120,20 @@ pub fn compose_notice(o: &DeliveryOutcome) -> Notice {
             body: format!("{count} 件を {peer} へ渡しました(転送完了。相手側で受け取れます)"),
             kind: NoticeKind::Suppressible,
         },
+        DeliveryResult::PlacedOnScreen => Notice {
+            title: TITLE.to_string(),
+            // 相手から結果が届いた**事実**なので言い切る
+            body: format!("{count} 件を {peer} の画面に置きました(ドロップできました)"),
+            kind: NoticeKind::Suppressible,
+        },
         DeliveryResult::SavedOnly { why } => {
             // 成功語を使わない。「どこに入るか」「なぜか」「次にどうするか」を必ず書く
             let why = match why {
                 SaveWhy::ReleasedEarly => {
                     "渡し終わる前に離したため、相手はドラッグを始められませんでした"
+                }
+                SaveWhy::PeerDidNotPlace => {
+                    "相手が受け取らなかったため(置き場所が無い・取消など)、相手の受信フォルダに入りました"
                 }
             };
             Notice {
@@ -171,13 +186,13 @@ pub enum Recovery {
 
 /// 直前の結果をメニューに出すか。**成功は出さない**(メニューを混ませない)
 pub fn needs_attention(result: &DeliveryResult) -> bool {
-    !matches!(result, DeliveryResult::Placed)
+    !matches!(result, DeliveryResult::Placed | DeliveryResult::PlacedOnScreen)
 }
 
 /// 失敗の分類から回復手段を決める(純関数)。**再試行を促してよい場合だけ Resend**
 pub fn recovery_for(result: &DeliveryResult) -> Recovery {
     match result {
-        DeliveryResult::Placed => Recovery::None,
+        DeliveryResult::Placed | DeliveryResult::PlacedOnScreen => Recovery::None,
         DeliveryResult::SavedOnly { .. } => Recovery::SavedOnPeer,
         DeliveryResult::Failed {
             retryable: true, ..
@@ -238,6 +253,30 @@ mod tests {
     }
 
     #[test]
+    fn only_a_peer_confirmed_drop_claims_the_place() {
+        // 相手の結果が届いた経路だけ「置きました」と言い切る
+        let confirmed = compose_notice(&outcome(DeliveryResult::PlacedOnScreen));
+        assert!(
+            confirmed.body.contains("置きました"),
+            "事実なら言い切る: {}",
+            confirmed.body
+        );
+        assert_eq!(confirmed.kind, NoticeKind::Suppressible, "成功なので抑制可");
+        // 相手の結果が無い経路では言い切らない(観測を超えない)
+        let observed = compose_notice(&outcome(DeliveryResult::Placed));
+        for w in PLACEMENT_CLAIMS {
+            assert!(!observed.body.contains(w), "「{w}」は言わない: {}", observed.body);
+        }
+        // 保存のみの本文には、どちらの成功語も入らない
+        for why in [SaveWhy::ReleasedEarly, SaveWhy::PeerDidNotPlace] {
+            let saved = compose_notice(&outcome(DeliveryResult::SavedOnly { why }));
+            for w in PLACEMENT_CLAIMS {
+                assert!(!saved.body.contains(w), "{why:?}: {}", saved.body);
+            }
+        }
+    }
+
+    #[test]
     fn placed_reports_only_what_the_sender_can_observe() {
         let n = compose_notice(&outcome(DeliveryResult::Placed));
         assert_eq!(n.kind, NoticeKind::Suppressible, "成功だけ抑制してよい");
@@ -256,7 +295,7 @@ mod tests {
 
     #[test]
     fn saved_only_never_uses_success_words() {
-        for why in [SaveWhy::ReleasedEarly] {
+        for why in [SaveWhy::ReleasedEarly, SaveWhy::PeerDidNotPlace] {
             let n = compose_notice(&outcome(DeliveryResult::SavedOnly { why }));
             assert_eq!(n.kind, NoticeKind::Always, "置けなかったことは必ず出す");
             // 「置けた」と言い切る語(実装が使う語そのもの)を1つも含まない
@@ -269,8 +308,13 @@ mod tests {
             }
             // (a) 実体の場所 (b) 理由 (c) 次の一手 を必ず含む
             assert!(n.body.contains("受信フォルダに保存されています"), "場所: {}", n.body);
-            assert!(n.body.contains("離したため"), "理由: {}", n.body);
             assert!(n.body.contains("もう一度掴んで"), "次の一手: {}", n.body);
+            // 理由は理由ごとに読める(どの理由でも「保存のみ」であることは言い切る)
+            let expected = match why {
+                SaveWhy::ReleasedEarly => "離したため",
+                SaveWhy::PeerDidNotPlace => "受け取らなかった",
+            };
+            assert!(n.body.contains(expected), "理由({why:?}): {}", n.body);
         }
     }
 

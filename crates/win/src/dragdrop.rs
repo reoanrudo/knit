@@ -610,9 +610,22 @@ pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto:
         src_release(src);
         drop(host);
         LAZY_STARTED.store(0, Ordering::Relaxed);
+        let copied = effect == DROPEFFECT_COPY;
+        // **結果を送信側(Mac)へ返す**(W4)。Mac は推測ではなく事実で
+        // 「置けた / 保存のみ」を言い切れるようになる
+        if let Some(tx) = crate::state::WTX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(knit_common::proto::encode(&knit_common::proto::Msg::DragDone {
+                id,
+                copied,
+            }));
+        }
         println!(
             "[drag] 遅延提供のドラッグ終了: effect={effect} ({})",
-            if effect == DROPEFFECT_COPY { "置けた" } else { "置けず" }
+            if copied { "置けた" } else { "置けず" }
         );
         OleUninitialize();
     });
