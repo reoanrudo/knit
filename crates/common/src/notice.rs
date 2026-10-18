@@ -156,6 +156,75 @@ pub fn compose_notice(o: &DeliveryOutcome) -> Notice {
     }
 }
 
+/// 失敗のあとにメニューへ出す回復手段(I6)。通知バナーには
+/// `osascript display notification` の制約でアクションボタンを付けられないため、
+/// **押せる導線はメニューに置く**(実測: 通知の起動に 133〜255ms かかる点も理由)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovery {
+    /// 同じファイルでもう一度送り直せる(再試行の価値がある)
+    Resend,
+    /// 渡せず相手側の受信フォルダに入った。実体の場所を案内する
+    SavedOnPeer,
+    /// メニューに出す導線は無い(理由の表示だけ)
+    None,
+}
+
+/// 直前の結果をメニューに出すか。**成功は出さない**(メニューを混ませない)
+pub fn needs_attention(result: &DeliveryResult) -> bool {
+    !matches!(result, DeliveryResult::Placed)
+}
+
+/// 失敗の分類から回復手段を決める(純関数)。**再試行を促してよい場合だけ Resend**
+pub fn recovery_for(result: &DeliveryResult) -> Recovery {
+    match result {
+        DeliveryResult::Placed => Recovery::None,
+        DeliveryResult::SavedOnly { .. } => Recovery::SavedOnPeer,
+        DeliveryResult::Failed {
+            retryable: true, ..
+        } => Recovery::Resend,
+        DeliveryResult::Failed {
+            retryable: false, ..
+        } => Recovery::None,
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    fn failed(retryable: bool) -> DeliveryResult {
+        DeliveryResult::Failed {
+            reason: "接続が切れました".to_string(),
+            retryable,
+            saved_count: 0,
+        }
+    }
+
+    #[test]
+    fn only_failures_ask_for_attention() {
+        assert!(!needs_attention(&DeliveryResult::Placed), "成功はメニューに出さない");
+        assert!(needs_attention(&DeliveryResult::SavedOnly {
+            why: SaveWhy::ReleasedEarly
+        }));
+        assert!(needs_attention(&failed(true)));
+        assert!(needs_attention(&failed(false)));
+    }
+
+    #[test]
+    fn retryable_failure_offers_resend() {
+        assert_eq!(recovery_for(&failed(true)), Recovery::Resend);
+        // 権限・上限のような直らない失敗では再試行を促さない(理由の表示だけ)
+        assert_eq!(recovery_for(&failed(false)), Recovery::None);
+        assert_eq!(
+            recovery_for(&DeliveryResult::SavedOnly {
+                why: SaveWhy::ReleasedEarly
+            }),
+            Recovery::SavedOnPeer
+        );
+        assert_eq!(recovery_for(&DeliveryResult::Placed), Recovery::None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

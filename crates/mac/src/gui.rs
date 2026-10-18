@@ -141,6 +141,10 @@ static GUI_BUTTON: AtomicUsize = AtomicUsize::new(0);
 static GUI_STATE_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// ファイル転送の中止項目(進行中だけ有効。Esc と同じ働き)
 static GUI_XFER_ITEM: AtomicUsize = AtomicUsize::new(0);
+/// 直前の受け渡し結果の1行(失敗があるときだけ出す)
+static GUI_LASTLINE_ITEM: AtomicUsize = AtomicUsize::new(0);
+/// 「もう一度送る」(再試行の価値がある失敗のときだけ出す)
+static GUI_RETRY_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// クリップボード履歴のサブメニュー(項目は refresh_status が変化時だけ作り直す)
 static GUI_HISTORY_MENU: AtomicUsize = AtomicUsize::new(0);
 static GUI_UPDATE_ITEM: AtomicUsize = AtomicUsize::new(0);
@@ -773,8 +777,17 @@ unsafe extern "C" fn imp_vol(_s: ID, _c: SEL, sender: ID) {
     crate::send_msg(&crate::Msg::Vol { op });
 }
 
-unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {
-    // accessory アプリでも明示アクティベートすればモーダルパネルは出せる
+/// 「もう一度送る」(I6)。直前の失敗を同じファイルで送り直す
+unsafe extern "C" fn imp_retry_last(_s: ID, _c: SEL, _n: ID) {
+    crate::files::retry_last();
+}
+
+/// 「受信フォルダを開く」(I6)
+unsafe extern "C" fn imp_open_recv(_s: ID, _c: SEL, _n: ID) {
+    crate::files::open_receive_dir();
+}
+
+unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {    // accessory アプリでも明示アクティベートすればモーダルパネルは出せる
     let app = msg0(
         crate::objc_getClass(c"NSApplication".as_ptr()),
         sel(c"sharedApplication"),
@@ -2396,6 +2409,32 @@ fn refresh_status() {
                 msg1_void_u8(xfer_item, sel(c"setHidden:"), 1);
             }
         }
+        // 失敗の回復動線(I6)。直前の結果があるときだけ1行と再送項目を出す。
+        // 成功したら(記録が消えたら)隠す=普段のメニューは増えない
+        let lastline_item = GUI_LASTLINE_ITEM.load(Ordering::Relaxed) as ID;
+        let retry_item = GUI_RETRY_ITEM.load(Ordering::Relaxed) as ID;
+        if !lastline_item.is_null() {
+            match (crate::files::last_outcome_line(), crate::files::last_outcome_recovery()) {
+                (Some(line), recovery) => {
+                    msg1_void_id(
+                        lastline_item,
+                        sel(c"setTitle:"),
+                        nsstring(&format!("直前: {line}")),
+                    );
+                    msg1_void_u8(lastline_item, sel(c"setHidden:"), 0);
+                    if !retry_item.is_null() {
+                        let resend = recovery == knit_common::notice::Recovery::Resend;
+                        msg1_void_u8(retry_item, sel(c"setHidden:"), if resend { 0 } else { 1 });
+                    }
+                }
+                (None, _) => {
+                    msg1_void_u8(lastline_item, sel(c"setHidden:"), 1);
+                    if !retry_item.is_null() {
+                        msg1_void_u8(retry_item, sel(c"setHidden:"), 1);
+                    }
+                }
+            }
+        }
         // 状態行はメニューバー本体が開示中は書き換えない(開示中の setTitle は
         // 表示中のメニュー幅を脈動させる)。閉じた時に 1 回反映する
         if state_title_set_now(GUI_MAIN_MENU_OPEN.load(Ordering::Relaxed)) {
@@ -2703,6 +2742,8 @@ unsafe fn make_target() -> ID {
         (c"sdCmdMap:", imp_cmd_map as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
+        (c"sdRetryLast:", imp_retry_last as *const () as usize),
+        (c"sdOpenRecv:", imp_open_recv as *const () as usize),
         (c"sdTabletText:", text_input::show as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdClosePrefs:", imp_close_prefs as *const () as usize),
@@ -2836,6 +2877,31 @@ pub fn start() -> bool {
             msg1_void_id(sendf, sel(c"setTarget:"), target);
             msg1_void_sel(sendf, sel(c"setAction:"), sel(c"sdSendFile:"));
             add_item(menu, sendf);
+        }
+        // 失敗の回復動線(I6)。通知バナーには操作を載せられない(osascript)ため、
+        // 直前の結果を1行で残し、再試行できるときだけ押せる項目を出す。
+        // どちらも普段は隠す(失敗があるときだけ現れる=メニューを混ませない)
+        let lastline = menu_item("直前の受け渡し", None, "");
+        if !lastline.is_null() {
+            msg1_void_u8(lastline, sel(c"setEnabled:"), 0);
+            msg1_void_u8(lastline, sel(c"setHidden:"), 1);
+            add_item(menu, lastline);
+            GUI_LASTLINE_ITEM.store(lastline as usize, Ordering::Relaxed);
+        }
+        let retry = menu_item("もう一度送る", Some(c"sdRetryLast:"), "");
+        if !retry.is_null() {
+            msg1_void_id(retry, sel(c"setTarget:"), target);
+            msg1_void_sel(retry, sel(c"setAction:"), sel(c"sdRetryLast:"));
+            msg1_void_u8(retry, sel(c"setHidden:"), 1);
+            add_item(menu, retry);
+            GUI_RETRY_ITEM.store(retry as usize, Ordering::Relaxed);
+        }
+        // 受信フォルダを開く(Windows トレイの同名項目と対称。常設の導線)
+        let openrecv = menu_item("受信フォルダを開く", Some(c"sdOpenRecv:"), "");
+        if !openrecv.is_null() {
+            msg1_void_id(openrecv, sel(c"setTarget:"), target);
+            msg1_void_sel(openrecv, sel(c"setAction:"), sel(c"sdOpenRecv:"));
+            add_item(menu, openrecv);
         }
 
         // クリップボード履歴(送信・受信したテキストから選んで復元)。
