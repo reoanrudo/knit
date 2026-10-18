@@ -562,9 +562,11 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 // 結果を3状態で言い切る(I5)。判断は common の純関数にあり、ここは
                 // 「離した順序」を渡すだけ(配線にロジックを置かない)
                 DRAG_UNFINISHED.store(false, Ordering::Relaxed);
-                // 遅延提供で**受理済み**なら、相手のドロップ結果を少し待って**事実**で言い切る
-                // (相手は受理の時点でドラッグを始めており、置けたかは相手しか知らない)。
-                // 結果が来なければ従来どおり「離した順序」から慎重に判断する
+                // 結果を待つ間ぶん `FILE_TX_BUSY` を握ったままだと、次の転送を最大2.2秒
+                // 待たせてしまう。**離しの記録を先に読み**、後始末を済ませてから待つ
+                let released_early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed);
+                DRAG_UNFINISHED.store(false, Ordering::Relaxed);
+                drop(guard); // 転送は完了している。ここから先は判定だけ
                 let accepted = wait_lazy_accepted(id, Duration::from_millis(1000));
                 let done = accepted.then(|| wait_drag_done(id, Duration::from_millis(1200)));
                 let result = match done {
@@ -573,10 +575,7 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                         why: notice::SaveWhy::PeerDidNotPlace,
                     },
                     // 受理済みだが結果が来なかった/受理していない: 離した順序で判断する
-                    _ => {
-                        let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed) && !accepted;
-                        notice::placed_or_saved(early)
-                    }
+                    _ => notice::placed_or_saved(released_early && !accepted),
                 };
                 let outcome = notice::DeliveryOutcome {
                     peer: peer.clone(),
