@@ -151,7 +151,7 @@ fn refusal_reason_covers_every_reject_branch() {
     let label = "上限を超えています";
     let s = |path_count, link_ok, busy, collect| Signals { path_count, link_ok, busy, collect };
     let cases: [(Signals, Refusal, &str); 8] = [
-        (s(0, true, false, Collect::Pending), Refusal::TooMany, "掴んだまま渡せるのは 64 フォルダ/ファイルまでです"),
+        (s(0, true, false, Collect::Pending), Refusal::EmptyGrab, "掴んだまま渡せるのは 64 フォルダ/ファイルまでです"),
         (s(MAX_FILES + 1, true, false, Collect::Pending), Refusal::TooMany, "掴んだまま渡せるのは 64 フォルダ/ファイルまでです"),
         (s(1, false, false, Collect::Pending), Refusal::LinkDown, "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください"),
         (s(1, true, false, Collect::Stale), Refusal::CollectStale, "接続の状態が変わったため、ファイルをもう一度掴み直してください"),
@@ -166,7 +166,7 @@ fn refusal_reason_covers_every_reject_branch() {
         assert_eq!(reason.notice_body(), *body, "{reason:?}");
     }
     // 表が全理由を覆っている(理由を足したら表も足す)
-    let all = [Refusal::TooMany, Refusal::LinkDown, Refusal::CollectStale,
+    let all = [Refusal::TooMany, Refusal::EmptyGrab, Refusal::LinkDown, Refusal::CollectStale,
         Refusal::CollectTimeout, Refusal::CollectFailed { label: label.into() },
         Refusal::NothingToSend, Refusal::Busy];
     assert!(all.iter().all(|r| cases.iter().any(|(_, c, _)| c == r)), "表に無い理由がある");
@@ -175,6 +175,7 @@ fn refusal_reason_covers_every_reject_branch() {
     for r in &all {
         match r {
             Refusal::TooMany
+            | Refusal::EmptyGrab
             | Refusal::LinkDown
             | Refusal::CollectStale
             | Refusal::CollectTimeout
