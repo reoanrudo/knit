@@ -1091,14 +1091,20 @@ mod tests {
     fn invitation(lifetime: Duration) -> (Invitation, SocketAddr, String) {
         let token = credentials::generate().unwrap();
         // Reserve a test port by obtaining the address after bind in a test-only helper.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
-        (
-            Invitation::bind(addr, token.clone(), 24900, lifetime).unwrap(),
-            addr,
-            token,
-        )
+        // **Windows の CI ランナー**では、解放直後のポートへの再 bind が
+        // WSAEACCES(10013, PermissionDenied)で拒否されることがある(Hyper-V/WinNAT が
+        // 予約している範囲に当たるため)。ポートは毎回変わるので、数回試してから落とす
+        let mut last: Option<io::Error> = None;
+        for _ in 0..15 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            match Invitation::bind(addr, token.clone(), 24900, lifetime) {
+                Ok(invitation) => return (invitation, addr, token),
+                Err(e) => last = Some(e),
+            }
+        }
+        panic!("テスト用ポートを確保できません(15回試行): {last:?}");
     }
     #[test]
     fn code_and_frame_validation() {
