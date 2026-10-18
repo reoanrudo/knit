@@ -97,6 +97,11 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             incoming_drag::offer(id, count, total, position)
                         }
                         Msg::DragCommit { id } => incoming_drag::commit(id),
+                        // 遅延提供(版 17)の受理。**自分発の掴みドラッグ**にだけ掛ける
+                        // (相手発のIDは Win→Mac のドラッグなので incoming_drag が扱う)
+                        Msg::DragAccept { id } if id >> 63 == 1 => {
+                            crate::files::note_lazy_accepted(id)
+                        }
                         // 相手が自発的に止めた場合と、こちらの送信中ドラッグの中止要求
                         Msg::DragCancel { id } => {
                             incoming_drag::cancel(id);
