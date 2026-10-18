@@ -48,6 +48,7 @@ unsafe extern "system" {
     fn GlobalAlloc(u_flags: u32, bytes: usize) -> *mut c_void;
     fn GlobalLock(handle: *mut c_void) -> *mut c_void;
     fn GlobalUnlock(handle: *mut c_void) -> i32;
+    fn GlobalFree(handle: *mut c_void) -> *mut c_void;
 }
 const GMEM_MOVEABLE: u32 = 0x0002;
 
@@ -673,7 +674,12 @@ unsafe extern "system" fn le_next(
 
 unsafe extern "system" fn le_skip(this: *mut c_void, celt: u32) -> HRESULT {
     let e = LazyEnum::from_raw(this);
-    e.pos = (e.pos + celt).min(e.total());
+    let want = e.pos.saturating_add(celt);
+    e.pos = want.min(e.total());
+    // 末尾を越えて読み飛ばしたら S_FALSE(仕様どおり)
+    if want > e.total() {
+        return 1;
+    }
     S_OK
 }
 
@@ -706,6 +712,7 @@ unsafe fn hglobal_from(bytes: &[u8]) -> Option<*mut c_void> {
     }
     let p = GlobalLock(h);
     if p.is_null() {
+        GlobalFree(h); // 失敗した経路でハンドルを漏らさない
         return None;
     }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), p as *mut u8, bytes.len());
