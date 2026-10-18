@@ -236,6 +236,16 @@ unsafe fn set_dpi_awareness() {
         SetProcessDPIAware();
     }
 }
+/// 受信先(Downloads\Knit)。**1箇所で決める**: 遅延提供の IStream も同じ場所を見る
+/// (受信側は同名衝突で「名前 (n)」へずらすため、読み出し側はサイズ一致で解決する)
+pub(crate) fn receive_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join("Downloads")
+        .join("Knit")
+}
+
 fn main() {
     unsafe { set_dpi_awareness() };
     crate::state::init_boot_wall();
@@ -498,11 +508,7 @@ fn main() {
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
         token: token.clone(),
-        dir: std::env::var_os("USERPROFILE")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join("Downloads")
-            .join("Knit"),
+        dir: receive_dir(),
         on_event: win_on_bulk,
         log: |s| println!("{s}"),
         on_rx_bytes: |n| RX_BYTES.store(n, Ordering::Relaxed),

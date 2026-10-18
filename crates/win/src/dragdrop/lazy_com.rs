@@ -1,8 +1,3 @@
-//! **未配線**: 受信を staging へ流す経路(次の増分)が入るまで、ここは型と
-//! テストだけを維持する。配線が済んだらこの allow を外すこと
-//! (外し忘れを検出できるよう、警告ではなく意図として明示する)
-#![allow(dead_code)]
-
 //! 遅延提供の COM 面(Windows)。**目録だけで OLE ドラッグを開始し、内容は
 //! 届いた分から `IStream` として返す**。
 //!
@@ -91,10 +86,19 @@ fn wide(s: &str) -> Vec<u16> {
 
 #[derive(Clone)]
 struct Staged {
-    path: PathBuf,
+    /// 受信先のルート(受信側が公開する場所)
+    dir: PathBuf,
+    /// 目録の相対名(受信側は同名衝突で「名前 (n)」へずらすことがある)
+    rel: String,
     size: u64,
     kind: u8,
-    rel: String,
+}
+
+impl Staged {
+    /// いま読むべき実体。公開名がずれていてもサイズ一致で見つける
+    fn path(&self) -> PathBuf {
+        super::lazy::resolve_received(&self.dir, &self.rel, self.size, self.kind)
+    }
 }
 
 // ---------- IStream ----------
@@ -194,14 +198,14 @@ unsafe extern "system" fn st_read(
     }
     let want = (cb as u64).min(remaining) as u32;
     let need = s.pos + want as u64;
-    if !super::lazy::wait_ready(&s.file.path, need, s.file.kind, READ_WAIT) {
+    if !super::lazy::wait_ready(&s.file.path(), need, s.file.kind, READ_WAIT) {
         eprintln!(
             "[drag] 遅延提供: データが {} バイトに達しません(期限 {:?})",
             need, READ_WAIT
         );
         return E_FAIL;
     }
-    match std::fs::File::open(&s.file.path) {
+    match std::fs::File::open(s.file.path()) {
         Ok(mut f) => {
             use std::io::{Read, Seek, SeekFrom};
             if f.seek(SeekFrom::Start(s.pos)).is_err() {
@@ -342,14 +346,19 @@ impl LazySource {
         &mut *(this as *mut LazySource)
     }
 
-    /// 目録と staging の対応から作る。`entries` は `ManifestEntry` と同じ並び
-    pub fn new(descriptor: Vec<u8>, files: Vec<(PathBuf, u64, u8, String)>) -> Box<Self> {
+    /// 目録と受信先から作る。`files` は (受信先ルート, 相対名, サイズ, kind) の並び
+    pub fn new(dir: &std::path::Path, descriptor: Vec<u8>, files: Vec<(String, u64, u8)>) -> Box<Self> {
         Box::new(LazySource {
             vtbl: &LAZY_VTBL,
             descriptor,
             files: files
                 .into_iter()
-                .map(|(path, size, kind, rel)| Staged { path, size, kind, rel })
+                .map(|(rel, size, kind)| Staged {
+                    dir: dir.to_path_buf(),
+                    rel,
+                    size,
+                    kind,
+                })
                 .collect(),
             refs: AtomicU32::new(1),
         })
