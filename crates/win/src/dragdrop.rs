@@ -54,7 +54,7 @@ pub fn claim(id: u64, received: usize) -> knit_common::drag::Claim {
 }
 #[cfg(test)]
 static TEST_DRAG_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use windows_sys::Win32::System::Com::DVASPECT_CONTENT;
 use windows_sys::Win32::System::Ole::{DoDragDrop, OleInitialize, OleUninitialize};
@@ -71,6 +71,15 @@ const OLE_E_ADVISENOTSUPPORTED: HRESULT = 0x8004_0003u32 as i32;
 const DRAGDROP_S_DROP: HRESULT = 0x0004_0100;
 const DRAGDROP_S_CANCEL: HRESULT = 0x0004_0101;
 const DRAGDROP_S_USEDEFAULTCURSORS: HRESULT = 0x0004_0102;
+
+/// 遅延提供でドラッグを開始した受け渡しID(0 = なし)。通常の `start` を
+/// 二重に走らせないための記録(同じ転送で OLE ドラッグを 2 本立てない)
+static LAZY_STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// この受け渡しIDで遅延提供のドラッグを開始済みか
+pub fn lazy_started(id: u64) -> bool {
+    id != 0 && LAZY_STARTED.load(Ordering::Relaxed) == id
+}
 
 /// 予告逆転・押下遅着を吸収する待ち窓(両者で同じ長さが意図)。
 /// start の押下待ちと win_on_bulk の await_claim がこの窓で対になる
@@ -553,33 +562,22 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 /// `staging` は `entries` と同じ並びの (実パス, サイズ, kind) を渡す。
 /// 戻り値は DROPEFFECT(DRAGDROP_S_DROP なら置けた)
 ///
-/// **未配線**: 呼び出し元(受信を staging へ流す経路)は次の増分。それまでは
-/// `KNIT_LAZY=1` でも誰も呼ばないため、既定の挙動は何も変わらない
-#[allow(dead_code)]
-pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], staging: &[String]) {
+/// 呼び出し元は受信ループ(`Msg::Manifest` を受けたとき)。`KNIT_LAZY=1` のときだけ働く
+pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto::ManifestEntry>) {
     if !lazy::lazy_enabled() {
         return; // 既定は無効(現行方式のまま)
     }
-    if entries.is_empty() || entries.len() != rel.len() {
-        eprintln!("[drag] 遅延提供: 目録と staging の件数が合いません");
+    if files.is_empty() {
+        eprintln!("[drag] 遅延提供: 目録が空です");
         return;
     }
-    let manifest: Vec<knit_common::proto::ManifestEntry> = rel
+    let descriptor = lazy::descriptor_bytes(&files);
+    let pairs: Vec<(String, u64, u8)> = files
         .iter()
-        .zip(entries.iter())
-        .map(|(r, (_, size, kind))| knit_common::proto::ManifestEntry {
-            rel: r.clone(),
-            size: *size,
-            kind: *kind,
-        })
+        .map(|f| (f.rel.clone(), f.size, f.kind))
         .collect();
-    let descriptor = lazy::descriptor_bytes(&manifest);
-    let files: Vec<(std::path::PathBuf, u64, u8, String)> = entries
-        .iter()
-        .zip(rel.iter())
-        .map(|((path, size, kind), r)| (path.clone(), *size, *kind, r.clone()))
-        .collect();
-    let staging_note = staging.join("; ");
+    let dir = dir.to_path_buf();
+    LAZY_STARTED.store(id, Ordering::Relaxed);
     std::thread::spawn(move || unsafe {
         let hr_init = OleInitialize(std::ptr::null());
         if hr_init != S_OK && hr_init != S_FALSE {
@@ -594,7 +592,7 @@ pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], sta
             windows_sys::Win32::System::Threading::GetCurrentThreadId(),
             Ordering::Relaxed,
         );
-        let ds = lazy_com::LazySource::new(descriptor, files);
+        let ds = lazy_com::LazySource::new(&dir, descriptor, pairs);
         let ds = Box::into_raw(ds) as *mut c_void;
         let src = Box::into_raw(Box::new(DropSource {
             vtbl: &SRC_VTBL,
@@ -602,7 +600,8 @@ pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], sta
         })) as *mut c_void;
         let (dfmt, cfmt) = lazy_com::ensure_formats();
         println!(
-            "[drag] 遅延提供で DoDragDrop 開始(formats {dfmt}/{cfmt}, staging {staging_note})"
+            "[drag] 遅延提供で DoDragDrop 開始(formats {dfmt}/{cfmt}, 受信先 {})",
+            dir.display()
         );
         let mut effect: u32 = DROPEFFECT_NONE;
         let _hr = DoDragDrop(ds, src, DROPEFFECT_COPY, &mut effect);
@@ -610,6 +609,7 @@ pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], sta
         lazy_com::release(ds);
         src_release(src);
         drop(host);
+        LAZY_STARTED.store(0, Ordering::Relaxed);
         println!(
             "[drag] 遅延提供のドラッグ終了: effect={effect} ({})",
             if effect == DROPEFFECT_COPY { "置けた" } else { "置けず" }
