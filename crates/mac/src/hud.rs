@@ -9,8 +9,21 @@
 use crate::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// 表示待ちの内容と種類。**断りの説明は進捗より優先する**
+/// (同じスロットを取り合うため、種類を持たないと進捗の毎秒更新が断りを消してしまう)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HudKind {
+    /// 掴みを断った理由(利用者の操作に直接答える説明)
+    Refusal,
+    /// 受け取り待ちの進捗(毎秒更新される)
+    Progress,
+}
+
 /// 表示する文言(tap スレッドが書き、メインスレッドが取り出す)
-static PENDING: Mutex<Option<String>> = Mutex::new(None);
+static PENDING: Mutex<Option<(HudKind, String, u64)>> = Mutex::new(None);
+
+/// 断りの説明を優先する時間。この間は進捗で上書きしない
+const REFUSAL_PRIORITY_MS: u64 = 2_000;
 /// パネルとラベル(初回だけ作る)
 static PANEL: AtomicU64 = AtomicU64::new(0);
 static LABEL: AtomicU64 = AtomicU64::new(0);
@@ -29,22 +42,40 @@ fn sel(name: &std::ffi::CStr) -> SEL {
 
 /// 「掴みを断った理由」をカーソル近傍に出す(実際の表示はメインスレッド)
 pub(crate) fn note_refusal(reason: &knit_common::drag::Refusal) {
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(format!("{}\n{}", reason.hud_line(), knit_common::hud::HUD_HINT));
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        HudKind::Refusal,
+        format!("{}\n{}", reason.hud_line(), knit_common::hud::HUD_HINT),
+        now_ms(),
+    ));
     gui::request_hud();
 }
 
 /// 受け取り待ちの進捗をカーソル近傍に出す(Win→Mac の「押したまま待つ」に手元の表示)。
 /// **この向きでは離すと保存のみになる**ため、断りとは別の一言を添える
 pub(crate) fn note_progress(line: &str) {
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some(format!("{line}\n{}", knit_common::hud::PROGRESS_HINT));
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    // 出したばかりの断りの説明を、毎秒の進捗更新で消さない
+    if let Some((HudKind::Refusal, _, at)) = g.as_ref() {
+        if now_ms().saturating_sub(*at) < REFUSAL_PRIORITY_MS {
+            return;
+        }
+    }
+    *g = Some((
+        HudKind::Progress,
+        format!("{line}\n{}", knit_common::hud::PROGRESS_HINT),
+        now_ms(),
+    ));
+    drop(g);
     gui::request_hud();
 }
 
 /// メインスレッドのセレクタから呼ぶ: 表示する文言を取り出す
 pub(crate) fn take_pending() -> Option<String> {
-    PENDING.lock().unwrap_or_else(|e| e.into_inner()).take()
+    PENDING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .map(|(_, text, _)| text)
 }
 
 /// 非表示にしてよいか(純関数)。表示から grace 未満なら「新しい表示を守る」ため隠さない
@@ -261,10 +292,11 @@ mod tests {
     /// 連続で断られたときは**最後の1件**だけを出す(古い文言を残さない)
     #[test]
     fn only_the_latest_refusal_is_shown() {
-        *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some("古い".to_string());
-        note_refusal(&knit_common::drag::Refusal::Busy);
+        note_refusal(&knit_common::drag::Refusal::TooMany);
+        note_refusal(&knit_common::drag::Refusal::Busy); // 後から来たものが勝つ
         let line = take_pending().expect("要求がある");
-        assert!(line.contains("転送中"), "{line}");
+        assert!(line.contains("転送中です"), "最後の断り: {line}");
+        assert!(!line.contains("掴みすぎ"), "前の断りは残さない: {line}");
         assert!(take_pending().is_none(), "取り出したら消える");
     }
 
@@ -284,6 +316,22 @@ mod tests {
             !progress.contains(knit_common::hud::HUD_HINT),
             "受け取り待ちで「そのまま離してよい」と言わない: {progress}"
         );
+    }
+
+    /// **毎秒の進捗更新が、出したばかりの断りの説明を消さない**(優先度の固定)
+    #[test]
+    fn progress_does_not_erase_a_fresh_refusal() {
+        note_refusal(&knit_common::drag::Refusal::EmptyGrab);
+        note_progress("受け取り中 42%");
+        let shown = take_pending().expect("断りの説明が出る");
+        assert!(shown.contains("掴んだ項目がありません"), "{shown}");
+        assert!(!shown.contains("受け取り中"), "{shown}");
+        // 十分に時間が経ったら進捗が上書きしてよい(テストでは時刻を直接進められないため、
+        // 断りを消費した後に進捗が出ることを確かめる)
+        note_progress("受け取り中 42%");
+        let now = take_pending().expect("進捗が出る");
+        assert!(now.contains("受け取り中 42%"), "{now}");
+        assert!(now.contains(knit_common::hud::PROGRESS_HINT), "{now}");
     }
 
     /// 古い非表示予約が新しい表示を消さない(表示から grace 未満では隠さない)
