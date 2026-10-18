@@ -593,9 +593,11 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto::ManifestEntry>) {
     let drag_running = DRAG_THREAD.load(Ordering::Relaxed) != 0;
     if !lazy_start_allowed(lazy::lazy_enabled(), drag_running, files.len()) {
-        // 既定は無効 / 既にドラッグ中 / 目録が空 のいずれか
+        // 既定は無効 / 既にドラッグ中 / 目録が空 のいずれか(無言にしない)
         if drag_running {
             println!("[drag] 遅延提供: 既にドラッグ中のため開始しません");
+        } else if files.is_empty() {
+            println!("[drag] 遅延提供: 目録が空です");
         }
         return;
     }
@@ -640,10 +642,8 @@ pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto:
             OleUninitialize();
             return;
         };
-        DRAG_THREAD.store(
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-            Ordering::Relaxed,
-        );
+        // panic しても DRAG_THREAD を残さない(残ると以後の遅延提供が黙って効かなくなる)
+        let _drag_guard = DragThreadGuard::arm();
         // **ここで受理を返す**: 押下が続いており、OLE と捕捉ウィンドウも用意できた =
         // 「実際にドラッグを開始できる」と確認できた時点
         if let Some(tx) = crate::state::WTX

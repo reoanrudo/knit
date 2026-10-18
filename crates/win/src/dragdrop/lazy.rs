@@ -61,13 +61,31 @@ pub fn descriptor_bytes(entries: &[ManifestEntry]) -> Vec<u8> {
         // UTF-16LE で詰め、収まらない名前は 259 文字で切る(終端 NUL を必ず残す)
         let name = e.rel.replace('/', "\\");
         let mut used = 0usize;
-        for unit in name.encode_utf16().take(MAX_FILE_NAME - 1) {
+        for unit in truncate_utf16(&name, MAX_FILE_NAME - 1).into_iter() {
             out.extend_from_slice(&unit.to_le_bytes());
             used += 1;
         }
         out.extend(std::iter::repeat(0u8).take((MAX_FILE_NAME - used) * 2));
     }
     debug_assert_eq!(out.len(), GROUP_HEADER_SIZE + entries.len() * FILEDESCRIPTORW_SIZE);
+    out
+}
+
+/// UTF-16 の**サロゲートペアを割らずに** `max` ユニット以内へ切り詰める。
+/// 途中で切ると Explorer が壊れた名前(片側だけのサロゲート)を作るため、
+/// 境界に当たったら手前の完全な文字まで戻す
+pub fn truncate_utf16(s: &str, max: usize) -> Vec<u16> {
+    let mut out: Vec<u16> = s.encode_utf16().collect();
+    if out.len() <= max {
+        return out;
+    }
+    out.truncate(max);
+    // 末尾が上位サロゲート(単独で残った)なら、それも落とす
+    if let Some(&last) = out.last() {
+        if (0xD800..0xDC00).contains(&last) {
+            out.pop();
+        }
+    }
     out
 }
 
@@ -223,6 +241,24 @@ mod tests {
             bytes[attrs_off + 3],
         ]);
         assert_eq!(attrs & FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_DIRECTORY);
+    }
+
+    /// サロゲートペア(絵文字など)を割らない
+    #[test]
+    fn truncation_never_splits_a_surrogate_pair() {
+        // 絵文字 1 個 = 2 ユニット。境界がその途中に来る場合を作る
+        let name = format!("{}🎉tail", "a".repeat(258));
+        let cut = truncate_utf16(&name, 259);
+        assert_eq!(cut.len(), 258, "途中で割らずに手前まで戻す");
+        assert!(
+            !(0xD800..0xDC00).contains(cut.last().unwrap()),
+            "上位サロゲートを残さない"
+        );
+        // 割れない場合はそのまま max まで
+        let plain = "b".repeat(300);
+        assert_eq!(truncate_utf16(&plain, 259).len(), 259);
+        // 収まるときは触らない
+        assert_eq!(truncate_utf16("short", 259).len(), 5);
     }
 
     #[test]
