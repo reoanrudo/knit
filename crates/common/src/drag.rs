@@ -255,12 +255,24 @@ impl Carried {
             *released = true;
         }
     }
+    /// 新しい押下の開始。**離しの記録を消す**: これが無いと、一度でも離した後に
+    /// 始めた掴みが全部「離れた後の転送」と見なされ、ドラッグとして引き継がれない
+    /// (Windows 側は左ボタン解放のたびに release() を呼ぶため、モード切替後の
+    /// 最初のクリックでこの状態に入ってしまう。CI の windows-latest で検出)
+    pub fn press(&mut self) {
+        self.released_once = false;
+        if let Some((_, _, released)) = &mut self.expected {
+            *released = false;
+        }
+    }
     pub fn claim(&mut self, id: u64, received: usize) -> Claim {
         // 不一致(別の押下の遅延転送)では予告を残す: 直後に届く正しい転送を
         // 弹かないようにする
         match self.expected {
             Some((expected, count, released)) if expected == id => {
                 self.expected = None;
+                // 消費したら離しの記録も消す(次の掴みを「離れた後」と誤判定しない)
+                self.released_once = false;
                 if released {
                     Claim::Released
                 } else if received == count {
@@ -307,6 +319,32 @@ mod tests {
         carried.release();
         carried.announce(9, 2);
         assert_eq!(carried.claim(9, 2), Claim::Released, "先行した離しは予告到着後も有効");
+    }
+
+    #[test]
+    fn a_new_drag_after_a_release_is_carried_again() {
+        // 実機(Windows)では左ボタンを離すたびに release() が呼ばれる。粘着する実装だと
+        // **モード切替後の最初のクリック以降、掴みドラッグが全部「保存のみ」に化ける**
+        // (CI の windows-latest が検出した)。押下の開始と claim の消費で記録が消えること
+        let mut carried = Carried::new();
+        carried.announce(1, 1);
+        carried.release();
+        assert_eq!(carried.claim(1, 1), Claim::Released, "離した後の転送は通常の受信");
+        // 離しただけ(予告なし)の後に掴み直す場合も、押下の開始で記録が消える
+        // (実際のドラッグは必ず押下から始まるため、これが本線の順序)
+        carried.release();
+        carried.press();
+        carried.announce(2, 1);
+        assert_eq!(carried.claim(2, 1), Claim::Carried, "押し直したら引き継ぐ");
+        // 逆に、押下の開始が来ないまま予告だけが遅れて届いた場合は「離れた後」として
+        // 扱う(設計どおりの保護: 遅着した予告を新しいドラッグと誤認しない)
+        carried.release();
+        carried.announce(3, 1);
+        assert_eq!(
+            carried.claim(3, 1),
+            Claim::Released,
+            "遅れて届いた予告は離れた後として扱う"
+        );
     }
 
     #[test]

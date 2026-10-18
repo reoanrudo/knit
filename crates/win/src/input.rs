@@ -364,8 +364,14 @@ pub(crate) fn remote_mouse_button(btn: u8, down: bool) {
     } else {
         BTN_W[btn as usize].store(down, Ordering::Relaxed);
         inject_mouse_btn(btn, down);
-        if btn == 0 && !down {
-            dragdrop::relay_up();
+        if btn == 0 {
+            if down {
+                // 新しい押下 = 新しい掴みの可能性。離しの記録を消しておかないと、
+                // 以後の転送が「離れた後」と誤判定され、ドラッグとして引き継がれない
+                dragdrop::note_press();
+            } else {
+                dragdrop::relay_up();
+            }
         }
     }
 }
