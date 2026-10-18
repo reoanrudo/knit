@@ -268,15 +268,16 @@ impl Carried {
             *released = true;
         }
     }
-    /// 新しい押下の開始。**離しの記録を消す**: これが無いと、一度でも離した後に
-    /// 始めた掴みが全部「離れた後の転送」と見なされ、ドラッグとして引き継がれない
-    /// (Windows 側は左ボタン解放のたびに release() を呼ぶため、モード切替後の
-    /// 最初のクリックでこの状態に入ってしまう。CI の windows-latest で検出)
+    /// 新しい押下の開始。**粘着する `released_once` を消す**: これが無いと、一度でも
+    /// 離した後に始めた掴みが全部「離れた後の転送」と見なされ、ドラッグとして引き継がれない
+    /// (Windows 側は左ボタン解放のたびに release() を呼ぶため、モード切替後の最初の
+    /// クリックでこの状態に入ってしまう。CI の windows-latest で検出)
+    ///
+    /// **予告済みの `expected.released` は消さない**: それは「announce の時点で既に離して
+    /// いた」=前の操作の事実であり、新しい押下で覆すと古い転送を掴みドラッグとして開始して
+    /// しまう(敵対的検証役の反例: release → announce(9,2) → press → claim(9,2) は Released)
     pub fn press(&mut self) {
         self.released_once = false;
-        if let Some((_, _, released)) = &mut self.expected {
-            *released = false;
-        }
     }
     pub fn claim(&mut self, id: u64, received: usize) -> Claim {
         // 不一致(別の押下の遅延転送)では予告を残す: 直後に届く正しい転送を
@@ -358,6 +359,17 @@ mod tests {
             Claim::Released,
             "遅れて届いた予告は離れた後として扱う"
         );
+    }
+
+    /// 押し直しで「前の操作の事実」まで消さない(敵対的検証役の反例)。
+    /// 消すと、離した後に届いた古い転送を掴みドラッグとして開始してしまう
+    #[test]
+    fn a_new_press_does_not_resurrect_a_transfer_that_arrived_after_release() {
+        let mut carried = Carried::new();
+        carried.release();
+        carried.announce(9, 2);
+        carried.press();
+        assert_eq!(carried.claim(9, 2), Claim::Released, "前の操作の事実は覆らない");
     }
 
     #[test]

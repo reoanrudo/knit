@@ -62,7 +62,7 @@ pub(crate) unsafe fn hide() {
     }
     let panel = PANEL.load(Ordering::Relaxed) as ID;
     if !panel.is_null() {
-        call0(panel, c"orderOut:");
+        call1_id(panel, c"orderOut:", std::ptr::null_mut());
     }
 }
 
@@ -129,7 +129,14 @@ unsafe fn ensure_panel(line: &str) -> ID {
         call1_u8(label, c"setEditable:", 0);
         call1_u8(label, c"setSelectable:", 0);
         call1_u8(label, c"setDrawsBackground:", 0);
-        call1_u8(label, c"setWraps:", 1); // 2行に折り返す
+        // **NSTextField に setWraps: は無い**(呼ぶと NSInvalidArgumentException で
+        // 例外になる。敵対的検証役が clang -framework AppKit の実機プローブで確定)。
+        // 折り返しは cell に対して設定する。1行に収める設定も併せて外す
+        call1_u8(label, c"setUsesSingleLineMode:", 0);
+        let cell = msg0(label, sel(c"cell"));
+        if !cell.is_null() {
+            call1_u8(cell, c"setWraps:", 1); // 2行に折り返す
+        }
         msg1_id(
             label,
             sel(c"setTextColor:"),
@@ -154,15 +161,45 @@ fn body(line: &str) -> String {
     format!("{line}\n{}", knit_common::hud::HUD_HINT)
 }
 
+/// カーソルを含む画面の frame を返す。`[NSScreen mainScreen]` はキーウィンドウのある
+/// 画面(通常は主画面)なので、**2台目のディスプレイにカーソルがあると HUD が主画面へ
+/// 寄せられてしまう**(敵対的検証役の指摘)。見つからなければ主画面へ落とす
+unsafe fn cursor_screen(cursor: CGPoint) -> CGRect {
+    let frame: unsafe extern "C" fn(ID, SEL) -> CGRect =
+        std::mem::transmute(objc_msgSend as *const ());
+    let screens = msg0(objc_getClass(c"NSScreen".as_ptr()), sel(c"screens"));
+    if !screens.is_null() {
+        let count: unsafe extern "C" fn(ID, SEL) -> usize =
+            std::mem::transmute(objc_msgSend as *const ());
+        let object_at: unsafe extern "C" fn(ID, SEL, usize) -> ID =
+            std::mem::transmute(objc_msgSend as *const ());
+        for i in 0..count(screens, sel(c"count")) {
+            let s = object_at(screens, sel(c"objectAtIndex:"), i);
+            if s.is_null() {
+                continue;
+            }
+            let f = frame(s, sel(c"frame"));
+            if cursor.x >= f.origin.x
+                && cursor.x < f.origin.x + f.size.w
+                && cursor.y >= f.origin.y
+                && cursor.y < f.origin.y + f.size.h
+            {
+                return f;
+            }
+        }
+    }
+    frame(
+        msg0(objc_getClass(c"NSScreen".as_ptr()), sel(c"mainScreen")),
+        sel(c"frame"),
+    )
+}
+
 /// カーソルの近くへ置く(画面外へはみ出さない)。座標系は AppKit と同じ左下原点
 unsafe fn position(panel: ID) {
     let point: unsafe extern "C" fn(ID, SEL) -> CGPoint =
         std::mem::transmute(objc_msgSend as *const ());
     let cursor = point(objc_getClass(c"NSEvent".as_ptr()), sel(c"mouseLocation"));
-    let frame: unsafe extern "C" fn(ID, SEL) -> CGRect =
-        std::mem::transmute(objc_msgSend as *const ());
-    let screen = msg0(objc_getClass(c"NSScreen".as_ptr()), sel(c"mainScreen"));
-    let f = frame(screen, sel(c"frame"));
+    let f = cursor_screen(cursor);
     let (x, y) = knit_common::hud::place(
         (cursor.x, cursor.y),
         (HUD_W, HUD_H),
@@ -185,6 +222,11 @@ unsafe fn position(panel: ID) {
 unsafe fn call0(obj: ID, name: &std::ffi::CStr) {
     let f: unsafe extern "C" fn(ID, SEL) = std::mem::transmute(objc_msgSend as *const ());
     f(obj, sel(name));
+}
+
+unsafe fn call1_id(obj: ID, name: &std::ffi::CStr, value: ID) {
+    let f: unsafe extern "C" fn(ID, SEL, ID) = std::mem::transmute(objc_msgSend as *const ());
+    f(obj, sel(name), value);
 }
 
 unsafe fn call1_u8(obj: ID, name: &std::ffi::CStr, value: u8) {

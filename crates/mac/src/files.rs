@@ -133,6 +133,16 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                     "[file] 送信完了({n} 件, {:.1}MB/s)",
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
+                // 成功したら直前の失敗の記録を消す(メニューの「もう一度送る」が
+                // 残り続けて、同じファイルを二重に送ってしまうのを防ぐ)
+                note_outcome(
+                    &notice::DeliveryOutcome {
+                        peer: peer.clone(),
+                        count: n,
+                        result: notice::DeliveryResult::Placed,
+                    },
+                    &paths,
+                );
                 // collect 時(フォルダ走査)と送信時(open 失敗)の両方の読み取り不可を通知に反映
                 let mut all_skipped = cr.skipped.clone();
                 all_skipped.extend(rep.skipped.iter().cloned());
