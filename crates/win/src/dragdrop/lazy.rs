@@ -56,10 +56,12 @@ pub fn descriptor_bytes(entries: &[ManifestEntry]) -> Vec<u8> {
         out.extend_from_slice(&[0u8; 24]); // 3 つの FILETIME(未指定)
         out.extend_from_slice(&((e.size >> 32) as u32).to_le_bytes());
         out.extend_from_slice(&((e.size & 0xFFFF_FFFF) as u32).to_le_bytes());
-        // cFileName(WCHAR[260])。UTF-16LE で詰め、残りは NUL。
-        // 収まらない名前は 259 文字で切る(終端 NUL を必ず残す)
+        // cFileName(WCHAR[260])。**区切りは Windows 形式**(目録は `/` で来る)。
+        // ここで変換しないと Explorer が「資料/a.txt」という名前のファイルを作る。
+        // UTF-16LE で詰め、収まらない名前は 259 文字で切る(終端 NUL を必ず残す)
+        let name = e.rel.replace('/', "\\");
         let mut used = 0usize;
-        for unit in e.rel.encode_utf16().take(MAX_FILE_NAME - 1) {
+        for unit in name.encode_utf16().take(MAX_FILE_NAME - 1) {
             out.extend_from_slice(&unit.to_le_bytes());
             used += 1;
         }
@@ -201,17 +203,18 @@ mod tests {
     }
 
     #[test]
-    fn names_are_utf16le_and_folders_get_the_directory_attribute() {
+    fn names_are_utf16le_with_windows_separators() {
         let bytes = descriptor_bytes(&[e("資料/a.txt", 1, 0), e("資料/空", 0, 1)]);
-        // 2件目の cFileName の先頭 3 WCHAR が「資」「料」「/」
-        let second = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE;
-        let name_off = second + FILEDESCRIPTORW_SIZE - MAX_FILE_NAME * 2;
+        // 1件目の cFileName の先頭 4 WCHAR が「資」「料」「\」「a」
+        let name_off = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE - MAX_FILE_NAME * 2;
         let w = |i: usize| u16::from_le_bytes([bytes[name_off + i * 2], bytes[name_off + i * 2 + 1]]);
-        assert_eq!(w(0), '資' as u16);
-        assert_eq!(w(1), '料' as u16);
-        assert_eq!(w(2), '/' as u16);
-        assert_eq!(w(6), 0, "終端は NUL");
+        // 期待する名前そのものと突き合わせる(名前が変わっても終端まで検証できる)
+        let expected: Vec<u16> = "資料\\a.txt".encode_utf16().chain(std::iter::once(0)).collect();
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(w(i), *want, "cFileName[{i}]");
+        }
         // 2件目はフォルダ属性
+        let second = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE;
         let attrs_off = second + 4 + 16 + 8 + 8;
         let attrs = u32::from_le_bytes([
             bytes[attrs_off],
@@ -319,6 +322,15 @@ mod tests {
         // 見つからなければ宣言名を返す(呼び出し側が期限で失敗させる)
         let missing = resolve_received(&dir, "nope.txt", 5, 0);
         assert_eq!(missing.file_name().unwrap(), "nope.txt");
+        // 探索は 1..100 で有界。**上限を超える衝突では宣言名を返し**、
+        // 読み出し側の期限で失敗させる(誤った実体を渡さないことを優先する)
+        let declared = dir.join("many.bin");
+        std::fs::write(&declared, b"xx").unwrap();
+        for n in 1..120 {
+            std::fs::write(dir.join(format!("many ({n}).bin")), b"mismatch").unwrap();
+        }
+        let bounded = resolve_received(&dir, "many.bin", 99, 0);
+        assert_eq!(bounded.file_name().unwrap(), "many.bin", "上限内で見つからなければ宣言名");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

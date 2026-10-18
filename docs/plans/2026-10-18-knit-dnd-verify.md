@@ -1694,6 +1694,101 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
    (`waiting_for_data` / `receive`)は固定されているが、「受信のたびに `WAITING_SEEN_MS` が延びる」ことは
    テストされていない ✓。→ `note_rx_bytes` を呼んで `waiting_for_data` が生き続けることを1件足す ✓。
 
+## 6.11 第9ラウンド: Windows 側の W2-lite・W5-lite(+ 前ラウンドの残り2点)/ 判定: **合格**
+
+**検証対象(マージ除く。範囲 `6641762..8b0dd03`)**: `682e9a3`(前ラウンドの残り2点)→
+`1f5f6ba`(**W2-lite**: 30秒の無言取消をやめて理由を知らせる)→ `10d7c8b`(**W5-lite**:
+「受信フォルダを開く」をトレイメニュー先頭へ)。
+
+- HEAD `8b0dd03` / `git status` 空 / `cargo build` exit 0(**警告行 10 = 基準同数**)/
+  `cargo test` = **611 passed / 0 failed / 4 ignored**(申告の 610 と一致。+1 は `682e9a3` の新テスト ✓)。
+- **限界(重要)**: `cargo test -p knit-win --no-run` は macOS では **16 個のコンパイルエラー**で通らない ✓
+  (`rustup` の Windows ターゲットも未導入 ✓)。したがって `1f5f6ba` の `send_wait_tests` 2件と、
+  メニュー構築の実行は**私の手では動かせない** ✓ = Windows CI が唯一の実行検証 ✓(今回は CI pass の申告 ✓)。
+  また **golden list は `crates/win` を走査していない**(§1.6 の限界)ため、Windows 側の文言は
+  差分の読解で確認した ✓。
+
+### `682e9a3`: 前ラウンドの残り2点 / **解消** ✓
+
+- **共有ロックの範囲** ✓: `SHARED_STATE_LOCK` をファイル直下の `#[cfg(test)] pub(crate) static` にし、
+  `waiting_tests` の `lock()` も `mod tests` の `disconnect_keeps_native_resources_…` も
+  **同じ1本**を取る ✓ → 私が特定した「モジュール外の `reset()` が横から消す」経路が塞がった ✓。
+  私のストレス再実行: `incoming_drag` 並列 **0/20 失敗**(前ラウンドは 1/20)✓ / `hud::tests` 並列 **0/12** ✓。
+- **フック配線のテスト** ✓: `receiving_bytes_extends_the_wait` が実際の `files::note_rx_bytes(262_144)` を
+  呼び、`WAITING_SEEN_MS` が前へ進むことと待ちが生き続けることを固定 ✓ →
+  **前ラウンド生存した変異 m5(フックの `note_progress_seen` を外す)が赤** ✓
+  (`incoming_drag::waiting_tests::receiving_bytes_extends_the_wait`)✓。
+- 観察: `a_wait_without_any_progress_is_not_shown` の説明どおり、`now_ms()` は**プロセス起動からのミリ秒**
+  なので「15秒前」を実時間で作ると 0(=未設定)に飽和する ✓ → 停滞そのものは純関数 `waiting_alive` 側で
+  固定し、読み手側は `seen == 0` の場合を固定する、という切り分けは妥当 ✓
+  (私の m4 相当=呼び出し側の削除変異は、この形でも赤になることを確認済み ✓)。
+  軽微: テスト内で `WAITING_SEEN_MS` を2回続けて store しており、1回目は直前の2回目の store で
+  上書きされる(意図のコメントはあるが実質不要)✓。
+
+### `1f5f6ba`: W2-lite / **合格**(読解のみ。実行は Windows CI)
+
+- **(a) 取り消す条件は変えていない** ✓: 変更前
+  `(!enabled() || !at_target || !down || (!p.sending && p.began.elapsed() > 30s)) && !p.committed` →
+  変更後 `… || timed_out) && !p.committed`(`timed_out = !sending && waited > SEND_WAIT`)✓
+  **論理的に同一** ✓(`>` の境界も維持 ✓ テストが「ちょうど30秒はまだ待つ」を固定 ✓)。
+  唯一の差は `p.began.elapsed()` が short-circuit されず**常に評価**されること ✓(µs のコスト ✓ 意味の変化なし ✓)。
+- **(b) `timed_out` の立て方** ✓: タプルの3要素目を `cancel && timed_out` にしているため、
+  **実際に取り消した AND 理由に時間切れが含まれる**ときだけ通知する ✓(`p.committed` が真なら
+  `cancel=false` → 通知しない ✓ = 確定済みのドラッグに誤通知しない ✓)。
+  軽微: 時間切れと他の理由(例: カーソルが外れた)が同時のときも時間切れとして通知する ✓
+  (事実としては「30秒待った」は真 ✓ 誤りではない ✓)。
+- **(c) 文言は実態と合っている** ✓: 「受け渡しが始まりませんでした(30秒待ちました)。ドラッグは取り消しました。
+  もう一度掴んでください」= Win→Mac で Mac が受理しないまま時間切れ → Windows 側のドラッグが取り消される ✓
+  という実態と一致 ✓ 設計 §5 W2 の「取消時は必ず通知し、理由(時間切れ)と次の一手を出す」を満たす ✓。
+- **(d) `p.committed` の扱いは不変** ✓(`… && !p.committed` の位置・`finish` の式とも変更なし ✓)。
+- テスト ✓: `a_wait_that_never_starts_expires`(29秒/ちょうど30秒/31秒 ✓)/
+  `an_active_transfer_is_never_expired`(送信中は31秒でも6時間でも false ✓)
+  = 設計の核「長い転送を打ち切らない」を固定 ✓(実行は Windows CI ✓)。
+
+### `10d7c8b`: W5-lite / **合格**(読解のみ。実行は Windows CI)
+
+- **(a) 機能は不変** ✓: 移動したのは `AppendMenuW` の**位置**だけで、ハンドラ
+  `MENU_OPENFOLDER => { let dir = crate::receive_dir(); … }`(`tray.rs:910`)は無変更 ✓。
+  `receive_dir()` の使用も維持 ✓(前ラウンドで一本化した経路 ✓)。
+- **(b) 他の項目の相対順・区切りは不変** ✓: 旧位置(`MENU_BACKMAC` と「設定フォルダを開く」の間)から
+  1件を抜き、第1セパレータの直後(= 最初に押せる位置)へ入れただけ ✓。セパレータの追加・削除は無し ✓
+  (旧位置の前後にもセパレータは無い ✓)。設計 §5 W5 の「トレイメニューの先頭に出す」に一致 ✓。
+- **(c) ID の二重使用なし** ✓: `MENU_OPENFOLDER = 1008` は1箇所で定義 ✓、`AppendMenuW` も
+  **1箇所だけ**(`:1477`)✓ 旧 `:1535` の追加は削除済み ✓(grep で確認 ✓)。
+
+### 実測まとめ
+
+| 項目 | 結果 |
+|---|---|
+| HEAD / ツリー | `8b0dd03` / クリーン ✓ |
+| `cargo build` | exit 0 / 警告行 10(基準同数)✓ |
+| `cargo test`(既定メンバー) | **611 passed / 0 failed / 4 ignored** ✓ |
+| `682e9a3` の残り2点 | 共有ロック ✓(0/20)/ フック配線 ✓(m5' が赤)|
+| `knit-win` のローカル検証 | **不可**(16 コンパイルエラー / Windows ターゲット未導入)✓ = CI のみ |
+
+### 実機なしで「実装だけ」進められる Windows 側の残り(lead の質問への回答)
+
+優先順に、いずれも **純関数/テストを CI で回せる**形にできるものです ✓:
+
+1. **`start_lazy` の開始条件を純関数化**(`should_start_lazy(lazy_enabled, drag_thread, files_len) -> bool` 相当)✓
+   現在は `lazy_enabled` と `DRAG_THREAD != 0` と件数の判定が本体に混在 ✓ → 切り出せば CI で固定できる ✓
+   (私が前ラウンドで指摘した二重開始ガードの回帰を CI で守れる ✓)。
+2. **取り消し理由ごとの通知**(F10 の「無言」): `send_wait_expired` と同じ形で
+   「モード離脱」「切断」「相手の拒否」を純関数化し、それぞれに通知を出す ✓ — `edge.rs` の
+   `relay_cancel` 系は今も無言 ✓ 設計の「無言を作らない」文化に揃えられる ✓(CI で判定を固定 ✓)。
+3. **`ManifestEntry.rel` の区切り変換**(`/` → `\`): `cFileName` に渡す直前で正規化する純関数 ✓
+   CI でテストできる ✓(私が W1 検証で申し送った点 ✓)。
+4. **`W2` 本体の 200ms 閾値 + ツールチップ進捗**: 「準備が 200ms を超えたら出す」を純関数にして、
+   ツールチップ/状態行へ出す ✓ — 8MB 閾値の無言(F2)を消せる ✓ 表示の見た目だけが実機待ち ✓。
+5. **`DRAG_THREAD` のリークガード**: `store` 〜 `DoDragDrop` の間に panic すると フラグが残り、
+   以後の遅延提供が全部スキップされる ✓ → RAII ガードにする ✓(読解で直せる ✓)。
+6. **`resolve_received` の `(n)` 探索上限**(1..100)を超えた衝突の扱い ✓ 純関数で CI テスト可 ✓。
+
+**実機が必須で後回しが妥当**: W3 の層付きウィンドウ(HUD の見た目)、CFSTR_FILECONTENTS の
+`IStream` 寿命(9/28 設計 段階3 の PoC)、CF_HDROP しか受けないアプリへのフォールバック挙動、
+トーストのアクション(W5 本体)✓ — これらは「実装はできるが、確かめずに既定を反転させるのは危険」✓
+(遅延提供が `KNIT_LAZY=1` の opt-in である限り安全 ✓)。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
 
 | 増分 | 依頼 | 判定 | 備考 |
