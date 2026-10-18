@@ -386,4 +386,114 @@ mod tests {
         assert_eq!(percent, Some(10), "% は総量から出せる");
         assert_eq!(eta_ms, Some(9_000), "残り時間も総量と速度から出せる");
     }
+
+    /// **AC2: 「今離すとどうなるか」が常に1つに定まる**(曖昧なまま離させない)。
+    /// 代表ケースではなく**入力の全組合せ**(3×4×5×4×3×2×2 = 2880 通り)を回して、
+    /// 返る値が必ず1つであることと、`Unknown` を返してよい条件を固定する
+    #[test]
+    fn every_input_combination_yields_exactly_one_forecast() {
+        let phases = [
+            CarryPhase::Held,
+            CarryPhase::ReleasedEarly,
+            CarryPhase::ReleasedAfterComplete,
+        ];
+        let refusals = [
+            None,
+            Some(Refusal::TooMany),
+            Some(Refusal::LinkDown),
+            Some(Refusal::Busy),
+        ];
+        let pairs = [(0u64, 0u64), (0, 100), (50, 100), (100, 100), (150, 100)];
+        let samples = [0u32, 1, 2, 5];
+        let deadlines = [0u64, 1_000, 30_000];
+        let mut kinds: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        let mut cases = 0usize;
+        for &phase in &phases {
+            for refusal in &refusals {
+                for &(sent, total) in &pairs {
+                    for &speed_samples in &samples {
+                        for &peer_deadline_ms in &deadlines {
+                            for &accepted in &[false, true] {
+                                for &peer_lazy in &[false, true] {
+                                    let i = ForecastInput {
+                                        phase,
+                                        peer_lazy,
+                                        accepted,
+                                        sent,
+                                        total,
+                                        elapsed_ms: 500,
+                                        speed_samples,
+                                        peer_deadline_ms,
+                                        refusal: refusal.clone(),
+                                        save_dir: None,
+                                    };
+                                    let f = forecast_for(&i);
+                                    cases += 1;
+                                    let kind = match &f {
+                                        Forecast::WillPlace => "place",
+                                        Forecast::WillSaveOnly { .. } => "save",
+                                        Forecast::WaitingForPeer { .. } => "wait",
+                                        Forecast::WillFail { .. } => "fail",
+                                        Forecast::Unknown { .. } => "unknown",
+                                    };
+                                    *kinds.entry(kind).or_insert(0) += 1;
+
+                                    // 1) 材料不足のときだけ Unknown(理由も説明できる)
+                                    if let Forecast::Unknown { why } = &f {
+                                        assert!(
+                                            refusal.is_none(),
+                                            "拒否が確定していれば Unknown にしない: {i:?}"
+                                        );
+                                        assert_eq!(sent == 0, total == 0, "材料不足の条件: {i:?}");
+                                        let want = if sent == 0 {
+                                            Why::NoTransferStarted
+                                        } else {
+                                            Why::TotalUnknown
+                                        };
+                                        assert_eq!(why, &want, "理由が説明できる: {i:?}");
+                                    }
+                                    // 2) 拒否は何よりも優先される(「置けます」と言わない)
+                                    if refusal.is_some() {
+                                        assert!(
+                                            matches!(
+                                                f,
+                                                Forecast::WillFail {
+                                                    reason: FailReason::Refused(_)
+                                                }
+                                            ),
+                                            "拒否が最優先: {i:?} → {f:?}"
+                                        );
+                                    }
+                                    // 3) 「置ける」と言えるのは、受理済みか全部届いたときだけ
+                                    if matches!(f, Forecast::WillPlace) {
+                                        assert!(
+                                            accepted || sent >= total,
+                                            "置ける根拠が無い: {i:?} → {f:?}"
+                                        );
+                                    }
+                                    // 4) 完了前に離したら保存のみ(受理済みの場合を除く)
+                                    if phase == CarryPhase::ReleasedEarly
+                                        && !accepted
+                                        && refusal.is_none()
+                                        && !(sent == 0 && total == 0)
+                                        && total > 0
+                                    {
+                                        assert_eq!(
+                                            f,
+                                            Forecast::WillSaveOnly { dir: None },
+                                            "完了前の離しは保存のみ: {i:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2880, "全組合せを回している(空回りしていない)");
+        assert!(kinds.len() >= 4, "複数の結果が出る組み合わせ: {kinds:?}");
+        println!("[forecast] 組合せ {cases} 通り: {kinds:?}");
+    }
 }
