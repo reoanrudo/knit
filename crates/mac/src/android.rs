@@ -1416,7 +1416,10 @@ mod tests {
     #[test]
     fn android_clipboard_image_stub_timings_and_call_count() {
         let _serial = STUB_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = std::env::temp_dir().join("knit-android-stub");
+        // **プロセスごとに別の場所**を使う: 固定名だと、別の cargo test が同時に走ったとき
+        // スタブや adb.log を奪い合って落ちる(実際にリードの検証と衝突して落ちた)。
+        // プロセス内は STUB_TEST_LOCK で直列化している
+        let tmp = std::env::temp_dir().join(format!("knit-android-stub-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("adb.log");
         let _ = std::fs::remove_file(&log);
@@ -1476,7 +1479,10 @@ mod tests {
 
     /// スタブ adb を作って push 先を差し替える。戻り値は(ログのパス, 作業ディレクトリ, 元の登録)
     fn stub_setup(dir_name: &str, script: &str) -> (std::path::PathBuf, std::path::PathBuf, Option<(PathBuf, String, String)>) {
-        let tmp = std::env::temp_dir().join(dir_name);
+        // **プロセスごとに別の場所**を使う: 固定名だと、別の cargo test が同時に走ったとき
+        // ここで `remove_dir_all` し合ってスタブを奪い、adb 起動回数が 0 になる
+        // (実際にリードの検証と同時実行して落ちた)
+        let tmp = std::env::temp_dir().join(format!("{dir_name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let log = tmp.join("adb.log");
