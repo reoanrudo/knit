@@ -582,9 +582,33 @@ pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto:
         let hr_init = OleInitialize(std::ptr::null());
         if hr_init != S_OK && hr_init != S_FALSE {
             println!("[drag] 遅延提供: OleInitialize 失敗(0x{hr_init:08x})");
+            // 記録を残すと、この受け渡しIDの通常の開始が永久に省略されてしまう
+            if LAZY_STARTED.load(Ordering::Relaxed) == id {
+                LAZY_STARTED.store(0, Ordering::Relaxed);
+            }
+            return;
+        }
+        // 押下が続いているかを確かめる(通常の start と同じ窓)。
+        // 目録は越境の直後に届くので、既に離している「フリックして離す」操作もここに入る。
+        // 離れていたら遅延提供を諦め、記録を消して通常の経路(受信後に判定)へ委ねる
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(CLAIM_WAIT_MS);
+        while (host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if host::cancelled() || !crate::BTN_W[0].load(Ordering::Relaxed) {
+            println!("[drag] 遅延提供: 押下が続いていないため開始しません(通常経路へ)");
+            if LAZY_STARTED.load(Ordering::Relaxed) == id {
+                LAZY_STARTED.store(0, Ordering::Relaxed);
+            }
+            OleUninitialize();
             return;
         }
         let Some(host) = host::Host::create() else {
+            if LAZY_STARTED.load(Ordering::Relaxed) == id {
+                LAZY_STARTED.store(0, Ordering::Relaxed);
+            }
             OleUninitialize();
             return;
         };
