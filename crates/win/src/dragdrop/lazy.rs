@@ -214,6 +214,7 @@ mod tests {
             assert_eq!(w(i), *want, "cFileName[{i}]");
         }
         // 2件目はフォルダ属性
+        let second = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE;
         let attrs_off = second + 4 + 16 + 8 + 8;
         let attrs = u32::from_le_bytes([
             bytes[attrs_off],
