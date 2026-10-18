@@ -166,6 +166,12 @@ pub(crate) fn set_waiting_for_test(id: u64, total: u64) {
     WAITING_SEEN_MS.store(now, Ordering::Relaxed);
 }
 
+/// 引き継げなかったときに出す本文。**元のファイルは Windows 側に残っている**ことを
+/// 必ず伝える(受け取れなかっただけで、掴んだ元が消えたわけではない)
+pub fn receive_failed_notice() -> &'static str {
+    "ファイルを引き継げませんでした(予告と件数が一致しません)。Windows 側のファイルはそのまま残っています。もう一度掴んでください"
+}
+
 pub fn receive(id: u64, paths: Vec<std::path::PathBuf>) {
     let result = INCOMING
         .lock()
@@ -178,9 +184,13 @@ pub fn receive(id: u64, paths: Vec<std::path::PathBuf>) {
             send_msg(&Msg::DragReady { id });
         }
         Err(paths) => {
+            // 受け取ったが予告と結び付かない(件数不一致・予告なし・消化済み)。
+            // **無言にしない**: この向きはユーザーが Mac を見ているので、
+            // 黙って消えると「掴んだファイルが消えた」と見える
             delete_received(paths);
             cancel(id);
             send_msg(&Msg::DragCancel { id });
+            notify("Knit", receive_failed_notice());
         }
     }
 }
@@ -755,5 +765,42 @@ mod waiting_tests {
         cancel(8);
         assert!(waiting_for_data().is_some(), "別IDでは消さない");
         cancel(7);
+    }
+}
+
+#[cfg(test)]
+mod receive_failed_tests {
+    use super::*;
+
+    /// 引き継げなかったときの本文は「元は残っている」ことと次の一手を含む
+    #[test]
+    fn the_failure_notice_reassures_and_guides() {
+        let n = receive_failed_notice();
+        assert!(n.contains("引き継げませんでした"), "{n}");
+        assert!(n.contains("Windows 側のファイルはそのまま残っています"), "元の所在: {n}");
+        assert!(n.contains("もう一度掴んでください"), "次の一手: {n}");
+        // 成功語を入れない(引き継げていないのに成功を装わない)
+        for w in knit_common::notice::PLACEMENT_CLAIMS {
+            assert!(!n.contains(w), "「{w}」を入れない: {n}");
+        }
+    }
+
+    /// 配線: 予告と一致しない受信は「引き継げない」経路に入る(通知の前提)
+    #[test]
+    fn a_mismatched_receive_cannot_be_carried() {
+        let _g = shared_state_lock();
+        assert!(
+            INCOMING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .offer(55, 2, 0.0),
+            "予告を作れる"
+        );
+        let got = INCOMING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receive(55, vec![std::path::PathBuf::from("/tmp/only-one")]);
+        assert!(got.is_err(), "件数が足りない受信は引き継がない(=通知の経路)");
+        let _ = INCOMING.lock().unwrap_or_else(|e| e.into_inner()).reset();
     }
 }
