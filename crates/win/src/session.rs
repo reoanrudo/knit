@@ -292,6 +292,24 @@ pub(crate) fn session(
                 *RX_DRAG.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total));
                 RX_BYTES.store(0, Ordering::Relaxed);
             }
+            // 遅延提供(版 17)の目録。**データの到着を待たずに**ドラッグを開始する
+            // (既定は無効。KNIT_LAZY=1 のときだけ働く)
+            Msg::Manifest { id, count, files, .. } => {
+                if dragdrop::lazy::lazy_enabled() {
+                    if files.len() != count {
+                        println!(
+                            "[drag] 遅延提供: 目録 {} 件が予告 {} 件と不一致のため開始しません",
+                            files.len(),
+                            count
+                        );
+                    } else {
+                        // 受理の行(DragAccept)は送らない: 現行の Mac は目録の後に
+                        // 無条件でデータを流すため、受理を待つ実装になっていない
+                        // (待つ実装が入ったら、ここで accept を返してから流す)
+                        dragdrop::start_lazy(id, &crate::receive_dir(), files);
+                    }
+                }
+            }
             Msg::DragAccept { id } => dragdrop::edge::accept(id),
             Msg::DragReady { id } => dragdrop::edge::ready(id),
             Msg::DragCancel { id } | Msg::DragDone { id, .. } => {
