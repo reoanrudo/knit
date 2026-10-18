@@ -917,20 +917,17 @@
                         } else {
                             let digest: [u8; 32] = hasher.finalize().into();
                             let hash_ok = body.len() != 32 || digest.as_slice() == body;
-                            // 更新日時の復元。**Windows では書き込みハンドルを閉じる時点で
-                            // 更新日時が上書きされる**ため、閉じる前の fd へ設定しても残らない
-                            // (CI の windows-latest で実測: 宣言値 1700000000 が現在時刻になった)。
-                            // そのため Windows は閉じた後にパス経由で設定し、macOS/Linux は
+                            // 更新日時の復元。**Windows では「書き込みハンドルを閉じる時点」と
+                            // 「未信頼マーク(Zone.Identifier の ADS)の書き込み」で更新日時が
+                            // 動く**ため、閉じる前や公開前に設定しても残らない(CI の
+                            // windows-latest で実測: 宣言値 1700000000 が現在時刻になった)。
+                            // Windows は公開が全部終わってから最終パスへ設定し、macOS/Linux は
                             // 閉じても変わらないので fd へ設定して開き直しの往復を省く(ループ2の計測)
                             #[cfg(not(windows))]
                             if hash_ok {
                                 crate::files::set_mtime_file(&f, mtime);
                             }
                             drop(f); // リネームの前に閉じる
-                            #[cfg(windows)]
-                            if hash_ok {
-                                crate::files::set_mtime(&tmp, mtime);
-                            }
                             if !hash_ok {
                                 let _ = std::fs::remove_file(&tmp);
                                 self.paths.pop();
@@ -940,6 +937,10 @@
                                 let desired = self.paths.last().cloned();
                                 match desired.and_then(|d| crate::files::publish(&tmp, &d).ok()) {
                                     Some(actual) => {
+                                        // Windows は ADS の書き込みと rename で更新日時が動くため、
+                                        // 公開が終わった最終パスへ設定する(ここが最後の書き込み)
+                                        #[cfg(windows)]
+                                        crate::files::set_mtime(&actual, mtime);
                                         // 同名衝突で「名前 (n)」へずれたら通知用に数える
                                         if is_renamed(&rel, &actual) {
                                             self.renamed += 1;
