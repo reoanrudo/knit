@@ -8,22 +8,41 @@ static INCOMING: Mutex<Incoming> = Mutex::new(Incoming::new());
 /// 手元へ進捗を出すため(Win→Mac は相手がドラッグを持っており、こちらは到着まで待つ)
 static WAITING: Mutex<Option<(u64, u64, u64)>> = Mutex::new(None);
 
-/// 無音のまま待ち続ける上限。フレーム段階で拒否されると Files イベントが来ず、
-/// キャンセルも切断も来ないまま進捗だけが残り得る(検証役の指摘 + 経路の分析)
-const WAITING_EXPIRE_MS: u64 = 30_000;
 
-/// 待ちが生きているか(純関数)。期限を過ぎたら「無かったこと」にする
-fn waiting_alive(at_ms: u64, now: u64) -> bool {
-    at_ms != 0 && now.saturating_sub(at_ms) <= WAITING_EXPIRE_MS
+/// **停滞**の上限。進捗が来なくなってからこの時間で表示を打ち切る
+/// (フレーム段階で拒否されると Files イベントもキャンセルも来ず、進捗だけが残り得る)。
+/// 「offer からの経過」で切ると、正当に長い転送(1GB=34秒・10GB=5分41秒)の表示まで
+/// 消えてしまうため、**最後に進捗を見た時刻**を基準にする
+const WAITING_STALL_MS: u64 = 15_000;
+/// どれだけ進捗が続いても、この時間を超えたら表示を打ち切る(異常の保険)
+const WAITING_HARD_MS: u64 = 15 * 60 * 1000;
+/// 最後に進捗を見た時刻(offer 受理時と、受信のたびに更新)
+static WAITING_SEEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 受信の進捗があったことを伝える(受信フックから)。表示の期限を延ばす
+pub fn note_progress_seen() {
+    if WAITING_SEEN_MS.load(Ordering::Relaxed) != 0 {
+        WAITING_SEEN_MS.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+/// 待ちが生きているか(純関数)。**停滞**か**全体の上限**で切る
+fn waiting_alive(seen_ms: u64, started_ms: u64, now: u64) -> bool {
+    if seen_ms == 0 {
+        return false; // 未設定
+    }
+    now.saturating_sub(seen_ms) <= WAITING_STALL_MS && now.saturating_sub(started_ms) <= WAITING_HARD_MS
 }
 
 /// 受け取り待ちか(データ到着を待っている最中だけ Some)。期限切れは消して None
 pub fn waiting_for_data() -> Option<(u64, u64)> {
     let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((id, total, at)) = *g {
-        if !waiting_alive(at, now_ms()) {
-            eprintln!("[drag] 受け取り待ちが期限切れ({id})");
+    if let Some((id, total, started)) = *g {
+        let seen = WAITING_SEEN_MS.load(Ordering::Relaxed);
+        if !waiting_alive(seen, started, now_ms()) {
+            eprintln!("[drag] 受け取り待ちが停滞したため表示を打ち切ります({id})");
             *g = None;
+            WAITING_SEEN_MS.store(0, Ordering::Relaxed);
             return None;
         }
         return Some((id, total));
@@ -35,6 +54,7 @@ fn clear_waiting(id: u64) {
     let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
     if g.as_ref().is_some_and(|(cur, _, _)| *cur == id) {
         *g = None;
+        WAITING_SEEN_MS.store(0, Ordering::Relaxed);
     }
 }
 static COMMIT: Mutex<Option<u64>> = Mutex::new(None);
@@ -108,7 +128,9 @@ pub fn offer(id: u64, count: usize, total: u64, position: f64) {
             .unwrap_or_else(|e| e.into_inner())
             .offer(id, count, position);
     if accepted {
-        *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total, now_ms()));
+        let now = now_ms();
+        *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total, now));
+        WAITING_SEEN_MS.store(now, Ordering::Relaxed);
         // 前のバッチの受信量で描かないよう、進捗もここで 0 に戻す
         crate::files::note_rx_begin();
     }
@@ -126,7 +148,10 @@ pub fn offer(id: u64, count: usize, total: u64, position: f64) {
 /// テスト専用: 待ち状態を差し込む(offer は接続状態など多くの前提を要するため)
 #[cfg(test)]
 pub(crate) fn set_waiting_for_test(id: u64, total: u64) {
-    *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total, now_ms()));
+    let now = now_ms();
+    *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total, now));
+    // 生きている待ちを模す(期限のテストは、この後に時刻を古くする)
+    WAITING_SEEN_MS.store(now, Ordering::Relaxed);
 }
 
 pub fn receive(id: u64, paths: Vec<std::path::PathBuf>) {
@@ -167,6 +192,7 @@ pub fn cancel(id: u64) {
 
 pub fn reset() {
     *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    WAITING_SEEN_MS.store(0, Ordering::Relaxed);
     *COMMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     delete_received(INCOMING.lock().unwrap_or_else(|e| e.into_inner()).reset());
     // 接続が切れたら進行中のセッションも終わらせ、境界切替の抑制を解く。
@@ -616,17 +642,66 @@ mod tests {
 mod waiting_tests {
     use super::*;
 
-    /// 待ちが期限で消える(相手がハングしても進捗が残り続けない)
+    /// 待ち状態はプロセス共有の static。テストは直列に走らせる
+    static WAIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        WAIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// **停滞**で消える(相手がハングしても進捗が残り続けない)。
+    /// 一方、進捗が続いている間は長い転送でも切れない(1GB=34秒・10GB=5分41秒 を想定)
     #[test]
-    fn a_silent_wait_expires() {
-        assert!(waiting_alive(1_000, 1_000 + WAITING_EXPIRE_MS), "期限内は生きている");
-        assert!(!waiting_alive(1_000, 1_000 + WAITING_EXPIRE_MS + 1), "過ぎたら消える");
-        assert!(!waiting_alive(0, 99_999), "未設定は生きていない");
+    fn a_silent_wait_expires_but_progress_keeps_it_alive() {
+        let _g = lock();
+        let start = 1_000;
+        assert!(waiting_alive(start, start, start), "始まったばかりは生きている");
+        assert!(
+            waiting_alive(start + 300_000, start, start + 300_000),
+            "進捗が続く限り 5 分でも生きている(長い転送を切らない)"
+        );
+        assert!(
+            !waiting_alive(start, start, start + WAITING_STALL_MS + 1),
+            "停滞したら消える"
+        );
+        assert!(
+            !waiting_alive(start + WAITING_HARD_MS + 1, start, start + WAITING_HARD_MS + 1),
+            "全体の上限を超えたら消える"
+        );
+        assert!(!waiting_alive(0, 0, 99_999), "未設定は生きていない");
+    }
+
+    /// 配線: 期限切れの待ちは `waiting_for_data` が消す(検証役の変異 m4)
+    #[test]
+    fn an_expired_wait_is_cleared_by_the_reader() {
+        let _g = lock();
+        set_waiting_for_test(1, 10);
+        WAITING_SEEN_MS.store(now_ms().saturating_sub(WAITING_STALL_MS + 1_000), Ordering::Relaxed);
+        assert!(waiting_for_data().is_none(), "停滞した待ちは見せない");
+        assert!(waiting_for_data().is_none(), "消えたままになる");
+    }
+
+    /// 配線: 到着(`receive`)で待ちが消える(検証役の変異 m5)。
+    /// 予告と同じIDで件数一致のファイルが届く = 実際の到着経路
+    #[test]
+    fn receiving_clears_the_waiting_state() {
+        let _g = lock();
+        assert!(
+            INCOMING
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .offer(99, 1, 0.0),
+            "予告を作れる"
+        );
+        set_waiting_for_test(99, 10);
+        assert!(waiting_for_data().is_some());
+        receive(99, vec![std::path::PathBuf::from("/tmp/knit-arrived")]);
+        assert!(waiting_for_data().is_none(), "到着で待ちが終わる");
     }
 
     /// 中止で待ちが消える(検証役の変異 m6 が指していた経路)
     #[test]
     fn cancelling_clears_the_waiting_state() {
+        let _g = lock();
         set_waiting_for_test(4242, 1024);
         assert!(waiting_for_data().is_some());
         cancel(4242);
@@ -636,6 +711,7 @@ mod waiting_tests {
     /// 別のIDの中止では消えない(取り違え防止)
     #[test]
     fn cancelling_another_id_keeps_the_waiting_state() {
+        let _g = lock();
         set_waiting_for_test(7, 1024);
         cancel(8);
         assert!(waiting_for_data().is_some(), "別IDでは消さない");
