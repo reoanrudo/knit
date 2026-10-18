@@ -1396,6 +1396,70 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
 | ml3' 流している最中の受理を受け付ける | **赤**(`an_accept_arriving_while_streaming_is_ignored`)✓ 解消 |
 | ml5a' 受理直後の `completed` を拒否する | **赤**(`completion_can_arrive_right_after_acceptance`)✓ 解消 |
 
+## 6.7 第5ラウンド: 指摘5件の修正版(`121b7b1` / マージ `5567a5f`)/ 判定: **合格**
+
+検証日: 2026-10-18 / rev **`5567a5f`**(`121b7b1` のマージ)/ `git status --porcelain` 空 /
+`cargo build` exit 0(**警告行 10 = 基準同数**)/ `cargo test` = **598 passed / 0 failed / 4 ignored, 11 binaries**。
+
+文言: `diff multiset_dbccefc multiset_121b7b1` は**意図した修正のみ** ✓
+(`…保存されています({reason})。{next}` への分割 / `相手が受け取らなかったため(…)、相手の受信フォルダに入りました`
+→ `相手が受け取らなかったため` / 新しい次の一手 `置ける場所(フォルダやデスクトップ)の上で離すと置けます` /
+テストメッセージ)。`H_multiset` = `19ce108b…3995d4`。
+
+**1. 受理のタイミング(前回の欠陥1)= 塞がった** ✓
+- `session.rs` の Manifest 腕から accept 送信を削除 ✓。`start_lazy` のスレッド内で
+  (a) `OleInitialize` → (b) **押下確認** → (c) `Host::create` → (d) `DRAG_THREAD` 設定 →
+  **(e) accept 送信** → `DoDragDrop` の順になり、「実際に開始できると確認できた後」だけ accept を返す ✓。
+  3つの失敗経路(OLE 初期化・Host・押下なし)はすべて accept を送らずに return する ✓。
+- 帰結を Mac 側の現物で確認: フリック離し(押下なし)では `lazy_accepted(id)` が **false のまま** ✓ →
+  `early = DRAG_RELEASED_EARLY.load() && !accepted`(`files.rs:566-575`)が **true** →
+  `placed_or_saved(true)` = **`SavedOnly{ReleasedEarly}`**(「保存のみ」)✓
+  = **遅延提供なしと同じ正しい案内に戻った** ✓(accept 済みだが結果が来ない場合だけ慎重な `Placed` に落ちる ✓)。
+
+**2. 案内文(前回の欠陥3)= 直った** ✓
+- `(reason, next)` を理由ごとに分離 ✓。`PeerDidNotPlace` の次の一手は
+  「置ける場所(フォルダやデスクトップ)の上で離すと置けます」= **「待てば直る」案内が消えた** ✓。
+- 受信フォルダの記述は1回だけ ✓(`n.body.matches("受信フォルダ").count() == 1` をテストで固定 ✓)。
+
+**3. `receive_dir()` の一本化** ✓: `tray.rs:911` が `crate::receive_dir()` を使用 ✓(自前組み立てを削除 ✓)。
+
+**4. `needs_attention`/`recovery_for(PlacedOnScreen)`** ✓: 両テストに assert が入り、
+**前回生存した変異 mn3 が赤になった**(下の表 ✓)+ 再送(Resend)を出す変異 mn4' も赤 ✓。
+
+**5. 二重開始(前回の低確率競合)** ✓: `start_lazy` の先頭に `DRAG_THREAD != 0` ガード ✓。
+`DRAG_THREAD` は通常の start(`dragdrop.rs:707`)と Win→Mac の帯(`edge.rs:690`)も立てるため、
+**「claim が先に処理されて通常ドラッグが走り、後から Manifest が届く」順序でも二重にならない** ✓。
+ガードは `LAZY_STARTED` を立てる**前**に return するので、通常経路の claim 判定も壊さない ✓。
+
+**6. その他** ✓: `hglobal_from` は `GlobalLock` 失敗時に `GlobalFree`(`lazy_com.rs:715`)✓ /
+`le_skip` は末尾超過で **S_FALSE**(`saturating_add` で桁溢れも回避 ✓)。
+
+**変異テスト(私の手で再実行。base = knit-common 294 passed、worktree は撤去済み)**
+
+| 変異 | 結果 |
+|---|---|
+| **mn3' `PlacedOnScreen` を「要注意」に戻す**(前回生存) | **赤**(`only_failures_ask_for_attention`)✓ = 解消 |
+| mn4' `PlacedOnScreen` に再送(Resend)を出す | **赤**(`retryable_failure_offers_resend`)✓ |
+| mo1 `PeerDidNotPlace` に「待ってから離す」を混ぜる | **赤**(`saved_only_never_uses_success_words`)✓ |
+| mo2 `PeerDidNotPlace` の理由に「受信フォルダに入りました」を戻す | **赤**(同上)✓ |
+| mo3 2つの理由の次の一手を入れ替える | **赤**(同上)✓ |
+
+- **Windows 専用部分(受理のタイミング・`DRAG_THREAD` ガード)は読解のみ** ✓:
+  `knit-win` は macOS ではビルドできず、この配線に自動テストも無いため、**CI(windows-latest)が唯一の
+  実行検証**である ✓。「accept を Manifest 腕へ戻す」変異はローカルでは検出できない(テストが存在しない)✓
+  = 前回の指摘どおり、この層は**読解が唯一の防御線**であり続ける ✓。
+
+**残る観察(いずれも軽微)**
+
+- 速い転送では、accept が届く前に Mac の送信が完了すると `accepted=false` となり、W4 の事実を待たずに
+  慎重な `Placed` 本文(「転送完了。相手側で受け取れます」)になる ✓。嘘ではないが「置けました」は出ない
+  (転送が accept の往復より遅い場合だけ事実で言い切れる)✓。
+- 1.2 秒待つ間も `TxGuard` が生きるため `FILE_TX_BUSY` と転送中表示が最大 1.2 秒残る ✓(前回から継続)。
+- 新しい assert(理由・次の一手・受信フォルダ1回)は `saved_only_never_uses_success_words` という名前の
+  テストに入っており、名前と内容がずれてきている ✓(assert メッセージで特定はできる ✓ 軽微)。
+- `DRAG_THREAD.store` の後に `DoDragDrop` までで panic すると `DRAG_THREAD` が残る
+  (既存の通常 start と同じ構造 ✓ 軽微)。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
 
 | 増分 | 依頼 | 判定 | 備考 |
@@ -1403,9 +1467,9 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
 | W1-glue(COM) | 受領(58240f1) | **合格**(読解+MSDN のみ) | vtbl 3式・STATSTG 80・STGMEDIUM 24・FormatEtc 32(offsets 正)・参照カウント・HGLOBAL・st_read を確認。軽微4点 |
 | W1-glue 防御+ABI | 受領(e6b4035・dbccefc) | **合格** | 押下確認・フラグ漏れ・ABI テスト ✓。`e6b4035` の FormatEtc=24 は誤り(実測 32)→ `dbccefc` で修正 ✓ |
 | W1-wire-mac | 受領(d07164a) | **合格** | move 前に目録作成 ✓ 版ゲート ✓ 中身を読まない ✓ |
-| W1-wire-win | 受領(05a5cd7) | **条件付き** | 二重開始の防止 ✓ / `resolve_received` 有界・安全 ✓。**DragAccept が開始可否より先**(欠陥1)/ `tray.rs` の一本化漏れ(欠陥2)/ Manifest×claim の低確率競合 |
+| W1-wire-win | 受領(05a5cd7)→ **修正版(121b7b1)** | **合格** | 欠陥1(accept のタイミング)✓・欠陥2(tray の一本化)✓・低確率競合(DRAG_THREAD ガード)✓ すべて解消。二重開始の防止 ✓ / `resolve_received` 有界・安全 ✓ |
 | 能力と受理 | 受領(5b84b02) | **合格** | 受理の事実で反転 ✓(mf1/mf2 赤)/ bit63 ガード ✓ / リセット ✓ |
-| W4 | 受領(ef9c43b) | **条件付き** | ロック規律 ✓ 推測しない ✓ 成功語なし ✓。**`PeerDidNotPlace` の文面**(欠陥3)/ `PlacedOnScreen` の要注意判定が未テスト(欠陥4)|
+| W4 | 受領(ef9c43b)→ **修正版(121b7b1)** | **合格** | ロック規律 ✓ 推測しない ✓ 成功語なし ✓。`PeerDidNotPlace` の文面 ✓(mo1/mo2/mo3 赤)/ `PlacedOnScreen` の要注意判定 ✓(mn3'/mn4' 赤)|
 | I8 残り2点 | 受領(652afc4) | **合格** | 前ラウンドの残指摘2件が変異で赤 ✓ |
 | その他 | I1〜I8・mtime・pairing・W1-core | 合格 | §6.5 の表を参照 |
 
