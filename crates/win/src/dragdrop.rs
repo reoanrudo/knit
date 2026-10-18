@@ -81,6 +81,32 @@ pub fn lazy_started(id: u64) -> bool {
     id != 0 && LAZY_STARTED.load(Ordering::Relaxed) == id
 }
 
+/// 遅延提供を始めてよいか(純関数)。判定を1箇所に集めて **CI で守れる**ようにする
+/// (二重開始のガードを外す退行を、Windows のテストで検出できる)
+fn lazy_start_allowed(enabled: bool, drag_running: bool, count: usize) -> bool {
+    enabled && !drag_running && count > 0
+}
+
+/// `DRAG_THREAD` を必ず下ろす(store と `DoDragDrop` の間で panic しても残さない。
+/// 残ると以後の遅延提供が全部スキップされる)
+struct DragThreadGuard;
+
+impl DragThreadGuard {
+    fn arm() -> Self {
+        DRAG_THREAD.store(
+            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            Ordering::Relaxed,
+        );
+        DragThreadGuard
+    }
+}
+
+impl Drop for DragThreadGuard {
+    fn drop(&mut self) {
+        DRAG_THREAD.store(0, Ordering::Relaxed);
+    }
+}
+
 /// 予告逆転・押下遅着を吸収する待ち窓(両者で同じ長さが意図)。
 /// start の押下待ちと win_on_bulk の await_claim がこの窓で対になる
 pub(crate) const CLAIM_WAIT_MS: u64 = 500;
@@ -564,18 +590,12 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 ///
 /// 呼び出し元は受信ループ(`Msg::Manifest` を受けたとき)。`KNIT_LAZY=1` のときだけ働く
 pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto::ManifestEntry>) {
-    if !lazy::lazy_enabled() {
-        return; // 既定は無効(現行方式のまま)
-    }
-    if files.is_empty() {
-        eprintln!("[drag] 遅延提供: 目録が空です");
-        return;
-    }
-    // 既に通常のドラッグ(受信完了後に開始したもの)が走っているなら開始しない。
-    // Manifest は本線、claim は大容量経路で届くため、順序が入れ替わると
-    // OLE ドラッグが二重に立ち得る(低確率だが起きると厄介)
-    if DRAG_THREAD.load(Ordering::Relaxed) != 0 {
-        println!("[drag] 遅延提供: 既にドラッグ中のため開始しません");
+    let drag_running = DRAG_THREAD.load(Ordering::Relaxed) != 0;
+    if !lazy_start_allowed(lazy::lazy_enabled(), drag_running, files.len()) {
+        // 既定は無効 / 既にドラッグ中 / 目録が空 のいずれか
+        if drag_running {
+            println!("[drag] 遅延提供: 既にドラッグ中のため開始しません");
+        }
         return;
     }
     let descriptor = lazy::descriptor_bytes(&files);
@@ -1090,5 +1110,22 @@ mod tests {
                 "原本を保持する"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lazy_start_tests {
+    use super::*;
+
+    /// 遅延提供を始めてよい条件(二重開始のガードを CI で守る)
+    #[test]
+    fn lazy_start_needs_enabled_no_drag_and_a_non_empty_manifest() {
+        assert!(lazy_start_allowed(true, false, 3), "有効・非ドラッグ中・1件以上");
+        assert!(!lazy_start_allowed(false, false, 3), "既定(無効)では始めない");
+        assert!(
+            !lazy_start_allowed(true, true, 3),
+            "既にドラッグ中なら二重に始めない"
+        );
+        assert!(!lazy_start_allowed(true, false, 0), "目録が空では始めない");
     }
 }
