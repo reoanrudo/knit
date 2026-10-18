@@ -14,7 +14,11 @@
     ///     いずれも旧側は未知の行・未知のフィールドとして無視するため MIN_VERSION は据え置き
     /// 16: ロック解除の連動。Mac のロック解除に合わせて Windows へ Unlock を送る。
     ///     旧側は未知の行として無視するため MIN_VERSION は据え置き(版ゲートで送らない)
-    pub const VERSION: u32 = 16;
+    /// 17: 掴みドラッグの遅延提供(drag.lazy)。ドロップを先に受理し、転送は後から流す。
+    ///     大容量(実測: Wi-Fi 実効 30MB/s で 1GB=34秒・10GB=5分41秒)で
+    ///     「渡し終わるまで押し続ける」問題を消すための能力。旧側は受理の行を知らないので
+    ///     **版ゲートで送らない**(現行方式へ自動フォールバック)
+    pub const VERSION: u32 = 17;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
@@ -36,6 +40,9 @@
         pub empty_dirs: bool,
         /// ロック解除の連動(Unlock の受信)ができる(版 16 以降)
         pub unlock: bool,
+        /// 掴みドラッグの遅延提供(drag.lazy)ができる(版 17 以降)。
+        /// ドロップを先に受理してから転送を流せる=押し続けなくてよい
+        pub lazy: bool,
     }
 
     pub fn peer_features(ver: u32) -> PeerFeatures {
@@ -43,6 +50,7 @@
             dirs: ver >= 14,
             empty_dirs: ver >= 15,
             unlock: ver >= 16,
+            lazy: ver >= 17,
         }
     }
 
@@ -630,5 +638,18 @@ mod tests {
         // 旧ゲートの回帰(版の境界を変えていないことの保証)
         assert!(!peer_features(13).dirs && peer_features(14).dirs);
         assert!(!peer_features(14).empty_dirs && peer_features(15).empty_dirs);
+    }
+
+    /// 版 17 の遅延提供(drag.lazy)。**旧版には送らない**(受理の行を知らないため)
+    #[test]
+    fn peer_features_gate_lazy_from_version_17() {
+        assert!(!peer_features(16).lazy, "版 16 は遅延提供に非対応");
+        assert!(peer_features(17).lazy, "版 17 は対応");
+        assert!(peer_features(u32::MAX).lazy, "将来版も対応扱い");
+        assert_eq!(VERSION, 17, "自分の版");
+        assert_eq!(MIN_VERSION, 11, "据え置き(旧版とも通信できる)");
+        // 遅延提供は他の能力と独立(片方だけ実装した版を作らない)
+        let f = peer_features(17);
+        assert!(f.dirs && f.empty_dirs && f.unlock && f.lazy);
     }
 }
