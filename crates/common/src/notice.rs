@@ -127,19 +127,23 @@ pub fn compose_notice(o: &DeliveryOutcome) -> Notice {
             kind: NoticeKind::Suppressible,
         },
         DeliveryResult::SavedOnly { why } => {
-            // 成功語を使わない。「どこに入るか」「なぜか」「次にどうするか」を必ず書く
-            let why = match why {
-                SaveWhy::ReleasedEarly => {
-                    "渡し終わる前に離したため、相手はドラッグを始められませんでした"
-                }
-                SaveWhy::PeerDidNotPlace => {
-                    "相手が受け取らなかったため(置き場所が無い・取消など)、相手の受信フォルダに入りました"
-                }
+            // 成功語を使わない。「どこに入るか」「なぜか」「次にどうするか」を必ず書く。
+            // **次の一手は理由ごとに違う**: 「待てば置ける」は ReleasedEarly にだけ当てはまり、
+            // 相手が受け取らなかった場合は待っても直らない(置ける場所で離す必要がある)
+            let (reason, next) = match why {
+                SaveWhy::ReleasedEarly => (
+                    "渡し終わる前に離したため、相手はドラッグを始められませんでした",
+                    "もう一度掴んで、渡し終わるまで待ってから離すと相手の画面に置けます",
+                ),
+                SaveWhy::PeerDidNotPlace => (
+                    "相手が受け取らなかったため",
+                    "置ける場所(フォルダやデスクトップ)の上で離すと置けます",
+                ),
             };
             Notice {
                 title: TITLE.to_string(),
                 body: format!(
-                    "{count} 件は {peer} の受信フォルダに保存されています({why})。もう一度掴んで、渡し終わるまで待ってから離すと相手の画面に置けます"
+                    "{count} 件は {peer} の受信フォルダに保存されています({reason})。{next}"
                 ),
                 kind: NoticeKind::Always,
             }
@@ -218,6 +222,11 @@ mod recovery_tests {
     #[test]
     fn only_failures_ask_for_attention() {
         assert!(!needs_attention(&DeliveryResult::Placed), "成功はメニューに出さない");
+        // 相手が置けたと確認できた場合も成功(メニューに「直前: …置きました」を出さない)
+        assert!(
+            !needs_attention(&DeliveryResult::PlacedOnScreen),
+            "確認済みの成功もメニューに出さない"
+        );
         assert!(needs_attention(&DeliveryResult::SavedOnly {
             why: SaveWhy::ReleasedEarly
         }));
@@ -237,6 +246,11 @@ mod recovery_tests {
             Recovery::SavedOnPeer
         );
         assert_eq!(recovery_for(&DeliveryResult::Placed), Recovery::None);
+        assert_eq!(
+            recovery_for(&DeliveryResult::PlacedOnScreen),
+            Recovery::None,
+            "確認済みの成功に再送は出さない"
+        );
     }
 }
 
@@ -308,13 +322,19 @@ mod tests {
             }
             // (a) 実体の場所 (b) 理由 (c) 次の一手 を必ず含む
             assert!(n.body.contains("受信フォルダに保存されています"), "場所: {}", n.body);
-            assert!(n.body.contains("もう一度掴んで"), "次の一手: {}", n.body);
-            // 理由は理由ごとに読める(どの理由でも「保存のみ」であることは言い切る)
-            let expected = match why {
-                SaveWhy::ReleasedEarly => "離したため",
-                SaveWhy::PeerDidNotPlace => "受け取らなかった",
+            // 理由と次の一手は理由ごとに違う(受信フォルダの記述は二重にしない)
+            let (reason, next) = match why {
+                SaveWhy::ReleasedEarly => ("離したため", "渡し終わるまで待ってから離す"),
+                SaveWhy::PeerDidNotPlace => ("受け取らなかった", "置ける場所"),
             };
-            assert!(n.body.contains(expected), "理由({why:?}): {}", n.body);
+            assert!(n.body.contains(reason), "理由({why:?}): {}", n.body);
+            assert!(n.body.contains(next), "次の一手({why:?}): {}", n.body);
+            assert_eq!(
+                n.body.matches("受信フォルダ").count(),
+                1,
+                "受信フォルダの説明は1回だけ: {}",
+                n.body
+            );
         }
     }
 

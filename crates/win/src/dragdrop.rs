@@ -571,6 +571,13 @@ pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto:
         eprintln!("[drag] 遅延提供: 目録が空です");
         return;
     }
+    // 既に通常のドラッグ(受信完了後に開始したもの)が走っているなら開始しない。
+    // Manifest は本線、claim は大容量経路で届くため、順序が入れ替わると
+    // OLE ドラッグが二重に立ち得る(低確率だが起きると厄介)
+    if DRAG_THREAD.load(Ordering::Relaxed) != 0 {
+        println!("[drag] 遅延提供: 既にドラッグ中のため開始しません");
+        return;
+    }
     let descriptor = lazy::descriptor_bytes(&files);
     let pairs: Vec<(String, u64, u8)> = files
         .iter()
@@ -616,6 +623,18 @@ pub fn start_lazy(id: u64, dir: &std::path::Path, files: Vec<knit_common::proto:
             windows_sys::Win32::System::Threading::GetCurrentThreadId(),
             Ordering::Relaxed,
         );
+        // **ここで受理を返す**: 押下が続いており、OLE と捕捉ウィンドウも用意できた =
+        // 「実際にドラッグを開始できる」と確認できた時点
+        if let Some(tx) = crate::state::WTX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = tx.send(knit_common::proto::encode(&knit_common::proto::Msg::DragAccept {
+                id,
+            }));
+            println!("[drag] 遅延提供: 受理を返しました(id {id})");
+        }
         let ds = lazy_com::LazySource::new(&dir, descriptor, pairs);
         let ds = Box::into_raw(ds) as *mut c_void;
         let src = Box::into_raw(Box::new(DropSource {

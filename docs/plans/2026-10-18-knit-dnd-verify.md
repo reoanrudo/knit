@@ -1201,6 +1201,214 @@ W4 の `DragDone{copied}` を受けてから「置けました」と言う。**�
 - **c49f95d / I6 / I8/I8b: 条件付き → 合格**(指摘はすべて解消 ✓。I8 には上記の軽微な残り2点 ✓)。
 - この修正版で、私が第3ラウンドで出した指摘は**すべて解消**した ✓。
 
+## 6.6 第4ラウンド: W1系とW4(未検証6件+α)/ 検証中に HEAD が動いた
+
+**検証対象(マージ除く)**: `58240f1`(W1-glue COM)→ `3d820f5`(allow)→ `d07164a`(mac 目録)→
+`05a5cd7`(win 配線)→ `5b84b02`(能力と受理の分離)→ `ef9c43b`(W4)→ `e6b4035`(3つの防御)→
+`652afc4`(I8 の残り2点)→ `dbccefc`(ABI 期待値の修正)。
+
+**アンカーと環境**:
+- C1 時点は `defa1a7`(クリーン)。**検証中に `e6b4035` と `dbccefc` が着地した**ため、
+  途中で読んだ `lazy_com.rs` は `e6b4035` の状態(ABI テストが **24** を assert)だった。
+  これは後述の「CI が検出した誤り」と一致する ✓。**教訓: 検証は常にコミットで固定する**
+  (§1.4 のコミット指定と同じ理由。作業ツリーを読むと、実装中の状態を「その増分」と誤認する)。
+- 最終確認は **`dbccefc`**: `cargo build` exit 0(**警告行 10 = 基準同数**)/
+  `cargo test` = **598 passed / 0 failed / 4 ignored, 11 binaries**。
+- 文言: `dbccefc` の `H_multiset` = `5343a6a4…96a850`(= ラウンド開始時と同一)。
+  新機能の文言(`[drag] mac->win manifest …` / `{count} 件を {peer} の画面に置きました(ドロップできました)` /
+  `相手が受け取らなかったため(置き場所が無い・取消など)、相手の受信フォルダに入りました` 等)以外に
+  **意図しない変更は無い** ✓。
+
+### フレーク2件の切り分け(製品コードの問題ではない)
+
+私の最初の `cargo test` は **exit 101 / failed=2** だった:
+`android::tests::clipboard_image_returns_fast_when_device_is_offline`(adb_calls=0)と
+`updater::tests::apply_rolls_back_when_the_new_version_does_not_stay_running`(`assertion failed: !ok`)。
+
+- **単体で各3回 + 2件同時 = すべて緑** ✓ / **干渉なしの全体 = 598 passed / 0 failed** ✓
+- `android.rs`・`updater.rs` は今ラウンドで**未変更**(`git diff --stat e5fb2f1..HEAD --` が空)✓
+  → **製品コードの問題ではない** ✓(リードの同時実行との衝突 ✓)
+- adb 側の原因はコードで確認: `android.rs:1419` の固定ディレクトリ(`temp_dir()/knit-android-stub`)と
+  固定 serial(`stub-serial`、`:1430`)を2つの `cargo test` が共有するため ✓(リードの説明と一致)
+- **updater 側は別の原因**(adb の説明では説明できない): 一時 root は PID を含むので衝突しない(`updater.rs:495`)✓
+  → 「新しい版が動き続けているか」の判定が負荷・タイミング依存か、`/usr/bin/pkill -f -- <root>`(:521-524)の
+  プロセス一致に依存しているためと推測される(**推測であることを明記**)✓
+- 推奨: この2件を直列化する(`--test-threads=1`)か、プロセス名一致に依存しない判定にする ✓
+
+### 58240f1: W1-glue(COM 面)/ 判定: **合格**(読解+MSDN 照合のみ。実機なし)
+
+**vtbl と構造体(一次資料・実行の両方で確認)**
+
+| 対象 | 検証 |
+|---|---|
+| `IStream` の並び(14) | qi, add_ref, release, read, write, seek, set_size, copy_to, commit, revert, lock_region, unlock_region, stat, clone = **MSDN の宣言順と一致** ✓ 各署名も `Read(void*,void*,ULONG,ULONG*)` / `Seek(LARGE_INTEGER,DWORD,ULARGE_INTEGER*)` 等と一致 ✓ |
+| `IDataObject`(12) | qi, add_ref, release, get_data, get_data_here, query_get_data, get_canonical_format_etc, set_data, enum_format_etc, d_advise, d_unadvise, enum_d_advise ✓(既存実装と同じ並び ✓) |
+| `IEnumFORMATETC`(7) | qi, add_ref, release, next, skip, reset, clone ✓ |
+| `STATSTG` | **MSDN(`objidl.h`)と完全一致** ✓ 桁を自力で数え直して **80 バイト** ✓(name@0, type@8, cbSize@16, mtime/ctime/atime@24/32/40, grfMode@48, grfLocks@52, clsid@56, grfStateBits@72, reserved@76)|
+| `STGMEDIUM` | tymed@0, h_global@8, p_unk_for_release@16 = **24 バイト** ✓ union へは `h_global` 経由でポインタを書いており、union は全てポインタサイズなので**レイアウト等価** ✓ |
+| `FormatEtc` | **実測 32 バイト**(下記)。offsets は cf_format@0, ptd@8, dw_aspect@16, lindex@20, tymed@24 = **C の FORMATETC と一致** ✓ |
+| `Guid` | 16 バイト ✓ |
+| クリップボード形式 | `RegisterClipboardFormatW("FileGroupDescriptorW"/"FileContents")` ✓(値は実行時に決まる ✓)|
+| フラグ | `TYMED_ISTREAM=4` / `STGTY_STREAM=2` / `STREAM_SEEK_*` / `GMEM_MOVEABLE=0x2` ✓ |
+
+**ABI の実測(私の手で実行)**: 同一の `#[repr(C)]` 定義を rustc でコンパイルして `size_of`/オフセットを出力:
+```
+size_of FormatEtc = 32     offsets: cf_format=0 ptd=8 dw_aspect=16 lindex=20 tymed=24
+size_of StgMedium = 24     offsets: tymed=0 h_global=8 p_unk=16
+size_of StatStg   = 80
+size_of Guid      = 16
+```
+- `e6b4035` は `FormatEtc == 24` を assert していた → **誤り**(実測 32。ポインタ由来の整列8で
+  28→32 に切り上げ)✓。**`dbccefc` が 32 に修正済み**で、私の実測と一致する ✓
+  (コミットメッセージに「CI が私の誤りを検出」とあり、CI が実際に機能した例 ✓)。
+- **提案**: サイズだけでなく **オフセット**を `std::mem::offset_of!` で固定する ✓
+  (今回の誤りはサイズ側だけだったが、OLE が読むのはオフセット ✓。実測では offsets は正しい ✓)。
+
+**参照カウント(QI で AddRef、0 で Box::from_raw)** ✓
+- `LazySource`: `Box::into_raw`(refs=1)→ DoDragDrop に渡す → OLE が AddRef/Release → 終了後に
+  `lazy_com::release(ds)` で作成側の参照を落とす(`dragdrop.rs:637`)✓ **漏れも二重解放も無い** ✓
+- `Stream`: `GetData` ごとに `refs=1` で生成し `pUnkForRelease=NULL` で渡す ✓
+  = **呼び手が Release する**という TYMED_ISTREAM の規約どおり ✓(Refs=1 をそのまま渡している ✓)
+- `LazyEnum`: `refs=1` で生成して返す ✓ / `fetch_sub` の underflow は u32 に飽和(二重解放にはならない)✓
+- `GetData` は `idx >= files.len()` で `DV_E_LINDEX` ✓ 境界チェックあり ✓
+
+**HGLOBAL** ✓: `GlobalAlloc(GMEM_MOVEABLE)` → `GlobalLock` → `copy` → `GlobalUnlock` ✓
+(受け手の `ReleaseStgMedium` が解放する規約に一致 ✓)。軽微: `GlobalLock` が失敗したとき
+`GlobalFree` していない(確保失敗/OOM 経路のみの小さな漏れ)✓
+
+**st_read の待ちと pos** ✓: 宣言サイズに達するまで `wait_ready`(10ms 刻み、上限 30 秒)で待ち、
+`File::open` + `seek(pos)` で読めた分だけ返す ✓ pos は読めた分だけ進む ✓ 終端は S_OK/0 バイト ✓
+期限切れは E_FAIL(無限に待たない ✓)。軽微: `resolve_received` を Read ごとに呼ぶ
+(通常は metadata 1 回 ✓、同名衝突時は最大 100 回 ✓ 有界 ✓)。
+
+**その他の軽微な観察**: `st_stat` は `pwcsName` を常に NULL、`grfMode` を 0 で返す
+(`STATFLAG_NONAME` 以外の呼び手には名前を返すのが仕様だが、Explorer は NONAME ✓ 実害は薄い)/
+`le_skip` は末尾を超えても S_OK(S_FALSE が仕様)✓ / `ls_get_canonical` は ptd=NULL + E_NOTIMPL ✓ 仕様どおり。
+
+### d07164a: Mac が目録を送る / 判定: **合格**
+
+- `bulk::manifest_of(&entries)` を **`entries` を `DRAG_TX` へ move する前**に作っている ✓
+  (`files.rs`: `let manifest = peer_features_lazy().then(|| bulk::manifest_of(&entries));` の直後に move ✓)。
+- 送信は `if let Some(files) = manifest` の中だけ = **旧版(版17未満)には送らない** ✓
+  (`peer_features_lazy()` が版ゲートに一本化 ✓ 閾値リテラルを呼び出し側に書かない ✓)。
+- `manifest_of` は `OutFile` の名前・サイズ・`is_dir` だけを見る(**中身を読まない** ✓)。
+  テスト `manifest_carries_names_sizes_and_kinds_without_reading_contents` が名前・サイズ・種別と
+  空入力の両方を固定 ✓(名前・種別の対応関係も ✓)。
+- 観察: `rel` は Mac 由来の `/` 区切り ✓(Windows 側の `staged_path` が `\`→`/` に正規化して
+  `/` で分割するので整合 ✓)。
+
+### 05a5cd7: Windows が目録で即開始 / 判定: **条件付き**
+
+- **二重開始の防止は効いている** ✓: `start_lazy` はセッションスレッドで同期的に
+  `LAZY_STARTED.store(id)`(`dragdrop.rs:580`)してからスレッドを起こし、claim 経路
+  (`xfer.rs:486` 付近)が `Claim::Carried if dragdrop::lazy_started(id)` で**通常の start を省略** ✓。
+  早期 return の3経路で `LAZY_STARTED` を消す(`:586-610`)✓ = e6b4035 の防御 ✓。
+- **`resolve_received` は無限ループしない** ✓: `1..100` の有界探索 ✓、見つからなければ宣言パスを返して
+  呼び出し側の待ちが期限切れになる ✓。`staged_path` が `..`・絶対パス・`:`(ADS)・空要素を拒否 ✓
+  = 受信先の外へは書かない/読まない ✓。誤マッチはサイズ一致ヒューリスティックなので理論上あり得るが、
+  1つの目録内で rel は一意 ✓ 受信側はハッシュ検証済み ✓ 実害は薄い ✓。
+- **欠陥1(中)**: **`DragAccept` が「実際にドラッグを開始できたか」より先に送られる**。
+  `session.rs` の Manifest 腕は `dragdrop::start_lazy(...)` の直後に無条件で accept を返すが、
+  `start_lazy` は**スレッドを起こすだけ**で、その中で (a) `OleInitialize` 失敗、(b) `Host::create` 失敗、
+  (c) **押下が続いていない**のいずれかなら開始せずに return する(`dragdrop.rs:582-615`)✓。
+  とくに (c) は「フリックして離す」= **F3 の典型操作**そのもの ✓。
+  この場合 Mac の `lazy_accepted(id)` は true のまま ✓ → `early = DRAG_RELEASED_EARLY && !accepted` が
+  **false に固定**され(`files.rs`)、結果も来ない(相手は DragDone を送らない)ので 1.2 秒待って
+  フォールバックの `Placed`(「転送完了。相手側で受け取れます」)になる ✓
+  = **遅延提供を使わない経路なら `SavedOnly{ReleasedEarly}`(「保存のみ」)と言えていた場面で、
+  より曖昧な(実態は保存のみなのに受け取れると言う)通知になる** ✓ + 予報(HUD)も「置けます」に反転する ✓。
+  **修正案**: accept は「押下確認を通って実際に `DoDragDrop` を始める直前」に送る
+  (または開始できなかったときに Mac の受理状態を消す/「開始できず」を返す)✓。
+- **欠陥2(軽)**: **`receive_dir()` の一本化漏れ** — トレイの「受信フォルダを開く」は今も
+  `tray.rs:913-916` で `USERPROFILE/Downloads/Knit` を**自前で組み立てている** ✓
+  (`main.rs:241` の `receive_dir()` を使っていない)。1行で揃う ✓。
+- 観察(競合・低確率): Manifest はセッションスレッド、claim は bulk スレッドで処理されるため、
+  理論上は claim が先に処理されると `lazy_started(id)` がまだ false → 通常 start が走り、
+  その後に Manifest で `start_lazy` が走って **OLE ドラッグが二重**になり得る ✓
+  (Mac は目録を先に送り、bulk は転送スレッドの起動を挟むので実際は Manifest が先 ✓ 低確率)。
+  対策案: `lazy_enabled() && 相手が lazy` のときは通常開始を抑止する(または DragOffer 時点で
+  「目録が来る」ことを記録する)✓。
+
+### 5b84b02: 能力と受理の分離 / 判定: **合格**
+
+- `ForecastInput.accepted` を追加し、`WillPlace` の条件を `peer_lazy` から **`accepted`** に変更 ✓
+  = 私が I2 の記録で申し送った「能力≠受理」が**構造で解消** ✓。
+- テスト `capability_without_acceptance_still_waits` が「能力だけでは反転しない/受理で反転する」を固定 ✓
+  → **変異 mf1(`accepted`→`peer_lazy`)が赤** ✓、mf2(`accepted` を無視)も赤 ✓。
+- **(a) `id >> 63 == 1` ガードは Win→Mac の受理を食っていない** ✓: Win 側のコードに最上位ビットを
+  立てる箇所は無い(`grep "1 << 63|DRAG_ID_BIT|0x8000…" crates/win/src` = 0 件 ✓)。
+  Mac の `DragAccept`/`DragDone` の腕はこのガード付きの1つだけで、他は既存の catch-all ✓。
+  逆向き(Windows 側が Mac 発の `DragDone` を受ける)も `edge::cancel(id)` が
+  **id 一致時だけ**状態を消す(`edge.rs:42-47`)✓ + RX_DRAG も id 一致時のみ ✓ = **無害** ✓。
+- **(b) 受理のリセット** ✓: `offer_drag_to_win` ごとに `LAZY_ACCEPTED_ID=0`(`files.rs:455`)✓、
+  `DRAG_DONE=None` も同所で消す ✓ → 前の掴みの受理/結果を引き継がない ✓。
+- **(c) 予報の反転** ✓: 上のとおり「受理の事実」でのみ反転 ✓。
+
+### ef9c43b: W4(結果を事実で言い切る)/ 判定: **条件付き**
+
+- **(a) 待ちの間のロック** ✓ **問題なし**:
+  `wait_drag_done` の `if let Some(...) = *DRAG_DONE.lock()…` は**一時ガードが if-let 文の末尾で落ちる**ため、
+  `sleep(25ms)` はロックの外 ✓。これは重要で、もし保持したままなら `note_drag_done`(セッションスレッド)が
+  書けず、**結果が永久に来ない→毎回タイムアウト**になるところだった ✓(コードを読んで確認 ✓)。
+- **(b) 推測で言い切らない** ✓: 結果が来なければ `None` → `placed_or_saved(early && !accepted)` に落ち、
+  `Placed` の慎重な本文(「転送完了。相手側で受け取れます」)になる ✓。「置けました」と言うのは
+  `DragDone{copied:true}` が届いた `PlacedOnScreen` だけ ✓。
+- **(d) 文言規則** ✓: `PeerDidNotPlace` でも成功語は入らない ✓(変異 mn2 が赤 ✓)。
+- **欠陥3(中): `PeerDidNotPlace` の文面が冗長で、次の一手が誤っている。**
+  共通テンプレートが既に「…の受信フォルダに保存されています({why})。もう一度掴んで、**渡し終わるまで
+  待ってから離すと相手の画面に置けます**」なので、`why` に「相手の受信フォルダに入りました」を足すと
+  **受信フォルダの記述が二重**になり ✓、さらに「待ってから離すと置けます」は**この理由では誤った案内** ✓
+  (相手が受け取らなかった = 置き場所が無い/取消であり、待っても直らない)。
+  → 理由ごとに「次の一手」を分ける(例: 置ける場所(フォルダ等)へドロップしてください)✓。
+- **欠陥4(軽): `needs_attention`/`recovery_for` の `PlacedOnScreen` が未テスト** ✓
+  (変異 mn3「PlacedOnScreen を要注意にする」が**生存**)。成功を「要注意」にするとメニューに
+  「直前: …置きました」と再送項目が出る ✓ → テスト1件で塞げる ✓。
+- 観察(軽): 1.2 秒待つ間も `TxGuard` が生きているため `FILE_TX_BUSY` と転送中表示が最大 1.2 秒残り、
+  直後の掴みが「前のファイルを転送中です」で断られ得る ✓。
+- 観察: `DRAG_DONE` は「最後に届いた結果」1件のみ保持するため、古い結果が新しい結果を上書きすると
+  新しい方はタイムアウトして慎重側に落ちる ✓(誤って言い切ることはない ✓)。
+
+### e6b4035 + dbccefc: 3つの防御と ABI 期待値の修正 / 判定: **合格**
+
+- **押下確認** ✓: Manifest 到着後 `CLAIM_WAIT_MS` のあいだ押下を待ち、離れていれば開始しない ✓
+  (ただし accept は先に送られている = 上記 05a5cd7 の欠陥1 ✓)。
+- **早期 return のフラグ漏れ** ✓: 3経路すべてで `LAZY_STARTED` を消す ✓ + DoDragDrop 後に必ず消す ✓。
+- **ABI 固定テスト** ✓(stat 80 / FormatEtc 32 / StgMedium 24 / Guid 16)。
+  `e6b4035` の `FormatEtc == 24` は**誤り**で、私の実測(32)と `dbccefc` の修正が一致 ✓
+  (**CI が検出した**とコミットメッセージにあり、CI が機能した実例 ✓)。
+
+### 652afc4: I8 の残り2点 / 判定: **合格**
+
+- 私が前ラウンドで残した2点(`Streaming` 中の受理の無視 / `Accepted` 直後の `completed`)に
+  テストが入った ✓ → **変異 ml3'・ml5a' がどちらも赤** ✓ = **残指摘は解消** ✓。
+
+### 変異テスト(私の手で実施。worktree は撤去済み)
+
+base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移動前に固定)。
+
+| 変異 | 結果 |
+|---|---|
+| mf1 `accepted` → `peer_lazy`(能力で反転) | **赤**(`capability_without_acceptance_still_waits`)✓ |
+| mf2 `accepted` を無視(`if false`) | **赤**(2件)✓ |
+| mn1 `PlacedOnScreen` の断定を外す | **赤**(`only_a_peer_confirmed_drop_claims_the_place`)✓ |
+| mn2 `PeerDidNotPlace` の理由に成功語を混ぜる | **赤**(2件)✓ |
+| **mn3 `PlacedOnScreen` を「要注意」にする** | **生存** ← 欠陥4 |
+| ml3' 流している最中の受理を受け付ける | **赤**(`an_accept_arriving_while_streaming_is_ignored`)✓ 解消 |
+| ml5a' 受理直後の `completed` を拒否する | **赤**(`completion_can_arrive_right_after_acceptance`)✓ 解消 |
+
+### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
+
+| 増分 | 依頼 | 判定 | 備考 |
+|---|---|---|---|
+| W1-glue(COM) | 受領(58240f1) | **合格**(読解+MSDN のみ) | vtbl 3式・STATSTG 80・STGMEDIUM 24・FormatEtc 32(offsets 正)・参照カウント・HGLOBAL・st_read を確認。軽微4点 |
+| W1-glue 防御+ABI | 受領(e6b4035・dbccefc) | **合格** | 押下確認・フラグ漏れ・ABI テスト ✓。`e6b4035` の FormatEtc=24 は誤り(実測 32)→ `dbccefc` で修正 ✓ |
+| W1-wire-mac | 受領(d07164a) | **合格** | move 前に目録作成 ✓ 版ゲート ✓ 中身を読まない ✓ |
+| W1-wire-win | 受領(05a5cd7) | **条件付き** | 二重開始の防止 ✓ / `resolve_received` 有界・安全 ✓。**DragAccept が開始可否より先**(欠陥1)/ `tray.rs` の一本化漏れ(欠陥2)/ Manifest×claim の低確率競合 |
+| 能力と受理 | 受領(5b84b02) | **合格** | 受理の事実で反転 ✓(mf1/mf2 赤)/ bit63 ガード ✓ / リセット ✓ |
+| W4 | 受領(ef9c43b) | **条件付き** | ロック規律 ✓ 推測しない ✓ 成功語なし ✓。**`PeerDidNotPlace` の文面**(欠陥3)/ `PlacedOnScreen` の要注意判定が未テスト(欠陥4)|
+| I8 残り2点 | 受領(652afc4) | **合格** | 前ラウンドの残指摘2件が変異で赤 ✓ |
+| その他 | I1〜I8・mtime・pairing・W1-core | 合格 | §6.5 の表を参照 |
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8)
 
 | 増分 | 依頼 | 判定 | 備考 |

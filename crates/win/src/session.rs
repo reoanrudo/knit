@@ -303,13 +303,10 @@ pub(crate) fn session(
                             count
                         );
                     } else {
+                        // 受理(DragAccept)は `start_lazy` が**実際に開始できると確認できた後**に
+                        // 返す(開始できないのに返すと、Mac が「受理された」と誤解して
+                        // 実態は保存のみなのに「受け取れます」と言ってしまう)
                         dragdrop::start_lazy(id, &crate::receive_dir(), files);
-                        // **受理を返す**: Mac は「能力(版)」ではなく「受理の事実」で
-                        // 「もう離してよい」を判断する(能力と受理の混同を避ける)
-                        if let Some(tx) = WTX.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                            let _ = tx.send(encode(&Msg::DragAccept { id }));
-                            println!("[drag] 遅延提供: 受理を返しました(id {id})");
-                        }
                     }
                 }
             }

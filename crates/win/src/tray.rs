@@ -909,11 +909,7 @@ unsafe fn handle_command(id: u32) {
         }
         MENU_OPENFOLDER => {
             // 受信フォルダ(DOWNLOADS\\Knit)をエクスプローラーで開く
-            let dir = std::env::var_os("USERPROFILE")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join("Downloads")
-                .join("Knit");
+            let dir = crate::receive_dir();
             let _ = std::fs::create_dir_all(&dir);
             let mut path: Vec<u16> = dir.to_string_lossy().encode_utf16().collect();
             path.push(0);
