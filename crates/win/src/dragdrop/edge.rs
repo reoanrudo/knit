@@ -27,6 +27,21 @@ fn send_wait_expired(sending: bool, waited: Duration) -> bool {
     !sending && waited > SEND_WAIT
 }
 
+/// 相手(Mac)が**受理する前に**断ったか(純関数)。このときだけ理由を知らせる:
+/// 送信が始まった後の取り消し(相手の操作・切断)は、それぞれの経路が既に知らせている
+fn refusal_notice_needed(pending_matches: bool, sending: bool, committed: bool) -> bool {
+    pending_matches && !sending && !committed
+}
+
+/// このIDの予告が「送信前」のまま残っているか(= 相手が受理しなかった)
+pub fn refused_before_send(id: u64) -> bool {
+    let state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    match state.as_ref() {
+        Some(p) if p.id == id => refusal_notice_needed(true, p.sending, p.committed),
+        _ => false,
+    }
+}
+
 struct Pending {
     id: u64,
     /// 展開後の送信内容(フォルダは相対パス付きの中のファイルへ展開済み)。
@@ -758,5 +773,28 @@ mod send_wait_tests {
     fn an_active_transfer_is_never_expired() {
         assert!(!send_wait_expired(true, Duration::from_secs(31)));
         assert!(!send_wait_expired(true, Duration::from_secs(6 * 60 * 60)));
+    }
+}
+
+#[cfg(test)]
+mod refusal_notice_tests {
+    use super::*;
+
+    /// 受理の前に断られたときだけ知らせる(二重のバナーを作らない)
+    #[test]
+    fn only_a_refusal_before_sending_is_announced() {
+        assert!(
+            refusal_notice_needed(true, false, false),
+            "送信前の取り消し = 相手が受理しなかった"
+        );
+        assert!(
+            !refusal_notice_needed(true, true, false),
+            "送信中の取り消しは各経路が知らせる(ここでは黙る)"
+        );
+        assert!(
+            !refusal_notice_needed(true, false, true),
+            "確定済みの取り消しは対象外"
+        );
+        assert!(!refusal_notice_needed(false, false, false), "別IDは対象外");
     }
 }

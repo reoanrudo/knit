@@ -313,6 +313,15 @@ pub(crate) fn session(
             Msg::DragAccept { id } => dragdrop::edge::accept(id),
             Msg::DragReady { id } => dragdrop::edge::ready(id),
             Msg::DragCancel { id } | Msg::DragDone { id, .. } => {
+                // **受理の前に断られた**ときだけ理由を知らせる(送信が始まった後の
+                // 取り消しは各経路が既に知らせており、二重のバナーにしない)
+                if matches!(msg, Msg::DragCancel { .. }) && dragdrop::edge::refused_before_send(id)
+                {
+                    crate::tray::notify(
+                        "Knit",
+                        "Macが受け取れませんでした(共有範囲外・容量超過・切断など)。もう一度掴んでください",
+                    );
+                }
                 dragdrop::edge::cancel(id);
                 // 掴み越境の受信表示は、キャンセル/完了が届いた時点で解く
                 // (転送本体が始まる前に打ち切られた場合、Files イベントは来ない)
