@@ -483,6 +483,12 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                     .join("Knit")
             };
             match outcome {
+                Claim::Carried if dragdrop::lazy_started(drag_id.unwrap_or(0)) => {
+                    // 遅延提供で既にドラッグが走っている(目録だけで開始済み)。
+                    // ここで通常の start を呼ぶと OLE ドラッグが二重になる
+                    println!("[drag] 遅延提供で開始済みのため通常の開始を省略します");
+                    return;
+                }
                 Claim::Carried => {
                     // まだ押している=掴んだまま → 本物の OLE ドラッグを開始
                     dragdrop::start(files);

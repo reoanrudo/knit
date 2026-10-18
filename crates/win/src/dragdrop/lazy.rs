@@ -117,6 +117,39 @@ pub fn is_ready(path: &std::path::Path, want: u64, kind: u8) -> bool {
     }
 }
 
+/// 受信側が**実際に公開したパス**を探す。受信側は同名衝突で「名前 (n).ext」へ
+/// ずらす(`files::unique_final`)ため、宣言名が無いときは (n) 付きを**サイズ一致で**探す。
+/// 見つからなければ宣言名をそのまま返す(呼び出し側が待って期限で失敗させる)
+pub fn resolve_received(root: &std::path::Path, rel: &str, size: u64, kind: u8) -> std::path::PathBuf {
+    let Some(declared) = staged_path(root, rel) else {
+        // 名前が不正(そもそも受信側も作らない)。呼び出し側の待ちで期限切れになる
+        return root.join(rel.replace('/', "\\"));
+    };
+    if is_ready(&declared, size, kind) {
+        return declared;
+    }
+    // 「stem (n).ext」を順に試す(受信側の採番は 1 から連番)
+    let parent = declared.parent().unwrap_or(root);
+    let stem = declared
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let ext = declared
+        .extension()
+        .map(|e| e.to_string_lossy().into_owned());
+    for n in 1..100u32 {
+        let name = match &ext {
+            Some(e) => format!("{stem} ({n}).{e}"),
+            None => format!("{stem} ({n})"),
+        };
+        let candidate = parent.join(name);
+        if is_ready(&candidate, size, kind) {
+            return candidate;
+        }
+    }
+    declared
+}
+
 /// 受け取り完了まで待つ(期限つき)。**呼び出し側のスレッドを長時間止めない**ため、
 /// 期限を必ず入れる(IStream の Read から呼ぶ)
 pub fn wait_ready(
@@ -264,6 +297,28 @@ mod tests {
         let f2 = dir.join("appears.bin");
         std::fs::write(&f2, b"0123456789").unwrap();
         assert!(wait_ready(&f2, 10, 0, std::time::Duration::from_millis(50)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同名衝突で「名前 (n)」へずらされた実体を見つけられる(受信側の unique_final と対)
+    #[test]
+    fn a_renamed_receipt_is_found_by_size() {
+        let dir = std::env::temp_dir().join(format!("knit-lazy-ren-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 既存の同名ファイル(前回の受け取り)
+        std::fs::write(dir.join("report.pdf"), b"old").unwrap();
+        // 今回の実体は「report (1).pdf」として公開される
+        std::fs::write(dir.join("report (1).pdf"), b"0123456789").unwrap();
+        let got = resolve_received(&dir, "report.pdf", 10, 0);
+        assert_eq!(got.file_name().unwrap(), "report (1).pdf", "サイズ一致で見つける");
+        // 宣言名がそのまま使えるときは動かさない
+        std::fs::write(dir.join("fresh.txt"), b"abc").unwrap();
+        let same = resolve_received(&dir, "fresh.txt", 3, 0);
+        assert_eq!(same.file_name().unwrap(), "fresh.txt");
+        // 見つからなければ宣言名を返す(呼び出し側が期限で失敗させる)
+        let missing = resolve_received(&dir, "nope.txt", 5, 0);
+        assert_eq!(missing.file_name().unwrap(), "nope.txt");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
