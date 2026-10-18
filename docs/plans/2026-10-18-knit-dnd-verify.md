@@ -1881,6 +1881,99 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
    文書化済み ✓
 - **同意**: I9(PoC 前提 ✓)と W3 の既定反転(実機必須 ✓)はリードの判断どおり後回しで妥当 ✓。
 
+## 6.13 第11ラウンド: ガード配線・サロゲート境界・拒否通知 / 判定: **合格**
+
+**検証対象(範囲 `61f2a34..7ba2c25`)**: `745aa4c`(前回の指摘3件)→ `ad3715c`(受理前の拒否通知)→
+`c256873`(スタブ adb のディレクトリをプロセスごとに。**前ラウンドで検証済み・内容も同一** ✓)→ docs。
+
+- HEAD `7ba2c25` / `git status` 空 / `cargo build` exit 0(**警告行 10 = 基準同数**)/
+  `cargo test` = **611 passed / 0 failed / 4 ignored** ✓。
+- 限界は前ラウンドと同じ ✓(`crates/win` は macOS でコンパイル不可 ✓ = 読解 + CI 申告 ✓)。
+
+### `745aa4c`: 指摘3件 / **すべて解消** ✓
+
+- **(a) 今度こそ使われている** ✓: `crates/win/src/dragdrop.rs:646` に
+  `let _drag_guard = DragThreadGuard::arm();` が **1箇所** ✓ あり、遅延提供の生の
+  `DRAG_THREAD.store(GetCurrentThreadId(), …)` は**消えている** ✓。
+  残る `DRAG_THREAD.store` は「ガード自身の `arm`(`:97`)」「ガードの `Drop`(`:107`)」
+  「通常 start(`:728`/`:747` = 元から別経路 ✓)」のみ ✓ = 意図どおり ✓。
+- **(b) DoDragDrop 後の明示 `store(0)`(`:672`)を残した判断は正しい** ✓:
+  - これにより**下りるタイミングが従来と同一** ✓(DoDragDrop 直後に下ろし、
+    後続の `lazy_com::release` / `src_release` / `drop(host)` の間だけ遅くする従来の挙動を維持 ✓)。
+  - ガードは**panic 経路の保険**として二重に効く ✓(`:646`〜:672` の間で panic しても Drop が下ろす ✓)。
+  - 二重 store(0) は冪等 ✓ 害なし ✓。
+- **(c) `truncate_utf16` の境界は正しい** ✓:
+  `out.truncate(max)` の後、**末尾が上位サロゲート(0xD800..0xDC00)のときだけ** pop する ✓
+  → 下位サロゲートが末尾に残る場合は、その直前の上位サロゲートも同時に残っている
+  = **完全なペア**なので pop 不要 ✓(`encode_utf16` はペアを連続して出すため ✓)。
+- テスト `truncation_never_splits_a_surrogate_pair` が良い境界を作っている ✓:
+  `"a"*258 + 🎉 + "tail"`(全264ユニット)を 259 に切ると 259 個目(= index 258)が**上位サロゲート** ✓
+  → pop して **258 ユニット**になることを固定 ✓ + 「割れない場合は max まで」✓ + 「収まるときは触らない」✓。
+- **空の目録のログ復元** ✓: `else if files.is_empty() { println!("[drag] 遅延提供: 目録が空です") }` ✓。
+  `lazy_start_allowed` が false になる3理由のうち、**無効(既定)以外は必ず理由が出る** ✓
+  (呼び出し元は `lazy_enabled()` のときだけ呼ぶので、空の目録での誤ログも出ない ✓)。
+- 軽微: `for unit in truncate_utf16(…).into_iter()` の `.into_iter()` は冗長 ✓(挙動は同じ ✓)。
+
+### `ad3715c`: 受理前の拒否通知 / **4点とも正しい** ✓
+
+- **(a) 判定が「送信前のまま残っている」に限定** ✓:
+  `refusal_notice_needed(pending_matches, sending, committed) = pending_matches && !sending && !committed` ✓
+  と純関数化し、`refused_before_send(id)` は **同じ id の Pending が残っているときだけ** true ✓
+  (`Some(p) if p.id == id` ✓ / 別IDは false ✓ = テストで固定 ✓)。
+- **(b) `Msg::DragDone` では通知しない** ✓: 腕は `DragCancel | DragDone` の共通だが、
+  条件に `matches!(msg, Msg::DragCancel { .. })` を入れて **DragCancel のときだけ**通知 ✓
+  = Mac が置き終えた `DragDone` を「受け取れませんでした」と誤通知しない ✓。
+- **(c) 他の取り消し経路で二重バナーにならない** ✓(経路を追って確認):
+  - ローカルの取り消し(Esc・モード離脱・切断)は Windows 側が `cancel_current()` で
+    Pending を **take してから** `DragCancel` を送る側 ✓ → この通知は「受信した DragCancel」でしか
+    発火しないので**出ない** ✓。
+  - Mac が受理後に失敗して送る `DragCancel` は、その時点で Windows 側の `p.sending == true` ✓
+    → `!sending` が false で通知しない ✓(二重なし ✓)。
+  - Mac の 30秒待ちの取り消し(W2-lite の通知 ✓)と競合する場合も、`edge::cancel(id)` が Pending を
+    消した後は `refused_before_send` が false ✓ = 二重にならない ✓。
+- **(d) 文言は実態と合っている** ✓: 「Macが受け取れませんでした(共有範囲外・容量超過・切断など)。
+  もう一度掴んでください」= Mac 側 `offer` の拒否条件(`AVAILABLE` / `WIN_MODE` / `BTN_DOWN` /
+  `HOTKEY_ONLY` / `share::allow_files` / `MAX_TOTAL` / 画面範囲 / `Incoming::offer`)✓ の主要因を
+  列挙しており ✓ 次の一手もある ✓。
+- **残る観察(本コミットの欠陥ではない)**: Mac が**受理した後**に受信で失敗した場合
+  (`incoming_drag::receive` の Err 腕 → `DragCancel` 送信 ✓)は、Windows 側が `sending=true` なので
+  この通知は出ず、Mac 側も通知しない ✓ → **その1経路だけ無言のまま** ✓(F9/F10 の残り ✓ 別タスク ✓)。
+
+### 実測まとめ
+
+| 項目 | 結果 |
+|---|---|
+| HEAD / ツリー | `7ba2c25` / クリーン ✓ |
+| `cargo build` | exit 0 / 警告行 10(基準同数)✓ |
+| `cargo test`(既定メンバー) | **611 passed / 0 failed / 4 ignored** ✓ |
+| `DragThreadGuard::arm` | `dragdrop.rs:646` の1箇所 ✓(生 store は消えた ✓)|
+| `truncate_utf16` | 上位サロゲートのみ落とす ✓(テストが 258 ユニットを固定 ✓)|
+| `refusal_notice_needed` | 4通りをテストで固定 ✓ / DragDone は除外 ✓ |
+
+### 判断を求められた3件への回答
+
+1. **W3 を `KNIT_HUD=1` の opt-in で「暗く」出荷する案 → 条件付きで賛成**(優先度は中)。
+   - 賛成の理由: 既定が off なら**出荷物の挙動は1ミリも変わらない** ✓(回帰リスクはゼロに近い ✓)。
+     実機が来た日にフラグを反転するだけで価値が出る ✓。判断材料(`ReleaseForecast`)は既に common にあり ✓
+     Windows 側は「命令を実行するだけ」の層 ✓ という設計の分離も崩さない ✓。
+   - 条件: (i) スイッチは既存の `KNIT_LAZY` と同じ**環境変数ではなく設定**に置くなら、
+     既定 off を**テストで固定**する ✓(うっかり既定 on にしない ✓)。
+     (ii) 見えない UI は**腐る**ので、`allow(dead_code)` に理由と「反転手順」を書き、
+     ランナップ(検証手順書)に**反転前チェックリスト**を1つ足す ✓。
+   - ただし**順序は W2 の方が先** ✓(下記2 ✓)。W3 は層付きウィンドウの描画が本体で、
+     実機なしでは「出る・消える・クリックを奪わない」が一切確かめられない ✓
+     = **入れても検証できないコードが増えるだけ** ✓ なので、W2 で情報を出せる場所を増やしてから ✓。
+2. **W2 本体(200ms閾値 + ツールチップ進捗)→ 今やる価値がある**(優先度は高)。
+   - 判定は純関数(`should_show_wait(elapsed_ms) = elapsed_ms > 200` 相当 ✓)にできて **CI で守れる** ✓。
+   - 表示先は既存のツールチップ/状態行(`tray.rs:410-416`)✓ = **新しい UI 機構を足さない** ✓
+     ので、実機なしでも「配線が正しい」ことは読解で確かめられる ✓。
+   - これで F2 の「8MB 以下は完全に無言」が消える ✓(現状の W2-lite は 30秒の取消時だけ ✓)。
+3. **`st_stat` の `grfMode`/`pwcsName` → 今は触らない**(優先度は低。**私の前回の指摘は過剰でした**)。
+   - `grfMode = 0` は **`STGM_READ`(0x00000000)そのもの** ✓ = 既に正しい ✓(直すものが無い ✓)。
+   - `pwcsName` は Explorer が `STATFLAG_NONAME` で列挙するため実害なし ✓(リードの判断どおり ✓)。
+   - `IStream::Stat` の呼び手が名前を期待する可能性は残るが、**未検証コードを触る価値は今は無い** ✓
+     =(設計 §7「やらないこと」の精神 ✓)。実機で問題が出たら直す ✓ で良い ✓。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
 
 | 増分 | 依頼 | 判定 | 備考 |
