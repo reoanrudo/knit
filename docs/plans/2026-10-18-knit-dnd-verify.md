@@ -2052,6 +2052,85 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
   `lazy_delivery_does_not_wait_for_the_bytes` が同じ性質を固定 ✓)/ AC2 の「全組合せ表」は
   代表ケースのみ ✓ / AC5・AC8 は目視前提 ✓。
 
+## 6.15 第13ラウンド: 受入基準(AC1〜AC8)の充足状況の監査 / 判定: **合格**(主張の精度に3点)
+
+- HEAD `562d3bd` / `git status` 空 / `cargo build` exit 0(**警告行 10 = 基準同数**)/
+  `cargo test` = **615 passed / 0 failed / 4 ignored** ✓(申告どおり ✓)。
+
+### Q1「AC1〜AC7 はテストで判定できる形になっている」→ **概ね正しいが、3つのACは「一部」**
+
+| AC | テストで判定できる部分 | 実機・目視が要る残り | 私の判定 |
+|---|---|---|---|
+| AC1 | 遅延提供の状態機械が bulk 完了を待たない ✓(`lazy_delivery_does_not_wait_for_the_bytes` ✓ 名指しテストの名前も設計が実装名に修正済み ✓) | **「10GB で 300ms 未満」は end-to-end**(Windows OLE ✓)+ AC 自身が「目視/ログ: 越境時刻と release-ok の差」を要求 ✓ | **一部** |
+| AC2 | 下記のとおり**強い表テスト**が入った ✓ | 分布の数値は未 assert(下記)✓ | **ほぼ完全** |
+| AC3 | 8理由 × `hud_line()` × `HUD_HINT` は下記のとおり充足 ✓ | AC 自身が「目視: 64件超・転送中・経路未接続・上限超過の4ケース」を要求 ✓ = カーソル近傍で読めるかは目視 ✓ | **一部** |
+| AC4 | `SavedOnly` の本文に成功語が無い ✓(否定 assert ✓ `PLACEMENT_CLAIMS` ✓) | なし ✓ | **完全** |
+| AC5 | 掴み検出の**構造**(既存 `file_drag.rs` のテスト緑 ✓)+ 下記のタップ経路監査 ✓ | **「8〜22ms を悪化させない」は実測**が要る ✓(AC 自身が目視を要求 ✓)| **一部** |
+| AC6 | build/test ✓(基準 548 + 新規 = 615 ✓) | なし ✓ | **完全** |
+| AC7 | `peer_features(16).lazy == false` ✓ + 旧 hello テスト ✓ | なし ✓ | **完全** |
+| AC8 | — | 3状態 × 両方向の実機 ✓ | **実機のみ** |
+
+→ 表の表現を「AC2・AC4・AC6・AC7 = テストで判定可 / AC1・AC3・AC5 = **テストで判定できる部分**が実装済み
+(残りは実機・目視)/ AC8 = 実機のみ」に割るのが正確 ✓。
+
+**AC5 のタップ経路監査(重点)** = **退行なし** ✓: タップスレッドに足されたのは次の2つだけ ✓
+- `tap.rs:1867` → `files::note_press_release()` = **AtomicBool 2つの load + 1つの store** ✓
+  (ロック・I/O・sleep なし ✓ = ns オーダー ✓)。
+- `refuse_drag` → `hud::note_refusal()`(`files.rs:322`) = `LAST_REFUSAL_MS.store`(Atomic ✓)+
+  `PENDING.lock()`(**短い Mutex** ✓ 保持者は µs オーダー ✓)+ `format!` 2つ + `now_ms()` +
+  `gui::request_hud()`(**`performSelectorOnMainThread:waitUntilDone:0` = 非ブロッキング** ✓)。
+  ロック内で I/O も sleep もしない ✓。
+- **1秒/1.2秒の待ち**(`wait_lazy_accepted` / `wait_drag_done`)は `files.rs:569-570` =
+  **転送スレッド**で、しかも `drop(guard)` の後 ✓ = **タップは待たない** ✓。
+- `note_rx_bytes`(bulk 受信スレッド ✓)と `note_progress_seen` は **Atomic のみ** ✓。
+  `waiting_for_data()`(WAITING の Mutex を取る ✓)は **gui/メインスレッド**(`gui.rs:2495`)からのみ ✓
+  = タップ経路ではない ✓。
+→ **CGEventTap のコールバックに新しい 50ms 超の同期処理は入っていない** ✓(構造として確認 ✓)。
+  ただし AC5 の「8〜22ms を悪化させない」は**実測**が要る ✓(私には測れない ✓ = 一部 ✓)。
+
+### Q2: AC3「拒否8分岐すべてに理由・次にすべきこと・『今離しても成立する』旨」→ **満たしている** ✓
+
+- `Refusal` = **8 variant**(`TooMany, EmptyGrab, LinkDown, CollectStale, CollectTimeout, CollectFailed,
+  NothingToSend, Busy` ✓ 機械的に数えて確認 ✓)で、`hud_line()` は**8腕の網羅 match**(コンパイラ強制 ✓)✓。
+  各行に**理由**と**次にすべきこと**が入っている ✓(例: 「掴みすぎです(64 件まで)」/「少し待って掴み直す」
+  「確認が間に合いません(少し待って掴み直す)」✓)。
+- 「今離しても Mac 内のドロップとして成立する」旨 = `HUD_HINT`
+  「このまま離すと Mac 内の操作になります」✓ が `note_refusal` で**無条件に添付**される ✓
+  → 8 variant すべてに付く ✓。
+- テスト ✓: `the_line_is_short_and_never_claims_success` が **8 variant を列挙**して
+  (i) 空でない ✓ (ii) 40 文字以内 ✓ (iii) `PLACEMENT_CLAIMS` を含まない ✓ (iv) EmptyGrab と TooMany が
+  別文言 ✓ (v) `HUD_HINT` が「Mac 内」を含む ✓ を固定 ✓ + `refusal_and_progress_use_different_reassurance`
+  が添付を固定 ✓。
+- 注: 設計の「8分岐」= 掴み経路の8分岐(拒否7 + スキップ1 ✓)と、実装の8 = `Refusal` 8 variant は
+  **集合が違う** ✓(スキップは拒否ではないので理由を持たない ✓ 設計 §2 T1 のとおり ✓)。
+  基準の**意図**(拒否には必ず理由と次の一手と安心の一言 ✓)は満たしている ✓。
+
+### Q3「テストで判定できると書いてあるが、実際は判定できていない」AC → **3点**
+
+1. **AC2 の分布の数値は assert されていない** ✗: 表は「fail 2160 / place 384 / unknown 144 / wait 96 /
+   save 96」と書いているが、テストの締めは `assert_eq!(cases, 2880)` と
+   `assert!(kinds.len() >= 4)`、そして `println!` だけ ✓ → **数値は一回の観測**であり、分布がずれても
+   (4種類以上出ていれば)緑のまま ✓。→ `assert_eq!(kinds, BTreeMap::from([...]))` を1行足せば
+   表の数値が**固定**される ✓。
+2. **AC2 の「全組合せ」は期限切れの枝を踏んでいない** ✗: `elapsed_ms: 500` 固定で
+   `peer_deadline_ms ∈ {0, 1000, 30000}` ✓ → 500 < 1000 なので **`PeerTimeout` が一度も出ない** ✓
+   (期限の軸は回しているが結果が変わらない=実質不活性 ✓)。`fail 2160` は全部「拒否」✓ で整合 ✓。
+   → `elapsed_ms` を軸に足す(例 `{0, 500, 30_001}` ✓)と期限切れも表に入る ✓(単体テストは別にあり ✓)。
+3. AC1・AC3・AC5 の**目視・実測部分**(上表 ✓)。
+
+### AC2 の新テストの評価(変異で確認)
+
+- 構成 ✓: 7軸の**入れ子ループ**で 2880 通りを回し ✓ `cases == 2880` を assert(= 空回り防止 ✓)✓、
+  不変条件4つを**リテラル付き**で assert ✓(テキストの写しではない ✓)。
+- 私の変異(base = このテストのみ):
+  | 変異 | 結果 |
+  |---|---|
+  | m1 `accepted` → `peer_lazy`(不変条件3を壊す) | **赤** ✓ |
+  | m2 完了前の離しを「置けた」に(不変条件4を壊す・旧 m8) | **赤** ✓ |
+  | m3 `Unknown` を余分に返す(入力範囲外の条件) | 生存(等価変異 ✓ = 表の入力範囲外なので不発 ✓ テストの穴ではない ✓) |
+  | m4 拒否より受理を優先(不変条件2を壊す) | **赤** ✓ |
+- → **AC2 は「代表ケース」から「全組合せ+不変条件」へ実際に強化された** ✓(上記の2点を直せば満点 ✓)。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
 
 | 増分 | 依頼 | 判定 | 備考 |
