@@ -54,6 +54,19 @@
         }
     }
 
+    /// 遅延提供(版 17)の目録の1項目。**名前とサイズだけ**を先に渡す
+    /// (内容は後から流す。パスは受信側の既存の無害化を通す前提の相対名)
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct ManifestEntry {
+        #[serde(default)]
+        pub rel: String,
+        #[serde(default)]
+        pub size: u64,
+        /// 0 = ファイル、1 = フォルダ(将来の種別追加に備えて数値で持つ)
+        #[serde(default)]
+        pub kind: u8,
+    }
+
     /// 1 枚のモニター(仮想画面座標系での位置とサイズ。Mac は CG 座標系のまま)。
     /// 版 13 以降の hello/hello_ok で交換し、複数モニターの自動認知に使う。
     /// 旧版からの受信は空配列(既定)になり、従来どおり w/h の 1 画面扱い
@@ -258,6 +271,19 @@
         },
         #[serde(rename = "drag_accept")]
         DragAccept { id: u64 },
+        /// 遅延提供(版 17)の目録。**データを流す前に**「何が届くか」を伝える。
+        /// 相手はこれだけでネイティブドラッグを開始できる(Windows の
+        /// CFSTR_FILEDESCRIPTORW / macOS の File Promise は名前とサイズを先に要る)。
+        /// 旧側は未知の行として無視する(decode が None)ため、送る側は版ゲートで守る
+        #[serde(rename = "manifest")]
+        Manifest {
+            id: u64,
+            /// 展開後の件数(実受信の件数と照合する)
+            count: usize,
+            /// 合計バイト
+            total: u64,
+            files: Vec<ManifestEntry>,
+        },
         #[serde(rename = "drag_ready")]
         DragReady { id: u64 },
         #[serde(rename = "drag_commit")]
@@ -651,5 +677,55 @@ mod tests {
         // 遅延提供は他の能力と独立(片方だけ実装した版を作らない)
         let f = peer_features(17);
         assert!(f.dirs && f.empty_dirs && f.unlock && f.lazy);
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    fn entry(rel: &str, size: u64, kind: u8) -> ManifestEntry {
+        ManifestEntry { rel: rel.to_string(), size, kind }
+    }
+
+    /// 目録は往復できる(名前・サイズ・種別をそのまま運ぶ)
+    #[test]
+    fn manifest_round_trips_with_names_sizes_and_kinds() {
+        let msg = Msg::Manifest {
+            id: 7,
+            count: 3,
+            total: 4096,
+            files: vec![
+                entry("資料/a.txt", 1024, 0),
+                entry("資料/sub", 0, 1),
+                entry("単独.bin", 3072, 0),
+            ],
+        };
+        let Msg::Manifest { id, count, total, files } =
+            decode(&encode(&msg)).expect("往復できる")
+        else {
+            panic!("Manifest として戻る");
+        };
+        assert_eq!((id, count, total), (7, 3, 4096));
+        assert_eq!(files.len(), 3, "全項目を運ぶ");
+        assert_eq!(files[0], entry("資料/a.txt", 1024, 0), "名前とサイズ");
+        assert_eq!(files[1].kind, 1, "フォルダの種別");
+        assert_eq!(files[2].rel, "単独.bin");
+    }
+
+    /// 旧版は未知の行として無視する(= decode が None)。
+    /// **送る側が版ゲートで守る**という前提をここで固定しておく
+    #[test]
+    fn an_older_peer_cannot_decode_the_manifest() {
+        let line = encode(&Msg::Manifest { id: 1, count: 0, total: 0, files: Vec::new() });
+        assert!(line.contains("manifest"), "行の名前: {line}");
+        assert!(decode("{\"type\":\"manifest_v99\"}").is_none(), "未知の行は受けない");
+    }
+
+    /// 空の目録(空フォルダだけの掴み)でも壊れない
+    #[test]
+    fn an_empty_manifest_is_valid() {
+        let msg = Msg::Manifest { id: 2, count: 0, total: 0, files: Vec::new() };
+        assert!(matches!(decode(&encode(&msg)), Some(Msg::Manifest { id: 2, count: 0, .. })));
     }
 }
