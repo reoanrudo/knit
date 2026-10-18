@@ -322,19 +322,27 @@ mod tests {
             }
             // (a) 実体の場所 (b) 理由 (c) 次の一手 を必ず含む
             assert!(n.body.contains("受信フォルダに保存されています"), "場所: {}", n.body);
-            // 理由と次の一手は理由ごとに違う(受信フォルダの記述は二重にしない)
-            let (reason, next) = match why {
-                SaveWhy::ReleasedEarly => ("離したため", "渡し終わるまで待ってから離す"),
-                SaveWhy::PeerDidNotPlace => ("受け取らなかった", "置ける場所"),
-            };
-            assert!(n.body.contains(reason), "理由({why:?}): {}", n.body);
-            assert!(n.body.contains(next), "次の一手({why:?}): {}", n.body);
-            assert_eq!(
-                n.body.matches("受信フォルダ").count(),
-                1,
-                "受信フォルダの説明は1回だけ: {}",
-                n.body
-            );
+        }
+    }
+
+    /// 理由ごとに「なぜか」「次にどうするか」が変わる(検証役の指摘で分離)。
+    /// 待っても直らない理由に「待ってから離す」と案内しない
+    #[test]
+    fn saved_only_guides_the_next_step_per_reason() {
+        let body = |why| compose_notice(&outcome(DeliveryResult::SavedOnly { why })).body;
+        let early = body(SaveWhy::ReleasedEarly);
+        assert!(early.contains("離したため"), "{early}");
+        assert!(early.contains("渡し終わるまで待ってから離す"), "{early}");
+        let refused = body(SaveWhy::PeerDidNotPlace);
+        assert!(refused.contains("受け取らなかった"), "{refused}");
+        assert!(
+            !refused.contains("待ってから離す"),
+            "待っても直らない理由で待たせない: {refused}"
+        );
+        assert!(refused.contains("置ける場所"), "代わりの一手: {refused}");
+        // 受信フォルダの説明はどちらも1回だけ(二重の説明をしない)
+        for b in [early, refused] {
+            assert_eq!(b.matches("受信フォルダ").count(), 1, "{b}");
         }
     }
 
