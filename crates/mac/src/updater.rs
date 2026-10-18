@@ -490,7 +490,13 @@ mod tests {
         app
     }
 
-    fn apply(tag: &str, new_body: &str) -> (PathBuf, bool) {
+    /// プロセスを起動・停止するテストは直列に走らせる(`ps` と `pkill` は機械全体を見るため)
+    static PROC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `wait` は新しい版が「動き続けているか」を判定するまでの秒数。
+    /// **短すぎると負荷時に誤判定する**(新しい版が現れる前に判定 → 巻き戻し /
+    /// 落ちるはずの版がまだ見えている → 成功扱い)。テストでは余裕を持たせる
+    fn apply(tag: &str, new_body: &str, wait: &str) -> (PathBuf, bool) {
         // パスに ( ) + [ ] を含めても、起動確認が正しく動くことも確かめる
         let root = std::env::temp_dir().join(format!("knit-apply-({tag})+[x]-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -503,7 +509,7 @@ mod tests {
         // 存在しない PID = すでに終了済みの旧プロセス
         let ok = Command::new("/bin/bash")
             .arg(&script)
-            .args(["999999999", new.to_str().unwrap(), target.to_str().unwrap(), "exec", "1"])
+            .args(["999999999", new.to_str().unwrap(), target.to_str().unwrap(), "exec", wait])
             .status()
             .unwrap()
             .success();
@@ -523,7 +529,9 @@ mod tests {
 
     #[test]
     fn apply_swaps_in_the_new_version_and_removes_leftovers() {
-        let (root, ok) = apply("ok", "sleep 30 # new-version");
+        let _g = PROC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 新しい版が `ps` に現れるまで余裕を持たせる(負荷時に 1 秒では足りない)
+        let (root, ok) = apply("ok", "sleep 30 # new-version", "4");
         assert!(ok);
         assert!(version_of(&root).contains("new-version"));
         assert!(!root.join("Knit.app.knit-old").exists());
@@ -533,7 +541,9 @@ mod tests {
 
     #[test]
     fn apply_rolls_back_when_the_new_version_does_not_stay_running() {
-        let (root, ok) = apply("rollback", "exit 1 # new-version");
+        let _g = PROC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 落ちるはずの版が `ps` から消えるまで余裕を持たせる(負荷時に 1 秒では足りない)
+        let (root, ok) = apply("rollback", "exit 1 # new-version", "4");
         assert!(!ok);
         assert!(version_of(&root).contains("old-version"));
         assert!(!root.join("Knit.app.knit-old").exists());
