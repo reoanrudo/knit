@@ -453,6 +453,7 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // begin_xfer より前(指紋計算・集計の間)に離される窓も「未完」に含める
     DRAG_RELEASED_EARLY.store(false, Ordering::Relaxed);
     LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed); // 前の受理を引き継がない
+    *DRAG_DONE.lock().unwrap_or_else(|e| e.into_inner()) = None; // 前の結果も引き継がない
     DRAG_IN_FLIGHT.store(true, Ordering::Relaxed);
     DRAG_UNFINISHED.store(true, Ordering::Relaxed);
     let count = entries.len();
@@ -559,13 +560,26 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 // 結果を3状態で言い切る(I5)。判断は common の純関数にあり、ここは
                 // 「離した順序」を渡すだけ(配線にロジックを置かない)
                 DRAG_UNFINISHED.store(false, Ordering::Relaxed);
-                // 遅延提供で**受理済み**なら、途中で離しても相手は置ける(保存のみではない)。
-                // 受理していない場合だけ「渡し終わる前に離した」=保存のみとする
-                let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed) && !lazy_accepted(id);
+                // 遅延提供で**受理済み**なら、相手のドロップ結果を少し待って**事実**で言い切る
+                // (相手は受理の時点でドラッグを始めており、置けたかは相手しか知らない)。
+                // 結果が来なければ従来どおり「離した順序」から慎重に判断する
+                let accepted = lazy_accepted(id);
+                let done = accepted.then(|| wait_drag_done(id, Duration::from_millis(1200)));
+                let result = match done {
+                    Some(Some(true)) => notice::DeliveryResult::PlacedOnScreen,
+                    Some(Some(false)) => notice::DeliveryResult::SavedOnly {
+                        why: notice::SaveWhy::PeerDidNotPlace,
+                    },
+                    // 受理済みだが結果が来なかった/受理していない: 離した順序で判断する
+                    _ => {
+                        let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed) && !accepted;
+                        notice::placed_or_saved(early)
+                    }
+                };
                 let outcome = notice::DeliveryOutcome {
                     peer: peer.clone(),
                     count: rep.sent,
-                    result: notice::placed_or_saved(early),
+                    result,
                 };
                 let n = notice::compose_notice(&outcome);
                 // メニューの回復動線へ記録する(成功なら消える)
@@ -818,6 +832,7 @@ static LAST_OUTCOME: Mutex<Option<LastOutcome>> = Mutex::new(None);
 fn menu_line(result: &notice::DeliveryResult) -> String {
     match result {
         notice::DeliveryResult::Placed => "渡しました".to_string(),
+        notice::DeliveryResult::PlacedOnScreen => "相手の画面に置きました".to_string(),
         notice::DeliveryResult::SavedOnly { .. } => {
             "置けず、相手の受信フォルダに保存されました".to_string()
         }
@@ -930,6 +945,31 @@ pub(crate) fn note_lazy_accepted(id: u64) {
 /// この掴みが受理済みか(受理済みなら、離すタイミングを待たなくてよい)
 pub(crate) fn lazy_accepted(id: u64) -> bool {
     id != 0 && LAZY_ACCEPTED_ID.load(Ordering::Relaxed) == id
+}
+
+/// 相手がドロップを受け取ったか(W4)。相手から届いた**事実**だけを入れる
+static DRAG_DONE: Mutex<Option<(u64, bool)>> = Mutex::new(None);
+
+/// 相手から結果が届いた(`Msg::DragDone`)。自分発の掴みドラッグのみ
+pub(crate) fn note_drag_done(id: u64, copied: bool) {
+    *DRAG_DONE.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, copied));
+}
+
+/// 結果が届くまで少し待つ(遅延提供のドロップは転送完了の後に確定する)。
+/// 届いたら `Some(copied)`、来なければ `None`(推測で言い切らない)
+fn wait_drag_done(id: u64, timeout: std::time::Duration) -> Option<bool> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some((got_id, copied)) = *DRAG_DONE.lock().unwrap_or_else(|e| e.into_inner()) {
+            if got_id == id {
+                return Some(copied);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// 掴みドラッグの転送を「渡し終わる前に離した」か(I5)。相手がネイティブのドラッグを

@@ -1686,9 +1686,12 @@ mod batch_open_tests {
     use blake2::Digest;
 
     fn scratch() -> std::path::PathBuf {
+        // 時刻だけだと同一ナノ秒で衝突し得る(実際に 1 度落ちた)。連番も混ぜる
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "knit-batch-open-{}-{}",
+            "knit-batch-open-{}-{}-{}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
