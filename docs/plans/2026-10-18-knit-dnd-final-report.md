@@ -135,3 +135,26 @@
 4. **赤いCIは、その後ろのテストを殺す。** 数週間赤だった windows ジョブのせいで `knit-win` のテストは一度も走っていなかった。push を検証ループに入れて初めて、製品バグが出た。
 5. **判断を純関数に寄せ、配線を1行にする。** 「配線が無テスト」という指摘が繰り返し出たため、判定を `common` の純関数へ出して呼び出し側を1行にする形が有効だった。
 6. **できないことは、できないと書く。** 画面の目視・Windows 実機の対話操作・実行時検証は、この環境では原理的に不可能。設計書と報告書に明記し、利用者の確認項目として切り出した。
+
+---
+
+## 9. 追記(ラウンド4): W1-glue の COM 面を実装・型検証した
+
+「押し続け不要」の本命 W1 について、**COM 面(Windows)を実装し、Windows CI で型検証**した。
+
+| コミット | 内容 | 検証 |
+|---|---|---|
+| `58240f1` | **W1-glue**: `LazySource`(IDataObject: 目録を HGLOBAL、内容を `TYMED_ISTREAM` で提供)/ `Stream`(IStream: `Read` は宣言サイズに達するまで待つ・期限30秒、`Seek`/`Stat` 対応)/ `LazyEnum`(IEnumFORMATETC: 目録 + 各ファイル)/ `start_lazy()`(目録だけで `DoDragDrop` を開始)。純粋部分も追加(`staged_path` の無害化、`is_ready`/`wait_ready` の期限つき待ち) | Windows CI **pass**(新規テスト11件が実行され緑) |
+| `3d820f5` | 未配線であることを理由つきで明示(`allow(dead_code)`)。配線が済んだら外す | Windows CI pass(警告は既存2件のみ) |
+
+**検証手法の改善**: Windows 固有コードは macOS では `cfg` で除外され、ローカルでは型検査すらできない。
+そこで **WIP ブランチ + ドラフトPR**(`pull_request` トリガ)で CI を回し、緑を確認してから main へ入れる
+運用にした(`gh pr create --draft` → 緑 → `gh pr merge`)。main を赤にせずに未検証コードを型検査できる。
+
+**正直な現在地**:
+- この COM 面は**まだ配線されていない**(`KNIT_LAZY=1` でも誰も呼ばない)。既定の挙動は何も変わらない。
+- 次の増分は「**受信を staging へ流す経路**」: `Msg::Manifest` を受けたら `DragAccept` を返して即ドラッグを開始し、
+  転送は staging ディレクトリへ書く(名前衝突を避けるため**ドラッグごとに新しい staging**を作る)。
+  ドロップ後・中止後は staging を捨てる。
+- **実行時の挙動は未検証**。Explorer が遅延提供(`CFSTR_FILECONTENTS` の `IStream`)を受けて
+  実際にコピーできるかは、Windows 実機の対話操作でしか確かめられない。
