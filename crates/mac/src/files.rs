@@ -453,6 +453,7 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // begin_xfer より前(指紋計算・集計の間)に離される窓も「未完」に含める
     DRAG_RELEASED_EARLY.store(false, Ordering::Relaxed);
     LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed); // 前の受理を引き継がない
+    MANIFEST_SENT_ID.store(0, Ordering::Relaxed); // 前の目録を引き継がない
     *DRAG_DONE.lock().unwrap_or_else(|e| e.into_inner()) = None; // 前の結果も引き継がない
     DRAG_IN_FLIGHT.store(true, Ordering::Relaxed);
     DRAG_UNFINISHED.store(true, Ordering::Relaxed);
@@ -483,6 +484,7 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
             total,
             files,
         });
+        MANIFEST_SENT_ID.store(id, Ordering::Relaxed);
         eprintln!("[drag] mac->win manifest {id}: {count} 件(遅延提供)");
     }
     Some(id)
@@ -563,7 +565,7 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 // 遅延提供で**受理済み**なら、相手のドロップ結果を少し待って**事実**で言い切る
                 // (相手は受理の時点でドラッグを始めており、置けたかは相手しか知らない)。
                 // 結果が来なければ従来どおり「離した順序」から慎重に判断する
-                let accepted = lazy_accepted(id);
+                let accepted = wait_lazy_accepted(id, Duration::from_millis(1000));
                 let done = accepted.then(|| wait_drag_done(id, Duration::from_millis(1200)));
                 let result = match done {
                     Some(Some(true)) => notice::DeliveryResult::PlacedOnScreen,
@@ -932,6 +934,10 @@ static DRAG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 指紋計算・集計の間)も true にする: この窓で離す「フリックして離す」操作を取りこぼすと、
 /// 相手は保存のみなのに「置けた」と言ってしまう
 static DRAG_UNFINISHED: AtomicBool = AtomicBool::new(false);
+/// 遅延提供の目録を送った受け渡しID(0 = なし)。相手が版17のときだけ入る。
+/// **速い転送では受理の往復より送信完了が先に来る**ため、受理を少し待つ判断に使う
+static MANIFEST_SENT_ID: AtomicU64 = AtomicU64::new(0);
+
 /// 遅延提供の受理(相手が**実際に**ドロップを先に受理した事実)。
 /// 版(能力)ではなく受理の事実で判断する: 相手が `KNIT_LAZY=1` で動いていなければ
 /// 受理は来ないので、「能力があるのに待たされる」を嘘と言わずに済む
@@ -953,6 +959,25 @@ static DRAG_DONE: Mutex<Option<(u64, bool)>> = Mutex::new(None);
 /// 相手から結果が届いた(`Msg::DragDone`)。自分発の掴みドラッグのみ
 pub(crate) fn note_drag_done(id: u64, copied: bool) {
     *DRAG_DONE.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, copied));
+}
+
+/// 受理が届くのを少し待つ。**速い転送では送信完了が受理より先に来る**ため、
+/// 待たずに判断すると「置けたのに保存のみと言う」ことになる(実運用で最も多い経路)。
+/// 目録を送っていない相手(版16以前)では待たずに即 false
+fn wait_lazy_accepted(id: u64, timeout: std::time::Duration) -> bool {
+    if MANIFEST_SENT_ID.load(Ordering::Relaxed) != id {
+        return false; // 遅延提供を交渉していない
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if lazy_accepted(id) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }
 
 /// 結果が届くまで少し待つ(遅延提供のドロップは転送完了の後に確定する)。
@@ -1287,5 +1312,45 @@ mod last_outcome_tests {
             notice::Recovery::None,
             "再試行は促さない"
         );
+    }
+}
+
+#[cfg(test)]
+mod lazy_accept_wait_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// 目録を送っていない相手(版16以前)では待たない
+    #[test]
+    fn no_wait_when_no_manifest_was_sent() {
+        MANIFEST_SENT_ID.store(0, Ordering::Relaxed);
+        let t0 = Instant::now();
+        assert!(!wait_lazy_accepted(42, Duration::from_millis(300)));
+        assert!(
+            t0.elapsed() < Duration::from_millis(100),
+            "交渉していなければ即座に返す(実際 {:?})",
+            t0.elapsed()
+        );
+    }
+
+    /// 目録を送った相手では、受理が来るまで(または期限まで)待つ。
+    /// 速い転送で「受理より送信完了が先」に来る場合の取りこぼしを防ぐ
+    #[test]
+    fn waiting_stops_as_soon_as_the_acceptance_arrives() {
+        MANIFEST_SENT_ID.store(7, Ordering::Relaxed);
+        LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed);
+        let t0 = Instant::now();
+        assert!(
+            !wait_lazy_accepted(7, Duration::from_millis(120)),
+            "来なければ false(期限まで待つ)"
+        );
+        assert!(t0.elapsed() >= Duration::from_millis(100), "{:?}", t0.elapsed());
+        // 受理済みなら待たずに true
+        note_lazy_accepted(7);
+        let t1 = Instant::now();
+        assert!(wait_lazy_accepted(7, Duration::from_millis(500)));
+        assert!(t1.elapsed() < Duration::from_millis(100), "{:?}", t1.elapsed());
+        LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed);
+        MANIFEST_SENT_ID.store(0, Ordering::Relaxed);
     }
 }
