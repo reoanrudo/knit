@@ -1629,6 +1629,71 @@ base = `knit-common` **294 passed** / すべて `defa1a7` で実施(HEAD の移�
    「呼び出し側が期限切れを消す」「到着(`receive`)で消す」「offer で受信量を戻す」はテストが無い ✓。
 4. **[軽] `DRAG_UNFINISHED.store(false, …)` が `files.rs` に二重に書かれている**(`:561` と `:568`)✓。
 
+## 6.10 第8ラウンド: 停滞ベースの期限(`6641762`)/ 判定: **合格**(軽微な残り2点)
+
+- HEAD `6641762` / `git status` 空 / `cargo build` exit 0(**警告行 10 = 基準同数**)/
+  `cargo test` = **610 passed / 0 failed / 4 ignored**(申告どおり ✓)。
+- 文言: 新規リテラルは**ログ1行のみ** ✓(`[drag] 受け取り待ちが停滞したため表示を打ち切ります({id})`)。
+  ユーザー可視の変更は無し ✓(差分を全文読んで確認 ✓ = 対象2ファイルともロジックとテストのみ ✓)。
+
+**1. 停滞ベースの期限 = 正しい** ✓(私の欠陥2の本体)
+- `WAITING_SEEN_MS`(最終進捗時刻)を `offer` で立て、`files::note_rx_bytes` → `incoming_drag::note_progress_seen()`
+  で更新 ✓。切る条件は `waiting_alive(seen, started, now)` = **停滞15秒** または **開始から15分** ✓。
+  `note_progress_seen` は `WAITING_SEEN_MS != 0` のときだけ書く = 「待ちが無いときは触らない」✓。
+  `clear_waiting` / 期限切れ / `reset` のすべてで `WAITING_SEEN_MS` を 0 に戻す ✓(掃除も揃っている ✓)。
+- **1GB=34秒の表示が消えない** ✓(テスト `a_silent_wait_expires_but_progress_keeps_it_alive` が
+  「進捗が続く限り5分でも生きている」を固定 ✓)。
+
+**2. 停滞の閾値(15秒)が極端に遅い回線で誤発火しないか = しない** ✓(コードで確認)
+- 受信フックは **`bulk.rs:898-900` で「受信したブロックを書き込むたび」**に呼ばれる ✓
+  (ファイル完了ごとではない ✓)。ブロックは送信側の `CHUNK`(=256KB)単位 ✓。
+- したがってフック間隔 = 256KB ÷ 実効速度 ✓:
+  30MB/s → 約 8.5ms / 1MB/s → 約 0.26秒 / 100KB/s → 約 2.5秒 / **17KB/s を下回ると 15 秒を超える** ✓。
+  → **15秒の停滞は「実効 17KB/s 未満」または本当の停止を意味する** ✓ = 閾値として妥当 ✓
+  (リードの見立てどおり ✓)。
+- 例外として理論上残るのは「1ファイルのハッシュ検証(blake2)が15秒を超える」場合 ✓
+  (最終チャンクの後・`receive` の前に無音になる ✓)。10GB 単一ファイルで約10秒程度 ✓ 通常は収まる ✓
+  → 気になるなら**ファイル完了時にも `note_progress_seen`** を呼ぶのが安全 ✓(軽微)。
+- **15分の保険** ✓: 10GB=341秒(5分41秒)なので余裕は約2.6倍 ✓ 妥当 ✓。
+  ただし 10GB を 11MB/s 未満で流すと保険に当たる(表示だけ切れる ✓ 転送は無事 ✓)✓。
+
+**3. `waiting_tests` の直列化 = 実効(11/20 → 1/20)** ✓ ただし**完全ではない**(下の残り1)
+- 5テストすべてが `lock()` を取り ✓、私のストレスでも **並列12回で 0 失敗** ✓(hud 側も 0/12 ✓)。
+- ただし `incoming_drag` 全体を並列 20 回で **1 回失敗** ✓(`cancelling_another_id_keeps_the_waiting_state`
+  が :717「別IDでは消さない」で失敗 ✓)。原因は**モジュール外の `reset()`**:
+  `mod tests` の `disconnect_keeps_native_resources_for_main_thread_cleanup`(`:601-607`)が
+  `reset()` を呼ぶが、`WAIT_TEST_LOCK` は `waiting_tests` の中の private static なので**掛からない** ✓
+  → その瞬間に `WAITING` と `WAITING_SEEN_MS` が消える ✓。
+
+**4. 配線のテスト = 塞がった** ✓(私の m4/m5 が赤になった)
+- `an_expired_wait_is_cleared_by_the_reader`(時刻を古くして `waiting_for_data` が消す ✓)
+- `receiving_clears_the_waiting_state`(実際の `INCOMING.offer(99,1,0.0)` + `receive(99,[…])` ✓)
+- `set_waiting_for_test` も「生きている待ち」を模すよう修正 ✓(前版の取り違えを解消 ✓)
+- `DRAG_UNFINISHED` の二重 store も解消 ✓。
+
+**変異とストレス(私の手で実行。worktree は撤去済み)**
+
+| 変異/実験 | 結果 |
+|---|---|
+| base(`waiting_tests` 5 / `receive_progress` 2) | 緑 ✓ |
+| m1 停滞の判定を外す | **赤**(`a_silent_wait_expires_but_progress_keeps_it_alive`)✓ |
+| m2 全体の上限(15分)を外す | **赤**(同上)✓ |
+| m3 `waiting_for_data` の期限チェックを外す | **赤**(`an_expired_wait_is_cleared_by_the_reader`)✓ = 前ラウンドの m4 が解消 |
+| m4 `receive` の `clear_waiting` を外す | **赤**(`receiving_clears_the_waiting_state`)✓ = 前ラウンドの m5 が解消 |
+| **m5 受信フックからの `note_progress_seen` を外す** | **生存** ← 残り2(フック→期限延長の配線が未テスト) |
+| s1 `incoming_drag` を並列 20 回 | **1 回失敗**(上記。前ラウンドは 11/20) |
+| s2 `hud::tests` を並列 12 回 | **0 回失敗** ✓ |
+
+### 残り(いずれも軽微。判定は合格)
+
+1. **[軽] ストレス 1/20 の残存フレーク**: `WAIT_TEST_LOCK` が `waiting_tests` の private static なので、
+   `mod tests` の `reset()` を巻き込めない ✓。→ ロックをファイル共有(`#[cfg(test)]` の crate 内 static)に
+   するか、`mod tests` の `disconnect_…` も同じロックを取る ✓。全スイート実行は3回とも 610/0 だが、
+   負荷次第では同じ経路が踏める ✓。
+2. **[軽] フック → 期限延長の配線が未テスト**(m5 生存): 純関数(`waiting_alive`)と読み手
+   (`waiting_for_data` / `receive`)は固定されているが、「受信のたびに `WAITING_SEEN_MS` が延びる」ことは
+   テストされていない ✓。→ `note_rx_bytes` を呼んで `waiting_for_data` が生き続けることを1件足す ✓。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8・W1・W4)
 
 | 増分 | 依頼 | 判定 | 備考 |

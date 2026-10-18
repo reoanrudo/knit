@@ -145,6 +145,18 @@ pub fn offer(id: u64, count: usize, total: u64, position: f64) {
     );
 }
 
+/// テスト専用: 待ち状態を共有する static を触るテストは**この1本のロック**を取る。
+/// `mod tests` の `reset()` を呼ぶテストも同じロックを取らないと、待ち状態が
+/// 横から消されてフレークする(検証役が並列20回で1回の失敗として実測)
+#[cfg(test)]
+pub(crate) static SHARED_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// テスト専用: 共有 static を触るテストのロックを取る
+#[cfg(test)]
+pub(crate) fn shared_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    SHARED_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// テスト専用: 待ち状態を差し込む(offer は接続状態など多くの前提を要するため)
 #[cfg(test)]
 pub(crate) fn set_waiting_for_test(id: u64, total: u64) {
@@ -603,6 +615,9 @@ mod tests {
 
     #[test]
     fn disconnect_keeps_native_resources_for_main_thread_cleanup() {
+        // このテストは `reset()` で `WAITING` も消すため、待ち状態のテストと同じ
+        // ロックを取る(取らないと並列実行で待ち状態が横から消える)
+        let _g = shared_state_lock();
         *ACTIVE.lock().unwrap() = Some(Active { id: 77, window: 0, source: 0, began_ms: 0 });
         reset();
         assert!(ACTIVE.lock().unwrap().is_none());
@@ -642,10 +657,10 @@ mod tests {
 mod waiting_tests {
     use super::*;
 
-    /// 待ち状態はプロセス共有の static。テストは直列に走らせる
-    static WAIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    /// 待ち状態はプロセス共有の static。テストは**ファイル共有のロック**で直列化する
+    /// (`mod tests` の `reset()` を呼ぶテストも同じロックを取る)
     fn lock() -> std::sync::MutexGuard<'static, ()> {
-        WAIT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::shared_state_lock()
     }
 
     /// **停滞**で消える(相手がハングしても進捗が残り続けない)。
@@ -670,14 +685,38 @@ mod waiting_tests {
         assert!(!waiting_alive(0, 0, 99_999), "未設定は生きていない");
     }
 
-    /// 配線: 期限切れの待ちは `waiting_for_data` が消す(検証役の変異 m4)
+    /// 配線: 進捗を一度も見ていない待ちは見せない(検証役の変異 m4)。
+    /// **停滞そのものの判定は純関数 `waiting_alive` 側で固定**する: 時計が起動からの
+    /// ミリ秒なので、テストで「15秒前」を作ろうとすると 0 に飽和して未設定と区別できない
     #[test]
-    fn an_expired_wait_is_cleared_by_the_reader() {
+    fn a_wait_without_any_progress_is_not_shown() {
         let _g = lock();
         set_waiting_for_test(1, 10);
-        WAITING_SEEN_MS.store(now_ms().saturating_sub(WAITING_STALL_MS + 1_000), Ordering::Relaxed);
-        assert!(waiting_for_data().is_none(), "停滞した待ちは見せない");
+        WAITING_SEEN_MS.store(0, Ordering::Relaxed); // 一度も進捗を見ていない
+        assert!(waiting_for_data().is_none(), "進捗の無い待ちは見せない");
         assert!(waiting_for_data().is_none(), "消えたままになる");
+    }
+
+    /// 配線: 受信のたびに期限が延びる(検証役の変異 m5)。
+    /// これが無いと、長い転送の途中で表示が消えてしまう
+    #[test]
+    fn receiving_bytes_extends_the_wait() {
+        let _g = lock();
+        set_waiting_for_test(31, 1_000_000);
+        // 14 秒前に進捗を見た状態にする(あと 1 秒で停滞と見なされる)
+        WAITING_SEEN_MS.store(now_ms().saturating_sub(WAITING_STALL_MS - 1_000), Ordering::Relaxed);
+        // 時計は**プロセス起動からのミリ秒**なので、起動直後は小さな値になる
+        // (実時間を引くと 0 に飽和する)。ここでは「進捗で時刻が前へ進む」ことを見る
+        WAITING_SEEN_MS.store(1, Ordering::Relaxed);
+        let before = WAITING_SEEN_MS.load(Ordering::Relaxed);
+        crate::files::note_rx_bytes(262_144); // 受信フック(256KB ブロック)
+        let after = WAITING_SEEN_MS.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "受信のたびに期限が延びる(before={before} after={after})"
+        );
+        assert!(waiting_for_data().is_some(), "待ちは生き続ける");
+        cancel(31);
     }
 
     /// 配線: 到着(`receive`)で待ちが消える(検証役の変異 m5)。
