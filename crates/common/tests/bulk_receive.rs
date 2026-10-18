@@ -88,10 +88,16 @@ fn folder_drag_roundtrips_with_structure_content_and_mtime() {
     assert_eq!(drag_id, &Some(1234));
     assert!(failed.is_empty(), "{failed:?}");
     assert_eq!(got.len(), 5);
-    // 構造の再現(相対パス)
+    // 構造の再現(相対パス)。区切りはプラットフォーム依存(Windows は `\`)なので、
+    // 構造の比較のために `/` へ正規化する(以前は Windows CI がここで落ちていた)
     let names: Vec<String> = got
         .iter()
-        .map(|p| p.strip_prefix(&dst).unwrap().to_string_lossy().into_owned())
+        .map(|p| {
+            p.strip_prefix(&dst)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
         .collect();
     for expect in [
         "資料フォルダ/a.txt",
