@@ -208,12 +208,11 @@ mod tests {
         // 1件目の cFileName の先頭 4 WCHAR が「資」「料」「\」「a」
         let name_off = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE - MAX_FILE_NAME * 2;
         let w = |i: usize| u16::from_le_bytes([bytes[name_off + i * 2], bytes[name_off + i * 2 + 1]]);
-        assert_eq!(w(0), '資' as u16);
-        assert_eq!(w(1), '料' as u16);
-        assert_eq!(w(2), '\\' as u16, "区切りは Windows 形式(Explorer が名前として作る)");
-        assert_eq!(w(3), 'a' as u16);
-        let second = GROUP_HEADER_SIZE + FILEDESCRIPTORW_SIZE;
-        assert_eq!(w(6), 0, "終端は NUL");
+        // 期待する名前そのものと突き合わせる(名前が変わっても終端まで検証できる)
+        let expected: Vec<u16> = "資料\\a.txt".encode_utf16().chain(std::iter::once(0)).collect();
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(w(i), *want, "cFileName[{i}]");
+        }
         // 2件目はフォルダ属性
         let attrs_off = second + 4 + 16 + 8 + 8;
         let attrs = u32::from_le_bytes([
