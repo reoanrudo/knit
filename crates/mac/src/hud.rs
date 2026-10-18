@@ -29,7 +29,16 @@ fn sel(name: &std::ffi::CStr) -> SEL {
 
 /// 「掴みを断った理由」をカーソル近傍に出す(実際の表示はメインスレッド)
 pub(crate) fn note_refusal(reason: &knit_common::drag::Refusal) {
-    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.hud_line());
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(format!("{}\n{}", reason.hud_line(), knit_common::hud::HUD_HINT));
+    gui::request_hud();
+}
+
+/// 受け取り待ちの進捗をカーソル近傍に出す(Win→Mac の「押したまま待つ」に手元の表示)。
+/// **この向きでは離すと保存のみになる**ため、断りとは別の一言を添える
+pub(crate) fn note_progress(line: &str) {
+    *PENDING.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(format!("{line}\n{}", knit_common::hud::PROGRESS_HINT));
     gui::request_hud();
 }
 
@@ -156,9 +165,9 @@ unsafe fn ensure_panel(line: &str) -> ID {
     panel
 }
 
-/// パネルに出す本文(理由 + そのままでも壊れないことの一言)
+/// パネルに出す本文(呼び出し側が2行に組み立て済み。ここでは足さない)
 fn body(line: &str) -> String {
-    format!("{line}\n{}", knit_common::hud::HUD_HINT)
+    line.to_string()
 }
 
 /// カーソルを含む画面の frame を返す。`[NSScreen mainScreen]` はキーウィンドウのある
@@ -259,12 +268,22 @@ mod tests {
         assert!(take_pending().is_none(), "取り出したら消える");
     }
 
-    /// 本文には理由と「そのまま離しても壊れない」の一言が入る
+    /// 断りの本文には「そのまま離しても壊れない」、進捗の本文には「離すと保存のみ」を
+    /// 示す別の一言が入る(取り違えると逆の案内になる)
     #[test]
-    fn the_body_always_reassures_the_user() {
-        let b = body("転送中です(完了後にもう一度)");
-        assert!(b.starts_with("転送中です"), "{b}");
-        assert!(b.contains(knit_common::hud::HUD_HINT), "{b}");
+    fn refusal_and_progress_use_different_reassurance() {
+        note_refusal(&knit_common::drag::Refusal::Busy);
+        let refusal = take_pending().expect("断りの要求がある");
+        assert!(refusal.contains("転送中です"), "{refusal}");
+        assert!(refusal.contains(knit_common::hud::HUD_HINT), "{refusal}");
+        note_progress("受け取り中 42%");
+        let progress = take_pending().expect("進捗の要求がある");
+        assert!(progress.contains("受け取り中 42%"), "{progress}");
+        assert!(progress.contains(knit_common::hud::PROGRESS_HINT), "{progress}");
+        assert!(
+            !progress.contains(knit_common::hud::HUD_HINT),
+            "受け取り待ちで「そのまま離してよい」と言わない: {progress}"
+        );
     }
 
     /// 古い非表示予約が新しい表示を消さない(表示から grace 未満では隠さない)
