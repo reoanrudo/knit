@@ -406,14 +406,19 @@ mod tests {
         let pairs = [(0u64, 0u64), (0, 100), (50, 100), (100, 100), (150, 100)];
         let samples = [0u32, 1, 2, 5];
         let deadlines = [0u64, 1_000, 30_000];
+        // **期限切れの枝も踏む**: 経過を軸にしないと `PeerTimeout` が一度も出ない
+        // (以前は 500ms 固定で、期限 1s/30s に対して常に「まだ待てる」だった)
+        let elapsed = [0u64, 500, 30_001];
         let mut kinds: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
         let mut cases = 0usize;
+        let mut timeouts = 0usize;
         for &phase in &phases {
             for refusal in &refusals {
                 for &(sent, total) in &pairs {
                     for &speed_samples in &samples {
                         for &peer_deadline_ms in &deadlines {
+                          for &elapsed_ms in &elapsed {
                             for &accepted in &[false, true] {
                                 for &peer_lazy in &[false, true] {
                                     let i = ForecastInput {
@@ -422,7 +427,7 @@ mod tests {
                                         accepted,
                                         sent,
                                         total,
-                                        elapsed_ms: 500,
+                                        elapsed_ms,
                                         speed_samples,
                                         peer_deadline_ms,
                                         refusal: refusal.clone(),
@@ -430,6 +435,14 @@ mod tests {
                                     };
                                     let f = forecast_for(&i);
                                     cases += 1;
+                                    if matches!(
+                                        f,
+                                        Forecast::WillFail {
+                                            reason: FailReason::PeerTimeout
+                                        }
+                                    ) {
+                                        timeouts += 1;
+                                    }
                                     let kind = match &f {
                                         Forecast::WillPlace => "place",
                                         Forecast::WillSaveOnly { .. } => "save",
@@ -487,13 +500,33 @@ mod tests {
                                     }
                                 }
                             }
+                          }
                         }
                     }
                 }
             }
         }
-        assert_eq!(cases, 2880, "全組合せを回している(空回りしていない)");
-        assert!(kinds.len() >= 4, "複数の結果が出る組み合わせ: {kinds:?}");
-        println!("[forecast] 組合せ {cases} 通り: {kinds:?}");
+        assert_eq!(cases, 8640, "全組合せを回している(空回りしていない)");
+        // **分布を契約として固定**(検証役の指摘: 数値は一度の観測のままだと、
+        // 分布がずれても「4種類以上あれば緑」で通ってしまう)
+        // **分布を契約として固定**(検証役の指摘: 数値は一度の観測のままだと、
+        // 分布がずれても「4種類以上あれば緑」で通ってしまう)。意図して挙動を変えたときは
+        // ここも更新する(その差分が「何がどう変わったか」の記録になる)
+        // 期限切れ(`PeerTimeout`)の件数。**0 だと「軸を回しているのに枝を踏んでいない」**
+        // 状態になる(検証役が指摘した不活性)。ここを固定して再発を防ぐ
+        const TIMEOUTS: usize = 64;
+        const DISTRIBUTION: [(&str, usize); 5] = [
+            ("fail", 6544),
+            ("place", 1152),
+            ("unknown", 432),
+            ("save", 288),
+            ("wait", 224),
+        ];
+        assert_eq!(
+            kinds,
+            std::collections::BTreeMap::from(DISTRIBUTION),
+            "結果の分布(意図して変えたときはここも更新する)"
+        );
+        assert_eq!(timeouts, TIMEOUTS, "期限切れの件数(軸が不活性でないこと)");
     }
 }
