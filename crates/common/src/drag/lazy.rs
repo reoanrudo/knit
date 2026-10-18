@@ -332,6 +332,29 @@ mod tests {
         assert!(h.streaming().is_empty(), "二度目は無視");
     }
 
+    /// 流している最中の二度目の受理も無視して状態を動かさない(検証役の残指摘 (a))
+    #[test]
+    fn an_accept_arriving_while_streaming_is_ignored() {
+        let mut h = LazyHandoff::new(LazySide::Sender);
+        h.offer(true, 1);
+        h.manifest_sent();
+        h.accepted();
+        h.streaming();
+        assert!(h.accepted().is_empty(), "流している最中の受理は無視");
+        assert_eq!(h.state(), LazyState::Streaming, "状態を動かさない");
+    }
+
+    /// 受理の直後にデータが揃う場合は、流し始めを挟まずに完了できる(検証役の残指摘 (b))
+    #[test]
+    fn completion_can_arrive_right_after_acceptance() {
+        let mut h = LazyHandoff::new(LazySide::Sender);
+        h.offer(true, 1);
+        h.manifest_sent();
+        h.accepted();
+        assert!(h.completed(1).is_empty(), "受理直後の完了もドロップ成立");
+        assert_eq!(h.state(), LazyState::Dropped);
+    }
+
     #[test]
     fn invalid_transitions_are_ignored() {
         let mut h = LazyHandoff::new(LazySide::Sender);

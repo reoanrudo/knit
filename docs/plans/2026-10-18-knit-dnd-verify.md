@@ -1128,6 +1128,79 @@ W4 の `DragDone{copied}` を受けてから「置けました」と言う。**�
   Windows 実機/CI での実行確認は私にはできない。したがって本判定は
   **「読解 + 一次資料(MSDN)との突き合わせ」のみ**であり、実行による裏取りは無い ✓。
 
+### e5fb2f1: 指摘の修正版(再検証)/ 判定: **合格**
+
+検証日: 2026-10-18 / rev **`e5fb2f1`**(HEAD)/ `git status --porcelain` 空
+
+- `cargo build` exit 0(**警告行 10 = 基準同数**)/ `cargo test` = **593 passed / 0 failed / 4 ignored**
+  (前回 590 から **+3 = 新規テスト3件** ✓ 申告どおり)。
+- 文言: `diff multiset_6bc0791 multiset_e5fb2f1` = **追加8件のみ、すべてテスト内メッセージ**
+  (`多くても置かせない` / `二度目は無視` / `受理だけでは流さない` 他)✓ **production の文言変更ゼロ** ✓。
+- 差分: `drag.rs` +26 / `lazy.rs` +52 / `files.rs` +10 / `hud.rs` +54(ほか私の doc 296)。
+
+**1. AppKit: 実機プローブで再確認(私が唯一の防波堤なので独立に実施)**
+
+| 呼び出し | 結果 |
+|---|---|
+| `[NSTextField cell]` | **OK** ✓ |
+| `[cell setWraps:]`(NSCell へ) | **OK ✓ 実行して例外なし**(新しい呼び方で文字列を設定しても例外なし) |
+| `[NSTextField setUsesSingleLineMode:]` | **OK** ✓ |
+| `[NSTextField setWraps:]` | **MISSING**(= もう呼んでいないことを確認 ✓ 不合格の原因は解消) |
+| `[NSArray count]` / `[NSArray objectAtIndex:]` | **OK** ✓(`[NSScreen screens]` は実行時に `count=1 / frame 0,0 2056x1329` を返した ✓) |
+| `[NSWindow orderOut:]`(nil を渡す) | **OK ✓ 実行して例外なし** |
+| `[NSScreen screens]` / `mainScreen` / `frame` / `setFrame:display:` | OK ✓ |
+
+- `cursor_screen`(`hud.rs:164-198`)の論理 ✓: `[NSScreen screens]` を走査し、**半開区間**
+  (`>= origin && < origin+size`)でカーソルを含む画面を選ぶ(隣接画面の二重マッチなし ✓)、
+  `screens` が nil または該当なしのときだけ `mainScreen` へ落とす ✓。`place()` にはその画面の frame が
+  渡る ✓ → **マルチディスプレイの指摘は解消** ✓。
+- `orderOut:` は `call1_id(panel, "orderOut:", nil)`(`hud.rs:65`)✓ = ABI の指摘も解消 ✓。
+- **未検証(正直に)**: **2行で実際に描画されるかは私には確認できない**(プローブで見られるのは API の実在と
+  例外の有無だけ)。`usesSingleLineMode:NO` + cell の `wraps:YES` は AppKit で複数行ラベルを作る標準的な
+  組み合わせ ✓ だが、**画面の目視は実機を持つ人にしかできない** ✓。
+
+**2. 反例 → 回帰テスト(変異で実効性を確認)** ✓
+
+- `press()` は `released_once` **だけ**を消す(`drag.rs:275-284`)✓。私の反例
+  `release → announce(9,2) → press → claim(9,2)` がそのままテストになり(`drag.rs:364-371`、期待 Released)、
+  **変異で元に戻すと赤**(`a_new_press_does_not_resurrect_a_transfer_that_arrived_after_release`)✓。
+  粘着バグの修正も維持されている(既存テスト緑 ✓ 変異テスト ml 系も緑 ✓)。
+
+**3. I6 のリセット漏れ** ✓ 解消
+
+- 通常送信の `Ok` 腕で `note_outcome(Placed)` を呼ぶ(`files.rs:136-146`)→ 成功で記録が消える ✓。
+  `retry_last()` は `send_files_to_win` を通るので**再送成功でも消える** ✓ = 「もう一度送る」が残り続けて
+  同じファイルを二重送信する経路は塞がれた ✓。
+- 観察: 記録のクリアはスキップ処理より前にあるため、一部スキップがあっても「もう一度送る」は消える
+  (スキップ自体は通知で残る ✓ 妥当)。
+
+**4. I8 の穴(変異で確認。base = `knit-common` 289 passed)**
+
+| 変異 | 期待 | 結果 |
+|---|---|---|
+| m_press: `press()` を元に戻す(expected.released も消す) | 赤 | **赤**(`a_new_press_does_not_resurrect…`)✓ |
+| ml2: 件数照合 `!=` → `<`(過剰受信を一致扱い) | 赤 | **赤**(`over_receipt_is_not_a_drop_either`)✓ **穴(a) 解消** |
+| ml6: `streaming()` の受理前ガードを外す | 赤 | **赤**(2件: `a_second_accept_is_ignored` / `invalid_transitions_are_ignored`)✓ = **`Accepted` が生きた状態になった**(設計の遷移 `ManifestSent → Accepted → Streaming` と一致 ✓)|
+| **ml3: `accepted()` を `Streaming` からも受け付ける(元の L3 の形)** | 赤 | **生存** ← 残る穴(a) |
+| **ml5a: `completed()` のガードから `Accepted` を外す** | 赤 | **生存** ← 残る穴(b) |
+
+- **残る穴(a)(軽微)**: 新テスト `a_second_accept_is_ignored` は「**受理直後**の二度目の受理」しか見ていない。
+  `Streaming` 中の受理を許す変更は緑のまま(状態が `Accepted` に戻る=不正遷移)。
+  1行(`h.streaming()` の後に `assert!(h.accepted().is_empty())` → 状態が `Streaming` のまま)で塞げる ✓。
+- **残る穴(b)(軽微)**: `completed()` を `Accepted` から直接呼ぶ経路が未テスト(全テストが `streaming()` を挟む)。
+  ガードは `Accepted` を意図的に許している(受理直後にデータが揃う場合)ので**到達し得る** ✓。
+  `accepted()` → `completed(n)` のテストを1件足すのが安全 ✓。
+- 元の L5(`released()` の matches から `Accepted` を外す)は**今も生存するが等価変異**:
+  `_` 腕が同じ `Vec::new()` を返すため挙動が変わらない ✓ = 指摘の性質が
+  「到達不能な死んだ状態」から「冗長な腕」に変わった ✓(実害なし)。
+
+**5. 判定の更新**
+
+- **I3: 不合格 → 合格**(致命的だった `setWraps:` とマルチディスプレイ・`orderOut:` が解消 ✓。
+  ただし**目視は依然として未実施** ✓ 私には画面を確認できない)。
+- **c49f95d / I6 / I8/I8b: 条件付き → 合格**(指摘はすべて解消 ✓。I8 には上記の軽微な残り2点 ✓)。
+- この修正版で、私が第3ラウンドで出した指摘は**すべて解消**した ✓。
+
 ### 増分の状態(I1・I2・I3・I5・I6・I7・I8)
 
 | 増分 | 依頼 | 判定 | 備考 |
@@ -1135,10 +1208,13 @@ W4 の `DragDone{copied}` を受けてから「置けました」と言う。**�
 | I1 | 受領(43de2e2)→ 指摘修正(a420d11) | **合格** | 3件の指摘はすべて修正され、修正自体も変異(m10/m11)で実効性を確認 |
 | I2 | 受領(da6129c)→ 指摘修正(53c6291) | **合格** | m8 の穴は私の手でも赤→復元で緑を確認。doc 申し送り3件も反映 |
 | I5 | 受領(85fdecb)→ 指摘修正(c7aae32) | **合格** | 条件付き3点(言い切り・取りこぼし窓・無テスト配線)がすべて解消 ✓ |
-| I3 | 受領(90bd8eb) | **不合格** | `setWraps:` が NSTextField に無く初回表示で例外(実機プローブで実証)/ マルチディスプレイで画面選択が誤り。他のセレクタ・スレッド規約・クリック透過は良好 |
-| I6 | 受領(5021c59) | **条件付き** | 記録のリセットが掴み経路の成功でしか行われない(通常送信の成功で消えない→再送の繰り返し) |
+| I3 | 受領(90bd8eb)→ **修正版(e5fb2f1)** | **合格** | `cell setWraps:` + `setUsesSingleLineMode:` で例外が消えたことをプローブで確認 ✓ / `cursor_screen` でマルチディスプレイ解消 ✓ / `orderOut:nil` ✓。**2行描画の目視は未実施** |
+| I6 | 受領(5021c59)→ 修正版(e5fb2f1) | **合格** | 通常送信の成功でも記録が消えるようになり、二重送信の経路が塞がった ✓ |
 | I7 | 受領(5cd0a42) | **合格** | 版ゲート・MIN_VERSION 据え置き・副作用なしを確認 |
-| I8/I8b | 受領(2f3e61e・54cf983) | **条件付き** | 過剰受信と二重受理が未固定(変異 L2・L3 が生存)/ `LazyState::Accepted` が到達不能な死んだ状態 |
+| I8/I8b | 受領(2f3e61e・54cf983)→ 修正版(e5fb2f1) | **合格** | 過剰受信(ml2)・二重受理(受理直後)・`Accepted` の生死(ml6)は変異で赤 ✓。残り: `Streaming` 中の受理と `Accepted` からの `completed()` が未テスト(軽微) |
+| 粘着バグ | 受領(c49f95d)→ 修正版(e5fb2f1) | **合格** | `press()` は `released_once` のみ消す ✓ 反例が回帰テスト化され、変異で赤 ✓ |
+| mtime | 受領(1047f61・ecf68a7) | **合格** | 公開後の最終パスへ設定 ✓ macOS の fd 経路維持 ✓ |
+| pairing テスト | 受領(2fbf21d) | **合格** | テスト専用 ✓ |
 | W1-core | 受領(6bc0791) | **合格**(読解+一次資料のみ) | 592 バイト・オフセット・フラグが MSDN と一致。実行検証は不可 |
 | W系その他 | 未受領 | — | 実機が要る(W1 配線・W2・W3・W4・W5)|
 
