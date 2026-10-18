@@ -66,8 +66,11 @@ pub enum Forecast {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForecastInput {
     pub phase: CarryPhase,
-    /// 相手が遅延提供(drag.lazy)に対応しているか
+    /// 相手が遅延提供(drag.lazy)に**対応しているか**(能力。版で決まる)
     pub peer_lazy: bool,
+    /// 相手が**この掴みを受理したか**(事実。受理の行が届いたときだけ true)。
+    /// **能力と混同しない**: 対応していても受理していなければ待つ必要がある
+    pub accepted: bool,
     pub sent: u64,
     pub total: u64,
     pub elapsed_ms: u64,
@@ -121,8 +124,10 @@ pub fn forecast_for(i: &ForecastInput) -> Forecast {
             why: Why::TotalUnknown,
         };
     }
-    // 遅延提供: 離す前に相手がドロップを受理できるので、押下を待たずに置ける
-    if i.peer_lazy {
+    // 遅延提供で**受理済み**: 離す前にドロップが成立しているので押下を待たずに置ける。
+    // 能力(`peer_lazy`)だけでは「置ける」と言わない(受理していなければ相手は
+    // まだドラッグを始めておらず、離すと保存のみになる)
+    if i.accepted {
         return Forecast::WillPlace;
     }
     if i.phase == CarryPhase::ReleasedEarly {
@@ -154,6 +159,7 @@ mod tests {
         ForecastInput {
             phase: CarryPhase::Held,
             peer_lazy: false,
+            accepted: false,
             sent: 1_000,
             total: 10_000,
             elapsed_ms: 1_000,
@@ -169,6 +175,7 @@ mod tests {
         // 遅延提供でも「越えられない」掴みを「置けます」と言わない(X8)
         let i = ForecastInput {
             peer_lazy: true,
+            accepted: true,
             refusal: Some(Refusal::LinkDown),
             ..base()
         };
@@ -260,6 +267,7 @@ mod tests {
         // 遅延提供なら、完了前に離しても置けた(受理は離す前)
         let early_lazy = ForecastInput {
             peer_lazy: true,
+            accepted: true,
             ..early
         };
         assert_eq!(forecast_for(&early_lazy), Forecast::WillPlace);
@@ -270,6 +278,28 @@ mod tests {
             ..base()
         };
         assert_eq!(forecast_for(&late), Forecast::WillPlace);
+    }
+
+    /// **能力と受理を混同しない**: 版 17 の相手でも、受理が届いていなければ
+    /// 「待つ」ままにする(相手が遅延提供を無効にしている場合が実際にある)
+    #[test]
+    fn capability_without_acceptance_still_waits() {
+        let capable = ForecastInput {
+            peer_lazy: true,
+            accepted: false,
+            ..base()
+        };
+        assert!(
+            matches!(forecast_for(&capable), Forecast::WaitingForPeer { .. }),
+            "受理が来るまでは待つ"
+        );
+        // 受理が届いたら、同じ入力で「置ける」に反転する(能力だけでは反転しない)
+        let accepted = ForecastInput {
+            peer_lazy: true,
+            accepted: true,
+            ..base()
+        };
+        assert_eq!(forecast_for(&accepted), Forecast::WillPlace);
     }
 
     #[test]
