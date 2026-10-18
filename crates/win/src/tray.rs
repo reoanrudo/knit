@@ -1470,6 +1470,11 @@ unsafe fn open_menu(hwnd: HWND) {
     w.push(0);
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, w.as_ptr());
     AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+    // **受信物への常設導線を最初に押せる位置へ**(W5)。受信完了の通知はトーストの
+    // アクションを持てないため、置き場所へ1手で行ける場所を先頭に置く
+    // (Mac 側の「受信フォルダを開く」と同じ位置づけ)
+    let fo = wide("受信フォルダを開く");
+    AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
     let open_w = wide("設定を開く…");
     AppendMenuW(menu, MF_STRING, MENU_STATUS as usize, open_w.as_ptr());
     // クリップボード履歴(送信・受信したテキストから選んで復元)
@@ -1530,8 +1535,6 @@ unsafe fn open_menu(hwnd: HWND) {
         MENU_BACKMAC as usize,
         bm.as_ptr(),
     );
-    let fo = wide("受信フォルダを開く");
-    AppendMenuW(menu, MF_STRING, MENU_OPENFOLDER as usize, fo.as_ptr());
     let sd = wide("設定フォルダを開く");
     AppendMenuW(menu, MF_STRING, MENU_OPENSETDIR as usize, sd.as_ptr());
     let log_w = wide("ログを開く");
