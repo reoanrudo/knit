@@ -22,8 +22,11 @@ enum HudKind {
 /// 表示する文言(tap スレッドが書き、メインスレッドが取り出す)
 static PENDING: Mutex<Option<(HudKind, String, u64)>> = Mutex::new(None);
 
-/// 断りの説明を優先する時間。この間は進捗で上書きしない
+/// 断りの説明を優先する時間。この間は進捗で上書きしない。
+/// `PENDING` は表示時に空になるため、**表示後も効く**よう別の時刻でも持つ
 const REFUSAL_PRIORITY_MS: u64 = 2_000;
+/// 直近に断りを出した時刻(表示して PENDING が空になっても残る)
+static LAST_REFUSAL_MS: AtomicU64 = AtomicU64::new(0);
 /// パネルとラベル(初回だけ作る)
 static PANEL: AtomicU64 = AtomicU64::new(0);
 static LABEL: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +45,7 @@ fn sel(name: &std::ffi::CStr) -> SEL {
 
 /// 「掴みを断った理由」をカーソル近傍に出す(実際の表示はメインスレッド)
 pub(crate) fn note_refusal(reason: &knit_common::drag::Refusal) {
+    LAST_REFUSAL_MS.store(now_ms(), Ordering::Relaxed);
     *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((
         HudKind::Refusal,
         format!("{}\n{}", reason.hud_line(), knit_common::hud::HUD_HINT),
@@ -53,13 +57,12 @@ pub(crate) fn note_refusal(reason: &knit_common::drag::Refusal) {
 /// 受け取り待ちの進捗をカーソル近傍に出す(Win→Mac の「押したまま待つ」に手元の表示)。
 /// **この向きでは離すと保存のみになる**ため、断りとは別の一言を添える
 pub(crate) fn note_progress(line: &str) {
-    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-    // 出したばかりの断りの説明を、毎秒の進捗更新で消さない
-    if let Some((HudKind::Refusal, _, at)) = g.as_ref() {
-        if now_ms().saturating_sub(*at) < REFUSAL_PRIORITY_MS {
-            return;
-        }
+    // 出したばかりの断りの説明を、毎秒の進捗更新で消さない。
+    // 表示済み(PENDING が空)でも効くよう、直近の断り時刻で判定する
+    if refusal_has_priority(LAST_REFUSAL_MS.load(Ordering::Relaxed), now_ms()) {
+        return;
     }
+    let mut g = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     *g = Some((
         HudKind::Progress,
         format!("{line}\n{}", knit_common::hud::PROGRESS_HINT),
@@ -76,6 +79,11 @@ pub(crate) fn take_pending() -> Option<String> {
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .map(|(_, text, _)| text)
+}
+
+/// 断りの説明を優先すべきか(純関数)。出した直後の窓では進捗で上書きしない
+fn refusal_has_priority(last_refusal_ms: u64, now: u64) -> bool {
+    last_refusal_ms != 0 && now.saturating_sub(last_refusal_ms) < REFUSAL_PRIORITY_MS
 }
 
 /// 非表示にしてよいか(純関数)。表示から grace 未満なら「新しい表示を守る」ため隠さない
@@ -112,7 +120,7 @@ unsafe fn ensure_panel(line: &str) -> ID {
     if !existing.is_null() {
         let label = LABEL.load(Ordering::Relaxed) as ID;
         if !label.is_null() {
-            msg1_id(label, sel(c"setStringValue:"), nsstring(&body(line)));
+            msg1_id(label, sel(c"setStringValue:"), nsstring(line));
         }
         return existing;
     }
@@ -164,7 +172,7 @@ unsafe fn ensure_panel(line: &str) -> ID {
         },
     );
     if !label.is_null() {
-        msg1_id(label, sel(c"setStringValue:"), nsstring(&body(line)));
+        msg1_id(label, sel(c"setStringValue:"), nsstring(line));
         call1_u8(label, c"setBezeled:", 0);
         call1_u8(label, c"setEditable:", 0);
         call1_u8(label, c"setSelectable:", 0);
@@ -194,11 +202,6 @@ unsafe fn ensure_panel(line: &str) -> ID {
     }
     PANEL.store(panel as u64, Ordering::Relaxed);
     panel
-}
-
-/// パネルに出す本文(呼び出し側が2行に組み立て済み。ここでは足さない)
-fn body(line: &str) -> String {
-    line.to_string()
 }
 
 /// カーソルを含む画面の frame を返す。`[NSScreen mainScreen]` はキーウィンドウのある
@@ -289,9 +292,17 @@ unsafe fn call1_f64_id(obj: ID, name: &std::ffi::CStr, value: f64) -> ID {
 mod tests {
     use super::*;
 
+    /// 表示待ちはプロセス共有の static。テストは直列に走らせる
+    /// (並列だと他のテストの `take_pending()` が文言を消費してフレークする: 検証役が実測)
+    static HUD_TEST_LOCK: Mutex<()> = Mutex::new(());
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        HUD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 連続で断られたときは**最後の1件**だけを出す(古い文言を残さない)
     #[test]
     fn only_the_latest_refusal_is_shown() {
+        let _g = lock();
         note_refusal(&knit_common::drag::Refusal::TooMany);
         note_refusal(&knit_common::drag::Refusal::Busy); // 後から来たものが勝つ
         let line = take_pending().expect("要求がある");
@@ -304,10 +315,13 @@ mod tests {
     /// 示す別の一言が入る(取り違えると逆の案内になる)
     #[test]
     fn refusal_and_progress_use_different_reassurance() {
+        let _g = lock();
         note_refusal(&knit_common::drag::Refusal::Busy);
         let refusal = take_pending().expect("断りの要求がある");
         assert!(refusal.contains("転送中です"), "{refusal}");
         assert!(refusal.contains(knit_common::hud::HUD_HINT), "{refusal}");
+        // 断りの優先窓を外してから進捗を出す(優先度そのものは別テストで固定)
+        LAST_REFUSAL_MS.store(0, Ordering::Relaxed);
         note_progress("受け取り中 42%");
         let progress = take_pending().expect("進捗の要求がある");
         assert!(progress.contains("受け取り中 42%"), "{progress}");
@@ -321,22 +335,28 @@ mod tests {
     /// **毎秒の進捗更新が、出したばかりの断りの説明を消さない**(優先度の固定)
     #[test]
     fn progress_does_not_erase_a_fresh_refusal() {
+        let _g = lock();
         note_refusal(&knit_common::drag::Refusal::EmptyGrab);
         note_progress("受け取り中 42%");
         let shown = take_pending().expect("断りの説明が出る");
         assert!(shown.contains("掴んだ項目がありません"), "{shown}");
         assert!(!shown.contains("受け取り中"), "{shown}");
-        // 十分に時間が経ったら進捗が上書きしてよい(テストでは時刻を直接進められないため、
-        // 断りを消費した後に進捗が出ることを確かめる)
+        // **表示後も優先**: 断りを消費(PENDING が空)した直後の進捗は出さない
         note_progress("受け取り中 42%");
-        let now = take_pending().expect("進捗が出る");
-        assert!(now.contains("受け取り中 42%"), "{now}");
-        assert!(now.contains(knit_common::hud::PROGRESS_HINT), "{now}");
+        assert!(
+            take_pending().is_none(),
+            "断りの直後の進捗で上書きしない(表示済みでも優先する)"
+        );
+        // 十分に時間が経てば出てよい(判定は純関数で固定)
+        assert!(refusal_has_priority(1_000, 1_500));
+        assert!(!refusal_has_priority(1_000, 1_000 + REFUSAL_PRIORITY_MS));
+        assert!(!refusal_has_priority(0, 99_999), "断りが無ければ優先しない");
     }
 
     /// 古い非表示予約が新しい表示を消さない(表示から grace 未満では隠さない)
     #[test]
     fn a_stale_hide_request_does_not_close_a_newer_hud() {
+        let _g = lock();
         assert!(!hide_due(1_000, 1_100, HIDE_GRACE_MS), "出した直後は隠さない");
         assert!(hide_due(1_000, 1_000 + HIDE_GRACE_MS, HIDE_GRACE_MS), "時間が来たら隠す");
         assert!(hide_due(0, 99_999, HIDE_GRACE_MS), "未表示なら隠してよい");
