@@ -33,6 +33,32 @@ fn refusal_notice_needed(pending_matches: bool, sending: bool, committed: bool) 
     pending_matches && !sending && !committed
 }
 
+/// 受け渡しを待っている間の言葉(純関数)。**200ms を超えたら**出す —
+/// 一瞬で終わる受け渡しでちらつかせない。送信中は進捗(`xfer_line`)が担当するので None
+fn waiting_word(sending: bool, waited: Duration, count: usize, total: u64) -> Option<String> {
+    const SHOW_AFTER: Duration = Duration::from_millis(200);
+    if sending || waited < SHOW_AFTER {
+        return None;
+    }
+    Some(format!(
+        "受け渡しの準備中({count} 件・{})",
+        crate::human_bytes(total)
+    ))
+}
+
+/// いま見せるべき「受け渡しの準備中」の1行(待っていなければ None)。
+/// **8MB 以下でも無言にしない**ためのもの(ツールチップと状態行が使う)
+pub fn waiting_line() -> Option<String> {
+    let state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let p = state.as_ref()?;
+    waiting_word(
+        p.sending,
+        p.began.elapsed(),
+        p.entries.len(),
+        bulk::entries_total(&p.entries),
+    )
+}
+
 /// このIDの予告が「送信前」のまま残っているか(= 相手が受理しなかった)
 pub fn refused_before_send(id: u64) -> bool {
     let state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
@@ -796,5 +822,34 @@ mod refusal_notice_tests {
             "確定済みの取り消しは対象外"
         );
         assert!(!refusal_notice_needed(false, false, false), "別IDは対象外");
+    }
+}
+
+#[cfg(test)]
+mod waiting_word_tests {
+    use super::*;
+
+    /// 一瞬で終わる受け渡しでは出さない(ちらつかせない)
+    #[test]
+    fn a_short_wait_is_not_shown() {
+        assert!(waiting_word(false, Duration::from_millis(0), 3, 1024).is_none());
+        assert!(waiting_word(false, Duration::from_millis(199), 3, 1024).is_none());
+    }
+
+    /// 200ms を超えたら件数と合計を見せる(**8MB 以下でも無言にしない**)
+    #[test]
+    fn a_visible_wait_shows_count_and_total() {
+        let line = waiting_word(false, Duration::from_millis(200), 3, 2048).expect("出す");
+        assert!(line.contains("準備中"), "{line}");
+        assert!(line.contains("3 件"), "{line}");
+        assert!(line.contains("2 KB"), "{line}");
+        // 小さい合計でも出す(以前は 8MB 以下が完全に無言だった)
+        assert!(waiting_word(false, Duration::from_millis(500), 1, 100).is_some());
+    }
+
+    /// 送信中は進捗の担当なので、ここでは出さない(二重表示にしない)
+    #[test]
+    fn an_active_transfer_is_left_to_the_progress_line() {
+        assert!(waiting_word(true, Duration::from_secs(5), 3, 1024).is_none());
     }
 }

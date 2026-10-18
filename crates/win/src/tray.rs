@@ -407,8 +407,9 @@ fn tray_status_text() -> String {
     } else {
         String::new()
     };
-    // 転送中は進捗を常に見える場所へ(ツールチップとステータス窓の状態行で共用)
-    let xfer_s = match crate::xfer_line() {
+    // 転送中は進捗を、待っている間は「準備中」を常に見える場所へ
+    // (ツールチップとステータス窓の状態行で共用。200ms 未満は出さない=ちらつかせない)
+    let xfer_s = match crate::xfer_line().or_else(crate::dragdrop::edge::waiting_line) {
         Some(x) => format!("・{x}"),
         None => String::new(),
     };
