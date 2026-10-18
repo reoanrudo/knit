@@ -552,6 +552,10 @@ static SRC_VTBL: IDropSourceVtbl = IDropSourceVtbl {
 /// 目録(名前とサイズ)だけで始め、内容は Explorer が要求した時点で staging から読む。
 /// `staging` は `entries` と同じ並びの (実パス, サイズ, kind) を渡す。
 /// 戻り値は DROPEFFECT(DRAGDROP_S_DROP なら置けた)
+///
+/// **未配線**: 呼び出し元(受信を staging へ流す経路)は次の増分。それまでは
+/// `KNIT_LAZY=1` でも誰も呼ばないため、既定の挙動は何も変わらない
+#[allow(dead_code)]
 pub fn start_lazy(entries: &[(std::path::PathBuf, u64, u8)], rel: &[String], staging: &[String]) {
     if !lazy::lazy_enabled() {
         return; // 既定は無効(現行方式のまま)
