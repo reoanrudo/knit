@@ -32,6 +32,13 @@ fn release_expected() {
     CARRIED.lock().unwrap_or_else(|e| e.into_inner()).release();
 }
 
+/// 新しい押下の開始を伝える(離しの記録を消す)。**これが無いと、モード切替後に
+/// 一度クリックしただけで、以後の掴みドラッグが全部「保存のみ」に化ける**
+/// (左ボタンの解放のたびに release() が呼ばれるため。CI の windows-latest が検出)
+pub fn note_press() {
+    CARRIED.lock().unwrap_or_else(|e| e.into_inner()).press();
+}
+
 /// 届いた転送が、いま掴んでいる操作のものか(一度だけ判定)。押下は別接続の
 /// 本線で届くため、到着の前後は start が待って吸収する。件数は予告(DragOffer)
 /// と照合し、一致しない転送はドラッグにしない

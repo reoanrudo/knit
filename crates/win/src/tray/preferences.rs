@@ -211,7 +211,13 @@ fn b64_encode(data: &[u8]) -> String {
 }
 
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
-    let s = s.trim_end_matches('=');
+    // パディングは末尾のみ・最大2つ。**過剰な = を黙って捨てない**
+    // ("AAAA====" のような不正入力を復号できてしまうと、設定欄の検証が甘くなる)
+    let body = s.trim_end_matches('=');
+    if s.len() - body.len() > 2 || body.contains('=') {
+        return None;
+    }
+    let s = body;
     if s.len() % 4 == 1 {
         return None;
     }
