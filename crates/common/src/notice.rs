@@ -74,8 +74,34 @@ pub fn retryable_error(e: &std::io::Error) -> bool {
     )
 }
 
-/// `SavedOnly` の本文に混ざってはいけない成功語(テストで否定 assert する)
-pub const SUCCESS_WORDS: &[&str] = &["置きました", "送信しました", "渡しました", "完了しました"];
+/// 「相手の画面に置けた」と**言い切る**語。`SavedOnly` には絶対に入れない
+/// (テストは「SavedOnly がこのどれも含まない」を assert する)
+pub const PLACEMENT_CLAIMS: &[&str] = &["置けました", "置きました", "置かれました"];
+
+/// 転送が終わったときの結果を、**mac 側で観測できる事実だけ**から決める。
+/// 観測できるのは「自分の送信が終わった」と「離した順序」の2つだけで、
+/// **相手が実際に画面へ置けたかは相手側の結果(W4: DragDone の逆向き)が要る**。
+/// そのため `Placed` の本文でも「置けました」とは言い切らない(摩擦 F5 の嘘を
+/// 別の形で作らないため)。W4 が入ったらここで `PlacedToScreen` のような状態を足す
+pub fn placed_or_saved(released_early: bool) -> DeliveryResult {
+    if released_early {
+        DeliveryResult::SavedOnly {
+            why: SaveWhy::ReleasedEarly,
+        }
+    } else {
+        DeliveryResult::Placed
+    }
+}
+
+/// 転送が失敗したときの結果。再試行の可否は**エラー種別から決める**
+/// (呼び出し側で反転させない: 判断はここに1つだけ置く)
+pub fn failed_result(e: &std::io::Error, saved_count: usize) -> DeliveryResult {
+    DeliveryResult::Failed {
+        reason: crate::bulk::send_error_label(e),
+        retryable: retryable_error(e),
+        saved_count,
+    }
+}
 
 /// 結果から通知を組み立てる(純関数)。文言はここにしか無い
 pub fn compose_notice(o: &DeliveryOutcome) -> Notice {
@@ -84,7 +110,8 @@ pub fn compose_notice(o: &DeliveryOutcome) -> Notice {
     match &o.result {
         DeliveryResult::Placed => Notice {
             title: TITLE.to_string(),
-            body: format!("{count} 件を {peer} へ渡しました(相手の画面に置けました)"),
+            // 観測できたのは「転送が終わった」ことまで。置けたかどうかは言い切らない
+            body: format!("{count} 件を {peer} へ渡しました(転送完了。相手側で受け取れます)"),
             kind: NoticeKind::Suppressible,
         },
         DeliveryResult::SavedOnly { why } => {
@@ -142,12 +169,20 @@ mod tests {
     }
 
     #[test]
-    fn placed_is_a_success_that_may_be_suppressed() {
+    fn placed_reports_only_what_the_sender_can_observe() {
         let n = compose_notice(&outcome(DeliveryResult::Placed));
         assert_eq!(n.kind, NoticeKind::Suppressible, "成功だけ抑制してよい");
         assert!(n.body.contains("3 件"), "件数: {}", n.body);
         assert!(n.body.contains("Windows PC"), "相手: {}", n.body);
-        assert!(n.body.contains("置けました"), "置けたと言い切る: {}", n.body);
+        assert!(n.body.contains("転送完了"), "観測できた事実: {}", n.body);
+        // 相手が実際に置けたかは相手側の結果(W4)が要るので、ここでは言い切らない
+        for w in PLACEMENT_CLAIMS {
+            assert!(
+                !n.body.contains(w),
+                "送信側だけでは「{w}」と言い切れない: {}",
+                n.body
+            );
+        }
     }
 
     #[test]
@@ -155,10 +190,11 @@ mod tests {
         for why in [SaveWhy::ReleasedEarly] {
             let n = compose_notice(&outcome(DeliveryResult::SavedOnly { why }));
             assert_eq!(n.kind, NoticeKind::Always, "置けなかったことは必ず出す");
-            for w in SUCCESS_WORDS {
+            // 「置けた」と言い切る語(実装が使う語そのもの)を1つも含まない
+            for w in PLACEMENT_CLAIMS {
                 assert!(
                     !n.body.contains(w),
-                    "保存のみの本文に成功語「{w}」を入れない: {}",
+                    "保存のみの本文に「{w}」を入れない: {}",
                     n.body
                 );
             }
@@ -167,6 +203,54 @@ mod tests {
             assert!(n.body.contains("離したため"), "理由: {}", n.body);
             assert!(n.body.contains("もう一度掴んで"), "次の一手: {}", n.body);
         }
+    }
+
+    /// 語の網羅性は実装と自動で一致させる: `Placed` が使う語を `PLACEMENT_CLAIMS` に
+    /// 入れ忘れると、`SavedOnly` に紛れ込んでも検出できない(敵対的検証の変異 a3)
+    #[test]
+    fn placement_claims_cover_the_words_the_implementation_uses() {
+        // 語彙そのものは「置けた」という**起きた事実**を主張する語の一覧として固定する
+        assert_eq!(PLACEMENT_CLAIMS, &["置けました", "置きました", "置かれました"]);
+        let saved = compose_notice(&outcome(DeliveryResult::SavedOnly {
+            why: SaveWhy::ReleasedEarly,
+        }));
+        // 「置けます」(今後の案内)は正当。禁じるのは「置けました」(起きた事実の主張)
+        assert!(
+            saved.body.contains("置けます"),
+            "次の一手としての案内は残す: {}",
+            saved.body
+        );
+        assert!(
+            !saved.body.contains("置けました"),
+            "起きた事実としての「置けました」は入れない: {}",
+            saved.body
+        );
+    }
+
+    #[test]
+    fn the_sender_side_decision_is_a_pure_function() {
+        // mac 側の配線が1行になるよう、判断はここに集約する(変異 c1/c2 対策)
+        assert_eq!(placed_or_saved(true), DeliveryResult::SavedOnly {
+            why: SaveWhy::ReleasedEarly
+        });
+        assert_eq!(placed_or_saved(false), DeliveryResult::Placed);
+        let retryable = failed_result(&std::io::Error::from(std::io::ErrorKind::NotConnected), 0);
+        assert_eq!(
+            retryable,
+            DeliveryResult::Failed {
+                reason: crate::bulk::send_error_label(&std::io::Error::from(
+                    std::io::ErrorKind::NotConnected
+                )),
+                retryable: true,
+                saved_count: 0,
+            }
+        );
+        let hopeless = failed_result(&std::io::Error::from(std::io::ErrorKind::PermissionDenied), 2);
+        let DeliveryResult::Failed { retryable, saved_count, .. } = hopeless else {
+            panic!("失敗として分類される");
+        };
+        assert!(!retryable, "権限エラーは再試行を促さない");
+        assert_eq!(saved_count, 2, "保存済み件数はそのまま通す");
     }
 
     #[test]
