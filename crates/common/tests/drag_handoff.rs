@@ -193,3 +193,85 @@ fn refusal_reason_covers_every_reject_branch() {
     assert_eq!(verdict_for(&s(1, true, false, Collect::Pending)), Verdict::Wait, "集計待ちは断らない");
     assert_eq!(verdict_for(&s(MAX_FILES, true, false, Collect::Done { entry_count: 3 })), Verdict::Ready { count: 3 });
 }
+
+/// 遅延提供(版 17)のハンドシェイクを、**実際のワイヤ表現**(JSON Lines)で端から端まで駆動する。
+/// Windows 側は macOS ではビルドできないため、プロトコル(目録・受理・結果)と状態機械の
+/// 噛み合わせをここで固定する(順序・件数照合・受理・結果の4点)
+#[test]
+fn lazy_handoff_runs_end_to_end_on_real_wire_messages() {
+    use knit_common::drag::lazy::{LazyCommand, LazyHandoff, LazySide, LazyState};
+    use knit_common::proto::{decode, encode, peer_features, ManifestEntry, Msg};
+
+    // 版 17 の相手にだけ遅延提供を申し出る(旧版は目録を知らない)
+    assert!(peer_features(17).lazy, "版 17 は対応");
+    assert!(!peer_features(16).lazy, "版 16 は非対応 → 現行方式へフォールバック");
+
+    let mut sender = LazyHandoff::new(LazySide::Sender);
+    assert_eq!(
+        sender.offer(peer_features(17).lazy, 2),
+        vec![LazyCommand::SendManifest]
+    );
+
+    // 目録は実際に符号化・復号しても同じ内容が届く(行の名前と型の固定)
+    let manifest = Msg::Manifest {
+        id: 7,
+        count: 2,
+        total: 4096,
+        files: vec![
+            ManifestEntry {
+                rel: "資料/a.txt".to_string(),
+                size: 1024,
+                kind: 0,
+            },
+            ManifestEntry {
+                rel: "資料/sub".to_string(),
+                size: 0,
+                kind: 1,
+            },
+        ],
+    };
+    let Some(Msg::Manifest {
+        id,
+        count,
+        total,
+        files,
+    }) = decode(&encode(&manifest))
+    else {
+        panic!("目録が往復する");
+    };
+    assert_eq!((id, count, total), (7, 2, 4096));
+    assert_eq!(files[1].kind, 1, "フォルダの種別も運ぶ");
+    assert_eq!(sender.manifest_sent(), vec![LazyCommand::StartNativeDrag]);
+
+    // 相手は受理を返す(データ到着を待たない)
+    let Some(Msg::DragAccept { id: accepted }) = decode(&encode(&Msg::DragAccept { id: 7 })) else {
+        panic!("受理が往復する");
+    };
+    assert_eq!(accepted, 7);
+    assert!(sender.accepted().is_empty(), "受理だけでは流さない");
+    assert_eq!(sender.streaming(), vec![LazyCommand::Stream]);
+
+    // 相手の結果(置けた)を受けて完了
+    let Some(Msg::DragDone { id: done_id, copied }) = decode(&encode(&Msg::DragDone {
+        id: 7,
+        copied: true,
+    })) else {
+        panic!("結果が往復する");
+    };
+    assert!(done_id == 7 && copied);
+    assert!(sender.completed(2).is_empty(), "件数一致でドロップ成立");
+    assert_eq!(sender.state(), LazyState::Dropped);
+
+    // 件数が合わない目録はドロップにしない(既存の整合性方針を遅延提供でも守る)
+    let mut receiver = LazyHandoff::new(LazySide::Receiver);
+    receiver.offer(true, 3);
+    receiver.manifest_sent();
+    receiver.accepted();
+    receiver.streaming();
+    let out = receiver.completed(2);
+    assert!(
+        out.contains(&LazyCommand::SendCancel),
+        "欠けたら相手の待ちを解く: {out:?}"
+    );
+    assert_eq!(receiver.state(), LazyState::Aborted);
+}
