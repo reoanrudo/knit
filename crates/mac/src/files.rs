@@ -182,6 +182,13 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
             }
             Err(e) => {
                 eprintln!("[file] 送信失敗: {e}");
+                // 通常送信(⌘C・メニュー)の失敗も回復動線へ記録する(I6)
+                let outcome = notice::DeliveryOutcome {
+                    peer: peer.clone(),
+                    count: entries.len(),
+                    result: notice::failed_result(e, 0),
+                };
+                note_outcome(&outcome, &paths);
                 notify(
                     "Knit",
                     &format!(
@@ -531,6 +538,8 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                     result: notice::placed_or_saved(early),
                 };
                 let n = notice::compose_notice(&outcome);
+                // メニューの回復動線へ記録する(成功なら消える)
+                note_outcome(&outcome, &paths);
                 match n.kind {
                     notice::NoticeKind::Always => notify(&n.title, &n.body),
                     notice::NoticeKind::Suppressible => notify_transfer(&n.title, &n.body),
@@ -544,11 +553,13 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                     // 利用者の中止は「結果」ではないので、現行の文言のまま出す
                     notify("Knit", "ファイル転送を中止しました");
                 } else {
-                    let n = notice::compose_notice(&notice::DeliveryOutcome {
+                    let outcome = notice::DeliveryOutcome {
                         peer: peer.clone(),
                         count,
                         result: notice::failed_result(e, 0),
-                    });
+                    };
+                    let n = notice::compose_notice(&outcome);
+                    note_outcome(&outcome, &paths);
                     notify(&n.title, &n.body);
                 }
             }
@@ -762,6 +773,106 @@ struct Xfer {
     began: std::time::Instant,
 }
 static XFER: Mutex<Option<Xfer>> = Mutex::new(None);
+/// 直前の受け渡し結果(I6)。通知バナーは数秒で消えるうえ操作もできないため、
+/// **メニューに「理由の1行」と押せる導線**を残す。成功したら消す(溜めない)
+struct LastOutcome {
+    /// メニューに出す短い1行(通知本文は長すぎる)
+    line: String,
+    /// もう一度送るための対象(空なら再送できない)
+    paths: Vec<std::path::PathBuf>,
+    recovery: notice::Recovery,
+}
+static LAST_OUTCOME: Mutex<Option<LastOutcome>> = Mutex::new(None);
+
+/// メニュー用の短い1行(長い通知本文はメニューに入らない)
+fn menu_line(result: &notice::DeliveryResult) -> String {
+    match result {
+        notice::DeliveryResult::Placed => "渡しました".to_string(),
+        notice::DeliveryResult::SavedOnly { .. } => {
+            "置けず、相手の受信フォルダに保存されました".to_string()
+        }
+        notice::DeliveryResult::Failed { reason, .. } => {
+            format!("渡せませんでした({reason})")
+        }
+    }
+}
+
+/// 結果を記録する(メニューの回復動線用)。成功なら記録を消す
+pub(crate) fn note_outcome(outcome: &notice::DeliveryOutcome, paths: &[std::path::PathBuf]) {
+    let mut g = LAST_OUTCOME.lock().unwrap_or_else(|e| e.into_inner());
+    if !notice::needs_attention(&outcome.result) {
+        *g = None;
+        return;
+    }
+    *g = Some(LastOutcome {
+        line: menu_line(&outcome.result),
+        paths: paths.to_vec(),
+        recovery: notice::recovery_for(&outcome.result),
+    });
+}
+
+/// メニューに出す直前の結果(無ければ None)
+pub(crate) fn last_outcome_line() -> Option<String> {
+    LAST_OUTCOME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|l| l.line.clone())
+}
+
+/// 直前の結果に対する回復手段(メニュー項目の出し分け)
+pub(crate) fn last_outcome_recovery() -> notice::Recovery {
+    LAST_OUTCOME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|l| l.recovery)
+        .unwrap_or(notice::Recovery::None)
+}
+
+/// 直前の失敗を同じファイルでもう一度送る(メニューの「もう一度送る」)。
+/// 開始できたら true(できない場合は理由を通知する)
+pub(crate) fn retry_last() -> bool {
+    let paths = LAST_OUTCOME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|l| l.paths.clone())
+        .unwrap_or_default();
+    if paths.is_empty() {
+        notify("Knit", "もう一度送れるファイルが残っていません");
+        return false;
+    }
+    match send_files_to_win(paths) {
+        SendFilesOutcome::Started => true,
+        SendFilesOutcome::Busy => {
+            notify("Knit", "前のファイルを転送中です。完了後にもう一度お試しください");
+            false
+        }
+        SendFilesOutcome::Denied => false,
+    }
+}
+
+/// 受信フォルダを Finder で開く(メニュー。Windows トレイの同名項目と対称)
+pub(crate) fn open_receive_dir() {
+    let dir = desktop_settings::receive_dir();
+    if !dir.exists() {
+        // 未受信のうちは無い。無言で失敗させず理由を出す
+        notify(
+            "Knit",
+            "受信フォルダはまだありません(ファイルを受け取ると作られます)",
+        );
+        return;
+    }
+    if std::process::Command::new("/usr/bin/open")
+        .arg(&dir)
+        .spawn()
+        .is_err()
+    {
+        notify("Knit", "受信フォルダを開けませんでした");
+    }
+}
+
 /// 掴みドラッグの受け渡しIDに立てる最上位ビット(通常送信のIDと区別する)
 const DRAG_ID_BIT: u64 = 1 << 63;
 /// 掴みドラッグが進行中か(offer が通り、転送スレッドの後始末が終わるまで)
@@ -1010,6 +1121,80 @@ mod xfer_ack_tests {
             wait_xfer_ack(Duration::from_millis(10)),
             None,
             "clear 後は前回分を読まない"
+        );
+    }
+}
+
+#[cfg(test)]
+mod last_outcome_tests {
+    use super::*;
+
+    /// 直前の結果はプロセス全体の static なので、テストは直列に走らせる
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    fn failed() -> notice::DeliveryOutcome {
+        notice::DeliveryOutcome {
+            peer: "Windows PC".to_string(),
+            count: 1,
+            result: notice::DeliveryResult::Failed {
+                reason: "接続が切れました".to_string(),
+                retryable: true,
+                saved_count: 0,
+            },
+        }
+    }
+
+    /// メニューの1行は短く、置けていないのに成功を主張しない
+    #[test]
+    fn menu_line_never_claims_a_place_that_did_not_happen() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let f = menu_line(&failed().result);
+        assert!(f.contains("接続が切れました"), "理由が読める: {f}");
+        let saved = menu_line(&notice::DeliveryResult::SavedOnly {
+            why: notice::SaveWhy::ReleasedEarly,
+        });
+        assert!(saved.contains("置けず"), "置けなかったと言い切る: {saved}");
+        for w in notice::PLACEMENT_CLAIMS {
+            assert!(!saved.contains(w), "「{w}」を入れない: {saved}");
+        }
+        assert!(saved.chars().count() < 30, "メニューに入る長さ: {saved}");
+    }
+
+    /// 失敗を記録 → 成功で消える(メニューに溜めない)。回復手段も連動する
+    #[test]
+    fn a_later_success_clears_the_recorded_failure() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let paths = vec![std::path::PathBuf::from("/tmp/knit-test-a.txt")];
+        let mut outcome = failed();
+        note_outcome(&outcome, &paths);
+        assert!(last_outcome_line().is_some(), "失敗は残る");
+        assert_eq!(last_outcome_recovery(), notice::Recovery::Resend);
+        outcome.result = notice::DeliveryResult::Placed;
+        note_outcome(&outcome, &paths);
+        assert!(last_outcome_line().is_none(), "成功したら消える");
+        assert_eq!(last_outcome_recovery(), notice::Recovery::None);
+    }
+
+    /// 直らない失敗では「もう一度送る」を出さない(理由の表示だけ)
+    #[test]
+    fn a_hopeless_failure_offers_no_retry() {
+        let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        note_outcome(
+            &notice::DeliveryOutcome {
+                result: notice::DeliveryResult::Failed {
+                    reason: "ファイルの共有が許可されていません".to_string(),
+                    retryable: false,
+                    saved_count: 0,
+                },
+                ..failed()
+            },
+            &[std::path::PathBuf::from("/tmp/knit-test-b.txt")],
+        );
+        assert!(last_outcome_line().is_some(), "理由は出す");
+        assert_eq!(
+            last_outcome_recovery(),
+            notice::Recovery::None,
+            "再試行は促さない"
         );
     }
 }
