@@ -119,9 +119,18 @@ impl LazyHandoff {
         vec![LazyCommand::StartNativeDrag]
     }
 
-    /// 相手が受理した(ドロップは先に成立。ここからデータを流す)
+    /// 相手が受理した(ドロップは先に成立)。**まだ 1 バイトも流していない**状態
     pub fn accepted(&mut self) -> Vec<LazyCommand> {
         if !matches!(self.state, LazyState::ManifestSent | LazyState::Offered) {
+            return Vec::new(); // 二重受理は無視する
+        }
+        self.state = LazyState::Accepted;
+        Vec::new()
+    }
+
+    /// データを流し始めた(受理の後)。ここから `Streaming`
+    pub fn streaming(&mut self) -> Vec<LazyCommand> {
+        if self.state != LazyState::Accepted {
             return Vec::new();
         }
         self.state = LazyState::Streaming;
@@ -188,7 +197,9 @@ mod tests {
             LazyState::ManifestSent,
             "ここではまだ 1 バイトも流れていない"
         );
-        assert_eq!(h.accepted(), vec![LazyCommand::Stream]);
+        assert!(h.accepted().is_empty(), "受理だけでは流さない");
+        assert_eq!(h.state(), LazyState::Accepted, "受理は流す前の状態");
+        assert_eq!(h.streaming(), vec![LazyCommand::Stream]);
         assert_eq!(h.state(), LazyState::Streaming);
         // 押下は受理の後に離れる(遅延提供ではこれが正常)
         assert!(h.released().is_empty(), "受理後の離しは中止ではない");
@@ -237,6 +248,7 @@ mod tests {
         h.offer(true, 1);
         h.manifest_sent();
         h.accepted();
+        h.streaming();
         let out = h.abort(LazyAbort::Escape);
         assert!(out.contains(&LazyCommand::DiscardTemporary), "{out:?}");
         assert!(out.contains(&LazyCommand::SendCancel), "{out:?}");
@@ -249,6 +261,7 @@ mod tests {
         h.offer(true, 5);
         h.manifest_sent();
         h.accepted();
+        h.streaming();
         let out = h.completed(4);
         assert_eq!(
             out,
@@ -279,11 +292,44 @@ mod tests {
             h.offer(true, 1);
             h.manifest_sent();
             h.accepted();
+            h.streaming();
             let out = h.abort(why.clone());
             assert_eq!(h.state(), LazyState::Aborted, "{why:?}");
             assert!(out.contains(&LazyCommand::SendCancel), "{why:?}: {out:?}");
             assert_eq!(out.last(), Some(&LazyCommand::Notify(why.clone())), "{why:?}");
         }
+    }
+
+    /// 過剰受信(重複・別バッチ混入)を「一致」とみなさない(変異 L2 の穴)
+    #[test]
+    fn over_receipt_is_not_a_drop_either() {
+        let mut h = LazyHandoff::new(LazySide::Receiver);
+        h.offer(true, 2);
+        h.manifest_sent();
+        h.accepted();
+        h.streaming();
+        let out = h.completed(3);
+        assert_eq!(h.state(), LazyState::Aborted, "多くても置かせない");
+        assert!(
+            out.contains(&LazyCommand::Notify(LazyAbort::ManifestMismatch {
+                expected: 2,
+                received: 3
+            })),
+            "{out:?}"
+        );
+    }
+
+    /// 二重受理は無視する(変異 L3 の穴)
+    #[test]
+    fn a_second_accept_is_ignored() {
+        let mut h = LazyHandoff::new(LazySide::Sender);
+        h.offer(true, 1);
+        h.manifest_sent();
+        assert!(h.accepted().is_empty());
+        assert!(h.accepted().is_empty(), "二度目の受理で状態を動かさない");
+        assert_eq!(h.state(), LazyState::Accepted);
+        assert!(!h.streaming().is_empty(), "流し始めは一度だけ");
+        assert!(h.streaming().is_empty(), "二度目は無視");
     }
 
     #[test]
@@ -300,9 +346,11 @@ mod tests {
         h.offer(true, 1);
         h.manifest_sent();
         assert!(h.completed(1).is_empty(), "受理前の完了は無視");
+        assert!(h.streaming().is_empty(), "受理前は流せない");
         assert_eq!(h.state(), LazyState::ManifestSent);
         // ドロップ成立後の中断は無効(片付けを出さない)
         h.accepted();
+        h.streaming();
         h.completed(1);
         assert!(h.abort(LazyAbort::Escape).is_empty(), "落ちた後の中断は無効");
         assert_eq!(h.state(), LazyState::Dropped);

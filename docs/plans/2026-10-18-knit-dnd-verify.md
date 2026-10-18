@@ -851,14 +851,304 @@ W4 の `DragDone{copied}` を受けてから「置けました」と言う。**�
 - 目視・実機は未実施(通知の実表示、掴んだまま離す操作の体感)。
 - mac 配線の実行時挙動は**テストでも目視でも確認していない**(欠陥3のとおりテストが存在しない)。
 
-### 増分の状態(I1・I2・I5)
+## 6.5 第3ラウンド: `85fdecb` 以降の未検証コミット(まとめて敵対的検証)
+
+検証日: 2026-10-18 / 対象: `c7aae32`〜`6bc0791`(11 コミット)
+
+**検証環境**: HEAD = `6bc0791` / `git status --porcelain` 空 /
+`cargo build` exit 0(**警告行 10 = 基準と同数**)/
+`cargo test` = **590 passed / 0 failed / 4 ignored, 11 binaries**(前回検証の 563 から +27)。
+
+**文言(golden list、`85fdecb` → `6bc0791`)**: 差分はすべて説明可能だった。
+- 意図的変更1件: `{count} 件を {peer} へ渡しました(相手の画面に置けました)` →
+  `{count} 件を {peer} へ渡しました(転送完了。相手側で受け取れます)`(= c7aae32 が私の I5 指摘1を修正)
+- 新規(I3): `hud_line()` の8文言 + `このまま離すと Mac 内の操作になります` + `[hud] NSPanel を作れません`
+- 新規(I6): `直前の受け渡し` / `直前: {line}` / `もう一度送る` / `受信フォルダを開く` /
+  `受信フォルダはまだありません(ファイルを受け取ると作られます)` / `受信フォルダを開けませんでした` /
+  `もう一度送れるファイルが残っていません` / `前のファイルを転送中です。完了後にもう一度お試しください`
+- **`Refusal::EmptyGrab` の追加でも通知文言は不変**(`notice_body()` が `TooMany` に委譲 = 同じ文字列)✓
+- 残りはすべてテスト内の assert/panic メッセージ ✓ → **意図しないユーザー可視文言の変更は検出されなかった**
+
+| コミット | 内容 | 判定 |
+|---|---|---|
+| `c7aae32` | I5 の指摘3件の修正(私の条件付きへの回答) | **合格** |
+| `c49f95d` | 粘着バグ修正(`Carried::released_once`) | **条件付き** |
+| `1047f61`+`ecf68a7` | Windows の mtime 回帰 | **合格** |
+| `2fbf21d` | pairing テストのポート再試行 | **合格** |
+| `5021c59` | I6(メニューの回復動線) | **条件付き** |
+| `5cd0a42` | I7(版 17・lazy ゲート) | **合格** |
+| `2f3e61e`+`54cf983` | I8/I8b(遅延提供の状態機械・目録) | **条件付き** |
+| `90bd8eb` | I3(カーソル近傍 HUD) | **不合格** |
+| `6bc0791` | W1-core(FILEGROUPDESCRIPTORW) | **合格**(実行検証は不可) |
+
+---
+
+### c7aae32: I5 の指摘3件の修正 / 判定: **合格**
+
+- 私の条件付き3点がすべて解消されたことを確認:
+  1. **`Placed` の言い切り** → 本文を「(転送完了。相手側で受け取れます)」に変更し、
+     `PLACEMENT_CLAIMS = ["置けました","置きました","置かれました"]` を **`Placed` 自身にも**
+     否定 assert(`notice.rs:172-190`)→ 送信側だけで言い切らない ✓
+  2. **越境直後の取りこぼし** → `DRAG_IN_FLIGHT` + `DRAG_UNFINISHED` の2つの Atomic を
+     offer 時(`files.rs:445-446`)に立て、完了時(`:535`)と `TxGuard` の Drop(`:760-761`)で下ろす ✓
+     `note_press_release`(`:894-897`)は **Mutex を取らない**(Atomic 2つの読み出しのみ)=
+     私が提案した tap 経路の Atomic 化がそのまま入った ✓
+  3. **配線が無テスト** → `placed_or_saved(released_early)` / `failed_result(e, saved_count)` を
+     common の純関数にし、テストで固定(`notice.rs:302-317`)✓
+     → 判定そのものは表テストで守られる(**`placed_or_saved` の反転は赤になる** = 変異 c1 相当)✓。
+     ただし **mac 側の呼び出し1行(どちらの値を渡すか)は依然として無テスト**である点は変わらない
+     (配線が1行になったぶん危険は小さい)✓
+- 4点目(SUCCESS_WORDS の網羅性)→ `PLACEMENT_CLAIMS` に「置けました」が入り、
+  かつ Placed 本文からも禁止語を排除 ✓。「送信しました/渡しました/完了しました」は対象外になったが、
+  SavedOnly の本文は「送信は実際に成功している」ので、**置けた主張の語に絞ったのは妥当** ✓
+- 観察: `PLACEMENT_CLAIMS` に未来形「置けます」は入らない(SavedOnly が次の一手として使う)✓ 妥当。
+
+### c49f95d: 離しの記録の粘着バグ修正 / 判定: **条件付き**
+
+- 差分: `common/src/drag.rs` +38 / `win/src/dragdrop.rs` +7 / `win/src/input.rs` +10/-2 /
+  `win/src/tray/preferences.rs` +8/-1。
+- **報告されたバグの修正は正しい** ✓: `press()` と `claim()`(一致 id の消費)で `released_once` が消える
+  (`drag.rs:275-288`)。追加テスト `a_new_drag_after_a_release_is_carried_again` が
+  「押下→予告→Carried」「押下なしの遅着予告→Released」の両方を固定 ✓。
+- **(b) `press()` の呼び忘れ経路は見つからない** ✓: `release_expected()` の呼び出し元は
+  `host.rs:47 relay_up` と `host.rs:55 relay_cancel` のみ。`relay_up` の production 呼び出し元は
+  `input.rs:373`(Mac 由来の左ボタン解放)で、**必ず `input.rs:371` の `note_press()` と対**になっている ✓
+  (`remote_mouse_button` の production 呼び出し元は `session.rs:542` の1箇所 ✓)。
+  `relay_cancel`(モード離脱・切断)は押下を伴わないが、次に Mac から押下が来た時点で消える ✓。
+- **(c) 既存テストの弱体化なし** ✓: 差分はテストの**追加のみ**(既存の assert を1行も変えていない)。
+- **欠陥(反例を実行して確認)**: **`press()` が保留中の `expected` の `released` まで消す**(`drag.rs:277-279`)。
+  これが余分で、既存の保護「離した後に届いた予告は Released」を新しい押下が上書きする。
+  実行した反例(`/tmp` の detached worktree に検証用テストを追加して実行):
+  ```
+  c.release(); c.announce(9, 2); c.press(); c.claim(9, 2)
+    -> left: Carried / right: Released   (assertion failed, exit 101)
+  ```
+  到達経路(**F3 の典型的な失敗操作**): 予告が届く → 転送中に離す(`release()` が `expected.released` を立てる)
+  → データ到着前に新しい押下が来る(`press()` がそれを消す)→ 旧データが `Carried` →
+  **Windows は古いファイルで OLE ドラッグを始める**(ユーザーは別の操作をしているのに、古いファイルが
+  カーソルに付く/意図しない場所に落ちる)。`expected` の `released` は「announce 時点で既に離していた」=
+  **前の操作に属する**という事実なので、押下で消してはいけない。
+  - 修正案: `press()` は `released_once = false` **だけ**行う(`expected` には触らない)。
+    粘着バグの修正はそれだけで成立する(`announce` は `released_once` を読んで記録するため ✓)。
+    併せて今回の反例を回帰テストにする(期待 `Released`)。
+- **入力検証の修正も確認** ✓: `b64_decode` はパディングを末尾のみ・最大2つに制限(`preferences.rs:214-219`)。
+  `body.contains('=')` で中間パディングも弾く ✓。
+- 未検証: Windows 実機なし(`knit-win` は macOS ではビルド対象外)。CI の windows-latest 依存 ✓。
+
+### 1047f61 + ecf68a7: Windows の mtime 復元 / 判定: **合格**(最終形 `ecf68a7` を評価)
+
+- 最終形(`bulk.rs:917-947`): `#[cfg(not(windows))]` は**閉じる前の fd**へ `set_mtime_file(&f, mtime)`
+  (従来の速い経路を維持 ✓ 質問(b) ✓)、`#[cfg(windows)]` は `publish()` が返した**最終パス**へ
+  `set_mtime(&actual, mtime)`。
+- 質問(a) 順序 ✓: `publish` の中で ADS(`Zone.Identifier`)の書き込みと rename が起きるため、
+  **その後**に設定するのが正しい ✓。以降に実体へ書き込む処理は無い(履歴・指紋は別ファイル)✓。
+- `hash_ok` が真の枝の中でのみ実行される ✓(検証に失敗したファイルへは触らない)。
+- テスト側: `\`→`/` の正規化は**構造比較を維持したまま**区切りだけを吸収 ✓(期待値側は `/` のまま ✓)。
+- 実機 Windows なし → 実行検証は不可(macOS 側の `bulk_receive` は緑 ✓)。
+
+### 2fbf21d: pairing テストのポート確保 / 判定: **合格**
+
+- 変更は `crates/common/src/pairing.rs` の **`mod tests` 内のみ**(`@@ ... @@ mod tests {` を確認)✓
+  製品コードに触れていない ✓。
+- 15回試行し、毎回 `bind("127.0.0.1:0")` で**新しいポート**を得る ✓(同じポートを再試行しない)。
+  失敗時は最後のエラーを添えて panic ✓ → 失敗の診断性は上がった ✓。弱点化ではない ✓。
+
+### 5021c59: I6(失敗からの回復動線) / 判定: **条件付き**
+
+- 差分: `notice.rs` +69(`Recovery` / `needs_attention` / `recovery_for` = 純関数+テスト ✓)、
+  `files.rs` +189、`gui.rs` +70。
+- **(b) `FILE_TX_BUSY` との競合なし** ✓: `retry_last()` は `send_files_to_win` を呼ぶだけで、
+  枠の予約は既存の `swap`(`files.rs:35`)に乗る ✓。`Busy` はその場で通知 ✓。
+- **(c) 既存項目の位置・文言** ✓: 新項目は「ファイルを送る…」の直後に3つ挿入され、
+  既存項目の**相対順と文言は不変**(golden list でも `転送を中止する({line}・Esc でも可)` 等は無変更 ✓)。
+  絶対位置は +3 ずれる(項目を増やせば不可避)✓。中止項目は従来どおり後段 ✓。
+- **(d) 未受信時に無言で失敗しない** ✓: `!dir.exists()` で
+  「受信フォルダはまだありません(ファイルを受け取ると作られます)」を通知 ✓。
+  観察: `/usr/bin/open` は `spawn` の成否しか見ないので、`open` 自体の失敗は無言(軽微)。
+- **欠陥(リセット漏れ・中)**: `note_outcome` の production 呼び出しは
+  `files.rs:191`(通常送信の**失敗**のみ)・`:544`(掴み成功)・`:564`(掴み失敗)の3箇所で、
+  **通常送信の成功経路(`:95-145` の `Ok` 側)に呼び出しが無い**。したがって
+  1. ⌘C/メニュー送信が**成功しても記録が消えない** → メニューに古い
+     「直前: 渡せませんでした(…)」と「もう一度送る」が残る(「直前」が事実と食い違う)。
+  2. `retry_last()` → `send_files_to_win` が**成功しても記録が消えない** →
+     「もう一度送る」が残り続け、もう一度押すと**同じファイルを再送**する
+     (相手側は自動リネームで「名前 (n)」が増える)。
+  再現手順: 掴みドラッグを失敗させる → メニューに「直前: …」が出る → 同じファイルを ⌘C で正常送信 →
+  メニューを開くと**前回の失敗が残っている**(期待: 消える)。
+  テスト側は `note_outcome` を直接叩くもの(`files.rs:1166-1190`)だけで、
+  **呼び出し側の配線は固定されていない**(I5 の c1〜c3 と同じ穴)✓。
+  修正案: 通常送信の `Ok` 腕で Placed の `note_outcome` を呼ぶ(1行)+ 受信経路も同様に。
+- 観察: `menu_line` は短く、SavedOnly では「置けず、相手の受信フォルダに保存されました」✓
+  (メニューに入る長さ <30 文字のテストあり ✓)。
+
+### 5cd0a42: I7(版 17) / 判定: **合格**
+
+- `VERSION = 17`(`proto.rs:21`)・`lazy: ver >= 17`(`:53`)・`MIN_VERSION = 11` 据え置き ✓。
+  テストが 16/17/`u32::MAX`/他能力との独立性/自分の版を固定(`:670-680`)✓。
+- **副作用の確認** ✓: 接続可否は `peer >= MIN_VERSION` のみ(`proto.rs:29`)→ 旧版(11〜16)は接続できる ✓。
+  `PeerFeatures` は相手版から**ローカルに構成**され、wire には乗らない(serialize されていない)✓
+  → フィールド追加でプロトコル互換は壊れない ✓。
+  自分の版は hello の `ver` に載る(`android.rs:741` 等)✓ → 旧版は ver=17 を見ても自分の古い閾値で
+  能力を判定する(= `lazy` を知らないので false)✓ 期待どおり。
+- 未検証: 旧版バイナリとの実接続(版ゲートは純関数としてテスト済み ✓)。
+
+### 2f3e61e + 54cf983: I8(状態機械)+ I8b(目録) / 判定: **条件付き**
+
+- 差分: `common/src/drag/lazy.rs` 310 新規 + `drag.rs` +4 / `proto.rs` +76(`ManifestEntry` + `Msg::Manifest` + テスト3)。
+- 設計適合 ✓: `offer` の「非対応・0 件・二重開始」ガード、**受理がデータ到着を待たない**
+  (`manifest_sent` → `StartNativeDrag`)、受理前の離し = abort、件数不一致はドロップにしない、
+  異常終端は同一、片付けは一度だけ、不正遷移は無視。
+- **変異テスト(私の手で。base = `knit-common` 286 passed)**:
+
+| 変異 | 内容 | 結果 |
+|---|---|---|
+| L1 | `offer` から `!peer_lazy` ガードを外す(旧版にも目録を送る) | **赤**(`a_peer_without_lazy_falls_back_to_the_current_path`)✓ AC7 が守られている |
+| **L2** | 件数照合 `received != expected` → `received < expected`(過剰受信をドロップ扱い) | **生存** ← 欠陥1 |
+| **L3** | `accepted()` を `Streaming` からも受け付ける(二重受理) | **生存** ← 欠陥2 |
+| L4 | 二度目の `abort` を許す(片付けが二度出る) | **赤**(`releasing_before_acceptance_aborts_and_cleans_up_once`)✓ |
+| **L5** | 死んでいる `Accepted` を matches から外す | **生存** ← 欠陥3(等価変異) |
+
+- **欠陥1(中): 過剰受信が未固定。** コードは `!=` で正しく断るが、テストは不足側(`completed(4)` vs
+  予告5)しか無い。`received > expected`(重複・別バッチ混入)を「一致」とみなす変更を検出できない。
+  設計 §4 I8 (d)「目録の件数と実受信が一致しなければドロップにしない」の**片側が無防備**。
+- **欠陥2(中): 二重受理が未固定。** 受理後に再度 `accepted()` が来ると `Stream` が二度出る
+  (状態機械としては不正遷移として無視すべき)。テストが無い。
+- **欠陥3(軽微・実証済み): `LazyState::Accepted` は到達不能な死んだ状態。**
+  代入箇所は `Offered`(`:108`)・`ManifestSent`(`:118`)・`Streaming`(`:127`)・`Dropped`(`:151`)・
+  `Aborted`(`:162`)のみで、`Accepted` は **matches でしか現れない**(`:134`,`:142`)。
+  設計 §4 I8 の遷移 `ManifestSent → Accepted → Streaming` と実装(`ManifestSent → Streaming`)が食い違い、
+  `matches!(Accepted | Streaming)` が「受理済みだが未ストリーム」があり得るように読める。
+  `Accepted` を実際に代入するか、状態を削って設計を直すか、どちらかに寄せるべき。
+- 観察: `Manifest` の `id/count/total` は既存 `DragOffer` と重複し、受理は既存 `DragAccept` のまま ✓
+  → 配線時(後続増分)に「同じ掴みでどちらが権威か」を1箇所で決める必要がある(両方を送ると二重開始の余地)✓
+- 観察: `an_older_peer_cannot_decode_the_manifest` は `"manifest_v99"` で代用しており、
+  旧版の decode を実際に試してはいない(「未知タグは None」で論理的には足りる ✓)。
+- 観察: `ManifestEntry.rel` は `/` 区切り(Mac 由来)。Windows の `cFileName` へ渡す際の区切り変換は
+  配線時の課題(W1)✓。
+
+### 90bd8eb: I3(カーソル近傍 HUD) / 判定: **不合格**
+
+**理由1(致命的): `setWraps:` は NSTextField に存在しない。初回表示で例外になる。**
+
+- `crates/mac/src/hud.rs:132` は `call1_u8(label, c"setWraps:", 1)` を **NSTextField に対して**呼ぶ。
+- 実機プローブ(`clang -framework AppKit` で `respondsToSelector` を確認):
+  ```
+  setWraps:  *** MISSING ***      (NSTextField instancesRespondToSelector = NO)
+  実行時の結果:
+  *** setWraps: で例外: NSInvalidArgumentException /
+      -[NSTextField setWraps:]: unrecognized selector sent to instance 0x1033a10d0
+  cell setWraps: 例外なし / cell responds=1     ← 正しい呼び先は NSCell
+  ```
+- 影響: ラベル生成時に必ず例外になる。`PANEL` はラベル生成の**後**にしか保存されない(`hud.rs:146-148`)ため、
+  拒否のたびに最初からやり直して毎回例外になる。しかも例外はメインスレッドのタイマー
+  コールバック(`imp_show_hud`)から、Rust の `extern "C"` フレームと `call1_u8` を貫いて発生する
+  → 最悪はプロセス異常終了、最良でも HUD は出ない(いずれにせよ「F1 が消える」増分が成立しない)。
+- 検証済みの修正(プローブで例外が出ないことを確認):
+  `msg0(label, c"cell")` でセルを取り、`call1_u8(cell, c"setWraps:", 1)`。
+  併用可: `setUsesSingleLineMode:`(NSTextField ✓)と `setMaximumNumberOfLines:`(NSTextField ✓)。
+- 他のセレクタはすべて実在を確認済み ✓(下の「良い点」参照)。**この1箇所だけが誤り**。
+
+**理由2(重要): マルチディスプレイで、カーソルの画面ではなく主画面に clamp される。**
+
+- `position()`(`hud.rs:158-182`)は `[NSScreen mainScreen]` の frame を `place()` に渡す。
+  `mainScreen` は「キーウィンドウのある画面」(キーウィンドウが無ければメニューバーのある主画面)であり、
+  **カーソルのある画面ではない**。`NSEvent.mouseLocation` はカーソル画面の座標を返すため、
+  カーソルが2台目のディスプレイにあると `place()` は主画面の範囲へ clamp する →
+  **HUD が別モニタに出る/カーソルから遠い端に出る**(設計 §4 I3 の検証項目に「マルチディスプレイ」が明記 ✓)。
+- 修正案: `[NSScreen screens]`(実在確認済み ✓)からカーソル座標を含む画面を選び、その frame を渡す。
+
+**その他の指摘**
+
+3. **[軽微] `orderOut:` を引数なしトランポリンで呼んでいる**(`hud.rs:65` の `call0`)→ 第3引数が不定。
+   `orderOut:` は sender を使わないので実害は出ないが、`msg1_id(panel, sel("orderOut:"), null)` にすべき。
+4. **[軽微] 表示時間 1.6 秒**(`gui.rs` の timer 1.6 秒 / `HIDE_GRACE_MS = 1400`)は設計の「1.2 秒」と食い違う
+   (コミットメッセージで宣言済み ✓)。連続拒否で古い予約が新しい表示を消さない仕組みは
+   `SHOWN_AT_MS` + grace で成立 ✓(コードコメントの「世代を渡す」は実装と合っていない=コメントの問題 ✓)。
+
+**確認できた良い点(セレクタは私が実機プローブで実在を確認)**
+
+- 判断は common の純関数 `place()` ✓(4隅・負座標・画面より大きいパネルの表テスト ✓)。
+- `Refusal::EmptyGrab` を足して **0 件と 64 件超の案内を分けた** ✓(`hud_line` は別文言、
+  `notice_body` は同一文言)= 私の §7-5 持ち越しを解消 ✓。
+- **クリック透過** `setIgnoresMouseEvents:1`(実在 ✓)、非アクティブ化 `styleMask = 128`
+  (`NSWindowStyleMaskNonactivatingPanel` = 128 ✓ 実測)、`NSBackingStoreBuffered = 2` ✓、
+  `setLevel:` 3(`NSFloatingWindowLevel` = 3 ✓ 実測)。
+- メインスレッド規約 ✓: `performSelectorOnMainThread:withObject:waitUntilDone:` を `waitUntilDone:0` で使用
+  (`gui.rs:790-806`)→ tap スレッドはブロックしない ✓。`sdShowHud:`/`sdHideHud:` は
+  `class_addMethod(..., "v@:@")` で登録され(`gui.rs:2799-2800`, `:2821`)、IMP の型
+  `fn(ID, SEL, ID)` と一致 ✓。`GUI_TARGET` はそのクラスのインスタンス(`:2837` の `new` → `:2876` で保存)✓
+  → **呼び先はメインスレッドで正しく実行される** ✓(質問(b) ✓)。
+- パネルは作り直さない ✓、2回目以降は `setStringValue:` で文言を更新(`hud.rs:71-78`)✓(質問(d) ✓)。
+- 通知は併用で残っている ✓(`files.rs:312-314`: ログ → HUD → 通知)✓ 設計 I3 の注意点どおり ✓。
+- `UI_PREVIEW` 中は出さない ✓(`gui.rs:784-786`)。
+- セレクタ実在: `initWithContentRect:styleMask:backing:defer:` / `setReleasedWhenClosed:` / `setOpaque:` /
+  `setIgnoresMouseEvents:` / `setHasShadow:` / `setBackgroundColor:` / `setLevel:` / `contentView` /
+  `orderFrontRegardless` / `orderOut:` / `setFrame:display:` / `NSTextField initWithFrame:` /
+  `setStringValue:` / `setBezeled:` / `setEditable:` / `setSelectable:` / `setDrawsBackground:` /
+  `setTextColor:` / `setFont:` / `addSubview:` / `NSColor colorWithAlphaComponent:` / `NSColor blackColor` /
+  `whiteColor` / `NSFont systemFontOfSize:` / `NSEvent mouseLocation` / `NSScreen mainScreen` /
+  `screens` / `NSTimer scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:` → **すべて OK** ✓
+  (`setWraps:` のみ MISSING)。
+
+### 6bc0791: W1-core(FILEGROUPDESCRIPTORW の組み立て) / 判定: **合格**(実行検証は不可)
+
+**独立に桁を数え直した(一次資料: MSDN `FILEDESCRIPTORW (shlobj_core.h)` を取得して照合)**
+
+| メンバ | 型/サイズ | オフセット | 実装 |
+|---|---|---|---|
+| dwFlags | DWORD 4 | 0 | `flags` ✓ |
+| clsid | CLSID 16 | 4 | ゼロ16 ✓ |
+| sizel | SIZEL 8 | 20 | ゼロ8 ✓ |
+| pointl | POINTL 8 | 28 | ゼロ8 ✓ |
+| dwFileAttributes | DWORD 4 | 36 | `attrs` ✓ |
+| ftCreation/ftLastAccess/ftLastWrite | FILETIME 8×3 = 24 | 40/48/56 | ゼロ24 ✓(FD_*TIME を立てないので無視される ✓) |
+| nFileSizeHigh / nFileSizeLow | DWORD 4+4 | 64 / 68 | `size>>32` → `size & 0xFFFFFFFF` ✓ 順序も正しい ✓ |
+| cFileName[MAX_PATH] | WCHAR 260 = 520 | 72 | UTF-16LE + NUL 詰め ✓ |
+
+- **合計 592 バイト** = 実装の `FILEDESCRIPTORW_SIZE = 592` ✓ **一致**。
+  (私は当初 `dwReserved0/dwReserved1` の 8 バイトを疑ったが、MSDN の現行定義には存在しないことを
+  一次資料で確認した。**実装が正しい**)
+- フラグ ✓(すべて MSDN 記載値): `FD_ATTRIBUTES 0x4` / `FD_FILESIZE 0x40` / `FD_PROGRESSUI 0x4000` /
+  `FD_UNICODE 0x80000000`。フォルダは `FD_FILESIZE` を立てず `FILE_ATTRIBUTE_DIRECTORY 0x10` ✓、
+  ファイルは `FILE_ATTRIBUTE_NORMAL 0x80` ✓。
+- `FILEGROUPDESCRIPTORW` のヘッダ = `cItems`(UINT 4)✓ リトルエンディアン ✓。
+- `descriptor_count` の検証(質問(b)): **完全長一致** `4 + n*592 == len` で弾く ✓、
+  件数だけ大きく書いた偽物も弾く ✓。内容(名前の NUL 終端やフラグ)までは見ないが、
+  純粋な組み立て部品としては妥当 ✓。
+- テストの目視確認: `name_off = 先頭 + 592 - 520 = +72` ✓ 正しい。フォルダの属性オフセット
+  `4+16+8+8 = 36` ✓ 正しい。**テストは自分の思い込みの写しではなく、MSDN のレイアウトと一致している** ✓。
+- 観察(次の増分への申し送り):
+  1. 259 WCHAR での切り詰めは**サロゲートペアを割り得る**(絵文字入りファイル名)→ 不正な UTF-16 が
+     `cFileName` に入る。境界をコードポイント単位にするのが安全 ✓。
+  2. `rel` は `/` 区切り(Mac 由来)。`cFileName` へ渡す際の区切り変換は配線時の課題 ✓。
+  3. `FD_PROGRESSUI` は常に立つ(小さい転送でも進行 UI の対象)✓ 意図と思われるが明示があると良い ✓。
+  4. `lazy_enabled()` のテストが `std::env::set_var` でプロセス環境を書き換える(同一バイナリ内の
+     他テストと競合し得る)✓ 軽微。
+- **未検証(重要)**: `#![cfg(windows)]` のため **macOS ではコンパイルすらされない**(`cargo test` の対象外)。
+  Windows 実機/CI での実行確認は私にはできない。したがって本判定は
+  **「読解 + 一次資料(MSDN)との突き合わせ」のみ**であり、実行による裏取りは無い ✓。
+
+### 増分の状態(I1・I2・I3・I5・I6・I7・I8)
 
 | 増分 | 依頼 | 判定 | 備考 |
 |---|---|---|---|
 | I1 | 受領(43de2e2)→ 指摘修正(a420d11) | **合格** | 3件の指摘はすべて修正され、修正自体も変異(m10/m11)で実効性を確認 |
 | I2 | 受領(da6129c)→ 指摘修正(53c6291) | **合格** | m8 の穴は私の手でも赤→復元で緑を確認。doc 申し送り3件も反映 |
-| I5 | 受領(85fdecb) | **条件付き** | 構造・SavedOnly・失敗系は良好。`Placed` の文言が観測を超える(欠陥1)/ 越境直後の離しが記録されない(欠陥2)/ 配線が無テスト(欠陥3) |
-| I3・I4 | 未受領 | — | §7-5 の `TooMany` 粒度、HUD と通知の同一値性、tap スレッド UI を突く |
+| I5 | 受領(85fdecb)→ 指摘修正(c7aae32) | **合格** | 条件付き3点(言い切り・取りこぼし窓・無テスト配線)がすべて解消 ✓ |
+| I3 | 受領(90bd8eb) | **不合格** | `setWraps:` が NSTextField に無く初回表示で例外(実機プローブで実証)/ マルチディスプレイで画面選択が誤り。他のセレクタ・スレッド規約・クリック透過は良好 |
+| I6 | 受領(5021c59) | **条件付き** | 記録のリセットが掴み経路の成功でしか行われない(通常送信の成功で消えない→再送の繰り返し) |
+| I7 | 受領(5cd0a42) | **合格** | 版ゲート・MIN_VERSION 据え置き・副作用なしを確認 |
+| I8/I8b | 受領(2f3e61e・54cf983) | **条件付き** | 過剰受信と二重受理が未固定(変異 L2・L3 が生存)/ `LazyState::Accepted` が到達不能な死んだ状態 |
+| W1-core | 受領(6bc0791) | **合格**(読解+一次資料のみ) | 592 バイト・オフセット・フラグが MSDN と一致。実行検証は不可 |
+| W系その他 | 未受領 | — | 実機が要る(W1 配線・W2・W3・W4・W5)|
+
+**このラウンドの横断的な所見**
+
+- **「純関数+テスト」は定着したが、「呼び出し側の配線」が無テストという穴が繰り返し現れている**
+  (I5 の c1〜c3 → I6 のリセット漏れ)。判定の在り処を common の純関数へ出し、
+  **配線は1行にする**という形が有効(c7aae32 で実際に効いた)✓。
+- 変異テストは「生存=テストの穴」とは限らない。L5/I2 の m1 は**到達不能な等価変異**であり、
+  コードの冗長さを示すシグナルとして読む ✓。
 
 ---
 
