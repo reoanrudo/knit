@@ -782,6 +782,58 @@ unsafe extern "C" fn imp_retry_last(_s: ID, _c: SEL, _n: ID) {
     crate::files::retry_last();
 }
 
+/// tap スレッドから HUD の表示を依頼する(AppKit はメインスレッドのみ)。
+/// 文言は `hud::note_refusal` が置いてあり、ここはメインスレッドへ投げるだけ
+pub(crate) fn request_hud() {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return; // 画面の写し取り中は出さない
+    }
+    let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+    if target.is_null() {
+        return;
+    }
+    unsafe {
+        let f: unsafe extern "C" fn(ID, SEL, SEL, ID, u8) =
+            std::mem::transmute(crate::objc_msgSend as *const ());
+        f(
+            target,
+            sel(c"performSelectorOnMainThread:withObject:waitUntilDone:"),
+            sel(c"sdShowHud:"),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
+/// カーソル近傍の案内を出す(I3)。**メインスレッドで走る**
+unsafe extern "C" fn imp_show_hud(_s: ID, _c: SEL, _n: ID) {
+    let Some(line) = crate::hud::take_pending() else {
+        return;
+    };
+    crate::hud::show(&line);
+    // 1.6 秒後に隠す。連続で出るときは前の予約を無効化する(世代を渡す)
+    let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+    if target.is_null() {
+        return;
+    }
+    let timer: unsafe extern "C" fn(ID, SEL, f64, ID, SEL, ID, u8) -> ID =
+        std::mem::transmute(crate::objc_msgSend as *const ());
+    timer(
+        objc_getClass(c"NSTimer".as_ptr()),
+        sel(c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+        1.6,
+        target,
+        sel(c"sdHideHud:"),
+        std::ptr::null_mut(),
+        0,
+    );
+}
+
+/// カーソル近傍の案内を隠す(I3)
+unsafe extern "C" fn imp_hide_hud(_s: ID, _c: SEL, _n: ID) {
+    crate::hud::hide();
+}
+
 /// 「受信フォルダを開く」(I6)
 unsafe extern "C" fn imp_open_recv(_s: ID, _c: SEL, _n: ID) {
     crate::files::open_receive_dir();
@@ -2744,6 +2796,8 @@ unsafe fn make_target() -> ID {
         (c"sdSendFile:", imp_send_file as *const () as usize),
         (c"sdRetryLast:", imp_retry_last as *const () as usize),
         (c"sdOpenRecv:", imp_open_recv as *const () as usize),
+        (c"sdShowHud:", imp_show_hud as *const () as usize),
+        (c"sdHideHud:", imp_hide_hud as *const () as usize),
         (c"sdTabletText:", text_input::show as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdClosePrefs:", imp_close_prefs as *const () as usize),

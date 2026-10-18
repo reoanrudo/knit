@@ -287,8 +287,8 @@ pub(crate) fn drag_offer_link_ok(link_up: bool, ms_since_switch: Option<u64>) ->
 fn refusal_log(reason: &drag::Refusal, raw: Option<&str>) -> Option<String> {
     use drag::Refusal::*;
     Some(match reason {
-        // 現行も通知のみでログ行を出さない
-        TooMany => return None,
+        // 現行も通知のみでログ行を出さない(0 件も同じ)
+        TooMany | EmptyGrab => return None,
         LinkDown => "[drag] mac->win 対象外: ファイル経路が未接続".to_string(),
         CollectStale => "[drag] mac->win 対象外: 集計条件が変わっています".to_string(),
         CollectTimeout => "[drag] mac->win 対象外: 集計結果の準備が間に合っていません".to_string(),
@@ -308,6 +308,8 @@ fn refuse_drag(reason: drag::Refusal, raw: Option<&str>) -> Option<u64> {
     if let Some(line) = refusal_log(&reason, raw) {
         eprintln!("{line}");
     }
+    // 理由を**カーソルの近く**にも出す(I3)。通知はフルスクリーン等で出ない場合の保険として残す
+    crate::hud::note_refusal(&reason);
     notify("Knit", &reason.notice_body());
     None
 }

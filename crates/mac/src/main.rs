@@ -6,6 +6,7 @@
 // SEL / CLS は Objective-C ランタイムの慣用名
 #![allow(clippy::upper_case_acronyms)]
 
+mod hud;
 mod android;
 mod audio;
 mod cg;

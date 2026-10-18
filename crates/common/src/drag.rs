@@ -19,8 +19,11 @@ pub const MAX_BATCH_FILES: usize = 512;
 /// もので、判定条件そのものは現行の `offer_drag_to_win` と同じ
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    /// 掴んだ件数が多すぎる。現行は 0 件も同じ文言で扱う(挙動を変えないため維持)
+    /// 掴んだ件数が多すぎる(上限超え)
     TooMany,
+    /// 掴んだ項目が無い(0 件)。**通知の文言は現行と同じ**だが、理由を分けておくことで
+    /// カーソル近傍の案内(I3)が「64 件まで」と誤って言わないようにする
+    EmptyGrab,
     /// ファイル経路がまだ張れていない(切替直後の猶予窓も過ぎた)
     LinkDown,
     /// 集計結果が古い(接続先の版が変わった等)
@@ -43,6 +46,8 @@ impl Refusal {
             Refusal::TooMany => {
                 format!("掴んだまま渡せるのは {} フォルダ/ファイルまでです", MAX_FILES)
             }
+            // 0 件のときの通知文言は現行のまま(変えない)。理由だけ分けて HUD で使い分ける
+            Refusal::EmptyGrab => Refusal::TooMany.notice_body(),
             Refusal::LinkDown => {
                 "ファイルの転送経路がまだ準備中です。少し待ってもう一度掴んでください".to_string()
             }
@@ -115,7 +120,11 @@ pub enum Verdict {
 /// 掴み渡しの判定(純関数)。順序は現行 `offer_drag_to_win` と同じ:
 /// 件数 → 経路 → 集計(古い/間に合わない/失敗/空) → 送信枠
 pub fn verdict_for(s: &Signals) -> Verdict {
-    if s.path_count == 0 || s.path_count > MAX_FILES {
+    if s.path_count == 0 {
+        // 文言は TooMany と同じだが、理由は分ける(0 件に「64 件まで」と言わない)
+        return Verdict::Refused(Refusal::EmptyGrab);
+    }
+    if s.path_count > MAX_FILES {
         return Verdict::Refused(Refusal::TooMany);
     }
     if !s.link_ok {

@@ -4,6 +4,7 @@ pub mod persist;
 pub mod diagnose;
 pub mod doctor;
 pub mod drag;
+pub mod hud;
 pub mod notice;
 pub mod history;
 pub mod pairing;
