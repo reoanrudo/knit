@@ -731,7 +731,11 @@ mod tests {
             return; // 32bit では桁が変わる
         }
         assert_eq!(std::mem::size_of::<StatStg>(), 80, "STATSTG は 80 バイト(x64)");
-        assert_eq!(std::mem::size_of::<super::FormatEtc>(), 24, "FORMATETC は 24 バイト");
+        // FORMATETC は 32 バイト: cfFormat(2) + 詰め物(6) + ptd(8) + dwAspect(4) +
+        // lindex(4) + tymed(4) = 28 だが、ポインタ由来の整列 8 で 32 に切り上げられる
+        // (MSVC の既定パッキングでも同じ。既存の CF_HDROP 経路が同じ構造体で
+        //  実機動作していることが傍証。CI で私の「24」という誤った期待を検出した)
+        assert_eq!(std::mem::size_of::<super::FormatEtc>(), 32, "FORMATETC は 32 バイト");
         assert_eq!(std::mem::size_of::<super::StgMedium>(), 24, "STGMEDIUM は 24 バイト");
         assert_eq!(
             std::mem::size_of::<super::Guid>(),
