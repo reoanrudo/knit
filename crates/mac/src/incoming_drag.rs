@@ -167,9 +167,12 @@ pub(crate) fn set_waiting_for_test(id: u64, total: u64) {
 }
 
 /// 引き継げなかったときに出す本文。**元のファイルは Windows 側に残っている**ことを
-/// 必ず伝える(受け取れなかっただけで、掴んだ元が消えたわけではない)
+/// 必ず伝える(受け取れなかっただけで、掴んだ元が消えたわけではない)。
+/// **理由を断定しない**: Err に入る経路は5通りあり(予告なし・別ID・commit 済み・受領済み・
+/// 件数不一致)、実際に最も多いのは**フリック離しで予告が無い**場合。件数不一致と書くと
+/// 大多数の場面で理由が食い違う(検証役の指摘)
 pub fn receive_failed_notice() -> &'static str {
-    "ファイルを引き継げませんでした(予告と件数が一致しません)。Windows 側のファイルはそのまま残っています。もう一度掴んでください"
+    "ファイルを引き継げませんでした(離すタイミングによっては、ドラッグとして渡せないことがあります)。Windows 側のファイルはそのまま残っています。もう一度掴んでください"
 }
 
 pub fn receive(id: u64, paths: Vec<std::path::PathBuf>) {
@@ -779,10 +782,26 @@ mod receive_failed_tests {
         assert!(n.contains("引き継げませんでした"), "{n}");
         assert!(n.contains("Windows 側のファイルはそのまま残っています"), "元の所在: {n}");
         assert!(n.contains("もう一度掴んでください"), "次の一手: {n}");
+        // 理由を断定しない(Err の経路は5通りあり、最多は「予告なし」)
+        assert!(
+            !n.contains("件数が一致しません"),
+            "特定の理由を書かない(大多数で食い違う): {n}"
+        );
         // 成功語を入れない(引き継げていないのに成功を装わない)
         for w in knit_common::notice::PLACEMENT_CLAIMS {
             assert!(!n.contains(w), "「{w}」を入れない: {n}");
         }
+    }
+
+    /// 配線: **予告が無い**受信(フリック離しで最も多い)も「引き継げない」経路に入る
+    #[test]
+    fn a_receive_without_any_offer_cannot_be_carried() {
+        let _g = shared_state_lock();
+        let got = INCOMING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receive(777, vec![std::path::PathBuf::from("/tmp/no-offer")]);
+        assert!(got.is_err(), "予告が無ければ引き継がない(=通知の経路)");
     }
 
     /// 配線: 予告と一致しない受信は「引き継げない」経路に入る(通知の前提)
