@@ -2487,6 +2487,14 @@ fn refresh_status() {
                 }
             }
         }
+        // Win→Mac の受け取り待ちは、カーソル近傍に進捗を出す(F2: 押したまま待つ間に
+        // 何も分からない)。この向きは**ユーザーが Mac 画面を見ている**ので HUD が効く。
+        // 表示は毎秒更新し、1.6 秒の自動非表示は「出し直し」で上書きされる
+        if !UI_PREVIEW.load(Ordering::Relaxed) {
+            if let Some(line) = crate::files::incoming_progress_line() {
+                crate::hud::note_progress(&line);
+            }
+        }
         // 状態行はメニューバー本体が開示中は書き換えない(開示中の setTitle は
         // 表示中のメニュー幅を脈動させる)。閉じた時に 1 回反映する
         if state_title_set_now(GUI_MAIN_MENU_OPEN.load(Ordering::Relaxed)) {

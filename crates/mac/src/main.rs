@@ -291,10 +291,13 @@ fn spawn_role_threads(generation: usize) {
         dir: desktop_settings::receive_dir(),
         on_event: mac_on_bulk,
         log: |s| eprintln!("{s}"),
-        on_rx_bytes: |_| {},
-        // 受信バッチの開始時点のアクティブ端末を履歴ラベルとして固定する
-        //(通知時点で読むと、受信中の端末切替でラベルがすり替わる)
-        on_batch_begin: note_bulk_rx_device,
+        on_rx_bytes: files::note_rx_bytes,
+        // 受信バッチの開始で進捗を 0 に戻す(掴み越境の待ち表示に使う)
+        // on_batch_begin は端末の記録と進捗の両方を行う
+        on_batch_begin: || {
+            note_bulk_rx_device();
+            files::note_rx_begin();
+        },
         // 待受 bind の初回失敗だけ通知センターへも出す(接続は生きているのに
         // ファイル・画像だけが届かない状態をログだけで終わらせない)
         on_bind_error: |s: &str| notify("Knit", s),

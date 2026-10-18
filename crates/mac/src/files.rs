@@ -934,6 +934,63 @@ static DRAG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// 指紋計算・集計の間)も true にする: この窓で離す「フリックして離す」操作を取りこぼすと、
 /// 相手は保存のみなのに「置けた」と言ってしまう
 static DRAG_UNFINISHED: AtomicBool = AtomicBool::new(false);
+/// いま受け取っているバッチの累計バイトと開始時刻(Win→Mac の待ち時間を見せる)。
+/// 受信フックは connection スレッドから呼ばれるので Atomic だけを使う
+static RX_BYTES: AtomicU64 = AtomicU64::new(0);
+static RX_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 受信バッチの開始(フック)。進捗の分母は目録(DragOffer)の合計を使う
+pub(crate) fn note_rx_begin() {
+    RX_BYTES.store(0, Ordering::Relaxed);
+    RX_STARTED_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+pub(crate) fn note_rx_bytes(n: u64) {
+    RX_BYTES.store(n, Ordering::Relaxed);
+}
+
+/// 受け取り待ちの表示1行(純関数)。合計が分からなければ割合は出さない(0% と偽らない)
+fn receive_progress_line(received: u64, total: u64, elapsed_ms: u64) -> String {
+    if received == 0 {
+        // まだ1バイトも来ていない: 0% と出すより「待っています」と言う
+        return "受け取りの準備中です".to_string();
+    }
+    let secs = elapsed_ms / 1000;
+    if total == 0 {
+        // 合計が分からなくても「進んでいる」ことは速度で示せる
+        let speed = if secs > 0 {
+            format!("・{}/s", human_bytes(received / secs))
+        } else {
+            String::new()
+        };
+        return format!("受け取り中 {}{speed}", human_bytes(received));
+    }
+    let pct = (received.saturating_mul(100) / total).min(100);
+    let speed = if secs > 0 {
+        format!("・{}/s", human_bytes(received / secs))
+    } else {
+        String::new()
+    };
+    format!(
+        "受け取り中 {pct}%({} / {}){speed}",
+        human_bytes(received),
+        human_bytes(total)
+    )
+}
+
+/// いま表示すべき受け取り進捗(待っていなければ None)
+pub(crate) fn incoming_progress_line() -> Option<String> {
+    let (_, total) = crate::incoming_drag::waiting_for_data()?;
+    let received = RX_BYTES.load(Ordering::Relaxed);
+    let started = RX_STARTED_MS.load(Ordering::Relaxed);
+    let elapsed = if started > 0 {
+        now_ms().saturating_sub(started)
+    } else {
+        0
+    };
+    Some(receive_progress_line(received, total, elapsed))
+}
+
 /// 遅延提供の目録を送った受け渡しID(0 = なし)。相手が版17のときだけ入る。
 /// **速い転送では受理の往復より送信完了が先に来る**ため、受理を少し待つ判断に使う
 static MANIFEST_SENT_ID: AtomicU64 = AtomicU64::new(0);
@@ -1352,5 +1409,38 @@ mod lazy_accept_wait_tests {
         assert!(t1.elapsed() < Duration::from_millis(100), "{:?}", t1.elapsed());
         LAZY_ACCEPTED_ID.store(0, Ordering::Relaxed);
         MANIFEST_SENT_ID.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod receive_progress_tests {
+    use super::*;
+
+    /// 合計が分かっているときは割合と実量、速度まで出す
+    #[test]
+    fn progress_shows_percent_amounts_and_speed() {
+        let line = receive_progress_line(2 * 1024 * 1024, 8 * 1024 * 1024, 2_000);
+        assert!(line.contains("25%"), "{line}");
+        // 表示は human_bytes の形式(2 MiB は「2.0 MB」)
+        assert!(line.contains("2.0 MB"), "受信量: {line}");
+        assert!(line.contains("8.0 MB"), "全体量: {line}");
+        assert!(line.contains("/s"), "速度: {line}");
+        // 経過 0 秒では速度を出さない(0 除算と「∞/s」を避ける)
+        let just_started = receive_progress_line(2048, 4096, 0);
+        assert!(!just_started.contains("/s"), "{just_started}");
+    }
+
+    /// **0% と偽らない**: 合計が不明なら割合を出さず、受信量だけを見せる
+    #[test]
+    fn an_unknown_total_never_fakes_a_percent() {
+        let line = receive_progress_line(1024, 0, 1_000);
+        assert!(!line.contains('%'), "{line}");
+        assert!(line.contains("1 KB"), "{line}");
+        assert!(line.contains("/s"), "合計が不明でも速度は出せる: {line}");
+        // 100% を超えない(宣言より多く届いても)
+        let over = receive_progress_line(9999, 1000, 1_000);
+        assert!(over.contains("100%"), "{over}");
+        // まだ何も届いていないときは「準備中」と言う(0% と言わない)
+        assert_eq!(receive_progress_line(0, 1000, 500), "受け取りの準備中です");
     }
 }

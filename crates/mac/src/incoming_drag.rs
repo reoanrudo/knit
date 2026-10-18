@@ -4,6 +4,21 @@ use knit_common::drag::Incoming;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 static INCOMING: Mutex<Incoming> = Mutex::new(Incoming::new());
+/// 受け取り待ちの (id, 合計バイト)。**転送が終わるまで待たされる間**に手元へ進捗を出すため
+/// (Win→Mac は相手がドラッグを持っており、こちらは全ファイル到着まで待つ)
+static WAITING: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+
+/// 受け取り待ちか(データ到着を待っている最中だけ Some)
+pub fn waiting_for_data() -> Option<(u64, u64)> {
+    *WAITING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn clear_waiting(id: u64) {
+    let mut g = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+    if g.is_some_and(|(cur, _)| cur == id) {
+        *g = None;
+    }
+}
 static COMMIT: Mutex<Option<u64>> = Mutex::new(None);
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
 static SOURCE_CLASS: AtomicUsize = AtomicUsize::new(0);
@@ -74,6 +89,9 @@ pub fn offer(id: u64, count: usize, total: u64, position: f64) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .offer(id, count, position);
+    if accepted {
+        *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, total));
+    }
     send_msg(&if accepted {
         Msg::DragAccept { id }
     } else {
@@ -93,6 +111,7 @@ pub fn receive(id: u64, paths: Vec<std::path::PathBuf>) {
     match result {
         Ok(()) => {
             eprintln!("[drag] win->mac ready {id}");
+            clear_waiting(id); // 到着したので待ちの表示を終える
             send_msg(&Msg::DragReady { id });
         }
         Err(paths) => {
@@ -108,6 +127,7 @@ pub fn commit(id: u64) {
 }
 
 pub fn cancel(id: u64) {
+    clear_waiting(id);
     let paths = INCOMING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -120,6 +140,7 @@ pub fn cancel(id: u64) {
 }
 
 pub fn reset() {
+    *WAITING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *COMMIT.lock().unwrap_or_else(|e| e.into_inner()) = None;
     delete_received(INCOMING.lock().unwrap_or_else(|e| e.into_inner()).reset());
     // 接続が切れたら進行中のセッションも終わらせ、境界切替の抑制を解く。
