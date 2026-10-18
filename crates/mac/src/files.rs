@@ -430,8 +430,11 @@ pub(crate) fn offer_drag_to_win(paths: &[std::path::PathBuf]) -> Option<u64> {
     // Windows 側が自分で採番する受け渡しIDと重ならないよう最上位ビットを立てる。
     // 採番は NEXT_TX_ID に一本化(独立カウンタだと通常送信と同じ ID を振り得る)
     let id = DRAG_ID_BIT | NEXT_TX_ID.fetch_add(1, Ordering::Relaxed);
-    // 新しい掴みが始まったので「途中で離した」の記録を消す(I5)
+    // 新しい掴みが始まったので、前回の記録を消して進行中を立てる(I5)。
+    // begin_xfer より前(指紋計算・集計の間)に離される窓も「未完」に含める
     DRAG_RELEASED_EARLY.store(false, Ordering::Relaxed);
+    DRAG_IN_FLIGHT.store(true, Ordering::Relaxed);
+    DRAG_UNFINISHED.store(true, Ordering::Relaxed);
     let count = entries.len();
     let total = bulk::entries_total(&entries);
     // 展開結果をそのまま送る(予告の件数・合計と厳密に一致させる)
@@ -458,7 +461,8 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
         .take()
         .filter(|(stashed, _)| *stashed == id);
     std::thread::spawn(move || {
-        let guard = TxGuard::new();
+        // 掴みドラッグ用の後始末: 進行中フラグを必ず下ろす(早期 return でも Drop が走る)
+        let guard = TxGuard::new_drag();
         let Some((id, entries)) = stash else {
             eprintln!("[drag] mac->win {id}: 予告が取り消されているため送信しません");
             return;
@@ -517,19 +521,14 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 rep.sent,
                 total as f64 / 1024.0 / 1024.0 / t0.elapsed().as_secs_f64().max(0.001)
                 );
-                // 結果を3状態で言い切る(I5)。渡し終わる前に離していたら、相手は
-                // ネイティブのドラッグを始められないので「置けた」とは言わない
+                // 結果を3状態で言い切る(I5)。判断は common の純関数にあり、ここは
+                // 「離した順序」を渡すだけ(配線にロジックを置かない)
+                DRAG_UNFINISHED.store(false, Ordering::Relaxed);
                 let early = DRAG_RELEASED_EARLY.load(Ordering::Relaxed);
                 let outcome = notice::DeliveryOutcome {
                     peer: peer.clone(),
                     count: rep.sent,
-                    result: if early {
-                        notice::DeliveryResult::SavedOnly {
-                            why: notice::SaveWhy::ReleasedEarly,
-                        }
-                    } else {
-                        notice::DeliveryResult::Placed
-                    },
+                    result: notice::placed_or_saved(early),
                 };
                 let n = notice::compose_notice(&outcome);
                 match n.kind {
@@ -548,11 +547,7 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                     let n = notice::compose_notice(&notice::DeliveryOutcome {
                         peer: peer.clone(),
                         count,
-                        result: notice::DeliveryResult::Failed {
-                            reason: knit_common::bulk::send_error_label(e),
-                            retryable: notice::retryable_error(e),
-                            saved_count: 0,
-                        },
+                        result: notice::failed_result(e, 0),
                     });
                     notify(&n.title, &n.body);
                 }
@@ -721,19 +716,38 @@ fn rename_note(renamed: usize) -> String {
 pub(crate) static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
 /// 送信スレッドの異常終了(panic)でもフラグ・進捗表示・中止要求を解くためのガード。
 /// パニック1回で Busy が永久残留すると、以後の全転送が再起動まで拒否される
-struct TxGuard(std::cell::Cell<Option<u64>>);
+struct TxGuard {
+    id: std::cell::Cell<Option<u64>>,
+    /// 掴みドラッグの転送か(DRAG_IN_FLIGHT / DRAG_UNFINISHED を下ろす責任を持つ)
+    drag: bool,
+}
 impl TxGuard {
     fn new() -> Self {
-        TxGuard(std::cell::Cell::new(None))
+        TxGuard {
+            id: std::cell::Cell::new(None),
+            drag: false,
+        }
+    }
+    /// 掴みドラッグ用。offer が立てた進行中フラグを、この後始末で必ず下ろす
+    /// (早期 return でも Drop が走る)
+    fn new_drag() -> Self {
+        TxGuard {
+            id: std::cell::Cell::new(None),
+            drag: true,
+        }
     }
     fn arm(&self, id: u64) {
-        self.0.set(Some(id));
+        self.id.set(Some(id));
     }
 }
 impl Drop for TxGuard {
     fn drop(&mut self) {
         FILE_TX_BUSY.store(false, Ordering::Relaxed);
-        if let Some(id) = self.0.get() {
+        if self.drag {
+            DRAG_IN_FLIGHT.store(false, Ordering::Relaxed);
+            DRAG_UNFINISHED.store(false, Ordering::Relaxed);
+        }
+        if let Some(id) = self.id.get() {
             end_xfer(id);
             knit_common::xfer::discard(id);
         }
@@ -750,19 +764,23 @@ struct Xfer {
 static XFER: Mutex<Option<Xfer>> = Mutex::new(None);
 /// 掴みドラッグの受け渡しIDに立てる最上位ビット(通常送信のIDと区別する)
 const DRAG_ID_BIT: u64 = 1 << 63;
+/// 掴みドラッグが進行中か(offer が通り、転送スレッドの後始末が終わるまで)
+static DRAG_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// 進行中の掴みドラッグが**まだ渡し終わっていない**か。offer の直後(begin_xfer 前の
+/// 指紋計算・集計の間)も true にする: この窓で離す「フリックして離す」操作を取りこぼすと、
+/// 相手は保存のみなのに「置けた」と言ってしまう
+static DRAG_UNFINISHED: AtomicBool = AtomicBool::new(false);
 /// 掴みドラッグの転送を「渡し終わる前に離した」か(I5)。相手がネイティブのドラッグを
 /// 始められるかは**離した順序**で決まるため、離した瞬間に確定させて結果に反映する
 /// (渡し終わってから離した = 置けた / 途中で離した = 相手の受信フォルダに保存のみ)
 static DRAG_RELEASED_EARLY: AtomicBool = AtomicBool::new(false);
 
-/// tap の離し(EVT_LEFT_UP)から呼ぶ: 進行中の掴みドラッグ転送が未完なら記録する。
+/// tap の離し(EVT_LEFT_UP)から呼ぶ: 掴みドラッグの転送が未完のまま離されたら記録する。
+/// **Mutex を取らない**(AtomicBool 2つの読み出しだけ): 入力経路を待たせない。
 /// 通常送信(メニュー・⌘C)は対象外(ドロップの成否に関係しない)
 pub(crate) fn note_press_release() {
-    let g = XFER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(x) = g.as_ref() {
-        if x.id & DRAG_ID_BIT != 0 && x.sent < x.total {
-            DRAG_RELEASED_EARLY.store(true, Ordering::Relaxed);
-        }
+    if DRAG_IN_FLIGHT.load(Ordering::Relaxed) && DRAG_UNFINISHED.load(Ordering::Relaxed) {
+        DRAG_RELEASED_EARLY.store(true, Ordering::Relaxed);
     }
 }
 /// 掴みドラッグの送信内容。予告(DragOffer)時点で展開したものと同じ内容を送る
