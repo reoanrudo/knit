@@ -11,6 +11,8 @@
 use std::ffi::c_void;
 pub mod edge;
 mod host;
+/// 遅延提供(版 17)の純粋部分。**既定は無効**(KNIT_LAZY=1 で有効)
+pub mod lazy;
 pub use host::{relay_cancel, relay_move, relay_up};
 #[cfg(test)]
 mod live_tests;
