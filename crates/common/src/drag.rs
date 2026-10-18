@@ -5,6 +5,10 @@ use std::path::PathBuf;
 pub mod forecast;
 pub use forecast::{forecast_for, CarryPhase, FailReason, Forecast, ForecastInput, Why};
 
+/// 遅延提供(drag.lazy)の状態機械(I8)。判断はここに集約し、各 OS は命令を実行するだけ
+pub mod lazy;
+pub use lazy::{LazyAbort, LazyCommand, LazyHandoff, LazySide, LazyState};
+
 pub const MAX_FILES: usize = 64;
 /// フォルダ展開後の件数上限(版 14 で導入)。掴みドラッグの予告(DragOffer)は
 /// 展開後の件数で送るため、受け側もこの上限まで受け付ける
