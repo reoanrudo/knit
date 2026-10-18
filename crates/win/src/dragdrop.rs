@@ -93,8 +93,9 @@ struct DragThreadGuard;
 
 impl DragThreadGuard {
     fn arm() -> Self {
+        // GetCurrentThreadId は unsafe(既存の store 呼び出しと同じ前提)
         DRAG_THREAD.store(
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() },
             Ordering::Relaxed,
         );
         DragThreadGuard
