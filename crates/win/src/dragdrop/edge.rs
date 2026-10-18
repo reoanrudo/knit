@@ -19,6 +19,14 @@ pub static CONTROLLED: AtomicBool = AtomicBool::new(false);
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
+/// 受け渡しが始まるのを待つ上限(これを過ぎたら無言で放置せず取り消して知らせる)
+const SEND_WAIT: Duration = Duration::from_secs(30);
+
+/// 受け渡しの待ちが長すぎるか(純関数)。**送信中は対象外**(転送そのものは止めない)
+fn send_wait_expired(sending: bool, waited: Duration) -> bool {
+    !sending && waited > SEND_WAIT
+}
+
 struct Pending {
     id: u64,
     /// 展開後の送信内容(フォルダは相対パス付きの中のファイルへ展開済み)。
@@ -483,26 +491,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, message: u32, wp: WPARAM, lp: 
         let mut cursor = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
         let at_target = GetCursorPos(&mut cursor) != 0
             && position_at(POINTL { x: cursor.x, y: cursor.y }).is_some();
-        let (cancel, finish) = {
+        let (cancel, finish, timed_out) = {
             let mut state = PENDING.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(p) = state.as_mut() {
-                let cancel = (!enabled()
-                    || !at_target
-                    || !down
-                    || (!p.sending && p.began.elapsed() > Duration::from_secs(30)))
-                    && !p.committed;
+                let timed_out = send_wait_expired(p.sending, p.began.elapsed());
+                let cancel =
+                    (!enabled() || !at_target || !down || timed_out) && !p.committed;
                 // Cfg更新で区間外になった直後にも、マウスUpで強制確定させない。
                 let finish = !cancel && at_target && p.ready && !p.committing;
                 if finish {
                     p.committing = true;
                 }
-                (cancel, finish)
+                (cancel, finish, cancel && timed_out)
             } else {
-                (false, false)
+                (false, false, false)
             }
         };
         if cancel {
             cancel_current();
+            // **無言で取り消さない**: 30秒待って受け渡しが始まらないときは理由を出す
+            // (取り消したこと自体が分からないと「壊れた」と誤解される)
+            if timed_out {
+                crate::tray::notify(
+                    "Knit",
+                    "受け渡しが始まりませんでした(30秒待ちました)。ドラッグは取り消しました。もう一度掴んでください",
+                );
+            }
         }
         // 元のExplorerへだけUpを届ける。Macの物理押下は引き継ぎまで保持する。
         if finish && !crate::inject_mouse_btn(0, false) {
@@ -721,5 +735,28 @@ mod tests {
         crate::CONNECTED.store(false, Ordering::Relaxed);
         CONTROLLED.store(false, Ordering::Relaxed);
         PEER_VERSION.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod send_wait_tests {
+    use super::*;
+
+    /// 送信が始まっていなければ、30秒を過ぎたら取り消して知らせる
+    #[test]
+    fn a_wait_that_never_starts_expires() {
+        assert!(!send_wait_expired(false, Duration::from_secs(29)), "29秒はまだ待つ");
+        assert!(send_wait_expired(false, Duration::from_secs(31)), "31秒は期限切れ");
+        assert!(
+            !send_wait_expired(false, SEND_WAIT),
+            "ちょうど30秒はまだ待つ(境界)"
+        );
+    }
+
+    /// **送信中は決して期限切れにしない**(長い転送を打ち切らない)
+    #[test]
+    fn an_active_transfer_is_never_expired() {
+        assert!(!send_wait_expired(true, Duration::from_secs(31)));
+        assert!(!send_wait_expired(true, Duration::from_secs(6 * 60 * 60)));
     }
 }
