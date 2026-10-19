@@ -186,6 +186,11 @@ impl DeviceRegistry {
     /// `open` と「書き込み直前」が使う
     fn reload_from_file(&self, inner: &mut Inner) {
         let Ok(bytes) = std::fs::read(&self.path) else {
+            // 読めない=ファイルが無い(動作中に削除された等)。前回の内容を
+            // 残すと commit の「読んだ時と同じか」比較が永久に食い違い、
+            // 台帳を作り直せなくなる。無い物は無い物として揃える
+            inner.raw = None;
+            inner.stamp = None;
             return;
         };
         match serde_json::from_slice::<LedgerFile>(&bytes) {

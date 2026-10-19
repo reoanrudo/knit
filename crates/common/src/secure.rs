@@ -33,19 +33,6 @@
         digest.iter().take(4).map(|b| format!("{b:02X}")).collect()
     }
 
-    /// 設定画面の暗号化の行の文言。暗号化は常時ONのためトグルは無く、状態を
-    /// 読み取れる1行として出す(フィンガープリント付きなら「鍵の略号: XXXXXXXX」を
-    /// 併記し、相手側画面との見比せ方を1文で添える)。
-    /// 両OSで同じ文言にするため common 側で組立てる
-    pub fn encryption_line(fingerprint: Option<&str>) -> String {
-        match fingerprint {
-            Some(fp) => format!(
-                "通信は常時暗号化・相互認証されています(設定不要)・鍵の略号: {fp}(相手側の設定画面と同じ文字列なら正しく対になっています)"
-            ),
-            None => "通信は常時暗号化・相互認証されています(設定不要)".into(),
-        }
-    }
-
     fn invalid(e: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     }
@@ -436,17 +423,6 @@
             assert!(!a.contains(token.as_str()), "トークン本文を含まない");
             // 大文字小文字は別の鍵として扱う(psk と同じ・正規化は保存時に済んでいる)
             assert_ne!(a, fingerprint(&token.to_ascii_uppercase()));
-        }
-
-        /// 暗号化の行の文言: フィンガープリントの有無で「鍵の略号:」の併記が変わるだけ
-        #[test]
-        fn encryption_line_appends_fingerprint_only_when_present() {
-            let base = "通信は常時暗号化・相互認証されています(設定不要)";
-            assert_eq!(encryption_line(None), base);
-            assert_eq!(
-                encryption_line(Some("AB12CD34")),
-                format!("{base}・鍵の略号: AB12CD34(相手側の設定画面と同じ文字列なら正しく対になっています)")
-            );
         }
 
         // ── 複数鍵の待受(端末別認証)のループバックテスト ──
