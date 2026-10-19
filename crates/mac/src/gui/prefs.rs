@@ -2173,7 +2173,7 @@ mod layout_values_tests {
             screen: (800.0, 600.0),
             monitors: vec![],
             writer: None,
-            gen: 1,
+            gen: 1, auth: knit_common::secure::Who::Legacy,
             side,
             edge_monitor,
             ver: 13,

@@ -92,6 +92,10 @@ pub(crate) struct PeerEntry {
     /// 端末ごとに peer-sides.json へ保存し、表示・履歴ラベルでコンピュータ名(name)
     /// より優先する。None・空=設定なし(コンピュータ名を使う)
     pub alias: Option<String>,
+    /// この接続をどの鍵で認証したか(accept_as の結果のスナップショット)。
+    /// 認証済み主体の表現。後段の許可行列・操作権はここから引く。
+    /// Legacy=従来の単一共有トークン(KNIT_TOKEN 運用・移行中の旧端末)
+    pub auth: knit_common::secure::Who,
 }
 pub(crate) static PEERS: Mutex<Vec<PeerEntry>> = Mutex::new(Vec::new());
 /// アクティブなピアの添字(未接続は usize::MAX)
@@ -111,6 +115,13 @@ pub(crate) fn active_screen_settings() -> Option<crate::screen_settings::PeerSet
         (peer.id.clone(), peer.side)
     };
     Some(crate::screen_settings::get(&id, side))
+}
+
+/// アクティブなピアの端末 id(大容量経路の接続など、宛先別トークンの解決に使う)
+pub(crate) fn active_peer_id() -> Option<String> {
+    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+    peers.get(act).map(|p| p.id.clone())
 }
 
 /// my_id がいまアクティブなピアか(pong の反映先判定などに使う)。
@@ -705,6 +716,7 @@ mod tests {
             edge_monitor: None,
             ver: 13,
             alias: None,
+            auth: knit_common::secure::Who::Legacy,
         }
     }
 

@@ -230,10 +230,14 @@
     /// 戻り値は bind 失敗のみ(待受に入ったら should_stop が true を返した時のみ戻る。
     /// 呼び出し側でログに出す)。should_stop は受信タイムアウトごとに呼ばれ、
     /// true で待受を終える(役割切替で待受側をやめる時など。Windows 側は false 固定)
+    /// 発見への応答側。`rooms` は自分が応答してよい部屋 ID の一覧を返す
+    /// (毎パケット呼ぶ。台帳運用では登録・失効が即座に反映されるように)。
+    /// 問い合わせ("KNIT?<room>")が自分の部屋と一致した時だけ、同じ部屋 ID で
+    /// 応答("KNIT!<room>")する=トークンを知る相手にだけ見つかる
     pub fn respond(
         bind: &str,
         port: u16,
-        token: &str,
+        rooms: impl Fn() -> Vec<String>,
         allow: fn(IpAddr) -> bool,
         should_stop: impl Fn() -> bool,
     ) -> std::io::Result<()> {
@@ -241,8 +245,6 @@
         // タイムアウトを 1 周回として扱う(設定失敗時は旧来のブロッキングのまま
         // should_stop が効かないが、待受が止まらないだけで応答自体は壊れない)
         let _ = sock.set_read_timeout(Some(RESPOND_POLL));
-        let ask = format!("KNIT?{}", room_id(token));
-        let ans = format!("KNIT!{}", room_id(token));
         let mut buf = [0u8; 128];
         // 1 回の recv エラーで応答ループを抜けない: Windows の未接続 UDP ソケットは
         // 閉じた port への送信に対する ICMP(Port Unreachable)を次の recv が
@@ -267,8 +269,14 @@
                     continue;
                 }
             };
-            if allow(from.ip()) && &buf[..n] == ask.as_bytes() {
-                let _ = sock.send_to(ans.as_bytes(), from);
+            if !allow(from.ip()) {
+                continue;
+            }
+            let packet = &buf[..n];
+            let asks: Vec<String> = rooms().iter().map(|r| format!("KNIT?{r}")).collect();
+            if let Some(ask) = asks.iter().find(|a| a.as_bytes() == packet) {
+                let room = ask.strip_prefix("KNIT?").unwrap_or_default();
+                let _ = sock.send_to(format!("KNIT!{room}").as_bytes(), from);
             }
         }
     }

@@ -414,6 +414,7 @@ fn handshake_and_hello(
         f64,
         f64,
         u32,
+        knit_common::secure::Who,
     ),
     String,
 > {
@@ -421,7 +422,14 @@ fn handshake_and_hello(
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let (r, hw) = secure::accept(stream, token, b"knit-main")
+    // 待受の鍵束。台帳があれば最新の状態(登録・失効の即時反映)、無ければ
+    // 従来どおり単一トークン(テスト・台帳を開けなかった場合)
+    let keys = match crate::registry() {
+        Some(r) => r.accept_keys(),
+        None => Ok(secure::ServerKeys::single(token)),
+    };
+    let (r, hw, who) = keys
+        .and_then(|k| secure::accept_as(stream, &k, b"knit-main"))
         .map_err(|e| format!("暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)"))?;
     let mut reader = std::io::BufReader::new(r);
     let mut line = String::new();
@@ -470,6 +478,7 @@ fn handshake_and_hello(
                 w.clamp(1, 32768) as f64,
                 h.clamp(1, 32768) as f64,
                 ver,
+                who,
             ))
         }
         _ => Err("invalid hello".into()),
@@ -605,7 +614,7 @@ pub(crate) fn server_thread(
                 let _ = hs_tx.send(out);
             });
         }
-        let (mut reader, mut w, disp, dev, mons, win_w, win_h, peer_ver) = match hs_rx
+        let (mut reader, mut w, disp, dev, mons, win_w, win_h, peer_ver, who) = match hs_rx
             .recv_timeout(Duration::from_secs(15))
         {
             Ok(Ok(x)) => x,
@@ -660,6 +669,8 @@ pub(crate) fn server_thread(
                     gen: my_gen, side, edge_monitor, ver: peer_ver,
                     // 保存済みのエイリアス(表示名)があれば接続時点で載せる
                     alias: tap::saved_peer_alias(&dev),
+                    // どの鍵で認証したか(端末別 or 従来の単一トークン)
+                    auth: who.clone(),
                 });
                 if replacing {
                     if let Some(old) = slot.take() { old.shutdown(); }
@@ -670,6 +681,20 @@ pub(crate) fn server_thread(
                 drop(slot);
                 if select {
                     activate_peer_id_locked(&dev, if first { "初回接続" } else { "再接続" });
+                }
+            }
+            // 台帳へ接続成功を記録する(last_seen と表示名の更新、宛先別トークンの
+            // 紐付け。失効後の試行は accept が弾くため、ここへは届かない)。
+            // 保存に失敗しても接続は止めない(表示の新しさだけが遅れる)
+            if let knit_common::secure::Who::Device(ref key) = who {
+                if let Some(r) = crate::registry() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Err(e) = r.note_seen(key, &dev, &disp, now) {
+                        eprintln!("[registry] 接続記録の保存に失敗: {e}");
+                    }
                 }
             }
             let _ = session_receive_loop(&mut reader, &dev, my_gen);

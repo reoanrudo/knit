@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::discover::room_id;
 use crate::persist::{quarantine, read_json_or_quarantine, write_atomic};
 use crate::proto::safe_peer_name;
-use crate::secure::{fingerprint, DeviceKeyId};
+use crate::secure::{fingerprint, DeviceKeyId, ServerKeys};
 
 /// 台帳に載せられる端末数の上限。accept は最初のレコードを全鍵で試すため
 /// 計算量が台数に比例する(1試行はマイクロ秒 order だが無制限にはしない)
@@ -242,6 +242,30 @@ impl DeviceRegistry {
             .collect()
     }
 
+    /// accept へ渡す鍵束。呼び出しごとに組む(失効・登録が次の接続から即座に
+    /// 反映される。レコード1回×鍵数の試行はマイクロ秒 order)
+    pub fn accept_keys(&self) -> io::Result<ServerKeys> {
+        let inner = self.lock_inner();
+        let legacy = !inner.legacy_revoked;
+        let devices = self.device_tokens_locked(&inner);
+        drop(inner);
+        ServerKeys::legacy_plus(&self.master, legacy, &devices)
+    }
+
+    /// 登録済み各端末の (key_id, 端末別トークン)。鍵束・発見の部屋・UI の
+    /// 略号表示の共通の源(導出は常にこの関数を経る=1つの source of truth)
+    pub fn device_tokens(&self) -> Vec<(DeviceKeyId, String)> {
+        self.device_tokens_locked(&self.lock_inner())
+    }
+
+    fn device_tokens_locked(&self, inner: &Inner) -> Vec<(DeviceKeyId, String)> {
+        inner
+            .devices
+            .iter()
+            .map(|d| (d.key_id.clone(), device_token(&self.master, &d.key_id)))
+            .collect()
+    }
+
     /// 接続成功の記録。last_seen と表示名を更新し、hello の device_id との
     /// 紐付け(メモリ)を作る。台帳に無い鍵(Legacy 等)は紐付けだけ作って
     /// last_seen は更新しない
@@ -297,8 +321,8 @@ impl DeviceRegistry {
         if !inner.legacy_revoked {
             rooms.push(room_id(&self.master));
         }
-        for d in &inner.devices {
-            let r = room_id(&device_token(&self.master, &d.key_id));
+        for (_, token) in self.device_tokens_locked(&inner) {
+            let r = room_id(&token);
             if !rooms.contains(&r) {
                 rooms.push(r);
             }
@@ -566,6 +590,22 @@ mod tests {
         reg.clear().unwrap();
         assert!(reg.devices().is_empty());
         assert_eq!(DeviceRegistry::open(&dir, &m).unwrap().devices(), vec![]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// accept_keys は台帳の状態を常に反映する(登録・失効・legacy 閉鎖)
+    #[test]
+    fn accept_keys_reflect_ledger_state() {
+        let dir = temp_dir("acceptkeys");
+        let m = master();
+        let reg = DeviceRegistry::open(&dir, &m).unwrap();
+        assert_eq!(reg.accept_keys().unwrap().len(), 1, "空台帳でも legacy 1本");
+        let a = reg.enroll("A").unwrap();
+        assert_eq!(reg.accept_keys().unwrap().len(), 2, "登録で1本増える");
+        reg.revoke(&a.key_id).unwrap();
+        assert_eq!(reg.accept_keys().unwrap().len(), 1, "失効で即座に消える");
+        reg.revoke_legacy().unwrap();
+        assert!(reg.accept_keys().is_err(), "legacy 閉鎖+0台は鍵束を作れない");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

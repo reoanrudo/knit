@@ -1422,8 +1422,14 @@ pub fn start(token: String, port: u16) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(12)))
                 .ok();
-            let (r, mut w) = match knit_common::secure::accept(stream, &token, b"knit-audio") {
-                Ok(x) => x,
+            // 待受の鍵束は台帳の最新状態(登録・失効の即時反映)。台帳が無ければ
+            // 従来どおり単一トークン
+            let keys = match crate::registry() {
+                Some(r) => r.accept_keys(),
+                None => Ok(knit_common::secure::ServerKeys::single(&token)),
+            };
+            let (r, mut w) = match keys.and_then(|k| knit_common::secure::accept_as(stream, &k, b"knit-audio")) {
+                Ok((r, w, _who)) => (r, w),
                 Err(e) => {
                     eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");
                     std::thread::sleep(throttle.fail());

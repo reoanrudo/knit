@@ -537,10 +537,11 @@ fn main() {
         });
         let tk = token.clone();
         std::thread::spawn(move || {
+            let rooms = move || vec![knit_common::discover::room_id(&tk)];
             if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
                 port + knit_common::discover::PORT_OFFSET,
-                &tk,
+                rooms,
                 knit_common::net::is_allowed,
                 || false,
             ) {

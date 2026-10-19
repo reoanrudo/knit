@@ -274,6 +274,54 @@ static ROLE_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ROLE_SCREEN: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
 static ROLE_CLIENT_HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// 端末別資格の登録台帳(全経路の待受鍵と宛先別トークンの唯一の source of truth)。
+/// master は起動時のトークン解決結果で固定(env を変えてもプロセス内では同じ)
+static REGISTRY: std::sync::OnceLock<std::sync::Arc<knit_common::registry::DeviceRegistry>> =
+    std::sync::OnceLock::new();
+
+/// 台帳を開く(最初の呼び出しで固定。以後は既存を返す)。開けなければ
+/// None = 従来の単一トークン動作へ戻す(接続は止めない)
+pub(crate) fn ensure_registry(
+    master: &str,
+) -> Option<&'static std::sync::Arc<knit_common::registry::DeviceRegistry>> {
+    if REGISTRY.get().is_none() {
+        match knit_common::envutil::data_dir() {
+            Some(dir) => match knit_common::registry::DeviceRegistry::open(&dir, master) {
+                Ok(r) => {
+                    let _ = REGISTRY.set(std::sync::Arc::new(r));
+                }
+                Err(e) => eprintln!("[registry] 台帳を開けません({e})。単一トークンで動作します"),
+            },
+            None => eprintln!("[registry] データ置き場が取れないため台帳は無効です"),
+        }
+    }
+    REGISTRY.get()
+}
+
+/// 開いている台帳(未初期化のうちの呼び出しは None)
+pub(crate) fn registry() -> Option<&'static std::sync::Arc<knit_common::registry::DeviceRegistry>> {
+    REGISTRY.get()
+}
+
+/// bulk 待受の鍵束(台帳の最新状態。台帳が無ければ従来の単一トークン)
+fn bulk_accept_keys() -> std::io::Result<knit_common::secure::ServerKeys> {
+    match registry() {
+        Some(r) => r.accept_keys(),
+        None => Ok(knit_common::secure::ServerKeys::single(
+            ROLE_TOKEN.get().map(String::as_str).unwrap_or(""),
+        )),
+    }
+}
+
+/// bulk 接続側のトークン。宛先(アクティブ端末)別に解決し、未紐付けの宛先
+/// (旧端末)は master にフォールバックする
+fn bulk_outgoing_token() -> String {
+    match (registry(), crate::conn::active_peer_id()) {
+        (Some(r), Some(id)) => r.outgoing_token(&id),
+        _ => ROLE_TOKEN.get().cloned().unwrap_or_default(),
+    }
+}
+
 /// 役割に応じた接続系スレッドを起こす(起動時=世代0 と役割切替の両方から呼ぶ)。
 /// client_role は CLIENT_ROLE(GUI 設定)と環境変数をその場で解決する
 /// (切替では CLIENT_ROLE が既に新役割へ書き換わっている前提)
@@ -286,7 +334,10 @@ fn spawn_role_threads(generation: usize) {
     let (screen_w, screen_h) = ROLE_SCREEN.get().copied().unwrap_or((0.0, 0.0));
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
-        credential: bulk::EndpointCred::Single(token.clone()),
+        credential: bulk::EndpointCred::Multi {
+            accept_keys: bulk_accept_keys,
+            connect_token: bulk_outgoing_token,
+        },
         // EndpointはOnceLock。設定の保存先変更は次回起動から反映する。
         dir: desktop_settings::receive_dir(),
         on_event: mac_on_bulk,
@@ -331,10 +382,17 @@ fn spawn_role_threads(generation: usize) {
         // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
         let tk = token.clone();
         std::thread::spawn(move || {
+            // 応答する部屋: 台帳があれば master + 全端末の部屋(端末別トークンで
+            // seek する相手の発見を壊さない)。無ければ従来どおり master のみ
+            let rooms = move || {
+                crate::registry()
+                    .map(|r| r.discover_rooms())
+                    .unwrap_or_else(|| vec![knit_common::discover::room_id(&tk)])
+            };
             if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
                 port + knit_common::discover::PORT_OFFSET,
-                &tk,
+                rooms,
                 knit_common::net::is_allowed,
                 || role_generation_stale(generation),
             ) {
@@ -794,7 +852,7 @@ fn main() {
             id: "pc-preview".into(), name: "DESKTOP-PREVIEW".into(),
             ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
             writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-            alias: None,
+            alias: None, auth: knit_common::secure::Who::Legacy,
         });
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
@@ -802,7 +860,7 @@ fn main() {
                 id: "android-preview".into(), name: "TABLET-PREVIEW".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-                alias: None,
+                alias: None, auth: knit_common::secure::Who::Legacy,
             });
             *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 1; // タブレットを見ている想定
         }
@@ -898,6 +956,9 @@ fn main() {
             }
         }
     };
+
+    // 端末別資格の台帳を開く(master=解決済みトークン)。失敗しても起動は続く
+    ensure_registry(&token);
 
     if !no_gui && !gui::setup::ensure_permission() {
         // 「あとで」で権限確認を中断した時も、再開方法を案内してから終了する
@@ -1857,6 +1918,7 @@ mod boundary_tests {
             side,
             edge_monitor,
             alias: None,
+            auth: knit_common::secure::Who::Legacy,
         }
     }
 
