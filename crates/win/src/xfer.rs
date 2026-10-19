@@ -11,6 +11,35 @@ use knit_common::proto::Msg;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// 版 18: 相手(Mac)が保持している部分から送信開始位置を決める。
+/// 相手が旧版・応答なし(1.5秒)のときは先頭から
+pub(crate) fn resume_offsets_for(entries: &[bulk::OutFile]) -> Vec<u64> {
+    let features = knit_common::proto::peer_features(
+        dragdrop::edge::PEER_VERSION.load(Ordering::Relaxed),
+    );
+    if !features.resume
+        || entries.iter().all(|e| e.is_dir)
+        || bulk::entries_total(entries) < 1024 * 1024
+    {
+        return vec![0; entries.len()];
+    }
+    let token = knit_common::bulk::next_resume_token();
+    if !send_main_msg(&Msg::XferResumeQuery {
+        token,
+        items: knit_common::bulk::resume_items(entries),
+    }) {
+        return vec![0; entries.len()];
+    }
+    let positions =
+        knit_common::bulk::wait_resume_state(token, Duration::from_millis(1500));
+    let offsets = knit_common::bulk::resume_offsets_of(entries, &positions);
+    let resumed = offsets.iter().filter(|o| **o > 0).count();
+    if resumed > 0 {
+        eprintln!("[xfer] 続きから送信します(再開: {resumed} 件)");
+    }
+    offsets
+}
+
 /// 進行中の Mac へのファイル送信(トレイ表示と Esc キャンセルで使う)
 struct XferTx {
     id: u64,
@@ -265,11 +294,13 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
     }
     begin_tx(id, total, &entries[0].name);
     clear_xfer_ack();
+    let offsets = resume_offsets_for(&entries);
     let send = || {
         BULK_LINK.send(|w| {
-            bulk::send_entries(
+            bulk::send_entries_from(
                 w,
                 &entries,
+                &offsets,
                 false,
                 None,
                 &mut || knit_common::xfer::take(id),

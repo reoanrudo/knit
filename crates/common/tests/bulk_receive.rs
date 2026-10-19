@@ -410,6 +410,79 @@ fn interrupted_transfer_resumes_from_the_received_prefix() {
     assert!(failed.is_empty(), "続きの照合と全体ハッシュが通る");
 }
 
+/// 版18の交渉: 部分から位置と前置ハッシュを作り、entries に対応付ける。
+/// 応答なしのタイムアウトは「先頭から」
+#[test]
+fn resume_negotiation_reports_positions_and_maps_offsets() {
+    let temp = Temp::new("resume-nego");
+    let dir = temp.0.join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tmp = dir.join(".knit-0000000000000001.part");
+    std::fs::write(&tmp, b"0123456789").unwrap();
+    knit_common::files::retain_partial(&dir, "a.bin", 100, 5, &tmp).unwrap();
+    let items = vec![knit_common::proto::ResumeItem {
+        rel: "a.bin".into(),
+        size: 100,
+        mtime: 5,
+    }];
+    let positions = bulk::resume_positions(&dir, &items);
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].offset, 10);
+    assert_eq!(positions[0].prefix.len(), 64, "BLAKE2s の16進");
+
+    let src = temp.0.join("src.bin");
+    std::fs::write(&src, vec![1u8; 100]).unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+    // 名前が一致しない応答は先頭から
+    assert_eq!(bulk::resume_offsets_of(&entries, &positions), vec![0]);
+    let exact = vec![knit_common::proto::ResumePos {
+        rel: entries[0].name.clone(),
+        offset: 40,
+        prefix: "00".repeat(32),
+    }];
+    assert_eq!(bulk::resume_offsets_of(&entries, &exact), vec![40]);
+
+    // 応答が無いときは空で、待ちも短く終わる
+    let started = std::time::Instant::now();
+    assert!(bulk::wait_resume_state(u64::MAX, std::time::Duration::from_millis(30)).is_empty());
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn explicit_cancel_asks_the_receiver_to_drop_partials() {
+    let temp = Temp::new("resume-cancel");
+    let src = temp.0.join("big.bin");
+    std::fs::write(&src, vec![3u8; 600 * 1024]).unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+    let mut wire = Vec::new();
+    let mut chunks = 0u32;
+    let _ = bulk::send_entries_from(
+        &mut wire,
+        &entries,
+        &[0],
+        false,
+        None,
+        &mut || {
+            chunks += 1;
+            chunks > 1
+        },
+        &mut |_, _, _| {},
+    );
+    let mut reader = Cursor::new(&wire);
+    let mut frame = Vec::new();
+    let mut saw_drop = false;
+    while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+        if kind == bulk::RESUME_DROP {
+            saw_drop = true;
+            let items: Vec<knit_common::proto::ResumeItem> =
+                serde_json::from_slice(&frame).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].rel, "big.bin");
+        }
+    }
+    assert!(saw_drop, "明示中止は部分の破棄を伝える");
+}
+
 #[test]
 fn resume_with_a_mismatched_prefix_fails_instead_of_publishing() {
     let temp = Temp::new("resume-bad");
