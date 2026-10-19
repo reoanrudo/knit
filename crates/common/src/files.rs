@@ -538,6 +538,116 @@
         }
     }
 
+    // ---------- 中断した転送の続き(版 18) ----------
+
+    /// 部分ファイルの置き場(受信フォルダ内の隠し)。最終名には見せない
+    pub const RESUME_DIR: &str = ".knit-resume";
+
+    /// 部分ファイルの識別子。相対名・宣言サイズ・更新日時が一致するものだけを
+    /// 同じ転送の続きとみなす(同名でも別のファイルを混ぜない)
+    pub fn resume_key(rel: &str, size: u64, mtime: u64) -> String {
+        use blake2::Digest;
+        let mut h = blake2::Blake2s256::new();
+        h.update(b"knit-resume-v1\0");
+        h.update(rel.as_bytes());
+        h.update(size.to_le_bytes());
+        h.update(mtime.to_le_bytes());
+        crate::update::to_hex(&h.finalize())
+    }
+
+    fn resume_path(base: &Path, rel: &str, size: u64, mtime: u64) -> PathBuf {
+        base.join(RESUME_DIR)
+            .join(format!("{}.part", resume_key(rel, size, mtime)))
+    }
+
+    /// 受信途中の実体を部分ファイルとして退避する(最終名には見せない)。
+    /// 既に置き場にある実体はそのまま残す
+    pub fn retain_partial(
+        base: &Path,
+        rel: &str,
+        size: u64,
+        mtime: u64,
+        tmp: &Path,
+    ) -> Option<PathBuf> {
+        let dest = resume_path(base, rel, size, mtime);
+        if tmp == dest {
+            return Some(dest);
+        }
+        std::fs::create_dir_all(dest.parent()?).ok()?;
+        if std::fs::rename(tmp, &dest).is_err() {
+            std::fs::copy(tmp, &dest).ok()?;
+            let _ = std::fs::remove_file(tmp);
+        }
+        Some(dest)
+    }
+
+    /// 続きから受けられる部分を探す。戻り値は (部分のパス, 受信済みバイト数)。
+    /// 宣言サイズ以上の実体は「完了直前で止まった残骸」なので続きに使わない
+    pub fn find_partial(base: &Path, rel: &str, size: u64, mtime: u64) -> Option<(PathBuf, u64)> {
+        let path = resume_path(base, rel, size, mtime);
+        let len = std::fs::metadata(&path).ok()?.len();
+        if len == 0 {
+            return None;
+        }
+        if len >= size {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((path, len))
+    }
+
+    /// 先頭 offset バイトのハッシュ(送信側と受信側の照合用)。
+    /// 実体が offset より短い・読めない場合は None(続きとして使わない)
+    pub fn prefix_hash(path: &Path, offset: u64) -> Option<[u8; 32]> {
+        use blake2::Digest;
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut h = blake2::Blake2s256::new();
+        let mut left = offset;
+        let mut buf = [0u8; 64 * 1024];
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            let n = f.read(&mut buf[..want]).ok()?;
+            if n == 0 {
+                return None;
+            }
+            h.update(&buf[..n]);
+            left -= n as u64;
+        }
+        Some(h.finalize().into())
+    }
+
+    /// 部分を捨てる(明示中止・最初からのやり直しのとき)
+    pub fn discard_partial(base: &Path, rel: &str, size: u64, mtime: u64) {
+        let _ = std::fs::remove_file(resume_path(base, rel, size, mtime));
+    }
+
+    /// 期限切れ(更新から ttl 秒以上)の部分を掃除する。起動時に呼ぶ。
+    /// 戻り値は消した件数
+    pub fn purge_expired_partials(base: &Path, ttl_secs: u64) -> usize {
+        let dir = base.join(RESUME_DIR);
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else {
+                continue;
+            };
+            let age = md
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            if age >= ttl_secs && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// 相手のファイルの更新日時を復元する(秒精度。失敗しても転送成否には影響しない)。
     /// 相手が指定した異常に大きな値では加算がオーバーフローして panic するため、
     /// 範囲外の値は無視する
@@ -654,6 +764,58 @@ mod tests {
         assert_eq!(sanitize(".knit-0123456789abcdef.par"), ".knit-0123456789abcdef.par");
         assert_eq!(sanitize(".knit-notes.md"), ".knit-notes.md");
         assert_eq!(sanitize(".part"), ".part");
+    }
+}
+
+/// 中断した転送の続き(部分ファイル置き場)の単体テスト
+#[cfg(test)]
+mod resume_store_tests {
+    use super::{find_partial, prefix_hash, purge_expired_partials, retain_partial, resume_key};
+
+    fn scratch() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "knit-resume-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 同じ相対名でもサイズ・更新日時が違えば別の部分として扱う
+    #[test]
+    fn key_separates_name_size_and_mtime() {
+        let a = resume_key("資料/a.bin", 100, 1);
+        assert_eq!(a, resume_key("資料/a.bin", 100, 1), "決定的");
+        assert_ne!(a, resume_key("資料/a.bin", 101, 1));
+        assert_ne!(a, resume_key("資料/a.bin", 100, 2));
+        assert_ne!(a, resume_key("資料/b.bin", 100, 1));
+    }
+
+    /// 退避した部分の受信済みバイト数と前置ハッシュが一致し、期限つきで消える
+    #[test]
+    fn retain_find_prefix_and_purge_round_trip() {
+        let dir = scratch();
+        let tmp = dir.join(".knit-0000000000000001.part");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+        let kept = retain_partial(&dir, "a.bin", 100, 5, &tmp).unwrap();
+        assert!(kept.exists() && !tmp.exists());
+        let (path, have) = find_partial(&dir, "a.bin", 100, 5).unwrap();
+        assert_eq!(have, 10);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+        // 前置ハッシュは先頭 4 バイトの BLAKE2s と一致し、同じ入力で決定的
+        let h = prefix_hash(&path, 4).unwrap();
+        assert_eq!(Some(h), prefix_hash(&path, 4));
+        assert!(prefix_hash(&path, 999).is_none(), "実体より長い前置は不可");
+        // サイズ以上になった部分は完了直前の残骸として捨てる
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        assert!(find_partial(&dir, "a.bin", 100, 5).is_none());
+        // ttl 0 は全部掃除(期限切れの検証)
+        std::fs::write(dir.join(super::RESUME_DIR).join("x.part"), b"x").unwrap();
+        assert_eq!(purge_expired_partials(&dir, 0), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
 
