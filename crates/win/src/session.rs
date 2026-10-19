@@ -432,11 +432,16 @@ pub(crate) fn session(
                 crate::xfer::note_xfer_ack(accepted, rejected, scope);
             }
             // 版 18: 送信側(Mac)からの再開位置の問い合わせに、
-            // 保持している部分ファイルから応答する
+            // 保持している部分ファイルから応答する。先頭ハッシュの計算は
+            // 部分が大きいほど時間がかかるため、本線ループ(入力の注入を含む)
+            // を止めないよう別スレッドで。応答はトークンで対応付ける
             Msg::XferResumeQuery { token, items } => {
-                let dir = crate::receive_dir();
-                let items = knit_common::bulk::resume_positions(&dir, &items);
-                let _ = wtx.send(encode(&Msg::XferResumeState { token, items }));
+                let tx = wtx.clone();
+                std::thread::spawn(move || {
+                    let dir = crate::receive_dir();
+                    let items = knit_common::bulk::resume_positions(&dir, &items);
+                    let _ = tx.send(encode(&Msg::XferResumeState { token, items }));
+                });
             }
             Msg::XferResumeState { token, items } => {
                 knit_common::bulk::note_resume_state(token, items);
