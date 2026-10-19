@@ -82,11 +82,26 @@ fn now_unix() -> u64 {
 /// 5秒を過ぎたロックは破棄して取り直す(書き込みはミリ秒で終わるため、実運用で
 /// このタイムアウトが効くことはほぼ無い)。取れない場合は None を返し、呼び出し側は
 /// 楽観排他(バイト列比較)だけを続行する(窓は大幅に狭まる)
+/// 同一プロセス内の書き込みを直列化する。ファイルロックだけに頼らない
+/// (同一プロセスの2ハンドルは、実装テストや将来の埋め込み利用で起こり得る。
+/// OS のロックはプロセス間のためだけに使う)
+static PROCESS_COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// プロセス間ロックの陳腐化判定。書き込みは通常ミリ秒で終わるため、
+/// これだけ待って解放されないロックは保持者が死んだとみなす。短すぎる値
+/// (以前は5秒)は、CI のように高負荷で保持スレッドが止まった時に生きたロックを
+/// 奪って二重取得=ロストアップデートを招くため、余裕を持たせる
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+/// ロック待ちの上限。取れなければ無言で書き込まずエラーにする(fail-closed)
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
 struct LedgerLock(std::path::PathBuf);
 
 fn lock_ledger(path: &Path) -> Option<LedgerLock> {
     let lock = path.with_extension("lock");
-    for _ in 0..40 {
+    let deadline = std::time::Instant::now() + LOCK_WAIT;
+    loop {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(_) => return Some(LedgerLock(lock)),
             Err(_) => {
@@ -94,21 +109,32 @@ fn lock_ledger(path: &Path) -> Option<LedgerLock> {
                     .and_then(|md| md.modified())
                     .ok()
                     .and_then(|t| t.elapsed().ok())
-                    .is_some_and(|e| e > std::time::Duration::from_secs(5));
+                    .is_some_and(|e| e > LOCK_STALE_AFTER);
                 if stale {
+                    // 保持者が死んでいる(60秒も解放されない)。取り直す
                     let _ = std::fs::remove_file(&lock);
                     continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(LOCK_POLL);
             }
         }
     }
-    None
 }
 
 impl Drop for LedgerLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        // Windows ではウィルススキャン等が一時的にファイルを掴み、削除が
+        // 失敗することがある。数回試し、それでも駄目なら陳腐化判定に任せる
+        for _ in 0..5 {
+            if std::fs::remove_file(&self.0).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        eprintln!("[registry] ロックファイルを削除できません: {} に残っています", self.0.display());
     }
 }
 
@@ -205,6 +231,8 @@ impl DeviceRegistry {
     /// 引き直してやり直す(失効が本体の書き戻しで無音に取り消されるのを防ぐ
     /// 唯一の防壁。プロセス内の Mutex は他プロセスには効かない)
     fn commit<T>(&self, f: impl Fn(&mut Inner) -> (io::Result<T>, bool)) -> io::Result<T> {
+        // プロセス内はここで直列化する(ファイルロックの成否に依存しない)
+        let _process = PROCESS_COMMIT.lock().unwrap_or_else(|e| e.into_inner());
         for attempt in 0..16 {
             if attempt > 0 {
                 // 競合が続く場合は少し空ける(書き合う両方が即再試行すると
@@ -214,6 +242,13 @@ impl DeviceRegistry {
             // 可能ならプロセス間ロックを取ってから読む(ロックが取れた場合は
             // 「確認→rename」の間に他プロセスが入る余地が無くなる)
             let guard = lock_ledger(&self.path);
+            if guard.is_none() {
+                // 無言で書き込まない: ロックが取れない間に書くと、他プロセスの
+                // 失効や登録を古い状態で上書きし得る。失敗を利用者へ返す
+                return Err(io::Error::other(
+                    "台帳が別のプロセスに使われています。少し待ってやり直してください",
+                ));
+            }
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // 書き込みは mtime+サイズの判定を信用しない: Windows のファイル時刻は
             // 分解能が粗く、「同一時刻・同一サイズ」の外部書き込み(別名端末の
