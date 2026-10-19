@@ -142,6 +142,16 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             // 送信スレッドの通知分岐に使う
                             note_xfer_ack(accepted, rejected, scope);
                         }
+                        // 版 18: 相手(送信側)からの再開位置の問い合わせに、
+                        // 保持している部分ファイルから応答する
+                        Msg::XferResumeQuery { token, items } => {
+                            let dir = crate::desktop_settings::receive_dir();
+                            let items = knit_common::bulk::resume_positions(&dir, &items);
+                            send_msg(&Msg::XferResumeState { token, items });
+                        }
+                        Msg::XferResumeState { token, items } => {
+                            knit_common::bulk::note_resume_state(token, items);
+                        }
                         Msg::PrefsGet => {
                             send_msg(&Msg::Prefs { json: gui::prefs_snapshot_json() });
                         }

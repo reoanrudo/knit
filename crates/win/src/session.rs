@@ -431,6 +431,16 @@ pub(crate) fn session(
                 // Mac 側の転送受理結果。送信スレッドの通知分岐に使う
                 crate::xfer::note_xfer_ack(accepted, rejected, scope);
             }
+            // 版 18: 送信側(Mac)からの再開位置の問い合わせに、
+            // 保持している部分ファイルから応答する
+            Msg::XferResumeQuery { token, items } => {
+                let dir = crate::receive_dir();
+                let items = knit_common::bulk::resume_positions(&dir, &items);
+                let _ = wtx.send(encode(&Msg::XferResumeState { token, items }));
+            }
+            Msg::XferResumeState { token, items } => {
+                knit_common::bulk::note_resume_state(token, items);
+            }
             Msg::Prefs { json } => {
                 if json.len() <= 16 * 1024 {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {

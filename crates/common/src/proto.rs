@@ -61,6 +61,23 @@
         }
     }
 
+    /// 再開問い合わせの1項目(版 18)。相対名・宣言サイズ・更新日時の3つが
+    /// 一致する部分だけを「同じ転送の続き」とみなす
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct ResumeItem {
+        pub rel: String,
+        pub size: u64,
+        pub mtime: u64,
+    }
+
+    /// 再開位置の1項目(版 18)。prefix は先頭 offset バイトの BLAKE2s(16進)
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct ResumePos {
+        pub rel: String,
+        pub offset: u64,
+        pub prefix: String,
+    }
+
     /// 遅延提供(版 17)の目録の1項目。**名前とサイズだけ**を先に渡す
     /// (内容は後から流す。パスは受信側の既存の無害化を通す前提の相対名)
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -467,6 +484,20 @@
             rejected: usize,
             #[serde(default)]
             scope: bool,
+        },
+        /// 中断した転送の再開位置の問い合わせ(版 18。送信側→受信側)。
+        /// 受信側は保持している部分ファイルの位置と前置ハッシュを返す。
+        /// 旧側は未知行として無視するため、**resume 対応の相手にだけ送る**
+        #[serde(rename = "resume_query")]
+        XferResumeQuery {
+            token: u64,
+            items: Vec<ResumeItem>,
+        },
+        /// 再開位置の応答(版 18。受信側→送信側)。offset=0 は「先頭から」
+        #[serde(rename = "resume_state")]
+        XferResumeState {
+            token: u64,
+            items: Vec<ResumePos>,
         },
         /// 設定の遠隔操作(Windows→Mac): Mac の設定一覧を要求する。
         /// 旧側は未知行として無視する拡張(版 14 のまま)

@@ -48,6 +48,10 @@
     pub const IMAGE_BEGIN: u8 = 7;
     pub const IMAGE_END: u8 = 8;
     pub const DROP_ID_BEGIN: u8 = 9;
+    /// 版 18: 明示中止(送信側が利用者の中止で止めた)ときに、受信側の
+    /// 部分ファイルを捨てる。切断(応答なし)では送られないため残り、次回
+    /// 続きから送れる。旧側は未知の種別として無視する
+    pub const RESUME_DROP: u8 = 10;
 
     pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
         let mut head = [0u8; 5];
@@ -441,6 +445,106 @@
     /// 中止はエラー(Interrupted)として返り、呼び出し元で接続を捨てて相手側の
     /// 切断時クリーンアップに委ねる。戻り値は送信結果(件数とスキップ)
     #[allow(clippy::too_many_arguments)]
+    /// 再開問い合わせの項目(版 18)。フォルダは対象外(空フォルダは部分を持たない)
+    pub fn resume_items(entries: &[OutFile]) -> Vec<crate::proto::ResumeItem> {
+        entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| crate::proto::ResumeItem {
+                rel: e.name.clone(),
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect()
+    }
+
+    /// 受信側: 保持している部分ファイルから再開位置を返す(offset>0 のみ)
+    pub fn resume_positions(
+        dir: &std::path::Path,
+        items: &[crate::proto::ResumeItem],
+    ) -> Vec<crate::proto::ResumePos> {
+        items
+            .iter()
+            .filter_map(|it| {
+                let (path, offset) =
+                    crate::files::find_partial(dir, &it.rel, it.size, it.mtime)?;
+                let prefix = crate::files::prefix_hash(&path, offset)?;
+                if offset == 0 {
+                    return None;
+                }
+                Some(crate::proto::ResumePos {
+                    rel: it.rel.clone(),
+                    offset,
+                    prefix: crate::update::to_hex(&prefix),
+                })
+            })
+            .collect()
+    }
+
+    /// 送信側: 応答から entries に対応する送信開始位置を作る(見つからなければ 0)
+    pub fn resume_offsets_of(
+        entries: &[OutFile],
+        positions: &[crate::proto::ResumePos],
+    ) -> Vec<u64> {
+        entries
+            .iter()
+            .map(|e| {
+                if e.is_dir {
+                    0
+                } else {
+                    positions
+                        .iter()
+                        .find(|p| p.rel == e.name)
+                        .map(|p| p.offset.min(e.size))
+                        .unwrap_or(0)
+                }
+            })
+            .collect()
+    }
+
+    static RESUME_TOKEN: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    static RESUME_STATE: std::sync::Mutex<
+        Option<(u64, Vec<crate::proto::ResumePos>)>,
+    > = std::sync::Mutex::new(None);
+    static RESUME_STATE_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+    /// 再開問い合わせの識別子(応答と対応付ける)
+    pub fn next_resume_token() -> u64 {
+        RESUME_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 本線受信ループから呼ぶ: 再開位置の応答を記録して待ち手を起こす
+    pub fn note_resume_state(token: u64, items: Vec<crate::proto::ResumePos>) {
+        let mut slot = RESUME_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some((token, items));
+        RESUME_STATE_CV.notify_all();
+    }
+
+    /// 再開位置の応答を待つ(タイムアウトは「応答なし=先頭から」)
+    pub fn wait_resume_state(
+        token: u64,
+        timeout: std::time::Duration,
+    ) -> Vec<crate::proto::ResumePos> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut slot = RESUME_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((got, items)) = slot.as_ref() {
+                if *got == token {
+                    return items.clone();
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Vec::new();
+            }
+            let (next, _) = RESUME_STATE_CV
+                .wait_timeout(slot, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            slot = next;
+        }
+    }
+
     pub fn send_entries(
         w: &mut impl Write,
         entries: &[OutFile],
@@ -465,7 +569,24 @@
         cancel: &mut dyn FnMut() -> bool,
         progress: &mut dyn FnMut(u64, u64, &str),
     ) -> std::io::Result<SendReport> {
-        send_entries_impl(w, entries, offsets, drop, drag_id, cancel, progress)
+        // 利用者の中止(切断ではない)を区別して、受信側の部分を捨てさせる。
+        // 切断のときは送れないので残り、次回の続きから使われる
+        let mut cancelled = false;
+        let mut cancel = || {
+            let hit = cancel();
+            if hit {
+                cancelled = true;
+            }
+            hit
+        };
+        let result =
+            send_entries_impl(w, entries, offsets, drop, drag_id, &mut cancel, progress);
+        if cancelled {
+            if let Ok(body) = serde_json::to_vec(&resume_items(entries)) {
+                let _ = write_frame(w, RESUME_DROP, &body);
+            }
+        }
+        result
     }
 
     fn send_entries_impl(
@@ -563,7 +684,7 @@
                     left -= n as u64;
                 }
                 // 前置だけのハッシュ(ここで finalize したいので複製する)
-                let mut probe = hasher.clone();
+                let probe = hasher.clone();
                 prefix_hex = crate::update::to_hex(&probe.finalize());
                 std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset))?;
             }
@@ -1551,7 +1672,10 @@
     fn spawn_reader(ep: &'static Endpoint, s: crate::secure::Reader, gen: u64, reply_keepalive: bool) {
         std::thread::spawn(move || {
             let mut r = std::io::BufReader::with_capacity(CHUNK + 16, s);
+            // 版 18: 中断した転送の部分を保持して続きから受ける
+            // (送信側が問い合わせてこない相手では、従来どおり捨てる動作になる)
             let mut rx = Receiver::new(&ep.dir)
+                .with_resume(true)
                 .with_rx_progress(ep.on_rx_bytes)
                 .with_interrupted_report(ep.on_event);
             let mut buf = Vec::new();
@@ -1562,6 +1686,17 @@
             let mut denied_files = 0usize;
             let mut tainted_logged = false;
             while let Ok(kind) = read_frame(&mut r, &mut buf) {
+                // 明示中止: このバッチの部分ファイルを捨てる(共有範囲の判定より先)
+                if kind == RESUME_DROP {
+                    if let Ok(items) =
+                        serde_json::from_slice::<Vec<crate::proto::ResumeItem>>(&buf)
+                    {
+                        for it in items {
+                            crate::files::discard_partial(&ep.dir, &it.rel, it.size, it.mtime);
+                        }
+                    }
+                    continue;
+                }
                 // 共有範囲の外の受信は、ディスクへ書かず読み捨てる(接続は保つ)
                 if kind == IMAGE_BEGIN {
                     in_image = true;

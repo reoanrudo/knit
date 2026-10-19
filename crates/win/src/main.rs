@@ -443,6 +443,11 @@ fn main() {
         knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
         eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
     }
+    // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
+    let purged = knit_common::files::purge_expired_partials(&receive_dir(), 7 * 24 * 3600);
+    if purged > 0 {
+        eprintln!("[xfer] 期限切れの部分ファイルを {purged} 件掃除しました");
+    }
     let port: u16 = args
         .iter()
         .position(|a| a == "--port")

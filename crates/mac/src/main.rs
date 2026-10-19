@@ -1074,6 +1074,14 @@ fn main() {
         "[file] 同名衝突の扱い: {}",
         knit_common::files::collision().label()
     );
+    // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
+    let purged = knit_common::files::purge_expired_partials(
+        &desktop_settings::receive_dir(),
+        7 * 24 * 3600,
+    );
+    if purged > 0 {
+        eprintln!("[file] 期限切れの部分ファイルを {purged} 件掃除しました");
+    }
     ensure_registry(&token);
 
     if !no_gui && !gui::setup::ensure_permission() {

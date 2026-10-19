@@ -28,6 +28,31 @@ pub enum SendFilesOutcome {
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
 /// 掴んだまま境界を越える場合は offer_drag_to_win を使う
+/// 版 18: 相手が保持している部分から送信開始位置を決める。相手が旧版・
+/// 応答なし(1.5秒)のときは先頭から。**resume 対応の相手にだけ問い合わせる**
+fn resume_offsets_for(entries: &[knit_common::bulk::OutFile]) -> Vec<u64> {
+    let features = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
+    if !features.resume
+        || entries.iter().all(|e| e.is_dir)
+        || knit_common::bulk::entries_total(entries) < 1024 * 1024
+    {
+        return vec![0; entries.len()];
+    }
+    let token = knit_common::bulk::next_resume_token();
+    send_msg(&Msg::XferResumeQuery {
+        token,
+        items: knit_common::bulk::resume_items(entries),
+    });
+    let positions =
+        knit_common::bulk::wait_resume_state(token, std::time::Duration::from_millis(1500));
+    let offsets = knit_common::bulk::resume_offsets_of(entries, &positions);
+    let resumed = offsets.iter().filter(|o| **o > 0).count();
+    if resumed > 0 {
+        eprintln!("[file] 続きから送信します(再開: {resumed} 件)");
+    }
+    offsets
+}
+
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
     if !knit_common::share::allow_files() {
         notify("Knit", "このPCではファイルの共有が許可されていません(KNIT_SHARE)");
@@ -88,11 +113,13 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
         }
         begin_xfer(id, total, &entries[0].name);
         clear_xfer_ack();
+        let offsets = resume_offsets_for(&entries);
         let send = || {
             BULK_LINK.send(|w| {
-                bulk::send_entries(
+                bulk::send_entries_from(
                     w,
                     &entries,
+                    &offsets,
                     false,
                     None,
                     &mut || knit_common::xfer::take(id),
@@ -518,11 +545,13 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
         begin_xfer(id, total, &entries[0].name);
         guard.arm(id);
         let peer = crate::active_peer_label();
+        let offsets = resume_offsets_for(&entries);
         let send = || {
             BULK_LINK.send(|w| {
-                bulk::send_entries(
+                bulk::send_entries_from(
                     w,
                     &entries,
+                    &offsets,
                     true,
                     Some(id),
                     &mut || knit_common::xfer::take(id),
