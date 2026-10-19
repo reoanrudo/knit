@@ -563,7 +563,7 @@ pub(crate) fn start_local_history() {
         let start = with_pool(clipboard_change_count);
         RECORD_DONE_COUNT.store(start, Ordering::Relaxed);
         // 600ms 周期の監視。panic した時だけ supervisor が記録して再起動する
-        // (初期化で求めた start は move で引き継ぎ、再取得しない)。
+        // (起動時点の変化回数は static に残るため、再開後も正しく続きから記録する)。
         crate::supervise::run_supervised("クリップボード監視", move || loop {
             std::thread::sleep(Duration::from_millis(600));
             with_pool(|| unsafe { record_local_copy() });

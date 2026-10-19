@@ -5,10 +5,25 @@
 use super::*;
 use std::sync::Mutex;
 fn path() -> std::io::Result<std::path::PathBuf> {
+    // テストはプロセス共通の環境変数を書き換えず、ここで差し替える
+    // (並列実行の getenv と競合させない)
+    #[cfg(test)]
+    if let Some(dir) = TEST_PROFILE_DIR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        return Ok(dir.join("preferences.json"));
+    }
     let dir = knit_common::envutil::data_dir()
         .ok_or_else(|| std::io::Error::other("LOCALAPPDATA is unavailable"))?;
     Ok(dir.join("preferences.json"))
 }
+
+/// テスト専用: 設定ファイルの置き場(Knit フォルダそのもの)
+#[cfg(test)]
+pub(super) static TEST_PROFILE_DIR: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
 pub(super) fn restore() {
     let Ok(path) = path() else { return };
     let Ok(bytes) = std::fs::read(path) else {
@@ -354,10 +369,10 @@ mod profile_round_trip_tests {
         dir
     }
 
-    /// テスト前後でプロセス共通の設定値と環境変数を元へ戻す。
-    /// 失敗時に assert で抜けても Drop で戻す
+    /// テスト前後でプロセス共通の設定値を元へ戻す。
+    /// 失敗時に assert で抜けても Drop で戻す(置き場は環境変数ではなく
+    /// TEST_PROFILE_DIR を差し替える)
     struct Snapshot {
-        local_app_data: Option<std::ffi::OsString>,
         audio: bool,
         clip: bool,
         files: bool,
@@ -369,7 +384,6 @@ mod profile_round_trip_tests {
     impl Snapshot {
         fn take() -> Self {
             Self {
-                local_app_data: std::env::var_os("LOCALAPPDATA"),
                 audio: crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed),
                 clip: knit_common::share::user_clip(),
                 files: knit_common::share::user_files(),
@@ -382,10 +396,6 @@ mod profile_round_trip_tests {
 
     impl Drop for Snapshot {
         fn drop(&mut self) {
-            match &self.local_app_data {
-                Some(v) => std::env::set_var("LOCALAPPDATA", v),
-                None => std::env::remove_var("LOCALAPPDATA"),
-            }
             crate::audio::AUDIO_ENABLED.store(self.audio, Ordering::Relaxed);
             knit_common::share::set_user_clip(self.clip);
             knit_common::share::set_user_files(self.files);
@@ -403,7 +413,9 @@ mod profile_round_trip_tests {
         let _serial = PROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _snapshot = Snapshot::take();
         let profile = temp_profile("roundtrip");
-        std::env::set_var("LOCALAPPDATA", &profile);
+        *super::TEST_PROFILE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(profile.join("Knit"));
 
         crate::audio::AUDIO_ENABLED.store(false, Ordering::Relaxed);
         knit_common::share::set_user_clip(false);
@@ -446,7 +458,9 @@ mod profile_round_trip_tests {
         let _serial = PROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _snapshot = Snapshot::take();
         let profile = temp_profile("broken");
-        std::env::set_var("LOCALAPPDATA", &profile);
+        *super::TEST_PROFILE_DIR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(profile.join("Knit"));
         let dir = profile.join("Knit");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("preferences.json"), b"{\"audio_enabled\":").unwrap();
