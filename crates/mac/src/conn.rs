@@ -120,13 +120,6 @@ pub(crate) fn active_screen_settings() -> Option<crate::screen_settings::PeerSet
     Some(crate::screen_settings::get(&id, side))
 }
 
-/// アクティブなピアの端末 id
-pub(crate) fn active_peer_id() -> Option<String> {
-    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-    peers.get(act).map(|p| p.id.clone())
-}
-
 /// アクティブなピアをどの鍵で認証したか。宛先別トークンの解決は自己申告の
 /// hello id ではなく、この認証済みの値を根拠にする
 pub(crate) fn active_peer_auth() -> Option<knit_common::secure::Who> {
@@ -316,11 +309,6 @@ pub(crate) fn active_peer_label() -> String {
 
 /// ピアをアクティブへ切り替える(送信口・画面・設定同期・通知)。
 /// ロック順は STREAM_SLOT → PEERS → ACTIVE_PEER で統一し、逆順で取得しないこと
-pub(crate) fn activate_peer(new: usize, reason: &str) {
-    let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
-    activate_peer_locked(new, reason);
-}
-
 pub(crate) fn activate_peer_by_id(id: &str, reason: &str) {
     let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     activate_peer_id_locked(id, reason);
@@ -863,7 +851,7 @@ pub(crate) fn mark_connected() {
     if since != 0 && now.saturating_sub(since) > 60_000 {
         // 再接続した相手の実名(hello の name。未受信の間は汎用の「端末」)で知らせる
         let peer = PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        notify(
+        notify_connection(
             "Knit",
             &format!("{} と再接続しました", if peer.is_empty() { "端末".to_string() } else { peer }),
         );
