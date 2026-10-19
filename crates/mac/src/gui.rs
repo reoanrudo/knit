@@ -3193,6 +3193,9 @@ pub fn start() -> bool {
                 add_item(menu, holder);
                 GUI_REGISTRY_ITEM.store(holder as usize, Ordering::Relaxed);
                 GUI_REGISTRY_MENU.store(reg_menu as usize, Ordering::Relaxed);
+                // 台帳が無効な環境(開けなかった)では項目ごと隠す。初期表示を
+                // 空のサブメニューのまま残さない
+                rebuild_registry_menu(reg_menu);
             }
         }
 

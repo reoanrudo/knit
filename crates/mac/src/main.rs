@@ -1272,6 +1272,18 @@ fn main() {
             }
             if ping_at.elapsed() >= Duration::from_secs(1) {
                 ping_at = std::time::Instant::now();
+                // M03: 操作権の期限。WIN_MODE 中に pong が5秒途絶えたら、切断(15秒)を
+                // 待たずにカーソルを手元へ戻す。この1秒周期はサーバ役・クライアント役の
+                // どちらでも走る(実際の発火は5〜6秒)
+                if crate::conn::lease_expired(
+                    WIN_MODE.load(Ordering::Relaxed),
+                    CONNECTED.load(Ordering::Relaxed),
+                    LAST_PONG_MS.load(Ordering::Relaxed),
+                    now_ms(),
+                ) {
+                    eprintln!("[conn] 操作権の期限切れ(最後の応答から5秒)。カーソルを手元へ戻します");
+                    crate::tap::leave_win_mode_cursor_unlock(None);
+                }
                 // 15 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う。相手の
                 // 9 秒無通信判定より十分遅くして、ping の間隔揺れで切らないようにする)

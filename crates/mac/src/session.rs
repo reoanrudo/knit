@@ -862,18 +862,44 @@ pub(crate) fn client_thread(
         // 発見が応答しない環境(Tailscale・AP 隔離・相手が再起動中)では、従来は
         // 発見の満了 600ms を待ってから最初のダイヤルを撃っていた
         let known = knit_common::connect::known_candidates(host.as_deref(), port);
-        // 既知の候補に「接続済みの相手」がいれば、その認証結果のトークンで
-        // ダイヤルする(端末登録済みの相手が KNIT_ROLE=server の場合への対応)
-        let dial_token = known
-            .iter()
-            .find_map(|a| crate::conn::known_peer_token(a.ip()))
-            .unwrap_or_else(|| token.clone());
+        // 既知候補を「接続済みの相手(認証結果から宛先トークンを解ける)」と
+        // 「まだ分からない候補(従来のトークン)」に分け、認証済みを先に試す。
+        // クライアント役の通常運用は宛先1台。複数台が混在する構成では同じ群の
+        // 先頭のトークンを使う(設計書 §9-8 の残り)
+        let mut authed: Vec<std::net::SocketAddr> = Vec::new();
+        let mut unknown: Vec<std::net::SocketAddr> = Vec::new();
+        let mut authed_token: Option<String> = None;
+        for a in &known {
+            match crate::conn::known_peer_token(a.ip()) {
+                Some(tok) => {
+                    authed.push(*a);
+                    authed_token.get_or_insert(tok);
+                }
+                None => unknown.push(*a),
+            }
+        }
         let t0 = std::time::Instant::now();
-        match knit_common::connect::connect_first(&known, port, &dial_token, Duration::from_secs(3)) {
-            Some((s, a)) => {
+        let mut chosen: Option<(std::net::TcpStream, std::net::SocketAddr, String)> = None;
+        for (addrs, tok) in [
+            (authed, authed_token),
+            (unknown, Some(token.clone())),
+        ] {
+            let Some(tok) = tok else { continue };
+            if addrs.is_empty() {
+                continue;
+            }
+            if let Some((s, a)) =
+                knit_common::connect::connect_first(&addrs, port, &tok, Duration::from_secs(3))
+            {
+                chosen = Some((s, a, tok));
+                break;
+            }
+        }
+        match chosen {
+            Some((s, a, tok)) => {
                 eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
-                match client_attempt(s, &dial_token, screen_w, screen_h) {
+                match client_attempt(s, &tok, screen_w, screen_h) {
                     Ok(()) => backoff.reset(),
                     Err(e) => eprintln!("[conn] {e}"),
                 }
