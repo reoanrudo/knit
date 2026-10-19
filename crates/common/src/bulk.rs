@@ -449,6 +449,34 @@
         cancel: &mut dyn FnMut() -> bool,
         progress: &mut dyn FnMut(u64, u64, &str),
     ) -> std::io::Result<SendReport> {
+        send_entries_impl(w, entries, &[], drop, drag_id, cancel, progress)
+    }
+
+    /// 中断した転送の続きから送る(版 18)。`offsets[i]` は entries[i] の
+    /// 受信済みバイト数。0 より大きいときは FILE_BEGIN に offset と前置
+    /// ハッシュを載せ、先頭のその分を読まずに飛ばす。
+    /// **相手が resume 対応のときだけ使う**(旧側は先頭から書くため)
+    pub fn send_entries_from(
+        w: &mut impl Write,
+        entries: &[OutFile],
+        offsets: &[u64],
+        drop: bool,
+        drag_id: Option<u64>,
+        cancel: &mut dyn FnMut() -> bool,
+        progress: &mut dyn FnMut(u64, u64, &str),
+    ) -> std::io::Result<SendReport> {
+        send_entries_impl(w, entries, offsets, drop, drag_id, cancel, progress)
+    }
+
+    fn send_entries_impl(
+        w: &mut impl Write,
+        entries: &[OutFile],
+        offsets: &[u64],
+        drop: bool,
+        drag_id: Option<u64>,
+        cancel: &mut dyn FnMut() -> bool,
+        progress: &mut dyn FnMut(u64, u64, &str),
+    ) -> std::io::Result<SendReport> {
         if !crate::share::allow_files() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -473,11 +501,16 @@
         let mut buf = vec![0u8; CHUNK];
         let mut report = SendReport::default();
         let mut sent_bytes = 0u64;
-        for e in entries {
+        for (i, e) in entries.iter().enumerate() {
             if cancel() {
                 return Err(cancelled_err());
             }
             progress(sent_bytes, declared, &e.name);
+            let offset = if e.is_dir {
+                0
+            } else {
+                offsets.get(i).copied().unwrap_or(0).min(e.size)
+            };
             if e.is_dir {
                 // 空フォルダ。データは無く、受け側がディレクトリを作る(版 15 以降)
                 let head = serde_json::json!({ "name": e.name, "size": 0, "mtime": 0, "dir": 1 })
@@ -508,11 +541,42 @@
                     ),
                 ));
             }
-            let head = serde_json::json!({ "name": e.name, "size": size, "mtime": e.mtime })
-                .to_string();
-            write_frame(w, FILE_BEGIN, head.as_bytes())?;
+            // 続きから: 前置(受信済み)バイトを読んでハッシュへ流し、位置を
+            // offset へ進める。前置ハッシュは受信側の部分と突き合わせる
             let mut hasher = blake2::Blake2s256::new();
-            let mut remain = size;
+            let mut prefix_hex = String::new();
+            if offset > 0 {
+                use blake2::Digest;
+                use std::io::Read;
+                let mut left = offset;
+                let mut pbuf = vec![0u8; CHUNK.min(64 * 1024)];
+                while left > 0 {
+                    let want = left.min(pbuf.len() as u64) as usize;
+                    let n = f.read(&mut pbuf[..want])?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "file shortened before resume point",
+                        ));
+                    }
+                    hasher.update(&pbuf[..n]);
+                    left -= n as u64;
+                }
+                // 前置だけのハッシュ(ここで finalize したいので複製する)
+                let mut probe = hasher.clone();
+                prefix_hex = crate::update::to_hex(&probe.finalize());
+                std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset))?;
+            }
+            let head = serde_json::json!({
+                "name": e.name,
+                "size": size,
+                "mtime": e.mtime,
+                "offset": offset,
+                "prefix": if offset > 0 { serde_json::json!(prefix_hex) } else { serde_json::Value::Null },
+            })
+            .to_string();
+            write_frame(w, FILE_BEGIN, head.as_bytes())?;
+            let mut remain = size.saturating_sub(offset);
             while remain > 0 {
                 let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
                 if n == 0 {
@@ -652,9 +716,13 @@
             /// 無害化済みの相対名(失敗報告・ログ用)
             rel: String,
             mtime: u64,
+            /// 宣言サイズ(中断時に部分ファイルを続き用に残すための識別子)
+            size: u64,
             hasher: blake2::Blake2s256,
             /// Overwrite で既存を置き換える(公開時に publish_with を使う)
             replace: bool,
+            /// 続きから受信している(.knit-resume の実体を直接使う)
+            resumed: bool,
         },
         /// 衝突ポリシー Skip で保存しないと決めたファイル。DATA は届くので
         /// サイズだけ数えて捨てる(ストリームの位置を保つ)
@@ -698,6 +766,9 @@
         skipped: usize,
         /// Overwrite で既存を置き換えた件数(BATCH_END で報告)
         replaced: usize,
+        /// 中断した転送の続きを受ける(版 18)。オフのときは従来どおり
+        /// 途中の実体を捨てる
+        resume: bool,
         /// バッチの途中で切断(Drop)したときの部分報告先(spawn_reader が
         /// Endpoint の on_event を渡す。保存済み件数を Event::Interrupted で伝える)
         on_interrupted: Option<fn(Event)>,
@@ -724,6 +795,7 @@
                 collision: None,
                 skipped: 0,
                 replaced: 0,
+                resume: false,
                 on_interrupted: None,
                 rx_hook: None,
             }
@@ -733,6 +805,13 @@
         /// 通常はプロセス共通の設定を使う)
         pub fn with_collision(mut self, policy: crate::files::Collision) -> Self {
             self.collision = Some(policy);
+            self
+        }
+
+        /// 中断した転送の続きから受ける(版 18 の相手にだけ使う)。
+        /// オンのときも、送信側が offset を送らなければ従来どおり先頭から
+        pub fn with_resume(mut self, on: bool) -> Self {
+            self.resume = on;
             self
         }
 
@@ -780,9 +859,25 @@
         /// 書き込み途中のファイルを破棄する(Drop・境界から呼ぶ。完了済みは残す)。
         /// reason が空でなければ失敗報告へ積む
         fn discard_open_file(&mut self, reason: &str) {
-            if let Sink::File { f, tmp, rel, .. } = std::mem::replace(&mut self.sink, Sink::None) {
+            if let Sink::File {
+                f,
+                tmp,
+                rel,
+                mtime,
+                size,
+                resumed,
+                ..
+            } = std::mem::replace(&mut self.sink, Sink::None)
+            {
                 drop(f); // Windows でも削除できるよう、ハンドルを先に閉じる
-                let _ = std::fs::remove_file(&tmp);
+                // 中断(理由なし)は続きから送れるよう部分を残す。明示的な失敗は
+                // 壊れた実体なので捨てる。resume がオフなら従来どおり捨てる
+                if self.resume && reason.is_empty() {
+                    let _ = crate::files::retain_partial(&self.dir, &rel, size, mtime, &tmp);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                let _ = resumed;
                 self.paths.pop(); // 予約済みの最終名も取り下げる
                 if !reason.is_empty() {
                     self.failed.push((rel, reason.to_string()));
@@ -827,6 +922,10 @@
                     let name = v["name"].as_str().unwrap_or("file");
                     let size = v["size"].as_u64().unwrap_or(0);
                     let mtime = v["mtime"].as_u64().unwrap_or(0);
+                    // 版 18: 続きから(受信済みバイト数と前置ハッシュ)。
+                    // 旧版の送信側は送らないので 0/None になる
+                    let offset = v["offset"].as_u64().unwrap_or(0).min(size);
+                    let prefix = v["prefix"].as_str();
                     // 空フォルダ(版 15 以降)。ディレクトリとして作って公開する。
                     // DATA は続かない(送信側が出さない)
                     if v["dir"].as_u64() == Some(1) {
@@ -936,19 +1035,81 @@
                     let replace =
                         policy == crate::files::Collision::Overwrite && reserved.existed;
                     let parent = final_path.parent().unwrap_or(&self.dir).to_path_buf();
-                    let Some((f, tmp)) = crate::files::create_temp(&parent) else {
-                        fail(self, &rel, "一時ファイルを作成できません");
-                        return None;
+                    // 続きから受ける(版 18)。offset は送信側の「受信済みバイト数」。
+                    // 部分の実体と前置ハッシュが一致するときだけ続き、不一致なら
+                    // 部分を捨てて失敗にする(壊れた続きを公開しない)
+                    let mut resumed = false;
+                    let mut hasher = blake2::Blake2s256::new();
+                    let tmp = if self.resume && offset > 0 {
+                        use blake2::Digest;
+                        let Some((path, have)) =
+                            crate::files::find_partial(&self.dir, &rel, size, mtime)
+                        else {
+                            fail(self, &rel, "続きからの転送に一致する部分がありません");
+                            return None;
+                        };
+                        let prefix_ok = have == offset
+                            && prefix.is_some_and(|p| {
+                                crate::files::prefix_hash(&path, offset)
+                                    .map(|h| crate::update::to_hex(&h) == p)
+                                    .unwrap_or(false)
+                            });
+                        if !prefix_ok {
+                            crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                            fail(self, &rel, "続きからの転送が一致しません");
+                            return None;
+                        }
+                        // 全体の内容ハッシュを検証できるよう、前置バイトを
+                        // ハッシュへ流す(部分の再読込はこの1回だけ)
+                        let Some(mut old) = std::fs::File::open(&path).ok() else {
+                            fail(self, &rel, "続きの部分を開けません");
+                            return None;
+                        };
+                        use std::io::Read;
+                        let mut left = offset;
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while left > 0 {
+                            let want = left.min(buf.len() as u64) as usize;
+                            match old.read(&mut buf[..want]) {
+                                Ok(0) | Err(_) => {
+                                    fail(self, &rel, "続きの部分を読めません");
+                                    return None;
+                                }
+                                Ok(n) => {
+                                    hasher.update(&buf[..n]);
+                                    left -= n as u64;
+                                }
+                            }
+                        }
+                        let Some(f) = std::fs::OpenOptions::new().append(true).open(&path).ok()
+                        else {
+                            fail(self, &rel, "続きの部分を開けません");
+                            return None;
+                        };
+                        resumed = true;
+                        (f, path)
+                    } else {
+                        // 先頭からのやり直しは、古い部分を捨ててから始める
+                        if self.resume && offset == 0 {
+                            crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                        }
+                        let Some(pair) = crate::files::create_temp(&parent) else {
+                            fail(self, &rel, "一時ファイルを作成できません");
+                            return None;
+                        };
+                        pair
                     };
                     self.paths.push(final_path);
                     self.sink = Sink::File {
-                        f,
-                        remain: size,
-                        tmp,
+                        f: tmp.0,
+                        remain: size.saturating_sub(offset),
+                        tmp: tmp.1,
                         rel,
                         mtime,
-                        hasher: blake2::Blake2s256::new(),
+                        size,
+                        hasher,
                         replace,
+                        resumed,
                     };
                 }
                 DATA => match &mut self.sink {
@@ -1007,6 +1168,7 @@
                         mtime,
                         hasher,
                         replace,
+                        ..
                     } = std::mem::replace(&mut self.sink, Sink::None)
                     {
                         if remain > 0 {

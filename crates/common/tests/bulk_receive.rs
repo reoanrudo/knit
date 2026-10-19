@@ -323,6 +323,117 @@ fn deliver_with(
     events
 }
 
+/// フレーム列の DATA 実バイト数(レジュームで「送り直していない」ことの測定)
+fn data_bytes(wire: &[u8]) -> u64 {
+    let mut reader = Cursor::new(wire);
+    let mut frame = Vec::new();
+    let mut total = 0u64;
+    while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+        if kind == bulk::DATA {
+            total += frame.len() as u64;
+        }
+    }
+    total
+}
+
+/// 続きから受ける受信器でフレーム列を通し、完了イベントを返す
+fn deliver_resumed(wire: &[u8], dir: &std::path::Path) -> Vec<bulk::Event> {
+    let mut rx = bulk::Receiver::new(dir).with_resume(true);
+    let mut reader = Cursor::new(wire);
+    let mut frame = Vec::new();
+    let mut events = Vec::new();
+    while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+        if let Some(e) = rx.feed(kind, &frame) {
+            events.push(e);
+        }
+    }
+    events
+}
+
+#[test]
+fn interrupted_transfer_resumes_from_the_received_prefix() {
+    let temp = Temp::new("resume");
+    let src = temp.0.join("big.bin");
+    // CHUNK(256KiB)より十分大きくして、途中で確実に止める
+    let data: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&src, &data).unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+
+    // 1回目: 途中で中止する(受信側は resume オンなので部分を残す)
+    let mut wire1 = Vec::new();
+    let mut chunks = 0u32;
+    let _ = bulk::send_entries(
+        &mut wire1,
+        &entries,
+        false,
+        None,
+        &mut || {
+            chunks += 1;
+            chunks > 2
+        },
+        &mut |_, _, _| {},
+    );
+    let offset = data_bytes(&wire1);
+    assert!(offset > 0 && offset < data.len() as u64, "途中までで止まる");
+    let dst = temp.0.join("received");
+    {
+        let mut rx = bulk::Receiver::new(&dst).with_resume(true);
+        let mut reader = Cursor::new(&wire1);
+        let mut frame = Vec::new();
+        while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+            let _ = rx.feed(kind, &frame);
+        }
+    }
+    assert!(!dst.join("big.bin").exists(), "未完の実体は公開しない");
+    let store = dst.join(knit_common::files::RESUME_DIR);
+    assert_eq!(
+        std::fs::read_dir(&store).unwrap().count(),
+        1,
+        "部分を1件だけ残す"
+    );
+
+    // 2回目: 受信済みバイトを送り直さず、続きだけを送る
+    let mut wire2 = Vec::new();
+    bulk::send_entries_from(&mut wire2, &entries, &[offset], false, None, &mut || false, &mut |_, _, _| {})
+        .unwrap();
+    assert_eq!(
+        data_bytes(&wire2),
+        data.len() as u64 - offset,
+        "受信済みの分を送り直さない"
+    );
+    let events = deliver_resumed(&wire2, &dst);
+    assert!(dst.join("big.bin").exists(), "続きから完了して公開される");
+    assert_eq!(std::fs::read(dst.join("big.bin")).unwrap(), data, "内容が一致");
+    let bulk::Event::Files { failed, .. } = &events[0] else {
+        panic!("完了イベントが無い");
+    };
+    assert!(failed.is_empty(), "続きの照合と全体ハッシュが通る");
+}
+
+#[test]
+fn resume_with_a_mismatched_prefix_fails_instead_of_publishing() {
+    let temp = Temp::new("resume-bad");
+    let dst = temp.0.join("received");
+    let src = temp.0.join("big.bin");
+    std::fs::write(&src, vec![7u8; 64 * 1024]).unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+    let size = entries[0].size;
+    let mtime = entries[0].mtime;
+    let mut wire = Vec::new();
+    let head = format!(
+        r#"{{"name":"big.bin","size":{size},"mtime":{mtime},"offset":1000,"prefix":"{}"}}"#,
+        "00".repeat(32)
+    );
+    bulk::write_frame(&mut wire, bulk::FILE_BEGIN, head.as_bytes()).unwrap();
+    bulk::write_frame(&mut wire, bulk::BATCH_END, &[]).unwrap();
+    let events = deliver_resumed(&wire, &dst);
+    assert!(!dst.join("big.bin").exists(), "不一致の続きは公開しない");
+    let bulk::Event::Files { failed, .. } = &events[0] else {
+        panic!("失敗が報告されない");
+    };
+    assert_eq!(failed.len(), 1, "理由つきで失敗する");
+}
+
 #[test]
 fn overwrite_policy_replaces_the_existing_file_and_counts_it() {
     let temp = Temp::new("collide-overwrite");
