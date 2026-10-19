@@ -521,3 +521,16 @@ M2(共通トークンの端末単位失効)は端末モデルの設計作業(gap
 |---|---|
 | 571 | **プロトコル版 13**: hello/hello_ok に端末識別子 id(起動ごとに生成・splitmix64)と全モニター Vec<Monitor>{x,y,w,h}(仮想画面座標系)を追加。serde(default)付きで旧版(12)と双方向互換(旧相手は空=従来の w/h 1 画面扱い・Mac 側は IP 由来の代替 id)。テスト追加(往復・旧形式 JSON の受入・device_id 安定性) |
 | 572 | **Mac のマルチピア化**: server_thread のセッション処理をスレッドへ分離し、PEERS(Vec)+ACTIVE_PEER(添字)で複数 Windows を同時保持。writer はアクティブ時のみ STREAM_SLOT へ貸し出す設計で既存送信系(send_msg 等)を無変更のまま、activate_peer() で送り先・画面・PEER_*・bulk 経路・⌘設定を一括切替。メニューバーに「接続先」サブメニュー(履歴サブメニューと同じ変化検知再構築・アクティブにチェック)。**実機で発見**: Windows の「経路昇格」は Tailscale と LAN 直の 2 本を同時に張るため、旧実装の「最後の確立が差し替え」方式と違い新実装は 2 本目の writer が行き場を失い pong 不応答→再接続ループ。世代番号(PEER_GEN)で新しいセッションを正とし、旧セッションは終了時に世代不一致で一覧を触らず静かに退出するよう修正→実機でループ解消(昇格 1 回で収束・以後安定)。非アクティブ peers へ 10 秒毎の keepalive ping(ping へは自分のセッションの writer へ直接 pong・pong の LAST_PONG 反映はアクティブのみ)。Windows は EnumDisplayMonitors・Mac は CGGetActiveDisplayList でモニター列挙を搭載。実機: Mac 2 面(2056x1329+2560x1080)・Win 1 面(1920x1080)の相互認識と旧 exe 相手(legacy-id)との後方互換を確認 |
+
+## 第28セッション(2026-10-19・573): 端末モデルの第一歩(端末別資格・登録台帳・失効)
+
+設計書 docs/plans/2026-10-19-knit-device-model-design.md(arena 2案競合・統合記録つき)に基づく増分A〜D。WIP ブランチ wip/device-model + ドラフト PR。
+
+| ループ | 内容 |
+|---|---|
+| 573 | **台帳と鍵束**: 端末別トークン `Blake2s256("knit-device-v1\0"+master+"\0"+key_id)` の導出、登録台帳 devices.json(非秘密・write_atomic・冪等な失効・last_seen)、secure::ServerKeys と全鍵試行 accept_as(最初のレコード1回を読み鍵ごとに responder を作り直す。TCP 往返不変・クライアント側の変更ゼロ)。孤立した #[test](フィンガープリスト試験が走っていなかった)も別コミットで修正 |
+| 573b | **配線**: 登録(pairing)は台帳で採番した端末別トークンを配る(master は配らない・"saved" ack 前にコミット)。Mac の本線/音声/bulk 待受は accept_as+accept_keys()(失効の即時反映)。PeerEntry.auth に認証結果。bulk の接続側は宛先(アクティブ端末)別トークン。discover 応答は master+全端末の部屋にマルチルーム化。Windows 側差分は EndpointCred::Single への差し替えと respond の部屋クロージャ化のみ |
+| 573c | **失効の実演(AC2)**: 登録A/B→revoke(A)→A拒否・B無影響・legacy無影響・2回目の冪等(台帳バイト列不変)を本物の Noise ループバックで証明(crates/common/tests/device_registry.rs 3本+secure/registry 単体)。3経路ラベルすべてで同時に効くことも固定。操作経路は knit-mac --registry list / revoke <key_id> / revoke-legacy(本体起動中でも効く: 台帳は mtime で再読込)。待機端末には Leave を書いてから切断(相手の押下解放を待たせない) |
+| 検証 | cargo test --workspace --exclude knit-win 全緑(14スイート)。実バイナリで --registry list の動作を実証(本体起動中・rc=0)。CI(macos+windows)を PR #13 で実施。既知の限界(設計書§9): Mac が本線クライアントになる経路は master のまま・設定 GUI の一覧/失効は後続増分・実機2台での登録・失効の確認は残タスク |
+
+snow 0.10 の IKpsk2(静的鍵)が名前解決・2メッセージ・get_remote_static まで動作することも実証済み(/tmp/snowcheck)。将来の静的鍵化は台帳の型(DeviceKeyId・Who)をそのまま使える。

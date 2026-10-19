@@ -586,6 +586,58 @@ pub(crate) fn drop_stream(reason: &str) {
     }
 }
 
+/// 台帳で1端末を失効し、稼働中のその端末のセッションも切る(失効の唯一の経路。
+/// UI と --registry CLI の両方から呼ぶ)。台帳から鍵が消えるため、以後の
+/// 本線・音声・bulk の全ハンドシェイクがその端末のトークンでは弾かれる。
+/// 稼働セッション: 待機中の端末には Leave を書いてから切断する(相手の
+/// 押下解放を生存検知(最長9秒)に待たせない)。アクティブな端末は
+/// drop_stream で切り、既存の切断経路(on_disconnect のカーソル復帰・
+/// 次端末への自動切替)に任せる
+pub(crate) fn registry_revoke(
+    reg: &std::sync::Arc<knit_common::registry::DeviceRegistry>,
+    key_id: &knit_common::secure::DeviceKeyId,
+) -> std::io::Result<knit_common::registry::RevokeOutcome> {
+    use knit_common::registry::RevokeOutcome;
+    use std::io::Write as _;
+    let outcome = reg.revoke(key_id)?;
+    if matches!(outcome, RevokeOutcome::Revoked) {
+        let mut drop_active = false;
+        {
+            let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+            let mut entries = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+            let target = knit_common::secure::Who::Device(key_id.clone());
+            // 待機中の該当端末: Leave を届けてから外す
+            let idle: Vec<(String, u64)> = entries
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| p.auth == target && *i != *active)
+                .map(|(_, p)| (p.id.clone(), p.gen))
+                .collect();
+            for (id, gen) in idle {
+                if let Some(p) = entries.iter_mut().find(|p| p.id == id && p.gen == gen) {
+                    if let Some(mut w) = p.writer.take() {
+                        let _ = w.write_all(
+                            knit_common::proto::encode(&knit_common::proto::Msg::Leave).as_bytes(),
+                        );
+                        let _ = w.flush();
+                        w.shutdown();
+                    }
+                }
+                crate::peers::detach(&mut entries, &mut active, &id, gen);
+            }
+            // アクティブな該当端末: drop_stream 後は既存の切断経路が detach する
+            if entries.get(*active).is_some_and(|p| p.auth == target) {
+                drop_active = true;
+            }
+        }
+        if drop_active {
+            drop_stream("この端末の登録を解除しました");
+        }
+    }
+    Ok(outcome)
+}
+
 /// `tailscale status --json` から相手への経路が直結か中継かを調べる
 pub(crate) fn tailscale_path(peer: std::net::IpAddr) -> Option<u8> {
     let out = [
