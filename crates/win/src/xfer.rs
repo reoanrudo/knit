@@ -11,33 +11,13 @@ use knit_common::proto::Msg;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-/// 版 18: 相手(Mac)が保持している部分から送信開始位置を決める。
-/// 相手が旧版・応答なし(1.5秒)のときは先頭から
+/// 版 18: 相手(Mac)が保持している部分から送信開始位置を決める(芯は common の
+/// resume_offsets_for。相手が旧版・応答なしのときは先頭から)
 pub(crate) fn resume_offsets_for(entries: &[bulk::OutFile]) -> Vec<u64> {
     let features = knit_common::proto::peer_features(
         dragdrop::edge::PEER_VERSION.load(Ordering::Relaxed),
     );
-    if !features.resume
-        || entries.iter().all(|e| e.is_dir)
-        || bulk::entries_total(entries) < 1024 * 1024
-    {
-        return vec![0; entries.len()];
-    }
-    let token = knit_common::bulk::next_resume_token();
-    if !send_main_msg(&Msg::XferResumeQuery {
-        token,
-        items: knit_common::bulk::resume_items(entries),
-    }) {
-        return vec![0; entries.len()];
-    }
-    let positions =
-        knit_common::bulk::wait_resume_state(token, Duration::from_millis(1500));
-    let offsets = knit_common::bulk::resume_offsets_of(entries, &positions);
-    let resumed = offsets.iter().filter(|o| **o > 0).count();
-    if resumed > 0 {
-        eprintln!("[xfer] 続きから送信します(再開: {resumed} 件)");
-    }
-    offsets
+    bulk::resume_offsets_for(entries, features, |msg| send_main_msg(&msg))
 }
 
 /// 進行中の Mac へのファイル送信(トレイ表示と Esc キャンセルで使う)
@@ -517,13 +497,6 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             };
             // 予告より受け取れた件数が少ない場合は、その分を通知に含める
             let mut mismatch: Option<(usize, usize)> = None;
-            let saved_dir = || {
-                std::env::var_os("USERPROFILE")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default()
-                    .join("Downloads")
-                    .join("Knit")
-            };
             match outcome {
                 Claim::Carried if dragdrop::lazy_started(drag_id.unwrap_or(0)) => {
                     // 遅延提供で既にドラッグが走っている(目録だけで開始済み)。
@@ -561,7 +534,7 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                     // 履歴には載せる(メニューから選び直せるように。
                     // 相手の受信も履歴に載るため挙動を揃える)
                     history_push_files(&paths, &crate::conn::peer_display());
-                    let dir = saved_dir();
+                    let dir = crate::receive_dir();
                     tray::notify(
                         "Knit",
                         &format!(
@@ -582,7 +555,7 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                 history_push_files(&paths, &crate::conn::peer_display());
                 println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                let dir = saved_dir();
+                let dir = crate::receive_dir();
                 let message = match mismatch {
                     Some((expected, got)) => format!(
                         "ファイルは {got}/{expected} 件のみの受信です{}(Ctrl+V で貼り付け可)。実体は {}",

@@ -343,11 +343,7 @@ fn main() {
 
     println!("[info] knit-win {BUILD_ID}");
     // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
-    let recv_dir = std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join("Downloads")
-        .join("Knit");
+    let recv_dir = receive_dir();
     let _ = std::fs::create_dir_all(&recv_dir);
     // 前回終了時に残った受信中ファイルの一時実体(.knit-*.part)を掃除する
     //(exit は Receiver の Drop を飛ばすための保険。Mac 側と同じ起動時掃除)
@@ -438,11 +434,6 @@ fn main() {
             }
         }
     };
-    // 同名衝突の扱い(既定 rename)。設定画面ができるまでの入口
-    if let Ok(v) = std::env::var("KNIT_COLLISION") {
-        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
-        eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
-    }
     // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
     let purged = knit_common::files::purge_expired_partials(&receive_dir(), 7 * 24 * 3600);
     if purged > 0 {
@@ -496,6 +487,13 @@ fn main() {
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
+    // 同名衝突の扱い(既定 rename)。preferences::restore が保存値(初回保存以降は
+    // 必ず collision キーを持つ)を当てた**後**に読むことで環境変数を優先する
+    // (KNIT_ROLE と同じ扱い。.env も見る)
+    if let Some(v) = knit_common::envutil::get("KNIT_COLLISION") {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
+        eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
+    }
     updater::report_last_result();
     updater::cleanup_leftovers();
     updater::start_background();

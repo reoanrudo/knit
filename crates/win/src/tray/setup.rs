@@ -426,7 +426,7 @@ pub fn first_run(preview: bool) -> Option<String> {
         let wc = WNDCLASSW {
             lpfnWndProc: Some(procedure),
             hInstance: instance,
-            hIcon: LoadIconW(instance, std::ptr::dangling::<u16>()),
+            hIcon: LoadIconW(instance, 1usize as *const u16), /*MAKEINTRESOURCEW(1)*/
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
             hbrBackground: brush,
             lpszClassName: class.as_ptr(),
