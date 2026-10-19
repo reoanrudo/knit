@@ -1400,7 +1400,9 @@ pub fn start(token: String, port: u16) {
         eprintln!("[audio] listening on {bind_ip}:{port}");
         // 本線と同じ連続失敗スロットル(認証失敗の連打を鈍らせる)
         let mut throttle = knit_common::secure::FailThrottle::new();
-        loop {
+        // 待受ループは長命。panic した時だけ supervisor が記録して再起動する
+        // (listener は閉じずにそのまま使い回すため、ポートの再 bind も不要)。
+        crate::supervise::run_supervised("音声受信", move || loop {
             let (stream, peer) = match listener.accept() {
                 Ok(x) => x,
                 Err(_) => {
@@ -1548,7 +1550,7 @@ pub fn start(token: String, port: u16) {
                 diag_log(&mut last_diag, rate);
             }
             eprintln!("[audio] stream ended");
-        }
+        });
     });
 }
 
