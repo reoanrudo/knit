@@ -369,6 +369,24 @@ fn registry_cli(args: &[String]) {
                 }
             }
         }
+        Some("prune") => {
+            let days: u64 = at
+                .and_then(|i| args.get(i + 2))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match reg.prune_unseen(days.saturating_mul(86_400), now) {
+                Ok(0) => println!("未接続の古い端末はありません(既定30日。日数は --registry prune <日数>)"),
+                Ok(n) => println!("未接続の古い端末を {n} 台削除しました"),
+                Err(e) => {
+                    eprintln!("[registry] 掃除に失敗: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("revoke-legacy") => {
             if let Err(e) = reg.revoke_legacy() {
                 eprintln!("[registry] 旧形式の閉鎖に失敗: {e}");
@@ -377,7 +395,7 @@ fn registry_cli(args: &[String]) {
             println!("旧形式(共通キー)での接続を受け付けなくなりました。端末別トークンの端末は影響しません。");
         }
         _ => {
-            eprintln!("使い方: --registry list | revoke <key_id> | revoke-legacy");
+            eprintln!("使い方: --registry list | revoke <key_id> | revoke-legacy | prune [日数]");
             std::process::exit(2);
         }
     }
