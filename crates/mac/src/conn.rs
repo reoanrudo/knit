@@ -481,17 +481,6 @@ pub(crate) fn keepalive_inactive_peers() {
         use std::io::Write as _;
         loop {
             cut_externally_revoked_peers();
-        // M03: 操作権の期限。相手が固まって pong が5秒途絶えたら、切断(15秒)を
-        // 待たずにカーソルを手元へ戻す(押下の解放は Leave/切断の既存経路)
-        if lease_expired(
-            WIN_MODE.load(Ordering::Relaxed),
-            CONNECTED.load(Ordering::Relaxed),
-            LAST_PONG_MS.load(Ordering::Relaxed),
-            crate::now_ms(),
-        ) {
-            eprintln!("[conn] 操作権の期限切れ(最後の応答から5秒)。カーソルを手元へ戻します");
-            crate::tap::leave_win_mode_cursor_unlock(None);
-        }
         std::thread::sleep(Duration::from_secs(1));
             // bulk 張替延期の保留判定(受信中に切り替えた端末の clear 予約)。
             // 世代ガードで「予約した時の切替」が現在も使われているときだけ
@@ -579,7 +568,7 @@ pub(crate) const LEASE_SILENCE_MS: u64 = 5_000;
 
 /// リース切れで操作権を手元へ戻すか(純関数・単体テスト対象)。
 /// WIN_MODE 中・接続中で、最後の pong から LEASE_SILENCE_MS 以上経過した時だけ
-fn lease_expired(win_mode: bool, connected: bool, last_pong_ms: u64, now_ms: u64) -> bool {
+pub(crate) fn lease_expired(win_mode: bool, connected: bool, last_pong_ms: u64, now_ms: u64) -> bool {
     win_mode && connected && last_pong_ms != 0 && now_ms.saturating_sub(last_pong_ms) >= LEASE_SILENCE_MS
 }
 
