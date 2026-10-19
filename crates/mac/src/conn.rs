@@ -595,8 +595,13 @@ fn cut_externally_revoked_peers() {
         }
         found
     };
+    let cut = !revoked.is_empty();
     for who in revoked {
         cut_sessions_where(&who);
+    }
+    if cut && peers_is_empty() {
+        crate::tap::save_peer_sides();
+        eprintln!("[conn] 全ての端末がいなくなったため配置設定を整理しました");
     }
 }
 
@@ -608,6 +613,13 @@ pub(crate) fn known_peer_token(ip: std::net::IpAddr) -> Option<String> {
     let reg = crate::registry()?;
     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
     peers.iter().find(|p| p.ip == ip).map(|p| reg.token_for(&p.auth))
+}
+
+/// 接続中のピアが1台もいないか(ロックを保持しない。配置の保存を呼ぶ前の
+/// 判定用。PEERS のロック順 PEER_SIDES_SAVE→PEERS を守るため、保存の直前に
+/// 単独で取得してすぐ離す)
+pub(crate) fn peers_is_empty() -> bool {
+    PEERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 pub(crate) fn allow_bulk_peer(ip: std::net::IpAddr) -> bool {
@@ -675,13 +687,18 @@ pub(crate) fn registry_revoke(
 /// 既存の切断経路 on_disconnect が整理する)
 fn cut_sessions_where(target: &knit_common::secure::Who) {
     use std::io::Write as _;
+    // セッション機構の初期化前に呼ばれた場合(CLI プロセス等)は切る対象も無い。
+    // --registry CLI は GUI 起動より前に終わるため STREAM_SLOT が未設定になる
+    let Some(slot_once) = STREAM_SLOT.get() else {
+        return;
+    };
     let mut leaves: Vec<secure::Writer> = Vec::new();
     let mut sockets: Vec<std::net::TcpStream> = Vec::new();
     let mut detach: Vec<(String, u64)> = Vec::new();
     let mut cut_active = false;
     {
         let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let mut slot = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = slot_once.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries = PEERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
         let hits: Vec<usize> = entries
@@ -720,9 +737,10 @@ fn cut_sessions_where(target: &knit_common::secure::Who) {
         for (id, gen) in &detach {
             peers::detach(&mut entries, &mut active, id, *gen);
         }
-        if entries.is_empty() {
-            crate::tap::save_peer_sides();
-        }
+        // 配置(peer-sides)の整理はここでは行わない: PEERS ロック保持中の
+        // save_peer_sides は PEERS を掴み直してデッドロックし、CLI プロセス
+        // (PEERS が常に空)では空の配置で上書きしてしまう。呼び出し側が
+        // ロックの外で peers_is_empty() を見て保存する
     }
     // ② ロック外で Leave を書いて切る(半開きの相手でも待つのはこの書込だけ。
     // 他の操作は止まらない)
@@ -870,6 +888,19 @@ mod tests {
             alias: None,
             auth: knit_common::secure::Who::Legacy, shut: None,
         }
+    }
+
+    /// CLI 相当(PEERS が空)でも切る対象が無ければ即座に戻る。
+    /// STREAM_SLOT が未設定のプロセスでは何もしない(パニックしない)
+    #[test]
+    fn cut_sessions_where_returns_quickly_when_there_is_nothing_to_cut() {
+        let target = knit_common::secure::Who::Device(
+            knit_common::secure::DeviceKeyId::parse(&"3".repeat(32)).unwrap(),
+        );
+        with_peers(Vec::new(), usize::MAX, || {
+            cut_sessions_where(&target);
+            assert!(PEERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        });
     }
 
     /// 操作権リース: WIN_MODE 中だけ・接続中だけ・最後の pong から5秒で切れる
