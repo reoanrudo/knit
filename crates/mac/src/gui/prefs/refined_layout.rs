@@ -425,15 +425,6 @@ pub(super) fn selected() -> Option<(String, u8)> {
     Some((p.id.clone(), p.side))
 }
 
-pub(super) fn select_first() {
-    let id = lock_draft()
-        .as_ref()
-        .and_then(|d| d.peers.first().map(|p| p.id.clone()));
-    if let Some(id) = id {
-        select_id(&id);
-    }
-}
-
 pub(super) fn select_id(id: &str) {
     let changed = {
         let mut state = lock_draft();

@@ -156,22 +156,23 @@ pub struct Invitation {
     workers: Vec<JoinHandle<()>>,
 }
 impl Invitation {
-    pub fn open(token: String, service_port: u16) -> io::Result<Self> {
+    pub fn open(
+        registry: std::sync::Arc<crate::registry::DeviceRegistry>,
+        service_port: u16,
+    ) -> io::Result<Self> {
         Self::bind(
             "0.0.0.0:24904".parse().unwrap(),
-            token,
+            registry,
             service_port,
             LIFETIME,
         )
     }
     fn bind(
         address: SocketAddr,
-        token: String,
+        registry: std::sync::Arc<crate::registry::DeviceRegistry>,
         service_port: u16,
         lifetime: Duration,
     ) -> io::Result<Self> {
-        // Legacy env tokens may have other lengths. Do not silently normalize them.
-        credentials::validate_transport_key(&token)?;
         if service_port == 0 {
             return Err(invalid("invalid credential"));
         }
@@ -219,6 +220,7 @@ impl Invitation {
         let worker_code = code.clone();
         let server_name = safe_name(&name);
         let worker = thread::spawn(move || {
+            let registry = &registry;
             let mut attempts = 0;
             while check_active(&worker_stop, until).is_ok() {
                 match tcp.accept() {
@@ -266,7 +268,7 @@ impl Invitation {
                             peer,
                             &worker_code,
                             &invitation_id,
-                            &token,
+                            registry,
                             service_port,
                             &worker_stop,
                             attempt_until,
@@ -358,7 +360,7 @@ fn serve_one(
     peer: SocketAddr,
     code: &str,
     id: &str,
-    token: &str,
+    registry: &std::sync::Arc<crate::registry::DeviceRegistry>,
     port: u16,
     stop: &AtomicBool,
     until: Instant,
@@ -378,7 +380,7 @@ fn serve_one(
         Err(e) => return Err(untried_connection(e, wire.received != 0)),
     };
     if incoming.starts_with(SAS_MARK) {
-        return serve_sas(wire, &incoming, peer, id, token, port, stop, session_until, server_name, ask);
+        return serve_sas(wire, &incoming, peer, id, registry, port, stop, session_until, server_name, ask);
     }
     let (state, message) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.as_bytes()),
@@ -390,13 +392,20 @@ fn serve_one(
         .finish(&incoming)
         .map_err(|_| invalid("invalid PAKE message"))?;
     let mut channel = Channel::handshake(wire, &key, false)?;
-    serve_credential(&mut channel, token, port, stop, session_until)
+    // 6桁コード方式では相手の名前を受け取らない。台帳には仮の名前で載せ、
+    // 初回接続の hello(note_seen)で本名へ更新する
+    serve_credential(&mut channel, registry, "登録した端末", port, stop, session_until)
 }
 
 /// 認証済みの暗号化経路で長期キーを渡す(6桁方式と承認方式で共通)。
+/// 渡すのは master そのものではなく、この端末専用に導出したトークン。
+/// 台帳へは "saved" ack を待たずにコミットする(ack が落ちても「相手は保存済み・
+/// 台帳なし」の二度と繋がらない不整合を避ける。保存されなかったエントリは
+/// UI から掃除する)
 fn serve_credential(
     channel: &mut Channel,
-    token: &str,
+    registry: &std::sync::Arc<crate::registry::DeviceRegistry>,
+    name: &str,
     port: u16,
     stop: &AtomicBool,
     until: SystemTime,
@@ -406,9 +415,10 @@ fn serve_credential(
         return Err(invalid("invalid confirmation"));
     }
     check_active(stop, until)?;
+    let enrolled = registry.enroll(name)?;
     channel.send(
         &serde_json::to_vec(&Credential {
-            token: token.into(),
+            token: enrolled.token,
             port,
         })
         .map_err(invalid)?,
@@ -496,7 +506,7 @@ fn serve_sas(
     first: &[u8],
     peer: SocketAddr,
     id: &str,
-    token: &str,
+    registry: &std::sync::Arc<crate::registry::DeviceRegistry>,
     port: u16,
     stop: &AtomicBool,
     session_until: SystemTime,
@@ -543,12 +553,12 @@ fn serve_sas(
             Err(e) => e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted,
         }
     };
-    if !ask(client_name, sas, peer, &alive)? {
+    if !ask(client_name.clone(), sas, peer, &alive)? {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not approved"));
     }
     check_active(stop, session_until)?;
     let mut channel = Channel::handshake(wire, &key, false)?;
-    serve_credential(&mut channel, token, port, stop, session_until)
+    serve_credential(&mut channel, registry, &client_name, port, stop, session_until)
 }
 
 /// 承認方式の依頼側(Windows・Android)が、確認番号を出した状態で待っている接続。
@@ -1088,8 +1098,25 @@ mod tests {
     }
 
     use super::*;
-    fn invitation(lifetime: Duration) -> (Invitation, SocketAddr, String) {
-        let token = credentials::generate().unwrap();
+    use crate::registry::DeviceRegistry;
+
+    fn fresh_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "knit-pairing-{}-{}-{tag}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn invitation(lifetime: Duration) -> (Invitation, SocketAddr, std::sync::Arc<DeviceRegistry>) {
+        // master は台帳経由でだけ使う(招待が配るのは登録ごとの導出トークン)
+        let registry = std::sync::Arc::new(
+            DeviceRegistry::open(&fresh_dir("invite"), &credentials::generate().unwrap()).unwrap(),
+        );
         // Reserve a test port by obtaining the address after bind in a test-only helper.
         // **Windows の CI ランナー**では、解放直後のポートへの再 bind が
         // WSAEACCES(10013, PermissionDenied)で拒否されることがある(Hyper-V/WinNAT が
@@ -1099,8 +1126,8 @@ mod tests {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             drop(listener);
-            match Invitation::bind(addr, token.clone(), 24900, lifetime) {
-                Ok(invitation) => return (invitation, addr, token),
+            match Invitation::bind(addr, registry.clone(), 24900, lifetime) {
+                Ok(invitation) => return (invitation, addr, registry),
                 Err(e) => last = Some(e),
             }
         }
@@ -1118,7 +1145,7 @@ mod tests {
     }
     #[test]
     fn pairing_success_is_single_use_and_discovery_exposes_no_secret() {
-        let (i, addr, token) = invitation(Duration::from_secs(10));
+        let (i, addr, registry) = invitation(Duration::from_secs(10));
         // 確認ポートは招待と同じポートに向ける(本番の discover が pairing::PORT
         // を向くのと同じ構成。ビーコンと TCP 待ち受けが同一ポートで揃う)
         let found = discover_probe(addr, Duration::from_millis(150), addr.port()).unwrap();
@@ -1126,15 +1153,22 @@ mod tests {
         // ビーコンは端末名ではなく匿名ラベルで応答する(LAN 全体に見えるため)
         assert_eq!(found[0].name, beacon_name());
         let beacon = serde_json::to_string(&found).unwrap();
-        assert!(!beacon.contains(&token));
         assert!(!beacon.contains(&i.code));
         let received = enroll(addr, &i.code, |key, peer| {
-            assert_eq!(key, token);
+            assert!(credentials::parse_key(key).is_ok(), "受け取るのは正規の64桁hex鍵");
             assert_eq!(peer.port(), 24900);
             Ok(())
         })
         .unwrap();
-        assert_eq!(received, token);
+        // 渡るのは master ではなく、台帳に載ったこの端末専用の導出トークン
+        let tokens = registry.device_tokens();
+        assert_eq!(tokens.len(), 1, "登録で台帳に1台載る");
+        assert_eq!(received, tokens[0].1);
+        // 登録後のビーコンにも鍵材料は出ない(表示は匿名ラベルのまま)
+        let after = discover_probe(addr, Duration::from_millis(150), addr.port()).unwrap();
+        let beacon2 = serde_json::to_string(&after).unwrap();
+        assert!(!beacon2.contains(&tokens[0].1), "導出トークンはビーコンに漏れない");
+        assert!(!beacon2.contains(&received));
         // 通常は 0.3 秒ほどで届く。全テストを並列に走らせるとマシンが混むため
         // 余裕を持たせる(2秒だと手元の並列実行でも落ちることがあった。CI の
         // ランナーはさらに遅い)。届かないこと自体は従来どおり失敗にする
@@ -1196,19 +1230,25 @@ mod tests {
     }
     #[test]
     fn existing_key_enrollment_preserves_bytes_without_changing_desktop_import() {
-        let token = "Legacy-Key-With-Mixed-CASE-And-Symbols+/==";
+        // legacy 形式の master(長さも文字種も自由)でも、招待が配るのは
+        // master から導いた正規形の端末別トークン(desktop の保存規則を壊さない)
+        let master = "Legacy-Key-With-Mixed-CASE-And-Symbols+/==";
+        let registry = std::sync::Arc::new(DeviceRegistry::open(&fresh_dir("legacy"), master).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let invitation = Invitation::bind(address, token.into(), 24900, Duration::from_secs(10)).unwrap();
-        assert!(enroll(address, &invitation.code, |_, _| panic!("canonical store must reject legacy key")).is_err());
-        assert_eq!(invitation.events.recv_timeout(Duration::from_secs(2)).unwrap(), Event::AttemptFailed(2));
+        let invitation = Invitation::bind(address, registry.clone(), 24900, Duration::from_secs(10)).unwrap();
+        // Android の保存経路(enroll_existing_key)でも、受け取った鍵のバイトを
+        // 壊さずに保存できる
         let received = enroll_existing_key(address, &invitation.code, |key, peer| {
-            assert_eq!(key.as_bytes(), token.as_bytes());
+            assert!(credentials::parse_key(key).is_ok(), "導出トークンは正規形(バイトを壊さない)");
             assert_eq!(peer.port(), 24900);
             Ok(())
         }).unwrap();
-        assert_eq!(received, token);
+        let tokens = registry.device_tokens();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(received, tokens[0].1, "保存経路を通っても台帳の導出値と同一");
+        assert_ne!(received, master, "master そのものは渡らない");
         assert!(matches!(invitation.events.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Registered(_)));
         for bad in ["123456".into(), "x".repeat(31), "x".repeat(513), format!("{}\n", "x".repeat(32))] {
             assert!(credentials::validate_transport_key(&bad).is_err());
@@ -1327,7 +1367,7 @@ mod tests {
 
     #[test]
     fn approval_needs_both_sides_and_shows_the_same_number() {
-        let (i, addr, token) = invitation(Duration::from_secs(30));
+        let (i, addr, registry) = invitation(Duration::from_secs(30));
         let client = approval_client(addr);
         let approval = next_approval(&i);
         assert_eq!(approval.name, "Test PC");
@@ -1345,8 +1385,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        assert_eq!(got, token);
-        assert_eq!(saved.lock().unwrap().as_deref(), Some(token.as_str()));
+        // 承認方式でも渡るのは台帳に載った導出トークン(master ではない)
+        let tokens = registry.device_tokens();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(got, tokens[0].1);
+        assert_eq!(saved.lock().unwrap().as_deref(), Some(tokens[0].1.as_str()));
         assert!(matches!(
             i.events.recv_timeout(Duration::from_secs(5)).unwrap(),
             Event::Registered(_)

@@ -269,20 +269,78 @@
     /// 形式は create_temp が作る名前と厳密に一致する物だけ(相手から届いた
     /// ファイルがたまたま .part で終わる名前でも消さない)。
     /// 戻り値は消した件数(ログ・通知の判断用)
+    /// ネストも辿る: 一時ファイルは最終ファイルの親に作られるため、フォルダ受信の
+    /// 途中で落ちると `受信先/資料/sub/.knit-*.part` が残る(浅い走査では消せない)。
+    /// シンボリックリンクのディレクトリは辿らない(受信先の外へ出ない)
     pub fn sweep_temp_files(dir: &Path) -> usize {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return 0;
-        };
         let mut removed = 0usize;
-        for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(|n| n.to_string()) else {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
                 continue;
             };
-            if is_temp_name(&name) && std::fs::remove_file(e.path()).is_ok() {
-                removed += 1;
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    if !ft.is_symlink() {
+                        stack.push(e.path());
+                    }
+                    continue;
+                }
+                let Some(name) = e.file_name().to_str().map(|n| n.to_string()) else {
+                    continue;
+                };
+                if is_temp_name(&name) && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
             }
         }
         removed
+    }
+
+    /// ディレクトリのエントリをディスクへ落とす(rename の永続化)。
+    /// Windows は std でディレクトリを fsync できないため何もしない
+    pub fn sync_dir(dir: &Path) {
+        #[cfg(unix)]
+        {
+            if let Ok(f) = std::fs::File::open(dir) {
+                let _ = f.sync_all();
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+        }
+    }
+
+    /// rel の親ディレクトリのうち、まだ存在しないものを浅い順に返す。
+    /// `unique_final` がディレクトリを作る**前に**呼び、中断時の片付け対象として
+    /// 覚えておくために使う(呼び出し後に作成される前提)
+    pub fn missing_parent_dirs(base: &Path, rel: &str) -> Vec<PathBuf> {
+        let rel_path = Path::new(rel);
+        let Some(parent_rel) = rel_path.parent() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cur = base.to_path_buf();
+        for c in parent_rel.components() {
+            if let std::path::Component::Normal(name) = c {
+                cur.push(name);
+                if !cur.exists() {
+                    out.push(cur.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// 渡されたディレクトリを深い順に削除する。中身が残った(完了ファイル入りの)
+    /// ものは削除に失敗するので、リストに残して後で再試行できるようにする
+    pub fn remove_empty_dirs(dirs: &mut Vec<PathBuf>) {
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        dirs.retain(|p| p.exists() && std::fs::remove_dir(p).is_err());
     }
 
     /// リネーム先の候補パスを組み立てる("名前 (n).拡張子"。n=0 は素の名前)
@@ -294,10 +352,84 @@
         }
     }
 
-    /// 受信ファイルの最終パスを予約する。実体はまだ作らない(原子的配置のため)。
+    /// 同名のファイルがあったときの扱い。既定は安全な Rename(上書きしない)
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Collision {
+        /// 「名前 (n).ext」へ退避する(既定)
+        Rename,
+        /// 既存を置き換える(利用者が明示したときだけ)
+        Overwrite,
+        /// 既存があるものは保存せず、データだけ受け取って捨てる
+        Skip,
+    }
+
+    impl Collision {
+        /// 設定文字列から読む(未知の値は安全側の Rename)
+        pub fn from_label(value: &str) -> Self {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "overwrite" | "上書き" => Collision::Overwrite,
+                "skip" | "スキップ" => Collision::Skip,
+                _ => Collision::Rename,
+            }
+        }
+
+        pub fn label(self) -> &'static str {
+            match self {
+                Collision::Rename => "rename",
+                Collision::Overwrite => "overwrite",
+                Collision::Skip => "skip",
+            }
+        }
+
+        fn code(self) -> u8 {
+            match self {
+                Collision::Rename => 0,
+                Collision::Overwrite => 1,
+                Collision::Skip => 2,
+            }
+        }
+
+        fn from_code(v: u8) -> Self {
+            match v {
+                1 => Collision::Overwrite,
+                2 => Collision::Skip,
+                _ => Collision::Rename,
+            }
+        }
+    }
+
+    static COLLISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// 受信側の同名衝突ポリシーを設定する(設定画面と環境変数から。即時反映)
+    pub fn set_collision(policy: Collision) {
+        COLLISION.store(policy.code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn collision() -> Collision {
+        Collision::from_code(COLLISION.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 予約した保存先。Overwrite/Skip では元の名前をそのまま返し、既存の有無を
+    /// existed で伝える(Rename は必ず空き名なので false)
+    pub struct Reserved {
+        pub path: PathBuf,
+        pub existed: bool,
+    }
+
+    /// 受信ファイルの最終パスを予約する(既定 = Rename)
+    pub fn unique_final(base: &Path, rel: &str, taken: &[PathBuf]) -> Option<PathBuf> {
+        unique_final_with(base, rel, taken, Collision::Rename).map(|r| r.path)
+    }
+
+    /// 衝突ポリシーを指定して最終パスを予約する。実体はまだ作らない。
     /// taken には同じバッチで既に予約済みのパスを渡す(一時ファイルだから
     /// ディスク上の存在確認だけでは重なりを検出できない)
-    pub fn unique_final(base: &Path, rel: &str, taken: &[PathBuf]) -> Option<PathBuf> {
+    pub fn unique_final_with(
+        base: &Path,
+        rel: &str,
+        taken: &[PathBuf],
+        policy: Collision,
+    ) -> Option<Reserved> {
         let rel_path = Path::new(rel);
         let name = rel_path.file_name()?.to_str()?.to_string();
         let parent_rel = rel_path.parent()?;
@@ -307,6 +439,17 @@
             base.join(parent_rel)
         };
         std::fs::create_dir_all(&parent).ok()?;
+        let desired = parent.join(&name);
+        if policy != Collision::Rename {
+            // 同じバッチ内で同名が来た場合は、転送中のファイル同士を潰さないよう
+            // 退避する(ディスク上の既存だけを対象に Overwrite/Skip を効かせる)
+            if !taken.contains(&desired) {
+                return Some(Reserved {
+                    existed: desired.exists(),
+                    path: desired,
+                });
+            }
+        }
         let p = Path::new(&name);
         let stem = p
             .file_stem()
@@ -319,7 +462,10 @@
         for i in 0..1000u32 {
             let cand = candidate(&parent, &stem, &ext, i);
             if !cand.exists() && !taken.contains(&cand) {
-                return Some(cand);
+                return Some(Reserved {
+                    path: cand,
+                    existed: false,
+                });
             }
         }
         None
@@ -363,6 +509,143 @@
             }
         }
         Err(last_err.unwrap_or_else(|| std::io::Error::other("publish: no free name")))
+    }
+
+    /// 衝突ポリシーを指定して公開する。Overwrite は既存を置き換える
+    /// (std の rename は両 OS で置換できる。掴まれている等で失敗したら
+    /// 受信フォルダ内に限り、消してからやり直す)
+    pub fn publish_with(
+        temp: &Path,
+        desired: &Path,
+        policy: Collision,
+    ) -> std::io::Result<PathBuf> {
+        match policy {
+            Collision::Overwrite => match std::fs::rename(temp, desired) {
+                Ok(()) => Ok(desired.to_path_buf()),
+                Err(first) => {
+                    if desired.exists() && std::fs::remove_file(desired).is_ok() {
+                        std::fs::rename(temp, desired)
+                            .map(|_| desired.to_path_buf())
+                            .map_err(|_| first)
+                    } else {
+                        Err(first)
+                    }
+                }
+            },
+            // Skip は受信側が公開前に捨てるため、ここへは来ない想定。
+            // 来たら安全側(退避名)で公開する
+            Collision::Skip | Collision::Rename => publish(temp, desired),
+        }
+    }
+
+    // ---------- 中断した転送の続き(版 18) ----------
+
+    /// 部分ファイルの置き場(受信フォルダ内の隠し)。最終名には見せない
+    pub const RESUME_DIR: &str = ".knit-resume";
+
+    /// 部分ファイルの識別子。相対名・宣言サイズ・更新日時が一致するものだけを
+    /// 同じ転送の続きとみなす(同名でも別のファイルを混ぜない)
+    pub fn resume_key(rel: &str, size: u64, mtime: u64) -> String {
+        use blake2::Digest;
+        let mut h = blake2::Blake2s256::new();
+        h.update(b"knit-resume-v1\0");
+        h.update(rel.as_bytes());
+        h.update(size.to_le_bytes());
+        h.update(mtime.to_le_bytes());
+        crate::update::to_hex(&h.finalize())
+    }
+
+    fn resume_path(base: &Path, rel: &str, size: u64, mtime: u64) -> PathBuf {
+        base.join(RESUME_DIR)
+            .join(format!("{}.part", resume_key(rel, size, mtime)))
+    }
+
+    /// 受信途中の実体を部分ファイルとして退避する(最終名には見せない)。
+    /// 既に置き場にある実体はそのまま残す
+    pub fn retain_partial(
+        base: &Path,
+        rel: &str,
+        size: u64,
+        mtime: u64,
+        tmp: &Path,
+    ) -> Option<PathBuf> {
+        let dest = resume_path(base, rel, size, mtime);
+        if tmp == dest {
+            return Some(dest);
+        }
+        std::fs::create_dir_all(dest.parent()?).ok()?;
+        if std::fs::rename(tmp, &dest).is_err() {
+            std::fs::copy(tmp, &dest).ok()?;
+            let _ = std::fs::remove_file(tmp);
+        }
+        Some(dest)
+    }
+
+    /// 続きから受けられる部分を探す。戻り値は (部分のパス, 受信済みバイト数)。
+    /// 宣言サイズ以上の実体は「完了直前で止まった残骸」なので続きに使わない
+    pub fn find_partial(base: &Path, rel: &str, size: u64, mtime: u64) -> Option<(PathBuf, u64)> {
+        let path = resume_path(base, rel, size, mtime);
+        let len = std::fs::metadata(&path).ok()?.len();
+        if len == 0 {
+            return None;
+        }
+        if len >= size {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+        Some((path, len))
+    }
+
+    /// 先頭 offset バイトのハッシュ(送信側と受信側の照合用)。
+    /// 実体が offset より短い・読めない場合は None(続きとして使わない)
+    pub fn prefix_hash(path: &Path, offset: u64) -> Option<[u8; 32]> {
+        use blake2::Digest;
+        use std::io::Read;
+        let mut f = std::fs::File::open(path).ok()?;
+        let mut h = blake2::Blake2s256::new();
+        let mut left = offset;
+        let mut buf = [0u8; 64 * 1024];
+        while left > 0 {
+            let want = left.min(buf.len() as u64) as usize;
+            let n = f.read(&mut buf[..want]).ok()?;
+            if n == 0 {
+                return None;
+            }
+            h.update(&buf[..n]);
+            left -= n as u64;
+        }
+        Some(h.finalize().into())
+    }
+
+    /// 部分を捨てる(明示中止・最初からのやり直しのとき)
+    pub fn discard_partial(base: &Path, rel: &str, size: u64, mtime: u64) {
+        let _ = std::fs::remove_file(resume_path(base, rel, size, mtime));
+    }
+
+    /// 期限切れ(更新から ttl 秒以上)の部分を掃除する。起動時に呼ぶ。
+    /// 戻り値は消した件数
+    pub fn purge_expired_partials(base: &Path, ttl_secs: u64) -> usize {
+        let dir = base.join(RESUME_DIR);
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            return 0;
+        };
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else {
+                continue;
+            };
+            let age = md
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(u64::MAX);
+            if age >= ttl_secs && std::fs::remove_file(e.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// 相手のファイルの更新日時を復元する(秒精度。失敗しても転送成否には影響しない)。
@@ -484,6 +767,58 @@ mod tests {
     }
 }
 
+/// 中断した転送の続き(部分ファイル置き場)の単体テスト
+#[cfg(test)]
+mod resume_store_tests {
+    use super::{find_partial, prefix_hash, purge_expired_partials, retain_partial, resume_key};
+
+    fn scratch() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "knit-resume-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 同じ相対名でもサイズ・更新日時が違えば別の部分として扱う
+    #[test]
+    fn key_separates_name_size_and_mtime() {
+        let a = resume_key("資料/a.bin", 100, 1);
+        assert_eq!(a, resume_key("資料/a.bin", 100, 1), "決定的");
+        assert_ne!(a, resume_key("資料/a.bin", 101, 1));
+        assert_ne!(a, resume_key("資料/a.bin", 100, 2));
+        assert_ne!(a, resume_key("資料/b.bin", 100, 1));
+    }
+
+    /// 退避した部分の受信済みバイト数と前置ハッシュが一致し、期限つきで消える
+    #[test]
+    fn retain_find_prefix_and_purge_round_trip() {
+        let dir = scratch();
+        let tmp = dir.join(".knit-0000000000000001.part");
+        std::fs::write(&tmp, b"0123456789").unwrap();
+        let kept = retain_partial(&dir, "a.bin", 100, 5, &tmp).unwrap();
+        assert!(kept.exists() && !tmp.exists());
+        let (path, have) = find_partial(&dir, "a.bin", 100, 5).unwrap();
+        assert_eq!(have, 10);
+        assert_eq!(std::fs::read(&path).unwrap(), b"0123456789");
+        // 前置ハッシュは先頭 4 バイトの BLAKE2s と一致し、同じ入力で決定的
+        let h = prefix_hash(&path, 4).unwrap();
+        assert_eq!(Some(h), prefix_hash(&path, 4));
+        assert!(prefix_hash(&path, 999).is_none(), "実体より長い前置は不可");
+        // サイズ以上になった部分は完了直前の残骸として捨てる
+        std::fs::write(&path, vec![0u8; 100]).unwrap();
+        assert!(find_partial(&dir, "a.bin", 100, 5).is_none());
+        // ttl 0 は全部掃除(期限切れの検証)
+        std::fs::write(dir.join(super::RESUME_DIR).join("x.part"), b"x").unwrap();
+        assert_eq!(purge_expired_partials(&dir, 0), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 /// 起動時の一時ファイル掃除(sweep_temp_files)の単体テスト
 #[cfg(test)]
 mod sweep_temp_tests {
@@ -569,6 +904,37 @@ mod sweep_temp_tests {
         std::fs::write(&real, b"leftover").unwrap();
         assert_eq!(sweep_temp_files(&dir), 1);
         assert!(!real.exists(), "本物の一時ファイルは消える");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ネストした一時ファイルも消える(フォルダ受信の途中で落ちた場合)
+    #[test]
+    fn sweeps_temp_files_inside_nested_folders() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("資料/sub")).unwrap();
+        let part = dir.join("資料/sub/.knit-0123456789abcdef.part");
+        std::fs::write(&part, b"x").unwrap();
+        let keep = dir.join("資料/sub/keep.bin");
+        std::fs::write(&keep, b"k").unwrap();
+        assert_eq!(sweep_temp_files(&dir), 1, "ネストも数える");
+        assert!(!part.exists(), "ネストした残骸は消える");
+        assert!(keep.exists(), "受信済みは残る");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 中断時に作ったディレクトリを深い順に片付ける(中身があるものは残す)
+    #[test]
+    fn empty_dirs_are_removed_from_the_deepest_and_kept_when_filled() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/keep.bin"), b"k").unwrap();
+        // 実際の記録は浅い順に全階層を含む(a と a/b と a/b/c)
+        let mut dirs = vec![dir.join("a"), dir.join("a/b"), dir.join("a/b/c"), dir.join("d")];
+        super::remove_empty_dirs(&mut dirs);
+        assert!(!dir.join("a").exists(), "空の連鎖は根元まで消える");
+        assert!(dir.join("d").exists(), "中身のあるディレクトリは残る");
+        assert_eq!(dirs.len(), 1, "残ったものだけを保持する");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

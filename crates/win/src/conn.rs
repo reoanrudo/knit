@@ -570,3 +570,43 @@ fn speaker_disconnect_if_audio_down() {
         audio::speaker_disconnect();
     }
 }
+
+#[cfg(test)]
+mod peer_display_tests {
+    use super::{peer_display, PEER_NAME};
+
+    fn set_name(name: &str) {
+        *PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()) = name.to_string();
+    }
+
+    fn name_now() -> String {
+        PEER_NAME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// テスト前の相手名へ必ず戻す(後続テストへ状態を漏らさない)
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_name(&self.0);
+        }
+    }
+
+    /// 名前が未受信・空白だけなら汎用の「端末」へ落とし、前後の空白は落とす。
+    /// 通知や再接続メッセージに空の名前を出さないための境界
+    #[test]
+    fn blank_names_fall_back_to_the_generic_label() {
+        let _restore = Restore(name_now());
+        set_name("");
+        assert_eq!(peer_display(), "端末");
+        set_name("   \n");
+        assert_eq!(peer_display(), "端末");
+        set_name("  MacBook Pro  ");
+        assert_eq!(peer_display(), "MacBook Pro");
+        // 実名が「端末」でもそのまま(空欄ではないので汎用名へ落とさない)
+        set_name("端末");
+        assert_eq!(peer_display(), "端末");
+    }
+}

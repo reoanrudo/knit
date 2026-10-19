@@ -33,19 +33,6 @@
         digest.iter().take(4).map(|b| format!("{b:02X}")).collect()
     }
 
-    /// 設定画面の暗号化の行の文言。暗号化は常時ONのためトグルは無く、状態を
-    /// 読み取れる1行として出す(フィンガープリント付きなら「鍵の略号: XXXXXXXX」を
-    /// 併記し、相手側画面との見比せ方を1文で添える)。
-    /// 両OSで同じ文言にするため common 側で組立てる
-    pub fn encryption_line(fingerprint: Option<&str>) -> String {
-        match fingerprint {
-            Some(fp) => format!(
-                "通信は常時暗号化・相互認証されています(設定不要)・鍵の略号: {fp}(相手側の設定画面と同じ文字列なら正しく対になっています)"
-            ),
-            None => "通信は常時暗号化・相互認証されています(設定不要)".into(),
-        }
-    }
-
     fn invalid(e: impl std::fmt::Display) -> io::Error {
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     }
@@ -235,22 +222,88 @@
         split(s, hs)
     }
 
-    /// 待ち受けた側(TCP サーバ)のハンドシェイク。トークンが違えばここで失敗する
-    pub fn accept(mut s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
-        let key = psk(token);
-        let mut hs = builder(label, &key)?.build_responder().map_err(invalid)?;
-        let mut buf = vec![0u8; MAX_MSG];
+    /// 待受側の資格の束。従来の単一トークン運用も、台帳からの複数鍵運用も
+    /// この型で表す。中身(鍵の並び・legacy の扱い)は非公開で、空では作れない
+    /// (accept が「1本以上を試る」ことを型で保証する。鍵ゼロでの待受=
+    /// 全拒否の見落としを防ぐ)
+    #[derive(Clone)]
+    pub struct ServerKeys {
+        entries: Vec<(Who, [u8; 32])>,
+    }
+
+    impl ServerKeys {
+        /// 単一トークン(従来運用・KNIT_TOKEN・Windows 側・テスト)
+        pub fn single(token: &str) -> Self {
+            Self {
+                entries: vec![(Who::Legacy, psk(token))],
+            }
+        }
+
+        /// 台帳運用(Mac)。legacy を受付中なら master の鍵を先頭に置き、
+        /// 端末別トークンの鍵を加える。legacy 失効かつ登録0台は Err
+        /// (待ち受けられる鍵が無い=待受を始められない)
+        pub fn legacy_plus(
+            master: &str,
+            legacy_accepts: bool,
+            devices: &[(DeviceKeyId, String)],
+        ) -> io::Result<Self> {
+            let mut entries = Vec::new();
+            if legacy_accepts {
+                entries.push((Who::Legacy, psk(master)));
+            }
+            for (id, token) in devices {
+                entries.push((Who::Device(id.clone()), psk(token)));
+            }
+            if entries.is_empty() {
+                return Err(io::Error::other(
+                    "待ち受けできる鍵がありません(旧形式を閉じた状態で登録済み端末もありません)",
+                ));
+            }
+            Ok(Self { entries })
+        }
+
+        /// 束の鍵数(テストと監視用)
+        pub fn len(&self) -> usize {
+            self.entries.len()
+        }
+    }
+
+    /// 待ち受けた側(TCP サーバ)のハンドシェイク。単一トークン向けの簡易形
+    /// (認証結果は暗黙に Legacy)。複数鍵と認証結果が必要な側は accept_as
+    pub fn accept(s: TcpStream, token: &str, label: &[u8]) -> io::Result<(Reader, Writer)> {
+        let (r, w, _) = accept_as(s, &ServerKeys::single(token), label)?;
+        Ok((r, w))
+    }
+
+    /// 待ち受けた側のハンドシェイク(複数鍵)。最初の Noise レコードを1回だけ
+    /// 読み、束の鍵ごとに responder を作り直して試す(TCP 往復は単一鍵の現行と
+    /// 同一で、クライアント側からは区別できない)。どの鍵で通ったかを Who で
+    /// 返す。全滅なら現行どおり PermissionDenied。線形探索(先頭=legacy から)の
+    /// ため「どの鍵で当たったか」が処理時間に漏れる素地はある(設計書の弱点として
+    /// 明記。cap と FailThrottle で軽減し、除去はしない)
+    pub fn accept_as(
+        mut s: TcpStream,
+        keys: &ServerKeys,
+        label: &[u8],
+    ) -> io::Result<(Reader, Writer, Who)> {
         let mut rec = Vec::new();
         read_rec(&mut s, &mut rec)?;
-        hs.read_message(&rec, &mut buf).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "handshake failed (token mismatch?)",
-            )
-        })?;
-        let n = hs.write_message(&[], &mut buf).map_err(invalid)?;
-        write_rec(&mut s, &buf[..n])?;
-        split(s, hs)
+        let mut buf = vec![0u8; MAX_MSG];
+        for (who, key) in &keys.entries {
+            let mut cand = builder(label, key)?.build_responder().map_err(invalid)?;
+            // 失敗した responder は捨てて次の鍵で作り直す(read_message は
+            // レコードを借用渡しで読むため、同じレコードを再試行できる)
+            if cand.read_message(&rec, &mut buf).is_ok() {
+                let n = cand.write_message(&[], &mut buf).map_err(invalid)?;
+                write_rec(&mut s, &buf[..n])?;
+                let (r, w) = split(s, cand)?;
+                return Ok((r, w, who.clone()));
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "handshake failed (token mismatch?)",
+        ))
     }
 
     /// 待受ループの連続失敗スロットル。認証に失敗し続ける接続が高頻度で
@@ -285,13 +338,52 @@
         }
     }
 
+    /// 登録台帳の1端末を指す鍵ID(OS 乱数由来のhex32)。newtype であり
+    /// `parse` 以外の経路では作らせない(境界で検証し、内部では信頼する)。
+    /// 台帳ファイルへの保存・復元もこの形だけで行う
+    #[derive(Clone, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
+    pub struct DeviceKeyId(String);
+
+    impl DeviceKeyId {
+        /// hex32(16バイトの16進)だけを通す。台帳の壊れた行はこれで弾く。
+        /// 大文字は小文字へ正規化する
+        pub fn parse(s: &str) -> Option<Self> {
+            if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Some(Self(s.to_ascii_lowercase()))
+            } else {
+                None
+            }
+        }
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+        /// 新規採番(OS の安全な乱数から128bit)。登録ごとに新規で、使い回ししない
+        pub fn generate() -> io::Result<Self> {
+            let full = crate::credentials::generate()?;
+            Ok(Self(full[..32].to_string()))
+        }
+    }
+
+    impl std::fmt::Display for DeviceKeyId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    /// accept が「どの鍵で認証したか」を返す。Legacy は従来の単一共有トークン
+    /// (KNIT_TOKEN 運用・移行中の旧端末)。Device は端末別導出鍵。呼び出し側は
+    /// これを PeerEntry 等へ運ぶ(認証済み主体。hello の id は表示名の紐付け用で
+    /// 認証の根拠にはしない)
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub enum Who {
+        Legacy,
+        Device(DeviceKeyId),
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
 
-        /// フィンガープリントは同じ鍵で同じ値・異なる鍵で異なる値。トークンの
-        /// 本文を含まない(鍵を画面に出さない前提の確認手段だから)
-        #[test]
         /// レビュー指摘: 短書き(部分書き込み)でもヘッダ+本体が順に書き切られること。
         /// 1バイトずつしか書けない書き込み関数で、ヘッダを書き終えた後に本体が
         /// 残る状況を作る(以前は空のヘッダ側を渡して 0 を返し、接続を切っていた)
@@ -318,6 +410,9 @@
             assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
         }
 
+        /// フィンガープリントは同じ鍵で同じ値・異なる鍵で異なる値。トークンの
+        /// 本文を含まない(鍵を画面に出さない前提の確認手段だから)
+        #[test]
         fn fingerprint_is_stable_distinct_and_hides_the_token() {
             let token = "7f".repeat(32);
             let a = fingerprint(&token);
@@ -330,15 +425,117 @@
             assert_ne!(a, fingerprint(&token.to_ascii_uppercase()));
         }
 
-        /// 暗号化の行の文言: フィンガープリントの有無で「鍵の略号:」の併記が変わるだけ
+        // ── 複数鍵の待受(端末別認証)のループバックテスト ──
+        use crate::registry::device_token;
+
+        fn dev_key(n: u8) -> DeviceKeyId {
+            DeviceKeyId::parse(&format!("{:032x}", n as u32 * 0x01010101)).unwrap()
+        }
+
+        /// 1組の accept_as×connect を試し、accept 側の認証結果(Who)を返す。
+        /// connect 側の成否は accept 側と一致する(失敗時はどちらも Err)
+        fn who_among(keys: &ServerKeys, token: &str) -> io::Result<Who> {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let keys = keys.clone();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = l.accept().unwrap();
+                accept_as(stream, &keys, b"knit-main").map(|(_, _, who)| who)
+            });
+            let client = std::net::TcpStream::connect(addr).unwrap();
+            let _ = connect(client, token, b"knit-main");
+            server.join().unwrap()
+        }
+
+        fn bundle(legacy: bool, devs: &[u8]) -> io::Result<ServerKeys> {
+            let master = "5f".repeat(32);
+            let devices: Vec<(DeviceKeyId, String)> = devs
+                .iter()
+                .map(|n| {
+                    let id = dev_key(*n);
+                    let tok = device_token(&master, &id);
+                    (id, tok)
+                })
+                .collect();
+            ServerKeys::legacy_plus(&master, legacy, &devices)
+        }
+
+        fn token_of(n: u8) -> String {
+            device_token(&"5f".repeat(32), &dev_key(n))
+        }
+
+        /// 束のどの鍵で接続しても、その鍵の Who が返る(legacy・端末別の混在)
         #[test]
-        fn encryption_line_appends_fingerprint_only_when_present() {
-            let base = "通信は常時暗号化・相互認証されています(設定不要)";
-            assert_eq!(encryption_line(None), base);
-            assert_eq!(
-                encryption_line(Some("AB12CD34")),
-                format!("{base}・鍵の略号: AB12CD34(相手側の設定画面と同じ文字列なら正しく対になっています)")
-            );
+        fn multi_key_accept_tells_who_connected() {
+            let keys = bundle(true, &[1, 2]).unwrap();
+            assert_eq!(keys.len(), 3, "legacy + 2台");
+            assert_eq!(who_among(&keys, &"5f".repeat(32)).unwrap(), Who::Legacy);
+            assert_eq!(who_among(&keys, &token_of(1)).unwrap(), Who::Device(dev_key(1)));
+            assert_eq!(who_among(&keys, &token_of(2)).unwrap(), Who::Device(dev_key(2)));
+        }
+
+        /// 束に無いトークンは従来どおり PermissionDenied(成否以外の差は出ない)
+        #[test]
+        fn key_miss_is_permission_denied_for_every_key() {
+            let keys = bundle(true, &[1, 2]).unwrap();
+            let err = who_among(&keys, &"aa".repeat(32)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
+
+        /// 鍵が1本も無い束は作れない(待受開始時の全拒否見落としを防ぐ)
+        #[test]
+        fn empty_server_keys_are_rejected_at_construction() {
+            assert!(bundle(false, &[]).is_err());
+            // legacy だけ・端末だけは作れる
+            assert!(bundle(true, &[]).is_ok());
+            assert!(bundle(false, &[1]).is_ok());
+        }
+
+        /// 従来形 accept(単一トークン)は Legacy として認識される
+        #[test]
+        fn single_key_accept_keeps_legacy_identity() {
+            let keys = ServerKeys::single(&"7e".repeat(32));
+            assert_eq!(who_among(&keys, &"7e".repeat(32)).unwrap(), Who::Legacy);
+        }
+
+        /// 経路ラベルの取り違えは複数鍵でも弾かれる
+        #[test]
+        fn label_mismatch_fails_multi_key_too() {
+            let keys = bundle(true, &[1]).unwrap();
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = l.accept().unwrap();
+                accept_as(stream, &keys, b"knit-main")
+            });
+            let client = std::net::TcpStream::connect(addr).unwrap();
+            let wrong_label = connect(client, &token_of(1), b"knit-audio");
+            assert!(wrong_label.is_err(), "接続側も失敗する");
+            assert!(server.join().unwrap().is_err(), "accept 側も失敗する");
+        }
+
+        /// 失効(束からの取り下げ)は他端末に影響しない(AC2 の secure 層の核)
+        #[test]
+        fn removed_key_is_denied_while_others_stay() {
+            let with_both = bundle(true, &[1, 2]).unwrap();
+            assert!(who_among(&with_both, &token_of(1)).is_ok());
+            let without_1 = bundle(true, &[2]).unwrap();
+            assert!(who_among(&without_1, &token_of(1)).is_err(), "取り下げた鍵は拒否");
+            assert!(who_among(&without_1, &token_of(2)).is_ok(), "他端末は無影響");
+            assert_eq!(who_among(&without_1, &"5f".repeat(32)).unwrap(), Who::Legacy, "legacy も無影響");
+        }
+
+        /// 鍵数上限(64)でも最後尾の鍵で接続が完結する(線形探索の回帰監視。
+        /// しきい値は debug ビルドを見込んだ甘めの上限で、比例関係は主張しない)
+        #[test]
+        fn accept_stays_fast_at_the_key_cap() {
+            let devs: Vec<u8> = (0..crate::registry::MAX_DEVICES as u8 - 1).collect();
+            let keys = bundle(true, &devs).unwrap();
+            assert_eq!(keys.len(), crate::registry::MAX_DEVICES);
+            let start = std::time::Instant::now();
+            let who = who_among(&keys, &token_of(devs[devs.len() - 1])).unwrap();
+            assert_eq!(who, Who::Device(dev_key(devs[devs.len() - 1])));
+            assert!(start.elapsed() < std::time::Duration::from_secs(2), "上限鍵数でも即座に完了する");
         }
     }
 

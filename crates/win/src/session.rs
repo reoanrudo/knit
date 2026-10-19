@@ -431,6 +431,21 @@ pub(crate) fn session(
                 // Mac 側の転送受理結果。送信スレッドの通知分岐に使う
                 crate::xfer::note_xfer_ack(accepted, rejected, scope);
             }
+            // 版 18: 送信側(Mac)からの再開位置の問い合わせに、
+            // 保持している部分ファイルから応答する。先頭ハッシュの計算は
+            // 部分が大きいほど時間がかかるため、本線ループ(入力の注入を含む)
+            // を止めないよう別スレッドで。応答はトークンで対応付ける
+            Msg::XferResumeQuery { token, items } => {
+                let tx = wtx.clone();
+                std::thread::spawn(move || {
+                    let dir = crate::receive_dir();
+                    let items = knit_common::bulk::resume_positions(&dir, &items);
+                    let _ = tx.send(encode(&Msg::XferResumeState { token, items }));
+                });
+            }
+            Msg::XferResumeState { token, items } => {
+                knit_common::bulk::note_resume_state(token, items);
+            }
             Msg::Prefs { json } => {
                 if json.len() <= 16 * 1024 {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
@@ -841,7 +856,7 @@ fn maybe_notify_return(
 
 #[cfg(test)]
 mod return_edge_tests {
-    use super::{return_edge_hit, return_edge_position};
+    use super::{return_edge_dist, return_edge_hit, return_edge_position};
 
     #[test]
     fn return_is_gated_by_target_before_cleanup_for_every_side() {
@@ -889,5 +904,30 @@ mod return_edge_tests {
         // Mac は下 → Windows の上端
         assert!(return_edge_hit(3, 400, 0, 1920, 1080));
         assert!(!return_edge_hit(3, 400, 1, 1920, 1080), "1px 手前では戻らない");
+    }
+
+    /// 「入ってすぐ戻る」を防ぐ猶予(24px)の基準: 距離は辺の上だけ 0 になり、
+    /// 内側へ 1px 動くごとに 1 増える(辺ごとの向きを固定する)
+    #[test]
+    fn edge_distance_is_zero_only_on_the_edge_pixel() {
+        let (w, h) = (1920, 1080);
+        // 既定 = Mac は右 → Windows の左端(斜め配置の 4/5 も同じ水平辺)
+        for side in [0, 4, 5] {
+            assert_eq!(return_edge_dist(side, 0, 500, w, h), 0, "side={side}");
+            assert_eq!(return_edge_dist(side, 1, 500, w, h), 1);
+            assert_eq!(return_edge_dist(side, 24, 500, w, h), 24);
+        }
+        // Mac は左(左上/左下含む)→ Windows の右端
+        for side in [1, 6, 7] {
+            assert_eq!(return_edge_dist(side, w - 1, 500, w, h), 0, "side={side}");
+            assert_eq!(return_edge_dist(side, w - 25, 500, w, h), 24);
+            assert_eq!(return_edge_dist(side, w - 26, 500, w, h), 25);
+        }
+        // Mac は上 → Windows の下端
+        assert_eq!(return_edge_dist(2, 500, h - 1, w, h), 0);
+        assert_eq!(return_edge_dist(2, 500, h - 25, w, h), 24);
+        // Mac は下 → Windows の上端
+        assert_eq!(return_edge_dist(3, 500, 0, w, h), 0);
+        assert_eq!(return_edge_dist(3, 500, 24, w, h), 24);
     }
 }

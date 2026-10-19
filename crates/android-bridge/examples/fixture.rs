@@ -12,7 +12,12 @@ use std::{
 };
 fn main() {
     let token = "c".repeat(64);
-    let invitation = pairing::Invitation::open(token.clone(), 34900).unwrap();
+    // 検証用の一時台帳(端末別トークンの採番に必要。実データ置き場は触らない)
+    let dir = std::env::temp_dir().join(format!("knit-fixture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let registry = Arc::new(knit_common::registry::DeviceRegistry::open(&dir, &token).unwrap());
+    let invitation = pairing::Invitation::open(registry, 34900).unwrap();
     println!("TEST_CODE={}", invitation.code);
     std::thread::spawn(|| {
         let l = TcpListener::bind("127.0.0.1:34902").unwrap();

@@ -343,11 +343,7 @@ fn main() {
 
     println!("[info] knit-win {BUILD_ID}");
     // 起動時に受信フォルダと履歴を用意する(通知のパスが必ず有効になる)
-    let recv_dir = std::env::var_os("USERPROFILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default()
-        .join("Downloads")
-        .join("Knit");
+    let recv_dir = receive_dir();
     let _ = std::fs::create_dir_all(&recv_dir);
     // 前回終了時に残った受信中ファイルの一時実体(.knit-*.part)を掃除する
     //(exit は Receiver の Drop を飛ばすための保険。Mac 側と同じ起動時掃除)
@@ -438,6 +434,11 @@ fn main() {
             }
         }
     };
+    // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
+    let purged = knit_common::files::purge_expired_partials(&receive_dir(), 7 * 24 * 3600);
+    if purged > 0 {
+        eprintln!("[xfer] 期限切れの部分ファイルを {purged} 件掃除しました");
+    }
     let port: u16 = args
         .iter()
         .position(|a| a == "--port")
@@ -486,6 +487,13 @@ fn main() {
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
+    // 同名衝突の扱い(既定 rename)。preferences::restore が保存値(初回保存以降は
+    // 必ず collision キーを持つ)を当てた**後**に読むことで環境変数を優先する
+    // (KNIT_ROLE と同じ扱い。.env も見る)
+    if let Some(v) = knit_common::envutil::get("KNIT_COLLISION") {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
+        eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
+    }
     updater::report_last_result();
     updater::cleanup_leftovers();
     updater::start_background();
@@ -507,7 +515,7 @@ fn main() {
 
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
-        token: token.clone(),
+        credential: bulk::EndpointCred::Single(token.clone()),
         dir: receive_dir(),
         on_event: win_on_bulk,
         log: |s| println!("{s}"),
@@ -537,10 +545,11 @@ fn main() {
         });
         let tk = token.clone();
         std::thread::spawn(move || {
+            let rooms = move || vec![knit_common::discover::room_id(&tk)];
             if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
                 port + knit_common::discover::PORT_OFFSET,
-                &tk,
+                rooms,
                 knit_common::net::is_allowed,
                 || false,
             ) {

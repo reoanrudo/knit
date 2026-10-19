@@ -25,6 +25,7 @@ mod peers;
 mod screen_settings;
 mod session;
 mod state;
+mod supervise;
 mod tap;
 mod trackpad;
 mod updater;
@@ -274,6 +275,152 @@ static ROLE_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 static ROLE_SCREEN: std::sync::OnceLock<(f64, f64)> = std::sync::OnceLock::new();
 static ROLE_CLIENT_HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// 端末別資格の登録台帳(全経路の待受鍵と宛先別トークンの唯一の source of truth)。
+/// master は起動時のトークン解決結果で固定(env を変えてもプロセス内では同じ)
+static REGISTRY: std::sync::OnceLock<std::sync::Arc<knit_common::registry::DeviceRegistry>> =
+    std::sync::OnceLock::new();
+
+/// 台帳を開く(最初の呼び出しで固定。以後は既存を返す)。開けなければ
+/// None = 従来の単一トークン動作へ戻す(接続は止めない)
+pub(crate) fn ensure_registry(
+    master: &str,
+) -> Option<&'static std::sync::Arc<knit_common::registry::DeviceRegistry>> {
+    if REGISTRY.get().is_none() {
+        match knit_common::envutil::data_dir() {
+            Some(dir) => match knit_common::registry::DeviceRegistry::open(&dir, master) {
+                Ok(r) => {
+                    let _ = REGISTRY.set(std::sync::Arc::new(r));
+                }
+                Err(e) => eprintln!("[registry] 台帳を開けません({e})。単一トークンで動作します"),
+            },
+            None => eprintln!("[registry] データ置き場が取れないため台帳は無効です"),
+        }
+    }
+    REGISTRY.get()
+}
+
+/// 開いている台帳(未初期化のうちの呼び出しは None)
+pub(crate) fn registry() -> Option<&'static std::sync::Arc<knit_common::registry::DeviceRegistry>> {
+    REGISTRY.get()
+}
+
+/// --registry: 台帳の閲覧と失効(M2 の操作経路。設定 UI は後続の増分で載せる)
+fn registry_cli(args: &[String]) {
+    let master = if let Some(t) = envutil::get("KNIT_TOKEN").filter(|t| t.len() >= 32) {
+        t
+    } else {
+        match knit_common::credentials::load() {
+            Ok(Some(t)) => t,
+            _ => {
+                eprintln!("[registry] 接続キーがありません。先に初回登録を済ませてください");
+                std::process::exit(2);
+            }
+        }
+    };
+    let Some(reg) = ensure_registry(&master) else {
+        eprintln!("[registry] 台帳を開けませんでした");
+        std::process::exit(2);
+    };
+    let at = args.iter().position(|a| a == "--registry");
+    let cmd = at.and_then(|i| args.get(i + 1)).map(String::as_str);
+    match cmd {
+        Some("list") => {
+            if reg.legacy_accepts() {
+                println!("旧形式(共通キー)での接続: 受け付けています(--registry revoke-legacy で閉じられます)");
+            } else {
+                println!("旧形式(共通キー)での接続: 拒否中");
+            }
+            let devices = reg.devices();
+            if devices.is_empty() {
+                println!("登録済みの端末: ありません");
+                return;
+            }
+            println!("登録済みの端末: {}台", devices.len());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for d in devices {
+                let seen = d
+                    .last_seen
+                    .map(|t| format!("最終接続 {}秒前", now.saturating_sub(t)))
+                    .unwrap_or_else(|| "未接続".into());
+                println!("  {}  {}  略号 {}  {}", d.key_id, d.name, d.fp, seen);
+            }
+        }
+        Some("revoke") => {
+            let key = at
+                .and_then(|i| args.get(i + 2))
+                .and_then(|s| knit_common::secure::DeviceKeyId::parse(s));
+            let Some(key) = key else {
+                eprintln!("使い方: --registry revoke <key_id>(--registry list で確認)");
+                std::process::exit(2);
+            };
+            match conn::registry_revoke(reg, &key) {
+                Ok(knit_common::registry::RevokeOutcome::Revoked) => {
+                    println!("この端末からの接続を受け付けなくしました(本線・音声・ファイルの全経路)。");
+                    println!("相手の端末に保存された情報は消えません。以後の接続試行はすべて拒否されます。");
+                }
+                Ok(knit_common::registry::RevokeOutcome::NotFound) => {
+                    println!("この端末は既に登録がありません(何も変更していません)");
+                }
+                Err(e) => {
+                    eprintln!("[registry] 失効に失敗: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("prune") => {
+            let days: u64 = at
+                .and_then(|i| args.get(i + 2))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            match reg.prune_unseen(days.saturating_mul(86_400), now) {
+                Ok(0) => println!("未接続の古い端末はありません(既定30日。日数は --registry prune <日数>)"),
+                Ok(n) => println!("未接続の古い端末を {n} 台削除しました"),
+                Err(e) => {
+                    eprintln!("[registry] 掃除に失敗: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("revoke-legacy") => {
+            if let Err(e) = reg.revoke_legacy() {
+                eprintln!("[registry] 旧形式の閉鎖に失敗: {e}");
+                std::process::exit(2);
+            }
+            println!("旧形式(共通キー)での接続を受け付けなくなりました。端末別トークンの端末は影響しません。");
+        }
+        _ => {
+            eprintln!("使い方: --registry list | revoke <key_id> | revoke-legacy | prune [日数]");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// bulk 待受の鍵束(台帳の最新状態。台帳が無ければ従来の単一トークン)
+fn bulk_accept_keys() -> std::io::Result<knit_common::secure::ServerKeys> {
+    match registry() {
+        Some(r) => r.accept_keys(),
+        None => Ok(knit_common::secure::ServerKeys::single(
+            ROLE_TOKEN.get().map(String::as_str).unwrap_or(""),
+        )),
+    }
+}
+
+/// bulk 接続側のトークン。宛先は認証済みの主体(Who)から解決する
+/// (自己申告の hello id は根拠にしない)。Legacy は master にフォールバック
+fn bulk_outgoing_token() -> String {
+    match (registry(), crate::conn::active_peer_auth()) {
+        (Some(r), Some(who)) => r.token_for(&who),
+        _ => ROLE_TOKEN.get().cloned().unwrap_or_default(),
+    }
+}
+
 /// 役割に応じた接続系スレッドを起こす(起動時=世代0 と役割切替の両方から呼ぶ)。
 /// client_role は CLIENT_ROLE(GUI 設定)と環境変数をその場で解決する
 /// (切替では CLIENT_ROLE が既に新役割へ書き換わっている前提)
@@ -286,7 +433,10 @@ fn spawn_role_threads(generation: usize) {
     let (screen_w, screen_h) = ROLE_SCREEN.get().copied().unwrap_or((0.0, 0.0));
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
-        token: token.clone(),
+        credential: bulk::EndpointCred::Multi {
+            accept_keys: bulk_accept_keys,
+            connect_token: bulk_outgoing_token,
+        },
         // EndpointはOnceLock。設定の保存先変更は次回起動から反映する。
         dir: desktop_settings::receive_dir(),
         on_event: mac_on_bulk,
@@ -331,10 +481,17 @@ fn spawn_role_threads(generation: usize) {
         // LAN 自動発見への応答(ブロードキャストを受けるため常に 0.0.0.0 で待つ)
         let tk = token.clone();
         std::thread::spawn(move || {
+            // 応答する部屋: 台帳があれば master + 全端末の部屋(端末別トークンで
+            // seek する相手の発見を壊さない)。無ければ従来どおり master のみ
+            let rooms = move || {
+                crate::registry()
+                    .map(|r| r.discover_rooms())
+                    .unwrap_or_else(|| vec![knit_common::discover::room_id(&tk)])
+            };
             if let Err(e) = knit_common::discover::respond(
                 "0.0.0.0",
                 port + knit_common::discover::PORT_OFFSET,
-                &tk,
+                rooms,
                 knit_common::net::is_allowed,
                 || role_generation_stale(generation),
             ) {
@@ -731,6 +888,13 @@ fn main() {
     if args.iter().any(|a| a == "--update") {
         std::process::exit(updater::run_cli());
     }
+    // 台帳の閲覧・失効も --update と同じ扱い(二重起動防止より前に1回だけ実行)。
+    // 台帳ファイルは実行中の本体が変更を拾う(mtime で再読み込みする)ため、
+    // 本体が起動中でもこの CLI からの失効は効く
+    if args.iter().any(|a| a == "--registry") {
+        registry_cli(&args);
+        return;
+    }
     // 二重起動の防止: 役割の切替などで再起動が重なると、同じ Mac が複数動いて
     // 待ち受けや接続を取り合い、つながるまで数分かかる(実測)。ロックを握れなければ終了する
     let _instance_lock = if instance_lock_required(&args) {
@@ -794,7 +958,7 @@ fn main() {
             id: "pc-preview".into(), name: "DESKTOP-PREVIEW".into(),
             ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
             writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-            alias: None,
+            alias: None, auth: knit_common::secure::Who::Legacy, shut: None,
         });
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
@@ -802,7 +966,7 @@ fn main() {
                 id: "android-preview".into(), name: "TABLET-PREVIEW".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-                alias: None,
+                alias: None, auth: knit_common::secure::Who::Legacy, shut: None,
             });
             *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 1; // タブレットを見ている想定
         }
@@ -898,6 +1062,27 @@ fn main() {
             }
         }
     };
+
+    // 端末別資格の台帳を開く(master=解決済みトークン)。失敗しても起動は続く
+    // 同名衝突の扱い(既定 rename)。環境変数が優先し、保存済みの設定があれば上書きする
+    if let Ok(v) = std::env::var("KNIT_COLLISION") {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
+    }
+    let saved_collision = crate::desktop_settings::snapshot().collision;
+    knit_common::files::set_collision(knit_common::files::Collision::from_label(&saved_collision));
+    eprintln!(
+        "[file] 同名衝突の扱い: {}",
+        knit_common::files::collision().label()
+    );
+    // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
+    let purged = knit_common::files::purge_expired_partials(
+        &desktop_settings::receive_dir(),
+        7 * 24 * 3600,
+    );
+    if purged > 0 {
+        eprintln!("[file] 期限切れの部分ファイルを {purged} 件掃除しました");
+    }
+    ensure_registry(&token);
 
     if !no_gui && !gui::setup::ensure_permission() {
         // 「あとで」で権限確認を中断した時も、再開方法を案内してから終了する
@@ -1072,7 +1257,9 @@ fn main() {
         // 普通で、単調時計基準の pong 監視では気づけないため、即座に張り直す
         let mut wall = std::time::SystemTime::now();
         let mut mono = std::time::Instant::now();
-        loop {
+        // チャネルが閉じる(break)まで走る長命ループ。panic した時だけ
+        // supervisor が記録して再起動する。`rx` などは move で内側へ渡す。
+        supervise::run_supervised("送信", move || loop {
             let (wall_now, mono_now) = (std::time::SystemTime::now(), std::time::Instant::now());
             let slept = slept_duration(
                 wall_now.duration_since(wall).unwrap_or_default(),
@@ -1124,6 +1311,18 @@ fn main() {
             }
             if ping_at.elapsed() >= Duration::from_secs(1) {
                 ping_at = std::time::Instant::now();
+                // M03: 操作権の期限。WIN_MODE 中に pong が5秒途絶えたら、切断(15秒)を
+                // 待たずにカーソルを手元へ戻す。この1秒周期はサーバ役・クライアント役の
+                // どちらでも走る(実際の発火は5〜6秒)
+                if crate::conn::lease_expired(
+                    WIN_MODE.load(Ordering::Relaxed),
+                    CONNECTED.load(Ordering::Relaxed),
+                    LAST_PONG_MS.load(Ordering::Relaxed),
+                    now_ms(),
+                ) {
+                    eprintln!("[conn] 操作権の期限切れ(最後の応答から5秒)。カーソルを手元へ戻します");
+                    crate::tap::leave_win_mode_cursor_unlock(None);
+                }
                 // 15 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う。相手の
                 // 9 秒無通信判定より十分遅くして、ping の間隔揺れで切らないようにする)
@@ -1148,7 +1347,7 @@ fn main() {
                     }
                 }
             }
-        }
+        });
     });
 
     // 画面ロックの連動(1 秒毎)。Mac がロックされたら Windows 操作中でも制御を
@@ -1157,7 +1356,8 @@ fn main() {
     // Msg::Unlock を送る(旧 Windows へ送らない・受け側の設定は Windows 任せ)
     std::thread::spawn(|| {
         let mut was = false;
-        loop {
+        // 1 秒周期のロック連動。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("画面ロック連動", move || loop {
             std::thread::sleep(Duration::from_secs(1));
             let now = screen_locked();
             if now && !was {
@@ -1185,7 +1385,7 @@ fn main() {
                 }
             }
             was = now;
-        }
+        });
     });
 
     // ネットワーク構成の監視(1 秒毎)。既定経路のローカル IP が変わったら
@@ -1198,7 +1398,8 @@ fn main() {
             Some(s.local_addr().ok()?.ip())
         }
         let mut last = route_ip();
-        loop {
+        // 1 秒周期の経路監視。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("ネットワーク監視", move || loop {
             std::thread::sleep(Duration::from_millis(1000));
             let now = route_ip();
             if now == last {
@@ -1217,14 +1418,16 @@ fn main() {
                 drop_stream("ネットワーク構成の変化を検知");
                 BULK_LINK.clear();
             }
-        }
+        });
     });
 
     doctor::start();
 
     // Tailscale 経路の診断(30 秒毎)。直結から中継(DERP)へ落ちると遅延が数倍になり
     // 「カクつき」の原因になるため、切り替わった時だけ通知する
-    std::thread::spawn(|| loop {
+    std::thread::spawn(|| {
+        // 30 秒周期の経路診断。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("Tailscale経路診断", move || loop {
         std::thread::sleep(Duration::from_secs(30));
         let peer = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
         let Some(peer) = peer
@@ -1251,6 +1454,7 @@ fn main() {
                 );
             }
         }
+        });
     });
 
     // 音声受信・再生(Windows→Mac。独立ポート 24901。KNIT_AUDIO=0 で無効)
@@ -1307,7 +1511,8 @@ fn main() {
     }
     std::thread::spawn(|| {
         let mut last_cursor = (0.0f64, 0.0f64);
-        loop {
+        // 1 秒周期の診断出力。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("診断カーソル監視", move || loop {
             std::thread::sleep(Duration::from_secs(1));
             // 設定での切替は即時に効かせる(1 秒の確認は軽いため常駐で問題ない)
             if !DIAG_ENABLED.load(Ordering::Relaxed) {
@@ -1338,7 +1543,7 @@ fn main() {
                 );
                 last_cursor = (p.x, p.y);
             }
-        }
+        });
     });
 
     // 起動時点のクリップボードは送らない(以後の変化だけを切替時に同期する)
@@ -1351,7 +1556,9 @@ fn main() {
         // tap 側の wake_watcher() が unpark で即座に起こすため、検出は遅れない。
         // (16ms 固定では、操作していない間も毎秒 62.5 回起き続けていた)
         file_drag::register_watcher();
-        loop {
+        // 掴み検出の待機ループ。panic した時だけ supervisor が記録して再起動する
+        // (ウォッチャの登録は 1 回だけでよいため、ループの外に置く)。
+        supervise::run_supervised("ファイル掴み検出", move || loop {
             let interval = FILE_DRAG
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1386,7 +1593,7 @@ fn main() {
                     }
                 }
             });
-        }
+        });
     });
 
     // WIN モード中のカーソル固定監視(改善ループ4):
@@ -1395,7 +1602,9 @@ fn main() {
     // 常時 200ms ごとに固定位置へ巻き戻す(境界の同時移動抑止の最終防衛)
     std::thread::spawn(|| {
         let mut fixes: u64 = 0;
-        loop {
+        // 150ms 周期のカーソル固定監視。panic した時だけ supervisor が
+        // 記録して再起動する。
+        supervise::run_supervised("カーソル固定監視", move || loop {
             std::thread::sleep(Duration::from_millis(150));
             // 自己修復: WIN モードでないのにカーソルが隠れたままの異常状態
             // (将来の同種バグや予期しない経路)を検知し、表示を復元する
@@ -1472,7 +1681,7 @@ fn main() {
                     DIAG_WARP_COUNT.store(fixes, Ordering::Relaxed);
                 }
             }
-        }
+        });
     });
 
     // イベントタップ(メインスレッドで RunLoop)
@@ -1857,6 +2066,7 @@ mod boundary_tests {
             side,
             edge_monitor,
             alias: None,
+            auth: knit_common::secure::Who::Legacy, shut: None,
         }
     }
 

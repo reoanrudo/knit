@@ -2,7 +2,7 @@
 use super::*;
 use knit_common::credentials;
 
-unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) -> isize {
+pub(super) unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) -> isize {
     let app = msg0(
         objc_getClass(c"NSApplication".as_ptr()),
         sel(c"sharedApplication"),
@@ -341,7 +341,16 @@ fn show_invitation(token: &str, preview: bool, first: bool) {
             // 招待を開くたびに「登録完了」はやり直し(前回の結果を持ち越さない)
             INVITE_REGISTERED.store(false, Ordering::Relaxed);
             *TERMINATED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let invitation = match Invitation::open(token.into(), port) {
+            // 登録の発行は台帳(端末別トークンの採番)で行う。台帳が開けない場合は
+            // 従来の単一トークン配布に戻せないため、登録の受付自体を止める
+            let registry = match crate::ensure_registry(&token) {
+                Some(r) => r.clone(),
+                None => {
+                    error("端末登録の台帳を開けませんでした。データ置き場の確認後にやり直してください。");
+                    break;
+                }
+            };
+            let invitation = match Invitation::open(registry, port) {
                 Ok(i) => i,
                 Err(_) => {
                     error(
@@ -446,6 +455,13 @@ pub(super) unsafe extern "C" fn reset_registration(_s: ID, _c: SEL, _sender: ID)
     if let Err(e) = credentials::delete() {
         error(&format!("キーチェーンから接続キーを削除できませんでした。\n登録は変更していません。\n{e}"));
         return;
+    }
+    // 登録台帳も空にする(消し忘れると、新しい master で二度と繋がらない
+    // ゴーストエントリが「登録済み N台」として残り、台帳の上限を食う)
+    if let Some(reg) = crate::registry() {
+        if let Err(e) = reg.clear() {
+            eprintln!("[setup] 登録台帳の初期化に失敗しました: {e}(再起動後にやり直します)");
+        }
     }
     let Ok(token) = credentials::generate() else {
         error("接続キーを削除しましたが、新しいキーを作成できませんでした。\nKnitを再起動すると、初回登録の画面からやり直せます。");

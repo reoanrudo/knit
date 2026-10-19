@@ -137,10 +137,12 @@ pub fn accept(id: u64) {
                     .as_ref()
                     .is_some_and(|p| p.id == id)
         };
+        let offsets = crate::xfer::resume_offsets_for(&entries);
         let result = crate::BULK_LINK.send(|w| {
-            bulk::send_entries(
+            bulk::send_entries_from(
                 w,
                 &entries,
+                &offsets,
                 true,
                 Some(id),
                 &mut cancelled,

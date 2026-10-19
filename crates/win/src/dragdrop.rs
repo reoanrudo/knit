@@ -725,10 +725,7 @@ pub fn start(paths: Vec<String>) {
             OleUninitialize();
             return;
         };
-        DRAG_THREAD.store(
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
-            Ordering::Relaxed,
-        );
+        let _drag_guard = DragThreadGuard::arm();
         let ds = Box::into_raw(Box::new(DataSource {
             vtbl: &DATA_VTBL,
             paths: paths.clone(),
@@ -744,7 +741,6 @@ pub fn start(paths: Vec<String>) {
         );
         let mut effect: u32 = DROPEFFECT_NONE;
         let hr = DoDragDrop(ds, src, DROPEFFECT_COPY, &mut effect);
-        DRAG_THREAD.store(0, Ordering::Relaxed);
         ds_release(ds); // 我々の保持分(DoDragDrop 内部の参照は既に解放済み)
         src_release(src);
         drop(host);
@@ -804,11 +800,7 @@ fn fallback(paths: &[String]) {
         );
         #[cfg(not(test))]
         {
-            let dir = std::env::var_os("USERPROFILE")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join("Downloads")
-                .join("Knit");
+            let dir = crate::receive_dir();
             crate::tray::notify(
                 "Knit",
                 &format!(

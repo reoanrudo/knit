@@ -25,9 +25,44 @@ pub enum SendFilesOutcome {
     Denied,
 }
 
+/// 相手の受理結果(XferAck)から、メニューに残す転送結果を決める(純関数)。
+/// 全件受理が確認できたときだけ `Placed`。相手側で保存できなかった `rejected>0` は
+/// 再送で直りうるので再試行可(`Failed`)にし、設定による拒否(`scope`)は再送しても
+/// 直らないので再試行不可にする。Ack が無い(旧版・待ち切れ)は転送自体は
+/// 終わっているため従来どおり `Placed` とする。
+fn outcome_for_ack(ack: Option<(usize, usize, bool)>, n: usize) -> notice::DeliveryResult {
+    match ack {
+        Some((accepted, 0, false)) if accepted == n => notice::DeliveryResult::Placed,
+        Some((accepted, rejected, false)) if rejected > 0 => notice::DeliveryResult::Failed {
+            reason: "相手側で保存できませんでした".to_string(),
+            retryable: true,
+            saved_count: accepted,
+        },
+        Some((accepted, _, true)) => notice::DeliveryResult::Failed {
+            reason: "相手側の設定で受け取りが拒否されました".to_string(),
+            retryable: false,
+            saved_count: accepted,
+        },
+        // 件数の不一致: 成功とは言えず、再送しても直る保証が無い
+        Some((accepted, _, _)) => notice::DeliveryResult::Failed {
+            reason: "相手側での保存を確認できませんでした".to_string(),
+            retryable: false,
+            saved_count: accepted,
+        },
+        None => notice::DeliveryResult::Placed,
+    }
+}
+
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
 /// 掴んだまま境界を越える場合は offer_drag_to_win を使う
+/// 版 18: 相手が保持している部分から送信開始位置を決める(芯は common の
+/// resume_offsets_for。相手が旧版・応答なしのときは先頭から)
+fn resume_offsets_for(entries: &[knit_common::bulk::OutFile]) -> Vec<u64> {
+    let features = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
+    knit_common::bulk::resume_offsets_for(entries, features, |msg| send_msg_reported(&msg))
+}
+
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
     if !knit_common::share::allow_files() {
         notify("Knit", "このPCではファイルの共有が許可されていません(KNIT_SHARE)");
@@ -88,11 +123,13 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
         }
         begin_xfer(id, total, &entries[0].name);
         clear_xfer_ack();
+        let offsets = resume_offsets_for(&entries);
         let send = || {
             BULK_LINK.send(|w| {
-                bulk::send_entries(
+                bulk::send_entries_from(
                     w,
                     &entries,
+                    &offsets,
                     false,
                     None,
                     &mut || knit_common::xfer::take(id),
@@ -133,13 +170,16 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                     "[file] 送信完了({n} 件, {:.1}MB/s)",
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
-                // 成功したら直前の失敗の記録を消す(メニューの「もう一度送る」が
-                // 残り続けて、同じファイルを二重に送ってしまうのを防ぐ)
+                // 相手の受理結果を待つ(版 15 以降の相手だけ返す。旧版はタイムアウト)。
+                // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
+                let ack = wait_xfer_ack(Duration::from_millis(2500));
+                // 記録は相手の結果を待ってから決める: 先に Placed を書くと、
+                // 一部が保存できなかった場合にメニューの「もう一度送る」が出なくなる
                 note_outcome(
                     &notice::DeliveryOutcome {
                         peer: peer.clone(),
                         count: n,
-                        result: notice::DeliveryResult::Placed,
+                        result: outcome_for_ack(ack, n),
                     },
                     &paths,
                 );
@@ -147,9 +187,6 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                 let mut all_skipped = cr.skipped.clone();
                 all_skipped.extend(rep.skipped.iter().cloned());
                 let skip_note = skip_note(&all_skipped);
-                // 相手の受理結果を待つ(版 15 以降の相手だけ返す。旧版はタイムアウト)。
-                // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
-                let ack = wait_xfer_ack(Duration::from_millis(2500));
                 match ack {
                     Some((_, _, true)) => {
                         notify(
@@ -518,11 +555,13 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
         begin_xfer(id, total, &entries[0].name);
         guard.arm(id);
         let peer = crate::active_peer_label();
+        let offsets = resume_offsets_for(&entries);
         let send = || {
             BULK_LINK.send(|w| {
-                bulk::send_entries(
+                bulk::send_entries_from(
                     w,
                     &entries,
+                    &offsets,
                     true,
                     Some(id),
                     &mut || knit_common::xfer::take(id),
@@ -637,12 +676,15 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             paths,
             failed,
             renamed,
+            skipped,
+            replaced,
             denied,
             ..
         } => {
             report_failed_files(&failed);
             send_msg(&Msg::XferAck {
-                accepted: paths.len(),
+                // Skip は「保存しなかったが受理した」ため accepted に数える
+                accepted: paths.len() + skipped,
                 rejected: failed.len(),
                 scope: denied > 0,
             });
@@ -657,14 +699,19 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             // 保存済み設定ではなく、今回のEndpointが実際に使っている起動時の場所。
             let place = desktop_settings::receive_dir().display().to_string();
             // 同名衝突で「名前 (n)」へ保存した分を通知に添える(黙って別名になるのを防ぐ)
-            let rename_note = rename_note(renamed);
+            let rename_note = collision_note(renamed, skipped, replaced);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 // 履歴ラベルはバッチ開始時点の端末で固定(受信中の切替で替えない)
                 history_push_files(&paths, &bulk_rx_device());
                 let total = knit_common::bulk::total_size(&paths);
                 // 保存失敗・拒否・同名変更の注意がある場合は設定にかかわらず通知。
-                let notify_done = if failed.is_empty() && denied == 0 && renamed == 0 {
+                let notify_done = if failed.is_empty()
+                    && denied == 0
+                    && renamed == 0
+                    && skipped == 0
+                    && replaced == 0
+                {
                     notify_transfer
                 } else {
                     notify
@@ -761,11 +808,19 @@ fn report_failed_files(failed: &[(String, String)]) {
 }
 
 /// 同名衝突で「名前 (n)」として保存した件数の通知用追記。無ければ空文字列
-fn rename_note(renamed: usize) -> String {
-    if renamed == 0 {
-        return String::new();
+/// 同名衝突の結果を通知に添える(黙って別名・上書き・スキップになるのを防ぐ)
+fn collision_note(renamed: usize, skipped: usize, replaced: usize) -> String {
+    let mut s = String::new();
+    if renamed > 0 {
+        s.push_str(&format!("。同名の {renamed} 件は「名前 (n)」として保存しました"));
     }
-    format!("。同名の {renamed} 件は「名前 (n)」として保存しました")
+    if replaced > 0 {
+        s.push_str(&format!("。同名の {replaced} 件は上書きしました"));
+    }
+    if skipped > 0 {
+        s.push_str(&format!("。同名の {skipped} 件はスキップしました"));
+    }
+    s
 }
 /// ファイル送信中(多重送信の抑制)
 pub(crate) static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);
@@ -1369,6 +1424,56 @@ mod last_outcome_tests {
             notice::Recovery::None,
             "再試行は促さない"
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_for_ack_tests {
+    use super::*;
+
+    /// 相手側で一部保存できなかった場合を Placed にすると、メニューの
+    /// 「もう一度送る」が出なくなる(監査 SHOULD 2)
+    #[test]
+    fn partial_save_failure_is_not_placed_and_offers_resend() {
+        let result = outcome_for_ack(Some((2, 1, false)), 3);
+        assert_ne!(
+            result,
+            notice::DeliveryResult::Placed,
+            "未確認の一部失敗を成功にしない"
+        );
+        assert!(notice::needs_attention(&result), "メニューに理由を出す");
+        assert_eq!(
+            notice::recovery_for(&result),
+            notice::Recovery::Resend,
+            "再送を促す"
+        );
+    }
+
+    /// 全件受理が確認できたときだけ Placed
+    #[test]
+    fn fully_accepted_ack_is_placed() {
+        assert_eq!(
+            outcome_for_ack(Some((3, 0, false)), 3),
+            notice::DeliveryResult::Placed
+        );
+    }
+
+    /// 設定による拒否(scope)は再送しても直らないので Resend を出さない
+    #[test]
+    fn scope_rejection_is_not_placed_and_does_not_offer_resend() {
+        let result = outcome_for_ack(Some((0, 3, true)), 3);
+        assert_ne!(result, notice::DeliveryResult::Placed, "拒否を成功にしない");
+        assert_eq!(
+            notice::recovery_for(&result),
+            notice::Recovery::None,
+            "再送は促さない"
+        );
+    }
+
+    /// Ack が無い旧版相手は、転送自体は終わっているので従来どおり Placed
+    #[test]
+    fn missing_ack_stays_placed() {
+        assert_eq!(outcome_for_ack(None, 3), notice::DeliveryResult::Placed);
     }
 }
 

@@ -454,13 +454,6 @@ pub(crate) fn side_dir() -> u8 {
     base_dir(SIDE.load(Ordering::Relaxed))
 }
 
-/// 画面の辺 d に配置されている接続先の添字(無ければ None)。斜め配置の端末は
-/// 基の辺(右/左)に接続しているものとして数える
-pub(crate) fn peer_at_side(d: u8) -> Option<usize> {
-    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    peers.iter().position(|p| base_dir(p.side) == d)
-}
-
 /// 端末の対象の辺までの距離。モニター指定(edge_monitor)ならその矩形の辺で
 /// 測り、辺の延長線上にいなければ到達扱いにしない(f64::MAX)。
 /// 全画面(None)は全体領域の端。
@@ -2719,7 +2712,7 @@ mod side_geometry_tests {
             screen: (1920.0, 1080.0),
             monitors: Vec::new(),
             writer: None,
-            gen: 1,
+            gen: 1, auth: knit_common::secure::Who::Legacy, shut: None,
             side,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
@@ -2890,7 +2883,7 @@ mod missing_monitor_tests {
             screen: (1920.0, 1080.0),
             monitors: Vec::new(),
             writer: None,
-            gen: 1,
+            gen: 1, auth: knit_common::secure::Who::Legacy, shut: None,
             side,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
@@ -3051,7 +3044,7 @@ mod peer_sides_save_tests {
         PeerEntry {
             id: id.into(), name: format!("{id}のPC"), alias: None,
             ip: "127.0.0.1".parse().unwrap(), screen: (1920.0, 1080.0),
-            monitors: Vec::new(), writer: None, gen: 42, side,
+            monitors: Vec::new(), writer: None, gen: 42, side, auth: knit_common::secure::Who::Legacy, shut: None,
             edge_monitor: monitor, ver: knit_common::proto::VERSION,
         }
     }

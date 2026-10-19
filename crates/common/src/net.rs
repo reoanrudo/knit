@@ -33,51 +33,6 @@
         crate::envutil::get("KNIT_ALLOW_TS").as_deref() == Some("1")
     }
 
-    /// 接続の受け入れ範囲(is_allowed と同じ環境変数から導く)。設定画面への
-    /// 表示用で、環境変数の緩和が画面から見えない問題への対策
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum AcceptScope {
-        /// 既定: 家庭・社内の LAN と有線直結(リンクローカル)
-        Lan,
-        /// KNIT_ALLOW_TS=1: 既定に Tailscale を加える
-        Tailscale,
-        /// KNIT_ALLOW_ANY=1: すべてのアドレス(信頼できるネットワークでのみ使う)
-        Any,
-    }
-
-    impl AcceptScope {
-        /// 設定画面の「受け入れ範囲」に並べる説明
-        pub fn label(self) -> &'static str {
-            match self {
-                Self::Lan => "LAN・有線直結(既定)",
-                Self::Tailscale => "LAN・有線直結・Tailscale(KNIT_ALLOW_TS=1)",
-                Self::Any => "すべてのアドレス(KNIT_ALLOW_ANY=1)",
-            }
-        }
-        /// 警告色で示すべき範囲か(KNIT_ALLOW_ANY=1 のとき true)
-        pub fn is_wide_open(self) -> bool {
-            matches!(self, Self::Any)
-        }
-    }
-
-    pub fn accept_scope() -> AcceptScope {
-        accept_scope_from(
-            crate::envutil::get("KNIT_ALLOW_ANY").as_deref(),
-            crate::envutil::get("KNIT_ALLOW_TS").as_deref(),
-        )
-    }
-
-    /// accept_scope の本体。環境変数の値を引数へ分離し、テストで直接扱えるようにする
-    pub(crate) fn accept_scope_from(any: Option<&str>, ts: Option<&str>) -> AcceptScope {
-        if any == Some("1") {
-            AcceptScope::Any
-        } else if ts == Some("1") {
-            AcceptScope::Tailscale
-        } else {
-            AcceptScope::Lan
-        }
-    }
-
     /// is_allowed の本体。環境変数を引数へ分離し、テストで直接扱えるようにする
     pub(crate) fn allowed(ip: IpAddr, allow_ts: bool) -> bool {
         match ip {
@@ -215,20 +170,6 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn accept_scope_follows_the_relaxation_environment_variables() {
-        assert_eq!(accept_scope_from(None, None), AcceptScope::Lan);
-        assert_eq!(accept_scope_from(Some("0"), Some("0")), AcceptScope::Lan);
-        assert_eq!(accept_scope_from(None, Some("1")), AcceptScope::Tailscale);
-        assert_eq!(accept_scope_from(Some("0"), Some("1")), AcceptScope::Tailscale);
-        // ANY は TS に優先する(全許可が最も広いため)
-        assert_eq!(accept_scope_from(Some("1"), None), AcceptScope::Any);
-        assert_eq!(accept_scope_from(Some("1"), Some("1")), AcceptScope::Any);
-        assert!(AcceptScope::Any.is_wide_open());
-        assert!(!AcceptScope::Lan.is_wide_open());
-        assert!(!AcceptScope::Tailscale.is_wide_open());
-    }
 
     #[test]
     fn allowed_addresses_follow_lan_direct_and_tailscale_defaults() {

@@ -81,6 +81,7 @@ mod tests {
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
             alias: None,
+            auth: knit_common::secure::Who::Legacy, shut: None,
         }
     }
 
