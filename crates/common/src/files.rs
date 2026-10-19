@@ -269,20 +269,78 @@
     /// 形式は create_temp が作る名前と厳密に一致する物だけ(相手から届いた
     /// ファイルがたまたま .part で終わる名前でも消さない)。
     /// 戻り値は消した件数(ログ・通知の判断用)
+    /// ネストも辿る: 一時ファイルは最終ファイルの親に作られるため、フォルダ受信の
+    /// 途中で落ちると `受信先/資料/sub/.knit-*.part` が残る(浅い走査では消せない)。
+    /// シンボリックリンクのディレクトリは辿らない(受信先の外へ出ない)
     pub fn sweep_temp_files(dir: &Path) -> usize {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return 0;
-        };
         let mut removed = 0usize;
-        for e in rd.flatten() {
-            let Some(name) = e.file_name().to_str().map(|n| n.to_string()) else {
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&d) else {
                 continue;
             };
-            if is_temp_name(&name) && std::fs::remove_file(e.path()).is_ok() {
-                removed += 1;
+            for e in rd.flatten() {
+                let Ok(ft) = e.file_type() else {
+                    continue;
+                };
+                if ft.is_dir() {
+                    if !ft.is_symlink() {
+                        stack.push(e.path());
+                    }
+                    continue;
+                }
+                let Some(name) = e.file_name().to_str().map(|n| n.to_string()) else {
+                    continue;
+                };
+                if is_temp_name(&name) && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
             }
         }
         removed
+    }
+
+    /// ディレクトリのエントリをディスクへ落とす(rename の永続化)。
+    /// Windows は std でディレクトリを fsync できないため何もしない
+    pub fn sync_dir(dir: &Path) {
+        #[cfg(unix)]
+        {
+            if let Ok(f) = std::fs::File::open(dir) {
+                let _ = f.sync_all();
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = dir;
+        }
+    }
+
+    /// rel の親ディレクトリのうち、まだ存在しないものを浅い順に返す。
+    /// `unique_final` がディレクトリを作る**前に**呼び、中断時の片付け対象として
+    /// 覚えておくために使う(呼び出し後に作成される前提)
+    pub fn missing_parent_dirs(base: &Path, rel: &str) -> Vec<PathBuf> {
+        let rel_path = Path::new(rel);
+        let Some(parent_rel) = rel_path.parent() else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cur = base.to_path_buf();
+        for c in parent_rel.components() {
+            if let std::path::Component::Normal(name) = c {
+                cur.push(name);
+                if !cur.exists() {
+                    out.push(cur.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// 渡されたディレクトリを深い順に削除する。中身が残った(完了ファイル入りの)
+    /// ものは削除に失敗するので、リストに残して後で再試行できるようにする
+    pub fn remove_empty_dirs(dirs: &mut Vec<PathBuf>) {
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        dirs.retain(|p| p.exists() && std::fs::remove_dir(p).is_err());
     }
 
     /// リネーム先の候補パスを組み立てる("名前 (n).拡張子"。n=0 は素の名前)
@@ -569,6 +627,37 @@ mod sweep_temp_tests {
         std::fs::write(&real, b"leftover").unwrap();
         assert_eq!(sweep_temp_files(&dir), 1);
         assert!(!real.exists(), "本物の一時ファイルは消える");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ネストした一時ファイルも消える(フォルダ受信の途中で落ちた場合)
+    #[test]
+    fn sweeps_temp_files_inside_nested_folders() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("資料/sub")).unwrap();
+        let part = dir.join("資料/sub/.knit-0123456789abcdef.part");
+        std::fs::write(&part, b"x").unwrap();
+        let keep = dir.join("資料/sub/keep.bin");
+        std::fs::write(&keep, b"k").unwrap();
+        assert_eq!(sweep_temp_files(&dir), 1, "ネストも数える");
+        assert!(!part.exists(), "ネストした残骸は消える");
+        assert!(keep.exists(), "受信済みは残る");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 中断時に作ったディレクトリを深い順に片付ける(中身があるものは残す)
+    #[test]
+    fn empty_dirs_are_removed_from_the_deepest_and_kept_when_filled() {
+        let dir = scratch();
+        std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+        std::fs::create_dir_all(dir.join("d")).unwrap();
+        std::fs::write(dir.join("d/keep.bin"), b"k").unwrap();
+        // 実際の記録は浅い順に全階層を含む(a と a/b と a/b/c)
+        let mut dirs = vec![dir.join("a"), dir.join("a/b"), dir.join("a/b/c"), dir.join("d")];
+        super::remove_empty_dirs(&mut dirs);
+        assert!(!dir.join("a").exists(), "空の連鎖は根元まで消える");
+        assert!(dir.join("d").exists(), "中身のあるディレクトリは残る");
+        assert_eq!(dirs.len(), 1, "残ったものだけを保持する");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
