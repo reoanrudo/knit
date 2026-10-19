@@ -96,6 +96,9 @@ pub(crate) struct PeerEntry {
     /// 認証済み主体の表現。後段の許可行列・操作権はここから引く。
     /// Legacy=従来の単一共有トークン(KNIT_TOKEN 運用・移行中の旧端末)
     pub auth: knit_common::secure::Who,
+    /// 接続を閉じるためのハンドル(writer の複製)。writer を keepalive 等へ
+    /// 貸与中でも切断できる(失効時に Reader が生きたまま残るのを防ぐ)
+    pub shut: Option<std::net::TcpStream>,
 }
 pub(crate) static PEERS: Mutex<Vec<PeerEntry>> = Mutex::new(Vec::new());
 /// アクティブなピアの添字(未接続は usize::MAX)
@@ -117,11 +120,19 @@ pub(crate) fn active_screen_settings() -> Option<crate::screen_settings::PeerSet
     Some(crate::screen_settings::get(&id, side))
 }
 
-/// アクティブなピアの端末 id(大容量経路の接続など、宛先別トークンの解決に使う)
+/// アクティブなピアの端末 id
 pub(crate) fn active_peer_id() -> Option<String> {
     let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
     let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
     peers.get(act).map(|p| p.id.clone())
+}
+
+/// アクティブなピアをどの鍵で認証したか。宛先別トークンの解決は自己申告の
+/// hello id ではなく、この認証済みの値を根拠にする
+pub(crate) fn active_peer_auth() -> Option<knit_common::secure::Who> {
+    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    let act = *ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+    peers.get(act).map(|p| p.auth.clone())
 }
 
 /// my_id がいまアクティブなピアか(pong の反映先判定などに使う)。
@@ -469,7 +480,8 @@ pub(crate) fn keepalive_inactive_peers() {
     std::thread::spawn(|| {
         use std::io::Write as _;
         loop {
-            std::thread::sleep(Duration::from_secs(1));
+            cut_externally_revoked_peers();
+        std::thread::sleep(Duration::from_secs(1));
             // bulk 張替延期の保留判定(受信中に切り替えた端末の clear 予約)。
             // 世代ガードで「予約した時の切替」が現在も使われているときだけ
             // clear する。判定自体は純関数(bulk_defer_clear_action)
@@ -550,6 +562,29 @@ pub(crate) fn keepalive_inactive_peers() {
     });
 }
 
+/// 1秒周期の監視: 台帳に無い鍵で認証済みのピア(外部プロセスの --registry
+/// revoke で失効された端末)を切る。CLI は別プロセスなので本体の PEERS を
+/// 直接触れないため、ここが外部失効を稼働中セッションへ反映する経路
+fn cut_externally_revoked_peers() {
+    let Some(reg) = crate::registry() else { return };
+    let revoked: Vec<knit_common::secure::Who> = {
+        let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut found: Vec<knit_common::secure::Who> = Vec::new();
+        for p in peers.iter() {
+            if let knit_common::secure::Who::Device(k) = &p.auth {
+                if !reg.enrolled(k) && !found.contains(&p.auth) {
+                    eprintln!("[conn] 台帳から消えた端末({})を切断します", p.id);
+                    found.push(p.auth.clone());
+                }
+            }
+        }
+        found
+    };
+    for who in revoked {
+        cut_sessions_where(&who);
+    }
+}
+
 pub(crate) fn allow_bulk_peer(ip: std::net::IpAddr) -> bool {
     knit_common::net::is_allowed(ip) && *PEER_IP.lock().unwrap_or_else(|e|e.into_inner())==Some(ip)
 }
@@ -591,51 +626,91 @@ pub(crate) fn drop_stream(reason: &str) {
 /// 本線・音声・bulk の全ハンドシェイクがその端末のトークンでは弾かれる。
 /// 稼働セッション: 待機中の端末には Leave を書いてから切断する(相手の
 /// 押下解放を生存検知(最長9秒)に待たせない)。アクティブな端末は
-/// drop_stream で切り、既存の切断経路(on_disconnect のカーソル復帰・
-/// 次端末への自動切替)に任せる
+/// 台帳で1端末を失効し、稼働中のその端末のセッションも切る(失効の本体側の
+/// 経路。--registry CLI は別プロセスから台帳を書き、本体は keepalive の
+/// 定期チェックで切る)。台帳から鍵が消えるため、以後の本線・音声・bulk の
+/// 全ハンドシェイクがその端末のトークンでは弾かれる
 pub(crate) fn registry_revoke(
     reg: &std::sync::Arc<knit_common::registry::DeviceRegistry>,
     key_id: &knit_common::secure::DeviceKeyId,
 ) -> std::io::Result<knit_common::registry::RevokeOutcome> {
-    use knit_common::registry::RevokeOutcome;
-    use std::io::Write as _;
     let outcome = reg.revoke(key_id)?;
-    if matches!(outcome, RevokeOutcome::Revoked) {
-        let mut drop_active = false;
-        {
-            let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
-            let mut entries = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-            let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-            let target = knit_common::secure::Who::Device(key_id.clone());
-            // 待機中の該当端末: Leave を届けてから外す
-            let idle: Vec<(String, u64)> = entries
-                .iter()
-                .enumerate()
-                .filter(|(i, p)| p.auth == target && *i != *active)
-                .map(|(_, p)| (p.id.clone(), p.gen))
-                .collect();
-            for (id, gen) in idle {
-                if let Some(p) = entries.iter_mut().find(|p| p.id == id && p.gen == gen) {
-                    if let Some(mut w) = p.writer.take() {
-                        let _ = w.write_all(
-                            knit_common::proto::encode(&knit_common::proto::Msg::Leave).as_bytes(),
-                        );
-                        let _ = w.flush();
-                        w.shutdown();
-                    }
-                }
-                crate::peers::detach(&mut entries, &mut active, &id, gen);
-            }
-            // アクティブな該当端末: drop_stream 後は既存の切断経路が detach する
-            if entries.get(*active).is_some_and(|p| p.auth == target) {
-                drop_active = true;
-            }
-        }
-        if drop_active {
-            drop_stream("この端末の登録を解除しました");
-        }
+    if matches!(outcome, knit_common::registry::RevokeOutcome::Revoked) {
+        cut_sessions_where(&knit_common::secure::Who::Device(key_id.clone()));
     }
     Ok(outcome)
+}
+
+/// 認証主体が一致するピアのセッションを切る(台帳での失効と、外部プロセスでの
+/// 失効の定期反映から使う)。切断は2段階: ①3ロック(STREAM_SLOT→PEERS→
+/// ACTIVE_PEER)の中で「切るべきライター」だけ集める(ブロッキング書込はしない。
+/// keepalive と同じ作法。アクティブが対象なら、切替が割り込めないよう同じ
+/// ロック区間でスロットの writer も外す)。②ロックを解放してから Leave を書き、
+/// 接続を閉じ、待機端末を一覧から外す(アクティブ分はセッションスレッドの
+/// 既存の切断経路 on_disconnect が整理する)
+fn cut_sessions_where(target: &knit_common::secure::Who) {
+    use std::io::Write as _;
+    let mut leaves: Vec<secure::Writer> = Vec::new();
+    let mut sockets: Vec<std::net::TcpStream> = Vec::new();
+    let mut detach: Vec<(String, u64)> = Vec::new();
+    let mut cut_active = false;
+    {
+        let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut slot = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
+        let hits: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.auth == *target)
+            .map(|(i, _)| i)
+            .collect();
+        for i in hits {
+            let p = &mut entries[i];
+            detach.push((p.id.clone(), p.gen));
+            if i == *active {
+                cut_active = true;
+            } else if let Some(mut w) = p.writer.take() {
+                if let Ok(h) = w.shutdown_handle() {
+                    sockets.push(h);
+                }
+                leaves.push(w);
+            }
+            // writer の貸与中(keepalive の ping)でも、このハンドルで切れる
+            if let Some(h) = p.shut.as_ref().and_then(|s| s.try_clone().ok()) {
+                sockets.push(h);
+            }
+        }
+        if cut_active {
+            // アクティブの writer は STREAM_SLOT が持つ: 切替が割り込む前に
+            // 同じロック区間で外し、世代を進めて以後の入力を破棄する
+            if let Some(mut w) = slot.take() {
+                if let Ok(h) = w.shutdown_handle() {
+                    sockets.push(h);
+                }
+                leaves.push(w);
+            }
+            OUTBOUND_GENERATION.fetch_add(1, Ordering::SeqCst);
+        }
+        for (id, gen) in &detach {
+            peers::detach(&mut entries, &mut active, id, *gen);
+        }
+        if entries.is_empty() {
+            crate::tap::save_peer_sides();
+        }
+    }
+    // ② ロック外で Leave を書いて切る(半開きの相手でも待つのはこの書込だけ。
+    // 他の操作は止まらない)
+    for mut w in leaves {
+        let _ = w.write_all(
+            knit_common::proto::encode(&knit_common::proto::Msg::Leave).as_bytes(),
+        );
+        let _ = w.flush();
+        w.shutdown();
+    }
+    for s in sockets {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 /// `tailscale status --json` から相手への経路が直結か中継かを調べる
@@ -768,7 +843,7 @@ mod tests {
             edge_monitor: None,
             ver: 13,
             alias: None,
-            auth: knit_common::secure::Who::Legacy,
+            auth: knit_common::secure::Who::Legacy, shut: None,
         }
     }
 

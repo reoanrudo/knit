@@ -393,11 +393,11 @@ fn bulk_accept_keys() -> std::io::Result<knit_common::secure::ServerKeys> {
     }
 }
 
-/// bulk 接続側のトークン。宛先(アクティブ端末)別に解決し、未紐付けの宛先
-/// (旧端末)は master にフォールバックする
+/// bulk 接続側のトークン。宛先は認証済みの主体(Who)から解決する
+/// (自己申告の hello id は根拠にしない)。Legacy は master にフォールバック
 fn bulk_outgoing_token() -> String {
-    match (registry(), crate::conn::active_peer_id()) {
-        (Some(r), Some(id)) => r.outgoing_token(&id),
+    match (registry(), crate::conn::active_peer_auth()) {
+        (Some(r), Some(who)) => r.token_for(&who),
         _ => ROLE_TOKEN.get().cloned().unwrap_or_default(),
     }
 }
@@ -939,7 +939,7 @@ fn main() {
             id: "pc-preview".into(), name: "DESKTOP-PREVIEW".into(),
             ip: "127.0.0.2".parse().unwrap(), screen: (2560.0,1440.0), monitors: Vec::new(),
             writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-            alias: None, auth: knit_common::secure::Who::Legacy,
+            alias: None, auth: knit_common::secure::Who::Legacy, shut: None,
         });
         if args.iter().any(|a| a == "--preview-tablet") {
             android::display::remember("android-preview", Some(android::display::PhysicalSize { width_mm: 175.4, height_mm: 263.2 }));
@@ -947,7 +947,7 @@ fn main() {
                 id: "android-preview".into(), name: "TABLET-PREVIEW".into(),
                 ip: "127.0.0.1".parse().unwrap(), screen: (3048.0,2032.0), monitors: Vec::new(),
                 writer: None, gen: 0, side: 0, edge_monitor: Some(0), ver: knit_common::proto::VERSION,
-                alias: None, auth: knit_common::secure::Who::Legacy,
+                alias: None, auth: knit_common::secure::Who::Legacy, shut: None,
             });
             *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 1; // タブレットを見ている想定
         }
@@ -2005,7 +2005,7 @@ mod boundary_tests {
             side,
             edge_monitor,
             alias: None,
-            auth: knit_common::secure::Who::Legacy,
+            auth: knit_common::secure::Who::Legacy, shut: None,
         }
     }
 

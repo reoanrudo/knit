@@ -1428,7 +1428,15 @@ pub fn start(token: String, port: u16) {
                 Some(r) => r.accept_keys(),
                 None => Ok(knit_common::secure::ServerKeys::single(&token)),
             };
-            let (r, mut w) = match keys.and_then(|k| knit_common::secure::accept_as(stream, &k, b"knit-audio")) {
+            let keys = match keys {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[audio] 待受鍵がありません: {e}");
+                    std::thread::sleep(throttle.fail());
+                    continue;
+                }
+            };
+            let (r, mut w) = match knit_common::secure::accept_as(stream, &keys, b"knit-audio") {
                 Ok((r, w, _who)) => (r, w),
                 Err(e) => {
                     eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");

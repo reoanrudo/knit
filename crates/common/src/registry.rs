@@ -7,7 +7,6 @@
 //! 失効は物理削除で冪等(NotFound も成功)。「鍵束から消えること」が失効そのもので、
 //! 本線・音声・bulk の全経路に同時に効く(経路ごとに失効チェックを書く場所はない)
 
-use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -15,9 +14,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::discover::room_id;
-use crate::persist::{quarantine, read_json_or_quarantine, write_atomic};
+use crate::persist::{quarantine, write_atomic};
 use crate::proto::safe_peer_name;
-use crate::secure::{fingerprint, DeviceKeyId, ServerKeys};
+use crate::secure::{fingerprint, DeviceKeyId, ServerKeys, Who};
 
 /// 台帳に載せられる端末数の上限。accept は最初のレコードを全鍵で試すため
 /// 計算量が台数に比例する(1試行はマイクロ秒 order だが無制限にはしない)
@@ -77,15 +76,40 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_ledger(path: &Path, legacy_revoked: bool, devices: &[DeviceEntry]) -> io::Result<()> {
-    let file = LedgerFile {
-        v: 1,
-        legacy_revoked,
-        devices: devices.to_vec(),
-    };
-    let bytes =
-        serde_json::to_vec(&file).map_err(|e| io::Error::other(format!("台帳の直列化に失敗: {e}")))?;
-    write_atomic(path, &bytes)
+
+/// 台帳ディレクトリのプロセス間排他(ロックファイル)。本体と --registry CLI の
+/// 書き込み(read→変更→rename)が重ならないためのもの。保持者が死んだ場合に備え、
+/// 5秒を過ぎたロックは破棄して取り直す(書き込みはミリ秒で終わるため、実運用で
+/// このタイムアウトが効くことはほぼ無い)。取れない場合は None を返し、呼び出し側は
+/// 楽観排他(バイト列比較)だけを続行する(窓は大幅に狭まる)
+struct LedgerLock(std::path::PathBuf);
+
+fn lock_ledger(path: &Path) -> Option<LedgerLock> {
+    let lock = path.with_extension("lock");
+    for _ in 0..40 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Some(LedgerLock(lock)),
+            Err(_) => {
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|md| md.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|e| e > std::time::Duration::from_secs(5));
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+    None
+}
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// 登録の成果物。token は認証済み登録経路でこの端末へ渡すもの
@@ -104,12 +128,15 @@ pub enum RevokeOutcome {
 struct Inner {
     legacy_revoked: bool,
     devices: Vec<DeviceEntry>,
-    /// hello の device_id → key_id の紐付け(メモリのみ。accept 成功ごとに再構築。
-    /// 宛先別トークンで Mac から接続側に回る時の解決に使う)
-    links: HashMap<String, DeviceKeyId>,
+    /// 最後に読み込み・書き込みで確定させた台帳ファイルのバイト列。
+    /// 楽観排他の基準(書込直前にファイルがこれと同じか確かめる)
+    raw: Option<Vec<u8>>,
     /// 最後に読んだ台帳ファイルの (更新時刻, サイズ)。--registry CLI のように
     /// 別プロセスが書き換えた変更を、再起動なしで拾うための目安
     stamp: Option<(std::time::SystemTime, u64)>,
+    /// discover 応答の部屋一覧のキャッシュ(stamp が同じ間は再計算しない)。
+    /// 応答は UDP パケットごとに呼ばれるため
+    rooms: Option<((std::time::SystemTime, u64), Vec<String>)>,
 }
 
 /// 登録台帳。master(既存トークン)はメモリにのみ保持し、ディスクへは書かない。
@@ -129,8 +156,8 @@ impl DeviceRegistry {
     }
 
     /// 台帳ファイルが別プロセス(--registry CLI 等)で書き換わっていれば読み直す。
-    /// 判定は mtime+サイズ(毎ロックの stat 1回で済む)。links(メモリの紐付け)は
-    /// 保持する。読み直しで壊れた行を見たら open と同じく退避・除外する
+    /// 判定は mtime+サイズ(毎ロックの stat 1回で済む)。読み直しで壊れた内容を
+    /// 見たら退避して空で起動する(open と同じ扱い)
     fn reload_if_changed(&self, inner: &mut Inner) {
         let Ok(md) = std::fs::metadata(&self.path) else {
             return;
@@ -139,63 +166,101 @@ impl DeviceRegistry {
         if Some(stamp) == inner.stamp {
             return;
         }
-        if let Some(v) = read_json_or_quarantine(&self.path) {
-            if let Ok(f) = serde_json::from_value::<LedgerFile>(v) {
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return;
+        };
+        match serde_json::from_slice::<LedgerFile>(&bytes) {
+            Ok(f) => {
                 let mut devices = f.devices;
                 devices.retain(|e| DeviceKeyId::parse(e.key_id.as_str()).is_some());
                 inner.legacy_revoked = f.legacy_revoked;
                 inner.devices = devices;
+                inner.raw = Some(bytes);
+                inner.rooms = None;
+                inner.stamp = Some(stamp);
+            }
+            Err(e) => {
+                quarantine(&self.path);
+                eprintln!("[registry] 台帳の形が読み取れません({e})。退避して空で起動します");
+                inner.legacy_revoked = false;
+                inner.devices = Vec::new();
+                inner.raw = None;
+                inner.rooms = None;
+                inner.stamp = None;
             }
         }
-        inner.stamp = Some(stamp);
     }
 
-    /// 書き込み後に自分の書いた状態を stamp に反映する(次の reload で読み直さない)
-    fn note_wrote(&self, inner: &mut Inner) {
-        inner.stamp = std::fs::metadata(&self.path)
-            .ok()
-            .map(|md| (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len()));
+    /// 台帳への書き込みを楽観排他で行う: 読み直し→変更→「ファイルが読んだ時の
+    /// バイト列のままか完全比較」→書き込み。--registry CLI のような別プロセスの
+    /// 書き込みが読みと書きの間に割り込んだ場合は、こちらの変更を捨てて台帳を
+    /// 引き直してやり直す(失効が本体の書き戻しで無音に取り消されるのを防ぐ
+    /// 唯一の防壁。プロセス内の Mutex は他プロセスには効かない)
+    fn commit<T>(&self, f: impl Fn(&mut Inner) -> (io::Result<T>, bool)) -> io::Result<T> {
+        for attempt in 0..16 {
+            if attempt > 0 {
+                // 競合が続く場合は少し空ける(書き合う両方が即再試行すると
+                // またぶつかるため。実運用の競合は1回の再試行で消える)
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            // 可能ならプロセス間ロックを取ってから読む(ロックが取れた場合は
+            // 「確認→rename」の間に他プロセスが入る余地が無くなる)
+            let guard = lock_ledger(&self.path);
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            self.reload_if_changed(&mut inner);
+            let basis = inner.raw.clone();
+            let (out, wrote) = f(&mut inner);
+            let out = match out {
+                Err(e) => return Err(e),
+                Ok(v) => v,
+            };
+            if !wrote {
+                return Ok(out);
+            }
+            // バイト列の完全比較(mtime の分解能に頼らない)
+            if std::fs::read(&self.path).ok() == basis {
+                let file = LedgerFile {
+                    v: 1,
+                    legacy_revoked: inner.legacy_revoked,
+                    devices: inner.devices.clone(),
+                };
+                let bytes = serde_json::to_vec(&file)
+                    .map_err(|e| io::Error::other(format!("台帳の直列化に失敗: {e}")))?;
+                write_atomic(&self.path, &bytes)?;
+                inner.raw = Some(bytes);
+                inner.stamp = std::fs::metadata(&self.path).ok().map(|md| {
+                    (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len())
+                });
+                inner.rooms = None;
+                return Ok(out);
+            }
+            // 競合: この周回の変更は捨て、引き直してやり直す
+            drop(inner);
+            drop(guard);
+        }
+        Err(io::Error::other(
+            "台帳の書き込みが競合しました(他のプロセスが書き続けています)。少し待ってやり直してください",
+        ))
     }
 
     /// master を種に台帳を開く。ファイルが無ければ空台帳。壊れていれば退避
     /// (.corrupt)して空台帳で起動(legacy は master から再構築されるため
     /// 接続は止まらない。端末だけ登録し直し)
     pub fn open(dir: &Path, master: &str) -> io::Result<Self> {
-        let path = dir.join(FILE);
-        let mut legacy_revoked = false;
-        let mut devices = Vec::new();
-        if let Some(v) = read_json_or_quarantine(&path) {
-            match serde_json::from_value::<LedgerFile>(v) {
-                Ok(f) => {
-                    legacy_revoked = f.legacy_revoked;
-                    devices = f.devices;
-                }
-                Err(e) => {
-                    // JSON だが形が壊れている(例: devices が配列でない)場合も
-                    // 退避して空で起動する(読み方の分からない台帳は信用しない)
-                    quarantine(&path);
-                    eprintln!("[registry] 台帳の形が読み取れません({e})。退避して空で起動します");
-                }
-            }
-        }
-        let before = devices.len();
-        devices.retain(|e| DeviceKeyId::parse(e.key_id.as_str()).is_some());
-        if devices.len() != before {
-            eprintln!(
-                "[registry] key_id の壊れた {} 行をスキップしました",
-                before - devices.len()
-            );
-        }
-        Ok(Self {
-            path,
+        let reg = Self {
+            path: dir.join(FILE),
             master: master.to_string(),
             inner: Mutex::new(Inner {
-                legacy_revoked,
-                devices,
-                links: HashMap::new(),
+                legacy_revoked: false,
+                devices: Vec::new(),
+                raw: None,
                 stamp: None,
+                rooms: None,
             }),
-        })
+        };
+        // 実ファイルの内容・バイト列・stamp を確定させる(壊れていれば退避)
+        drop(reg.lock_inner());
+        Ok(reg)
     }
 
     /// 認証済み登録経路での発行。key_id を新規採番(使い回ししない)し、
@@ -203,62 +268,58 @@ impl DeviceRegistry {
     /// コミットする(ack 欠落で「相手は保存済み・台帳なし」の二度と繋がらない
     /// 不整合を避ける。未使用エントリは UI から掃除する)
     pub fn enroll(&self, name: &str) -> io::Result<Enrolled> {
-        let mut inner = self.lock_inner();
-        if inner.devices.len() >= MAX_DEVICES {
-            return Err(io::Error::other(format!(
-                "登録できる端末は {MAX_DEVICES} 台までです。不要な端末を登録解除してください"
-            )));
-        }
-        let key_id = loop {
-            let candidate = DeviceKeyId::generate()?;
-            if !inner.devices.iter().any(|d| d.key_id == candidate) {
-                break candidate;
+        self.commit(|inner| {
+            if inner.devices.len() >= MAX_DEVICES {
+                return (
+                    Err(io::Error::other(format!(
+                        "登録できる端末は {MAX_DEVICES} 台までです。不要な端末を登録解除してください"
+                    ))),
+                    false,
+                );
             }
-        };
-        let token = device_token(&self.master, &key_id);
-        let mut devices = inner.devices.clone();
-        devices.push(DeviceEntry {
-            key_id: key_id.clone(),
-            name: safe_peer_name(name),
-            fp: fingerprint(&token),
-            added_at: now_unix(),
-            last_seen: None,
-        });
-        write_ledger(&self.path, inner.legacy_revoked, &devices)?;
-        inner.devices = devices;
-        self.note_wrote(&mut inner);
-        Ok(Enrolled { key_id, token })
+            let key_id = match DeviceKeyId::generate() {
+                Ok(k) => k,
+                Err(e) => return (Err(e), false),
+            };
+            // key_id は毎回新規乱数なので衝突しない(万一ぶつかったら採番し直し)
+            if inner.devices.iter().any(|d| d.key_id == key_id) {
+                return (Err(io::Error::other("key_id の採番が衝突しました。もう一度お試しください")), false);
+            }
+            let token = device_token(&self.master, &key_id);
+            inner.devices.push(DeviceEntry {
+                fp: fingerprint(&token),
+                key_id: key_id.clone(),
+                name: safe_peer_name(name),
+                added_at: now_unix(),
+                last_seen: None,
+            });
+            (Ok(Enrolled { key_id, token }), true)
+        })
     }
 
     /// 1端末の失効。台帳から物理削除(原子保存)→ 以後の鍵束から消える。
     /// 冪等(NotFound も成功)。書込失敗なら Err でメモリも変えない
     pub fn revoke(&self, key_id: &DeviceKeyId) -> io::Result<RevokeOutcome> {
-        let mut inner = self.lock_inner();
-        let Some(pos) = inner.devices.iter().position(|d| &d.key_id == key_id) else {
-            return Ok(RevokeOutcome::NotFound);
-        };
-        let mut devices = inner.devices.clone();
-        devices.remove(pos);
-        write_ledger(&self.path, inner.legacy_revoked, &devices)?;
-        inner.devices = devices;
-        inner.links.retain(|_, v| v != key_id);
-        self.note_wrote(&mut inner);
-        Ok(RevokeOutcome::Revoked)
+        self.commit(|inner| {
+            let Some(pos) = inner.devices.iter().position(|d| &d.key_id == key_id) else {
+                return (Ok(RevokeOutcome::NotFound), false);
+            };
+            inner.devices.remove(pos);
+            (Ok(RevokeOutcome::Revoked), true)
+        })
     }
 
     /// 旧形式(単一共有トークン=master そのもの)での受付停止。
     /// KNIT_TOKEN 運用での M2 相当。元に戻す操作は用意しない(全登録の初期化で
     /// 初期状態に戻る)
     pub fn revoke_legacy(&self) -> io::Result<()> {
-        let mut inner = self.lock_inner();
-        if inner.legacy_revoked {
-            return Ok(());
-        }
-        let devices = inner.devices.clone();
-        write_ledger(&self.path, true, &devices)?;
-        inner.legacy_revoked = true;
-        self.note_wrote(&mut inner);
-        Ok(())
+        self.commit(|inner| {
+            if inner.legacy_revoked {
+                return (Ok(()), false);
+            }
+            inner.legacy_revoked = true;
+            (Ok(()), true)
+        })
     }
 
     /// 旧形式での受付を受け付けているか(UI 表示と鍵束構築の両方から使う)
@@ -304,59 +365,57 @@ impl DeviceRegistry {
             .collect()
     }
 
-    /// 接続成功の記録。last_seen と表示名を更新し、hello の device_id との
-    /// 紐付け(メモリ)を作る。台帳に無い鍵(Legacy 等)は紐付けだけ作って
-    /// last_seen は更新しない
-    pub fn note_seen(
-        &self,
-        key_id: &DeviceKeyId,
-        device_id: &str,
-        name: &str,
-        now: u64,
-    ) -> io::Result<()> {
-        let mut inner = self.lock_inner();
-        inner.links.insert(device_id.to_string(), key_id.clone());
-        let mut devices = inner.devices.clone();
-        let Some(entry) = devices.iter_mut().find(|d| d.key_id == *key_id) else {
-            return Ok(());
-        };
-        let name = safe_peer_name(name);
-        if entry.last_seen == Some(now) && entry.name == name {
-            return Ok(());
-        }
-        entry.last_seen = Some(now);
-        entry.name = name;
-        write_ledger(&self.path, inner.legacy_revoked, &devices)?;
-        inner.devices = devices;
-        self.note_wrote(&mut inner);
-        Ok(())
+    /// 接続成功の記録。last_seen と表示名を更新する。台帳に無い鍵(Legacy 等)は
+    /// 何も記録しない(失効後の試行は accept が弾くため、そもそも届かない)
+    pub fn note_seen(&self, key_id: &DeviceKeyId, name: &str, now: u64) -> io::Result<()> {
+        self.commit(|inner| {
+            let Some(entry) = inner.devices.iter_mut().find(|d| d.key_id == *key_id) else {
+                return (Ok(()), false);
+            };
+            let name = safe_peer_name(name);
+            if entry.last_seen == Some(now) && entry.name == name {
+                return (Ok(()), false);
+            }
+            entry.last_seen = Some(now);
+            entry.name = name;
+            (Ok(()), true)
+        })
     }
 
-    /// 接続側(Mac→Win)の鍵解決。紐付け済みの宛先はその端末の導出トークン、
-    /// 未紐付けの宛先(旧端末)は master をそのまま返す
-    pub fn outgoing_token(&self, peer_device_id: &str) -> String {
-        let inner = self.lock_inner();
-        match inner.links.get(peer_device_id) {
-            Some(k) => device_token(&self.master, k),
-            None => self.master.clone(),
+    /// 認証結果から接続側(Mac→宛先)のトークンを解く。Device は台帳の導出
+    /// トークン、Legacy(旧端末・KNIT_TOKEN 運用)は master。宛先解決に自己申告の
+    /// hello id は使わない(accept が認証した Who のみが根拠)
+    pub fn token_for(&self, who: &Who) -> String {
+        match who {
+            Who::Device(k) => device_token(&self.master, k),
+            Who::Legacy => self.master.clone(),
         }
+    }
+
+    /// この鍵が今も登録済みか(外部プロセスでの失効を、稼働中セッションの
+    /// 切断へ反映するための定期チェックに使う)
+    pub fn enrolled(&self, key_id: &DeviceKeyId) -> bool {
+        self.lock_inner().devices.iter().any(|d| &d.key_id == key_id)
     }
 
     /// 登録の初期化用: 台帳を空に戻す(全端末の登録取り消し。UI の
     /// 「すべての登録を初期化」とは別に、master 差し替え時の案内で使う)
     pub fn clear(&self) -> io::Result<()> {
-        let mut inner = self.lock_inner();
-        write_ledger(&self.path, inner.legacy_revoked, &[])?;
-        inner.devices.clear();
-        inner.links.clear();
-        self.note_wrote(&mut inner);
-        Ok(())
+        self.commit(|inner| {
+            inner.devices.clear();
+            (Ok(()), true)
+        })
     }
 
     /// discover 応答側の部屋一覧。legacy を受付中なら room_id(master) を先頭に、
     /// 各端末の room_id(導出トークン) を加える(導入済み端末の発見を壊さないため)
     pub fn discover_rooms(&self) -> Vec<String> {
-        let inner = self.lock_inner();
+        let mut inner = self.lock_inner();
+        if let Some((stamp, rooms)) = &inner.rooms {
+            if Some(*stamp) == inner.stamp {
+                return rooms.clone();
+            }
+        }
         let mut rooms: Vec<String> = Vec::new();
         if !inner.legacy_revoked {
             rooms.push(room_id(&self.master));
@@ -367,6 +426,7 @@ impl DeviceRegistry {
                 rooms.push(r);
             }
         }
+        inner.rooms = inner.stamp.map(|s| (s, rooms.clone()));
         rooms
     }
 }
@@ -541,11 +601,71 @@ mod tests {
         assert_eq!(app.key_ids(), vec![a.key_id.clone()]);
         assert_eq!(app.accept_keys().unwrap().len(), 2, "legacy + A");
         // 本体側の書き込み(note_seen)も CLI 側から見える
-        app.note_seen(&a.key_id, "dev-1", "A端末", 999).unwrap();
+        app.note_seen(&a.key_id, "A端末", 999).unwrap();
         assert_eq!(
             cli.devices().iter().find(|d| d.key_id == a.key_id).unwrap().last_seen,
             Some(999)
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 読みと書きの間に別プロセスの書き込みが割り込んでも、どちらの変更も
+    /// 失われない(楽観排他の回帰。レビュー指摘 H1/中 の固定)
+    #[test]
+    fn writes_retry_when_another_process_writes_in_between() {
+        let dir = temp_dir("interleave");
+        let m = master();
+        let reg = DeviceRegistry::open(&dir, &m).unwrap();
+        let a = reg.enroll("A").unwrap();
+        // 外部プロセス(CLI)の書き込み結果を再現: A に加えて X が載った台帳
+        let cli = DeviceRegistry::open(&dir, &m).unwrap();
+        let x = cli.enroll("X").unwrap();
+        let external = std::fs::read(dir.join(FILE)).unwrap();
+        // reg の書き込み処理の途中で外部書き込みが割り込む状況を人為的に作る:
+        // f の実行中にファイルを外部の内容で差し替える
+        reg.commit(|inner| {
+            let _ = std::fs::write(dir.join(FILE), &external);
+            let entry = inner.devices.iter_mut().find(|d| d.key_id == a.key_id).unwrap();
+            entry.last_seen = Some(777);
+            (Ok(()), true)
+        })
+        .unwrap();
+        // 外部の X も本体の記録も失われない
+        let final_ = DeviceRegistry::open(&dir, &m).unwrap();
+        let devices = final_.devices();
+        assert_eq!(devices.len(), 2, "A と X の両方が残る: {:?}", devices.iter().map(|d| &d.name).collect::<Vec<_>>());
+        let ea = devices.iter().find(|d| d.key_id == a.key_id).unwrap();
+        assert_eq!(ea.last_seen, Some(777), "本体の記録も残る");
+        assert!(devices.iter().any(|d| d.key_id == x.key_id), "外部の登録も残る");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 2つのハンドル(本体と CLI)の同時書き込みで、登録・記録が無音に
+    /// 消えない(ロストアップデートのハンマーテスト)
+    #[test]
+    fn concurrent_registries_do_not_lose_each_others_writes() {
+        let dir = temp_dir("hammer");
+        let m = master();
+        let app = DeviceRegistry::open(&dir, &m).unwrap();
+        let cli = DeviceRegistry::open(&dir, &m).unwrap();
+        let a = app.enroll("A").unwrap();
+        let a_key = a.key_id.clone();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                for i in 0..25 {
+                    cli.enroll(&format!("C{i}")).unwrap();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            });
+            for t in 0..25u64 {
+                app.note_seen(&a_key, "A", 1000 + t).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        let final_ = DeviceRegistry::open(&dir, &m).unwrap();
+        let devices = final_.devices();
+        assert_eq!(devices.len(), 26, "登録も記録も失われない");
+        assert!(devices.iter().any(|d| d.key_id == a_key && d.last_seen.is_some()));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -577,19 +697,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// note_seen は last_seen と表示名を更新し、宛先解決の紐付けを作る
+    /// note_seen は last_seen と表示名を更新する(台帳に無い鍵は何もしない)
     #[test]
-    fn note_seen_updates_last_seen_name_and_link() {
+    fn note_seen_updates_last_seen_and_name() {
         let dir = temp_dir("seen");
         let m = master();
         let reg = DeviceRegistry::open(&dir, &m).unwrap();
         let a = reg.enroll("旧い名前").unwrap();
-        reg.note_seen(&a.key_id, "android-app-1", "新しい名前", 12345).unwrap();
+        reg.note_seen(&a.key_id, "新しい名前", 12345).unwrap();
         let entry = reg.devices().into_iter().find(|d| d.key_id == a.key_id).unwrap();
         assert_eq!(entry.last_seen, Some(12345));
         assert_eq!(entry.name, "新しい名前");
-        assert_eq!(reg.outgoing_token("android-app-1"), a.token, "紐付けた宛先は端末別トークン");
-        // 再読込しても last_seen は残る(links はメモリなので消える)
+        // 台帳に無い鍵(Legacy 相当)は何も記録しない
+        let other = DeviceKeyId::parse(&"7".repeat(32)).unwrap();
+        reg.note_seen(&other, "誰か", 1).unwrap();
+        assert!(reg.devices().iter().all(|d| d.key_id != other));
         let reopened = DeviceRegistry::open(&dir, &m).unwrap();
         assert_eq!(
             reopened.devices().into_iter().find(|d| d.key_id == a.key_id).unwrap().last_seen,
@@ -598,14 +720,19 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// 未紐付けの宛先は master にフォールバックする(旧端末との互換)
+    /// 宛先トークンの解決は認証結果(Who)から行う(Legacy は master)
     #[test]
-    fn outgoing_token_falls_back_to_master() {
-        let dir = temp_dir("outgoing");
+    fn token_for_follows_the_authenticated_identity() {
+        let dir = temp_dir("token_for");
         let m = master();
         let reg = DeviceRegistry::open(&dir, &m).unwrap();
-        reg.enroll("A").unwrap();
-        assert_eq!(reg.outgoing_token("unknown-device"), m);
+        assert_eq!(reg.token_for(&Who::Legacy), m, "Legacy は master");
+        let a = reg.enroll("A").unwrap();
+        assert_eq!(reg.token_for(&Who::Device(a.key_id.clone())), a.token);
+        // 導出は決定論的(失効しても値は同じ。失効した鍵を受け付ける待受は
+        // もう無い=accept_keys から消えていることは accept_keys_reflect で固定済み)
+        reg.revoke(&a.key_id).unwrap();
+        assert_eq!(reg.token_for(&Who::Device(a.key_id.clone())), a.token);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

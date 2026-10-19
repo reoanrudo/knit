@@ -663,6 +663,8 @@ pub(crate) fn server_thread(
                 let replacing = entries.get(previous).is_some_and(|p| p.id == dev);
                 let taken = entries.iter().map(|p| p.side).collect::<Vec<_>>();
                 let (side, edge_monitor) = assign_side_for_new_peer(&dev, &taken);
+                // writer の複製を切断用ハンドルとして持つ(貸与中でも切れる)
+                let shut = w.shutdown_handle().ok();
                 let select = peers::insert(&mut entries, previous, PeerEntry {
                     id: dev.clone(), name: disp.clone(), ip: peer.ip(),
                     screen: (win_w, win_h), monitors: mons, writer: Some(w),
@@ -671,6 +673,7 @@ pub(crate) fn server_thread(
                     alias: tap::saved_peer_alias(&dev),
                     // どの鍵で認証したか(端末別 or 従来の単一トークン)
                     auth: who.clone(),
+                    shut,
                 });
                 if replacing {
                     if let Some(old) = slot.take() { old.shutdown(); }
@@ -692,7 +695,7 @@ pub(crate) fn server_thread(
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    if let Err(e) = r.note_seen(key, &dev, &disp, now) {
+                    if let Err(e) = r.note_seen(key, &disp, now) {
                         eprintln!("[registry] 接続記録の保存に失敗: {e}");
                     }
                 }

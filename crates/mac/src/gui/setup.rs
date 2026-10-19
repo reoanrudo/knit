@@ -456,6 +456,13 @@ pub(super) unsafe extern "C" fn reset_registration(_s: ID, _c: SEL, _sender: ID)
         error(&format!("キーチェーンから接続キーを削除できませんでした。\n登録は変更していません。\n{e}"));
         return;
     }
+    // 登録台帳も空にする(消し忘れると、新しい master で二度と繋がらない
+    // ゴーストエントリが「登録済み N台」として残り、台帳の上限を食う)
+    if let Some(reg) = crate::registry() {
+        if let Err(e) = reg.clear() {
+            eprintln!("[setup] 登録台帳の初期化に失敗しました: {e}(再起動後にやり直します)");
+        }
+    }
     let Ok(token) = credentials::generate() else {
         error("接続キーを削除しましたが、新しいキーを作成できませんでした。\nKnitを再起動すると、初回登録の画面からやり直せます。");
         return;
