@@ -7,14 +7,14 @@
 // 複数機能が落ちた時に通知が連打されるため)。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// 再起動待ちの上限。これ以上待つと「復帰が遅すぎる」方が目立つため 30 秒で頭打ち。
 const MAX_RESTART_DELAY_SECS: u64 = 30;
 
-/// 利用者への通知を出したか(プロセス全体で 1 回)。
-static NOTIFIED_ONCE: AtomicBool = AtomicBool::new(false);
+/// 利用者への通知を出した機能(機能ごとに 1 回。プロセス全体で 1 回にすると
+/// 2 つ目以降に落ちた機能が無言のままになるため)
+static NOTIFIED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
 /// panic 後の再起動待ちを返す。`attempt` は「これまでに panic した回数」
 /// (0 始まり): 0→1s, 1→2s, 2→4s, ... 上限 30s。
@@ -56,9 +56,18 @@ pub(crate) fn run_supervised(name: &'static str, mut body: impl FnMut()) {
                     "[supervise] {name} のループが panic しました(thread={thread}, 連続{}回目): {message}",
                     attempt + 1
                 );
-                if !NOTIFIED_ONCE.swap(true, Ordering::SeqCst) {
-                    // 最初の 1 回だけ利用者へ知らせる。詳細(panic 内容・再起動の
-                    // 繰り返し)はログに残るため、通知は 1 行に留める。
+                let first_for_name = {
+                    let mut notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
+                    if notified.contains(&name) {
+                        false
+                    } else {
+                        notified.push(name);
+                        true
+                    }
+                };
+                if first_for_name {
+                    // 機能ごとに 1 回だけ知らせる(同じ機能の再起動連発では鳴らさない)。
+                    // 詳細(panic 内容・再起動の繰り返し)はログに残る
                     crate::notify(
                         "Knit",
                         &format!("{name}の機能が停止し、自動で再起動しました(詳細はログ)"),

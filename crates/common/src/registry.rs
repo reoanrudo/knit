@@ -77,23 +77,21 @@ fn now_unix() -> u64 {
 }
 
 
-/// 台帳ディレクトリのプロセス間排他(ロックファイル)。本体と --registry CLI の
-/// 書き込み(read→変更→rename)が重ならないためのもの。保持者が死んだ場合に備え、
-/// 5秒を過ぎたロックは破棄して取り直す(書き込みはミリ秒で終わるため、実運用で
-/// このタイムアウトが効くことはほぼ無い)。取れない場合は None を返し、呼び出し側は
-/// 楽観排他(バイト列比較)だけを続行する(窓は大幅に狭まる)
-/// 同一プロセス内の書き込みを直列化する。ファイルロックだけに頼らない
-/// (同一プロセスの2ハンドルは、実装テストや将来の埋め込み利用で起こり得る。
-/// OS のロックはプロセス間のためだけに使う)
+/// 台帳ディレクトリのプロセス間排他(ロックファイル。本体と --registry CLI の
+/// read→変更→rename が重ならないため)と、同一プロセス内の書き込みの直列化。
+/// ファイルロックはプロセス間のためのもの。取れないときは fail-closed で
+/// 呼び出し側へエラーを返し、無言で書き込まない
 static PROCESS_COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// プロセス間ロックの陳腐化判定。書き込みは通常ミリ秒で終わるため、
-/// これだけ待って解放されないロックは保持者が死んだとみなす。短すぎる値
-/// (以前は5秒)は、CI のように高負荷で保持スレッドが止まった時に生きたロックを
-/// 奪って二重取得=ロストアップデートを招くため、余裕を持たせる
+/// これだけ待って解放されないロックは保持者が死んだとみなして回収する。
+/// 短すぎる値(以前は5秒)は、CI のように高負荷で保持スレッドが止まった時に
+/// 生きたロックを奪って二重取得=ロストアップデートを招くため、余裕を持たせる。
+/// 代償: クラッシュ残骸があると最大この時間だけ登録・失効が失敗し得る
 const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-/// ロック待ちの上限。取れなければ無言で書き込まずエラーにする(fail-closed)
-const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+/// ロック待ちの上限。取れなければ無言で書き込まずエラーにする(fail-closed)。
+/// 呼び出しはメニュー操作から同期で来るため、UI を長く止めない値にする
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
 
 struct LedgerLock(std::path::PathBuf);
@@ -111,9 +109,12 @@ fn lock_ledger(path: &Path) -> Option<LedgerLock> {
                     .and_then(|t| t.elapsed().ok())
                     .is_some_and(|e| e > LOCK_STALE_AFTER);
                 if stale {
-                    // 保持者が死んでいる(60秒も解放されない)。取り直す
-                    let _ = std::fs::remove_file(&lock);
-                    continue;
+                    // 保持者が死んでいる(60秒も解放されない)。回収を試み、
+                    // 消せたら取り直す。消せない環境(共有違反等)でも
+                    // 無限ループにせず、下の待ち・期限判定へ落とす
+                    if std::fs::remove_file(&lock).is_ok() {
+                        continue;
+                    }
                 }
                 if std::time::Instant::now() >= deadline {
                     return None;
