@@ -107,6 +107,9 @@ struct Inner {
     /// hello の device_id → key_id の紐付け(メモリのみ。accept 成功ごとに再構築。
     /// 宛先別トークンで Mac から接続側に回る時の解決に使う)
     links: HashMap<String, DeviceKeyId>,
+    /// 最後に読んだ台帳ファイルの (更新時刻, サイズ)。--registry CLI のように
+    /// 別プロセスが書き換えた変更を、再起動なしで拾うための目安
+    stamp: Option<(std::time::SystemTime, u64)>,
 }
 
 /// 登録台帳。master(既存トークン)はメモリにのみ保持し、ディスクへは書かない。
@@ -120,7 +123,38 @@ pub struct DeviceRegistry {
 impl DeviceRegistry {
     fn lock_inner(&self) -> std::sync::MutexGuard<'_, Inner> {
         // 毒されたロックでも台帳の保存を止めない(改善監査#3 と同じ方針)
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.reload_if_changed(&mut guard);
+        guard
+    }
+
+    /// 台帳ファイルが別プロセス(--registry CLI 等)で書き換わっていれば読み直す。
+    /// 判定は mtime+サイズ(毎ロックの stat 1回で済む)。links(メモリの紐付け)は
+    /// 保持する。読み直しで壊れた行を見たら open と同じく退避・除外する
+    fn reload_if_changed(&self, inner: &mut Inner) {
+        let Ok(md) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        let stamp = (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len());
+        if Some(stamp) == inner.stamp {
+            return;
+        }
+        if let Some(v) = read_json_or_quarantine(&self.path) {
+            if let Ok(f) = serde_json::from_value::<LedgerFile>(v) {
+                let mut devices = f.devices;
+                devices.retain(|e| DeviceKeyId::parse(e.key_id.as_str()).is_some());
+                inner.legacy_revoked = f.legacy_revoked;
+                inner.devices = devices;
+            }
+        }
+        inner.stamp = Some(stamp);
+    }
+
+    /// 書き込み後に自分の書いた状態を stamp に反映する(次の reload で読み直さない)
+    fn note_wrote(&self, inner: &mut Inner) {
+        inner.stamp = std::fs::metadata(&self.path)
+            .ok()
+            .map(|md| (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len()));
     }
 
     /// master を種に台帳を開く。ファイルが無ければ空台帳。壊れていれば退避
@@ -159,6 +193,7 @@ impl DeviceRegistry {
                 legacy_revoked,
                 devices,
                 links: HashMap::new(),
+                stamp: None,
             }),
         })
     }
@@ -191,6 +226,7 @@ impl DeviceRegistry {
         });
         write_ledger(&self.path, inner.legacy_revoked, &devices)?;
         inner.devices = devices;
+        self.note_wrote(&mut inner);
         Ok(Enrolled { key_id, token })
     }
 
@@ -206,6 +242,7 @@ impl DeviceRegistry {
         write_ledger(&self.path, inner.legacy_revoked, &devices)?;
         inner.devices = devices;
         inner.links.retain(|_, v| v != key_id);
+        self.note_wrote(&mut inner);
         Ok(RevokeOutcome::Revoked)
     }
 
@@ -220,6 +257,7 @@ impl DeviceRegistry {
         let devices = inner.devices.clone();
         write_ledger(&self.path, true, &devices)?;
         inner.legacy_revoked = true;
+        self.note_wrote(&mut inner);
         Ok(())
     }
 
@@ -290,6 +328,7 @@ impl DeviceRegistry {
         entry.name = name;
         write_ledger(&self.path, inner.legacy_revoked, &devices)?;
         inner.devices = devices;
+        self.note_wrote(&mut inner);
         Ok(())
     }
 
@@ -310,6 +349,7 @@ impl DeviceRegistry {
         write_ledger(&self.path, inner.legacy_revoked, &[])?;
         inner.devices.clear();
         inner.links.clear();
+        self.note_wrote(&mut inner);
         Ok(())
     }
 
@@ -482,6 +522,30 @@ mod tests {
         let before = reg.devices();
         let reopened = DeviceRegistry::open(&dir, &m).unwrap();
         assert_eq!(reopened.devices(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 別プロセス(--registry CLI 等)の書き換えを、再オープンなしで拾う
+    #[test]
+    fn external_ledger_changes_are_seen_without_reopen() {
+        let dir = temp_dir("external");
+        let m = master();
+        let app = DeviceRegistry::open(&dir, &m).unwrap();
+        let cli = DeviceRegistry::open(&dir, &m).unwrap();
+        let a = app.enroll("A").unwrap();
+        // CLI 側での追加登録が本体から見える
+        let b = cli.enroll("B").unwrap();
+        assert_eq!(app.key_ids(), vec![a.key_id.clone(), b.key_id.clone()]);
+        // CLI 側での失効が本体から見える(=accept_keys から消える)
+        assert_eq!(cli.revoke(&b.key_id).unwrap(), RevokeOutcome::Revoked);
+        assert_eq!(app.key_ids(), vec![a.key_id.clone()]);
+        assert_eq!(app.accept_keys().unwrap().len(), 2, "legacy + A");
+        // 本体側の書き込み(note_seen)も CLI 側から見える
+        app.note_seen(&a.key_id, "dev-1", "A端末", 999).unwrap();
+        assert_eq!(
+            cli.devices().iter().find(|d| d.key_id == a.key_id).unwrap().last_seen,
+            Some(999)
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

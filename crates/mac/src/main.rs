@@ -303,6 +303,86 @@ pub(crate) fn registry() -> Option<&'static std::sync::Arc<knit_common::registry
     REGISTRY.get()
 }
 
+/// --registry: 台帳の閲覧と失効(M2 の操作経路。設定 UI は後続の増分で載せる)
+fn registry_cli(args: &[String]) {
+    let master = if let Some(t) = envutil::get("KNIT_TOKEN").filter(|t| t.len() >= 32) {
+        t
+    } else {
+        match knit_common::credentials::load() {
+            Ok(Some(t)) => t,
+            _ => {
+                eprintln!("[registry] 接続キーがありません。先に初回登録を済ませてください");
+                std::process::exit(2);
+            }
+        }
+    };
+    let Some(reg) = ensure_registry(&master) else {
+        eprintln!("[registry] 台帳を開けませんでした");
+        std::process::exit(2);
+    };
+    let at = args.iter().position(|a| a == "--registry");
+    let cmd = at.and_then(|i| args.get(i + 1)).map(String::as_str);
+    match cmd {
+        Some("list") => {
+            if reg.legacy_accepts() {
+                println!("旧形式(共通キー)での接続: 受け付けています(--registry revoke-legacy で閉じられます)");
+            } else {
+                println!("旧形式(共通キー)での接続: 拒否中");
+            }
+            let devices = reg.devices();
+            if devices.is_empty() {
+                println!("登録済みの端末: ありません");
+                return;
+            }
+            println!("登録済みの端末: {}台", devices.len());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for d in devices {
+                let seen = d
+                    .last_seen
+                    .map(|t| format!("最終接続 {}秒前", now.saturating_sub(t)))
+                    .unwrap_or_else(|| "未接続".into());
+                println!("  {}  {}  略号 {}  {}", d.key_id, d.name, d.fp, seen);
+            }
+        }
+        Some("revoke") => {
+            let key = at
+                .and_then(|i| args.get(i + 2))
+                .and_then(|s| knit_common::secure::DeviceKeyId::parse(s));
+            let Some(key) = key else {
+                eprintln!("使い方: --registry revoke <key_id>(--registry list で確認)");
+                std::process::exit(2);
+            };
+            match conn::registry_revoke(reg, &key) {
+                Ok(knit_common::registry::RevokeOutcome::Revoked) => {
+                    println!("この端末からの接続を受け付けなくしました(本線・音声・ファイルの全経路)。");
+                    println!("相手の端末に保存された情報は消えません。以後の接続試行はすべて拒否されます。");
+                }
+                Ok(knit_common::registry::RevokeOutcome::NotFound) => {
+                    println!("この端末は既に登録がありません(何も変更していません)");
+                }
+                Err(e) => {
+                    eprintln!("[registry] 失効に失敗: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("revoke-legacy") => {
+            if let Err(e) = reg.revoke_legacy() {
+                eprintln!("[registry] 旧形式の閉鎖に失敗: {e}");
+                std::process::exit(2);
+            }
+            println!("旧形式(共通キー)での接続を受け付けなくなりました。端末別トークンの端末は影響しません。");
+        }
+        _ => {
+            eprintln!("使い方: --registry list | revoke <key_id> | revoke-legacy");
+            std::process::exit(2);
+        }
+    }
+}
+
 /// bulk 待受の鍵束(台帳の最新状態。台帳が無ければ従来の単一トークン)
 fn bulk_accept_keys() -> std::io::Result<knit_common::secure::ServerKeys> {
     match registry() {
@@ -788,6 +868,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--update") {
         std::process::exit(updater::run_cli());
+    }
+    // 台帳の閲覧・失効も --update と同じ扱い(二重起動防止より前に1回だけ実行)。
+    // 台帳ファイルは実行中の本体が変更を拾う(mtime で再読み込みする)ため、
+    // 本体が起動中でもこの CLI からの失効は効く
+    if args.iter().any(|a| a == "--registry") {
+        registry_cli(&args);
+        return;
     }
     // 二重起動の防止: 役割の切替などで再起動が重なると、同じ Mac が複数動いて
     // 待ち受けや接続を取り合い、つながるまで数分かかる(実測)。ロックを握れなければ終了する
