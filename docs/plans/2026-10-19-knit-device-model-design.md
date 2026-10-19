@@ -81,7 +81,7 @@
 | A | 台帳モジュール。DeviceKeyId・device_token 導出・DeviceRegistry(open/enroll/revoke/revoke_legacy/note_seen/devices)・devices.json の原子保存と非漏えい | crates/common/src/registry.rs(新) | 単体テスト: 冪等(revoke 2回で台帳バイト同一)・shape(64hex・ドメイン分離)・台帳 JSON に master/トークンが部分文字列として現れない・破損時退避 | なし |
 | B | secure の鍵束。ServerKeys(single/legacy_plus・非空保証・cap64)・全鍵試行 accept・Who | crates/common/src/secure.rs | ループバック: single で旧どおり・legacy_plus で Device/Legacy 判別・全滅時 PermissionDenied・ラベル取り違え拒否・タイミング回帰(テスト6) | A |
 | C | 登録の発行と Mac 配線。pairing serve_credential が enroll・mac session/audio の accept 差し替え・PeerEntry.auth・outgoing_token・bulk・discover_rooms | common/pairing.rs・bulk.rs・discover.rs + crates/mac | pairing ループバック(テスト4: 受け取る token が導出鍵で accept に通る)・three_paths(テスト2) | B |
-| D | 失効の実演と UI。**AC2 の主軸テスト**(登録A/B→revoke(A)→A拒否・B無影響・legacy無影響・冪等)・稼働セッション切断・UI 一覧/失効/「旧形式を受け付け中」表示・Win 3行差分 | common+mac(gui 最小)・win 3箇各1行 | AC2+AC3+AC4 の全部・CI 両 OS | C |
+| D | 失効の実演と操作経路。**AC2 の主軸テスト**(登録A/B→revoke(A)→A拒否・B無影響・legacy無影響・冪等)・稼働セッション切断(待機はLeave後切断・アクティブはdrop_stream)・操作経路 --registry CLI(設定 GUI の一覧は後続増分)・Win 差分はCで済み | common(tests/device_registry.rs)+mac(conn/main) | AC2+AC3+AC4 の全部・CI 両 OS・実バイナリで --registry list を実証 | C |
 
 各増分のコミット前に `cargo test --workspace` を緑で通す(sequence-verifiable-units)。Windows 側を触る増分は CI の windows-latest を通してから次へ。
 
@@ -134,6 +134,8 @@
 5. **既存登録端末の移行**: 登録済みの Win 端末は旧トークン=legacy で自動共存するが、**失効の恩恵を受けるには再登録が必要**(再登録は新 key_id 採番)。UI の一覧に legacy 接続中の端末を「旧形式」と見分けられる表示を要する
 6. **実機2台での登録 UX は未検証**: ループバックテストが上限。実機確認手順を残タスクとして書く
 7. **Android の Keystore 保存**: android-bridge は validate_transport_key(32..=512)で導出トークンを保存可能。実機での discover・音声結合は今回の検証範囲外
+8. **Mac が本線クライアントになる経路は master のまま**: client_attempt/client_thread(接続先が誰か hello の前に分からない)は宛先別トークンを解決できないため master を使う。台帳端末が相手だと本線のハンドシェイクに失敗する(bulk 接続側はアクティブ宛先の解決済み)。役割反転運用は実験的位置づけであり、後続の「机」設計で解く
+9. **設定 GUI の一覧・失効は後続増分**: 今回の操作経路は knit-mac --registry(list / revoke / revoke-legacy)。本体起動中でも効く(台帳は mtime で再読込)。見た目の整備と「旧形式を受け付け中」の常時表示は UI 増分で載せる
 
 ## 10. 実装の順序(まとめ)
 
@@ -143,3 +145,4 @@
 
 - 2026-10-19: 起草。§3.1/§4-C は arena 統合待ち
 - 2026-10-19: arena 完了(base=候補1・graft3件・judge 29対24)。§0/§3.1/§4 を確定。snow IKpsk2 の動作実証と全鍵試行の実装可能性裏取り済み。成果物は [arena/](./2026-10-19-knit-device-model-arena/)
+- 2026-10-19: **増分A〜D 着地**(PR #13・ブランチ wip/device-model)。AC1〜AC4 まで実証済み(ループバック+ワークスペース全緑+実バイナリの --registry 動作+CI 両 OS)。AC5 は本設計書。**残タスク**: 設定 GUI の一覧・失効・「旧形式を受け付け中」表示 / 実機2台での登録・失効の確認 / M02・M03(操作権リース)の実装 / Mac がクライアントになる経路の宛先別トークン(§9-8)
