@@ -2,7 +2,7 @@
 use super::*;
 use knit_common::credentials;
 
-unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) -> isize {
+pub(super) unsafe fn alert(title: &str, body: &str, buttons: &[&str], key: Option<&str>) -> isize {
     let app = msg0(
         objc_getClass(c"NSApplication".as_ptr()),
         sel(c"sharedApplication"),
