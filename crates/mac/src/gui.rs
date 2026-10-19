@@ -2675,6 +2675,11 @@ unsafe extern "C" fn imp_revoke_device(_s: ID, _c: SEL, sender: ID) {
     }
     match crate::conn::registry_revoke(reg, &key_id) {
         Ok(knit_common::registry::RevokeOutcome::Revoked) => {
+            // 全端末がいなくなった時だけ配置を整理する(通常切断と同じ規則。
+            // cut_sessions_where はロック保持中の保存を避けるため、ここで行う)
+            if crate::conn::peers_is_empty() {
+                crate::tap::save_peer_sides();
+            }
             crate::notify("Knit", &format!("「{}」を失効しました(以後の接続は拒否されます)", dev.name));
             eprintln!("[registry] 端末を失効しました(key_id={key_id})");
         }
