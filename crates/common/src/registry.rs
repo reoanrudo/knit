@@ -398,6 +398,20 @@ impl DeviceRegistry {
         self.lock_inner().devices.iter().any(|d| &d.key_id == key_id)
     }
 
+    /// 未接続のまま残った古い行を掃除する(登録途中で保存されなかった orphan や、
+    /// 長期に接続していない端末)。判定は「最終接続(未接続なら登録時刻)」が
+    /// `older_than_secs` より前か。削除した台数を返す(0 なら書込もしない)
+    pub fn prune_unseen(&self, older_than_secs: u64, now: u64) -> io::Result<usize> {
+        self.commit(|inner| {
+            let before = inner.devices.len();
+            inner
+                .devices
+                .retain(|d| now.saturating_sub(d.last_seen.unwrap_or(d.added_at)) < older_than_secs);
+            let removed = before - inner.devices.len();
+            (Ok(removed), removed > 0)
+        })
+    }
+
     /// 登録の初期化用: 台帳を空に戻す(全端末の登録取り消し。UI の
     /// 「すべての登録を初期化」とは別に、master 差し替え時の案内で使う)
     pub fn clear(&self) -> io::Result<()> {
@@ -781,6 +795,34 @@ mod tests {
         reg.clear().unwrap();
         assert!(reg.devices().is_empty());
         assert_eq!(DeviceRegistry::open(&dir, &m).unwrap().devices(), vec![]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// prune_unseen は「最終接続(無ければ登録時刻)」が古い行だけを消す
+    #[test]
+    fn prune_removes_only_stale_entries() {
+        let dir = temp_dir("prune");
+        let m = master();
+        let reg = DeviceRegistry::open(&dir, &m).unwrap();
+        let a = reg.enroll("新しい端末").unwrap();
+        let b = reg.enroll("古い端末").unwrap();
+        // b の登録時刻を 40 日前へ書き換える(ファイル経由)
+        let p = dir.join(FILE);
+        let mut v: serde_json::Value = serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for d in v["devices"].as_array_mut().unwrap() {
+            if d["key_id"] == b.key_id.as_str() {
+                d["added_at"] = serde_json::json!(now - 40 * 86_400);
+            }
+        }
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        let removed = reg.prune_unseen(30 * 86_400, now).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(reg.key_ids(), vec![a.key_id.clone()], "古い行だけ消える");
+        assert_eq!(reg.prune_unseen(30 * 86_400, now).unwrap(), 0, "2回目は何もしない");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
