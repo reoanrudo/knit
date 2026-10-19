@@ -567,15 +567,20 @@ pub(crate) fn keepalive_inactive_peers() {
 /// 直接触れないため、ここが外部失効を稼働中セッションへ反映する経路
 fn cut_externally_revoked_peers() {
     let Some(reg) = crate::registry() else { return };
+    let legacy_closed = !reg.legacy_accepts();
     let revoked: Vec<knit_common::secure::Who> = {
         let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
         let mut found: Vec<knit_common::secure::Who> = Vec::new();
         for p in peers.iter() {
-            if let knit_common::secure::Who::Device(k) = &p.auth {
-                if !reg.enrolled(k) && !found.contains(&p.auth) {
-                    eprintln!("[conn] 台帳から消えた端末({})を切断します", p.id);
-                    found.push(p.auth.clone());
-                }
+            let hit = match &p.auth {
+                knit_common::secure::Who::Device(k) => !reg.enrolled(k),
+                // 旧形式の受付が閉じられたら、稼働中の legacy 接続も切る
+                // (次のハンドシェイクを待たせない)
+                knit_common::secure::Who::Legacy => legacy_closed,
+            };
+            if hit && !found.contains(&p.auth) {
+                eprintln!("[conn] 失効済みの端末({})を切断します", p.id);
+                found.push(p.auth.clone());
             }
         }
         found
@@ -845,6 +850,62 @@ mod tests {
             alias: None,
             auth: knit_common::secure::Who::Legacy, shut: None,
         }
+    }
+
+    /// 失効の切断: 指定した認証主体のセッションだけが切れ、他端末は無傷。
+    /// 対象は一覧から消え、相手側の読み出しが終わる(実際にソケットが閉じる)
+    #[test]
+    fn cut_sessions_where_shuts_down_only_the_target() {
+        let _ = STREAM_SLOT.set(std::sync::Arc::new(std::sync::Mutex::new(None)));
+        // ループバックで「対象」「第三者」の2組を作る。受け側は5秒だけ保持する
+        let pair = |token: &'static str| -> (secure::Reader, secure::Writer) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            std::thread::spawn(move || {
+                let (sock, _) = listener.accept().unwrap();
+                let (r, w) = secure::accept(sock, token, b"knit-main").unwrap();
+                std::thread::sleep(Duration::from_secs(5));
+                drop((r, w));
+            });
+            let socket = std::net::TcpStream::connect(addr).unwrap();
+            secure::connect(socket, token, b"knit-main").unwrap()
+        };
+        let (mut a_reader, a_writer) = pair("cut-target");
+        let (_b_reader, b_writer) = pair("cut-other");
+        a_reader.set_read_timeout(Some(Duration::from_secs(2)));
+        let target = knit_common::secure::Who::Device(
+            knit_common::secure::DeviceKeyId::parse(&"1".repeat(32)).unwrap(),
+        );
+        let other = knit_common::secure::Who::Device(
+            knit_common::secure::DeviceKeyId::parse(&"2".repeat(32)).unwrap(),
+        );
+        let mut t = entry("target");
+        t.auth = target.clone();
+        t.writer = Some(a_writer);
+        let mut o = entry("other");
+        o.auth = other;
+        o.writer = Some(b_writer);
+        with_peers(vec![t, o], usize::MAX, || {
+            cut_sessions_where(&target);
+            {
+                let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+                assert!(!peers.iter().any(|p| p.id == "target"), "対象は一覧から消える");
+                assert!(peers.iter().any(|p| p.id == "other"), "第三者は残る");
+            }
+            // 対象の接続は閉じる(シャットダウン後は読み出し 0/エラーで戻る)
+            let mut buf = [0u8; 1];
+            let n = std::io::Read::read(&mut a_reader, &mut buf);
+            assert!(matches!(n, Ok(0) | Err(_)), "対象側は読み出しが終わる: {n:?}");
+            // 第三者は書けるまま(一覧に残った writer を使って)
+            use std::io::Write as _;
+            let mut peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+            let other_writer = peers
+                .iter_mut()
+                .find(|p| p.id == "other")
+                .and_then(|p| p.writer.as_mut())
+                .expect("第三者の writer は残る");
+            assert!(other_writer.write_all(b"x").is_ok(), "第三者は無傷");
+        });
     }
 
     /// PEERS/ACTIVE_PEER はプロセス共有の状態。入れ替えて必ず元へ戻す
