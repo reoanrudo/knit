@@ -1182,10 +1182,41 @@
         }
     }
 
+    /// 経路の資格。単一トークン運用(Windows・テスト)と台帳運用(Mac)を1つの型で表す。
+    /// 待受(accept)と接続(connect)で鍵が違う形に対応するため、String ではなく
+    /// この型を持つ(台帳運用は accept に鍵束を、connect に宛先別トークンを渡す)
+    pub enum EndpointCred {
+        /// 単一トークン。accept も connect も同じ鍵(従来運用)
+        Single(String),
+        /// 台帳運用。accept_keys は毎接続で最新の鍵束を返し(失効の即時反映)、
+        /// connect_token は宛先(アクティブ端末)に応じたトークンを返す
+        Multi {
+            accept_keys: fn() -> std::io::Result<crate::secure::ServerKeys>,
+            connect_token: fn() -> String,
+        },
+    }
+
+    impl EndpointCred {
+        /// 待受が使う鍵束
+        pub fn accept_keys(&self) -> std::io::Result<crate::secure::ServerKeys> {
+            match self {
+                EndpointCred::Single(t) => Ok(crate::secure::ServerKeys::single(t)),
+                EndpointCred::Multi { accept_keys, .. } => accept_keys(),
+            }
+        }
+        /// 接続が使うトークン
+        pub fn connect_token(&self) -> String {
+            match self {
+                EndpointCred::Single(t) => t.clone(),
+                EndpointCred::Multi { connect_token, .. } => connect_token(),
+            }
+        }
+    }
+
     /// 経路ごとの設定(受信先・完了時の処理・ログ出力先)
     pub struct Endpoint {
         pub link: &'static Link,
-        pub token: String,
+        pub credential: EndpointCred,
         pub dir: PathBuf,
         pub on_event: fn(Event),
         pub log: fn(&str),
@@ -1413,8 +1444,18 @@
             let Ok(ctl) = s.try_clone() else { continue };
             ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
-            let (r, w) = match crate::secure::accept(s, &ep.token, LABEL) {
-                Ok(x) => x,
+            // 鍵束が作れない(旧形式を閉じて登録0台等)場合は待受を続けつつ
+            // 全接続を拒否する(ログで状態が見えるように)
+            let keys = match ep.credential.accept_keys() {
+                Ok(k) => k,
+                Err(e) => {
+                    (ep.log)(&format!("[bulk] 待受鍵がありません: {e}"));
+                    std::thread::sleep(throttle.fail());
+                    continue;
+                }
+            };
+            let (r, w) = match crate::secure::accept_as(s, &keys, LABEL) {
+                Ok((r, w, _who)) => (r, w),
                 Err(e) => {
                     (ep.log)(&format!("[bulk] handshake 失敗 ({peer}): {e}"));
                     std::thread::sleep(throttle.fail());
@@ -1473,7 +1514,7 @@
             let Ok(ctl) = s.try_clone() else { continue };
             ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
-            let (r, w) = match crate::secure::connect(s, &ep.token, LABEL) {
+            let (r, w) = match crate::secure::connect(s, &ep.credential.connect_token(), LABEL) {
                 Ok(x) => x,
                 Err(e) => {
                     (ep.log)(&format!("[bulk] handshake 失敗: {e}"));

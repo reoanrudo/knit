@@ -645,7 +645,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         drop(listener);
         let endpoint = ENDPOINT.get_or_init(|| Endpoint {
-            link: &LINK, token: "bulk-heartbeat-test-key".into(),
+            link: &LINK, credential: EndpointCred::Single("bulk-heartbeat-test-key".into()),
             dir: std::env::temp_dir().join(format!("knit-heartbeat-{}", std::process::id())),
             on_event: |_| panic!("keepalive must not produce a file event"), log: |_| {},
             on_rx_bytes: |_| {}, on_batch_begin: || {}, on_bind_error: |_| {},
@@ -660,7 +660,7 @@ mod tests {
             }
         };
         socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let (mut reader, mut writer) = crate::secure::connect(socket, &endpoint.token, b"knit-bulk").unwrap();
+        let (mut reader, mut writer) = crate::secure::connect(socket, &endpoint.credential.connect_token(), b"knit-bulk").unwrap();
         for _ in 0..2 {
             write_frame(&mut writer, KEEPALIVE, &[]).unwrap();
             writer.flush().unwrap();
@@ -687,7 +687,7 @@ mod tests {
         };
         let server = SERVER.get_or_init(|| Endpoint {
             link: &SERVER_LINK,
-            token: "secret".into(),
+            credential: EndpointCred::Single("secret".into()),
             dir: base.join("srv"),
             on_event: |e| {
                 if let Event::Files { paths, .. } = e {
@@ -701,7 +701,7 @@ mod tests {
         });
         let client = CLIENT.get_or_init(|| Endpoint {
             link: &CLIENT_LINK,
-            token: "secret".into(),
+            credential: EndpointCred::Single("secret".into()),
             dir: base.join("cli"),
             on_event: |_| {},
             log: |_| {},
