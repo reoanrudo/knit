@@ -481,6 +481,17 @@ pub(crate) fn keepalive_inactive_peers() {
         use std::io::Write as _;
         loop {
             cut_externally_revoked_peers();
+        // M03: 操作権の期限。相手が固まって pong が5秒途絶えたら、切断(15秒)を
+        // 待たずにカーソルを手元へ戻す(押下の解放は Leave/切断の既存経路)
+        if lease_expired(
+            WIN_MODE.load(Ordering::Relaxed),
+            CONNECTED.load(Ordering::Relaxed),
+            LAST_PONG_MS.load(Ordering::Relaxed),
+            crate::now_ms(),
+        ) {
+            eprintln!("[conn] 操作権の期限切れ(最後の応答から5秒)。カーソルを手元へ戻します");
+            crate::tap::leave_win_mode_cursor_unlock(None);
+        }
         std::thread::sleep(Duration::from_secs(1));
             // bulk 張替延期の保留判定(受信中に切り替えた端末の clear 予約)。
             // 世代ガードで「予約した時の切替」が現在も使われているときだけ
@@ -562,6 +573,16 @@ pub(crate) fn keepalive_inactive_peers() {
     });
 }
 
+/// 操作権リースの沈黙許容(ミリ秒)。WIN_MODE 中に pong がこの時間途絶えたら、
+/// 本線の切断(15秒)を待たずにカーソルを手元へ戻す(M03 の「操作権に期限」)
+pub(crate) const LEASE_SILENCE_MS: u64 = 5_000;
+
+/// リース切れで操作権を手元へ戻すか(純関数・単体テスト対象)。
+/// WIN_MODE 中・接続中で、最後の pong から LEASE_SILENCE_MS 以上経過した時だけ
+fn lease_expired(win_mode: bool, connected: bool, last_pong_ms: u64, now_ms: u64) -> bool {
+    win_mode && connected && last_pong_ms != 0 && now_ms.saturating_sub(last_pong_ms) >= LEASE_SILENCE_MS
+}
+
 /// 1秒周期の監視: 台帳に無い鍵で認証済みのピア(外部プロセスの --registry
 /// revoke で失効された端末)を切る。CLI は別プロセスなので本体の PEERS を
 /// 直接触れないため、ここが外部失効を稼働中セッションへ反映する経路
@@ -588,6 +609,16 @@ fn cut_externally_revoked_peers() {
     for who in revoked {
         cut_sessions_where(&who);
     }
+}
+
+/// 接続しようとしている候補 IP の「認証済みトークン」。PEERS に同じ IP の
+/// 相手がいれば、その認証結果(Who)から解く(端末登録済みの相手が
+/// KNIT_ROLE=server のとき、master ではハンドシェイクが通らないため)。
+/// 未接続の候補は None=呼び出し側は master を使う
+pub(crate) fn known_peer_token(ip: std::net::IpAddr) -> Option<String> {
+    let reg = crate::registry()?;
+    let peers = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    peers.iter().find(|p| p.ip == ip).map(|p| reg.token_for(&p.auth))
 }
 
 pub(crate) fn allow_bulk_peer(ip: std::net::IpAddr) -> bool {
@@ -850,6 +881,20 @@ mod tests {
             alias: None,
             auth: knit_common::secure::Who::Legacy, shut: None,
         }
+    }
+
+    /// 操作権リース: WIN_MODE 中だけ・接続中だけ・最後の pong から5秒で切れる
+    #[test]
+    fn lease_expires_only_after_five_seconds_of_silence() {
+        // 非 WIN_MODE・未接続・pong 無しは常に期限切れ扱いにしない
+        assert!(!lease_expired(false, true, 1_000, 99_000));
+        assert!(!lease_expired(true, false, 1_000, 99_000));
+        assert!(!lease_expired(true, true, 0, 99_000));
+        // 5秒未満は生きている(4.999秒)
+        assert!(!lease_expired(true, true, 10_000, 14_999));
+        // ちょうど5秒とそれ以上は切れる
+        assert!(lease_expired(true, true, 10_000, 15_000));
+        assert!(lease_expired(true, true, 10_000, 60_000));
     }
 
     /// 失効の切断: 指定した認証主体のセッションだけが切れ、他端末は無傷。
