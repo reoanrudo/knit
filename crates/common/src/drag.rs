@@ -9,6 +9,165 @@ pub use forecast::{forecast_for, CarryPhase, FailReason, Forecast, ForecastInput
 pub mod lazy;
 pub use lazy::{LazyAbort, LazyCommand, LazyHandoff, LazySide, LazyState};
 
+/// ドラッグで運ぶ内容の種類(版 18 の土台)。OS のペーストボード形式に依存せず、
+/// 予告・目録・上限判定を共通の語彙で扱う。**旧版は未知フィールドとして無視する**
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PayloadKind {
+    /// ファイル・フォルダ(従来)
+    File,
+    /// 画像(ク​リップボードの画像と同じ扱い。実体は大容量経路で運ぶ)
+    Image,
+    /// テキスト(インライン。上限は MAX_INLINE_PAYLOAD)
+    Text,
+    /// URL(テキストとして運ぶが、受け側でリンクとして扱えるよう区別する)
+    Url,
+}
+
+impl Default for PayloadKind {
+    fn default() -> Self {
+        PayloadKind::File
+    }
+}
+
+impl PayloadKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PayloadKind::File => "ファイル",
+            PayloadKind::Image => "画像",
+            PayloadKind::Text => "テキスト",
+            PayloadKind::Url => "URL",
+        }
+    }
+
+    /// MIME から種類を決める(OS 側の形式判定をここへ寄せる)
+    pub fn from_mime(mime: &str) -> Self {
+        let mime = mime.trim().to_ascii_lowercase();
+        if mime.starts_with("text/uri-list") {
+            PayloadKind::Url
+        } else if mime.starts_with("image/") {
+            PayloadKind::Image
+        } else if mime.starts_with("text/") {
+            PayloadKind::Text
+        } else {
+            PayloadKind::File
+        }
+    }
+
+    /// 予告・目録に本文を直接載せる種類か(大きな実体は版の既存経路で運ぶ)
+    pub fn is_inline(self) -> bool {
+        matches!(self, PayloadKind::Text | PayloadKind::Url)
+    }
+}
+
+/// インラインで運ぶテキスト/URL の上限。1行の JSON に載る大きさに抑え、
+/// それ以上はファイルとして運ぶ(黙って切り詰めない)
+pub const MAX_INLINE_PAYLOAD: usize = 64 * 1024;
+
+/// 運搬物1件。ファイル経路と同じ「名前・サイズ・更新日時」に種類と、
+/// Text/Url のときだけ本文(inline)を足す
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Payload {
+    #[serde(default)]
+    pub kind: PayloadKind,
+    pub name: String,
+    pub size: u64,
+    #[serde(default)]
+    pub mtime: u64,
+    /// Text/Url のときだけ入る(UTF-8)。File/Image は空
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub inline: String,
+}
+
+impl Payload {
+    /// テキスト/URL の1件を作る(上限は validate で弾く)
+    pub fn inline_payload(kind: PayloadKind, name: &str, text: &str) -> Self {
+        Self {
+            kind,
+            name: name.to_string(),
+            size: text.len() as u64,
+            mtime: 0,
+            inline: text.to_string(),
+        }
+    }
+
+    /// 受信側で受け入れてよいか。理由はそのまま利用者へ出さず、通知の文言へ写す
+    pub fn validate(&self) -> Result<(), String> {
+        if self.kind.is_inline() {
+            if self.inline.len() > MAX_INLINE_PAYLOAD {
+                return Err("インラインの内容が上限を超えています".into());
+            }
+            if self.inline.is_empty() {
+                return Err("内容が空です".into());
+            }
+            if self.name.trim().is_empty() {
+                return Err("名前がありません".into());
+            }
+            if self.size != self.inline.len() as u64 {
+                return Err("サイズと内容が一致しません".into());
+            }
+        } else if !self.inline.is_empty() {
+            return Err("ファイル以外にインラインの内容は指定できません".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::{Payload, PayloadKind, MAX_INLINE_PAYLOAD};
+
+    /// 種類の既定はファイル(旧版の目録・予告は kind を送らない)
+    #[test]
+    fn kind_defaults_to_file_for_older_peers() {
+        let p: Payload = serde_json::from_str(r#"{"name":"a.txt","size":3}"#).unwrap();
+        assert_eq!(p.kind, PayloadKind::File);
+        assert!(p.inline.is_empty());
+        assert!(p.validate().is_ok());
+    }
+
+    /// MIME から種類を決める(OS 側の判定をここへ寄せる)
+    #[test]
+    fn kind_is_decided_from_mime() {
+        assert_eq!(PayloadKind::from_mime("image/png"), PayloadKind::Image);
+        assert_eq!(PayloadKind::from_mime("TEXT/PLAIN"), PayloadKind::Text);
+        assert_eq!(PayloadKind::from_mime("text/uri-list;charset=utf-8"), PayloadKind::Url);
+        assert_eq!(PayloadKind::from_mime("application/pdf"), PayloadKind::File);
+        assert_eq!(PayloadKind::from_mime(""), PayloadKind::File);
+    }
+
+    /// テキストは往復でき、上限・空・サイズ不一致・ファイルへの inline を弾く
+    #[test]
+    fn inline_payload_round_trips_and_validates() {
+        let p = Payload::inline_payload(PayloadKind::Text, "メモ.txt", "こんにちは");
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Payload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+        assert!(back.validate().is_ok());
+        assert_eq!(back.size, "こんにちは".len() as u64);
+        // 空・サイズ不一致
+        let mut empty = p.clone();
+        empty.inline.clear();
+        empty.size = 0;
+        assert!(empty.validate().is_err());
+        let mut bad = p.clone();
+        bad.size = 999;
+        assert!(bad.validate().is_err());
+        // ファイルに inline は載らない
+        let mut file = Payload::inline_payload(PayloadKind::File, "a.bin", "x");
+        file.kind = PayloadKind::File;
+        assert!(file.validate().is_err());
+        // 上限超え
+        let huge = "x".repeat(MAX_INLINE_PAYLOAD + 1);
+        assert!(Payload::inline_payload(PayloadKind::Text, "big.txt", &huge)
+            .validate()
+            .is_err());
+        assert!(Payload::inline_payload(PayloadKind::Text, "lim.txt", &"x".repeat(MAX_INLINE_PAYLOAD))
+            .validate()
+            .is_ok());
+    }
+}
+
 pub const MAX_FILES: usize = 64;
 /// フォルダ展開後の件数上限(版 14 で導入)。掴みドラッグの予告(DragOffer)は
 /// 展開後の件数で送るため、受け側もこの上限まで受け付ける
