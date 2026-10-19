@@ -977,6 +977,16 @@
             self.created_dirs = dirs;
         }
 
+        /// 明示中止(RESUME_DROP)のとき、書き込み途中の実体を部分として残さず
+        /// 消す。切断(Drop)のときの保持とは別の経路
+        pub fn discard_in_progress(&mut self) {
+            if let Sink::File { f, tmp, .. } = std::mem::replace(&mut self.sink, Sink::None) {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp);
+                self.paths.pop();
+            }
+        }
+
         /// 書き込み途中のファイルを破棄する(Drop・境界から呼ぶ。完了済みは残す)。
         /// reason が空でなければ失敗報告へ積む
         fn discard_open_file(&mut self, reason: &str) {
@@ -1688,6 +1698,8 @@
             while let Ok(kind) = read_frame(&mut r, &mut buf) {
                 // 明示中止: このバッチの部分ファイルを捨てる(共有範囲の判定より先)
                 if kind == RESUME_DROP {
+                    // 書き込み途中の実体と、保持済みの部分の両方を捨てる
+                    rx.discard_in_progress();
                     if let Ok(items) =
                         serde_json::from_slice::<Vec<crate::proto::ResumeItem>>(&buf)
                     {
