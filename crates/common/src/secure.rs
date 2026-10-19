@@ -285,6 +285,48 @@
         }
     }
 
+    /// 登録台帳の1端末を指す鍵ID(OS 乱数由来のhex32)。newtype であり
+    /// `parse` 以外の経路では作らせない(境界で検証し、内部では信頼する)。
+    /// 台帳ファイルへの保存・復元もこの形だけで行う
+    #[derive(Clone, PartialEq, Eq, Debug, Hash, serde::Serialize, serde::Deserialize)]
+    pub struct DeviceKeyId(String);
+
+    impl DeviceKeyId {
+        /// hex32(16バイトの16進)だけを通す。台帳の壊れた行はこれで弾く。
+        /// 大文字は小文字へ正規化する
+        pub fn parse(s: &str) -> Option<Self> {
+            if s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                Some(Self(s.to_ascii_lowercase()))
+            } else {
+                None
+            }
+        }
+        pub fn as_str(&self) -> &str {
+            &self.0
+        }
+        /// 新規採番(OS の安全な乱数から128bit)。登録ごとに新規で、使い回ししない
+        pub fn generate() -> io::Result<Self> {
+            let full = crate::credentials::generate()?;
+            Ok(Self(full[..32].to_string()))
+        }
+    }
+
+    impl std::fmt::Display for DeviceKeyId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    /// accept が「どの鍵で認証したか」を返す。Legacy は従来の単一共有トークン
+    /// (KNIT_TOKEN 運用・移行中の旧端末)。Device は端末別導出鍵。呼び出し側は
+    /// これを PeerEntry 等へ運ぶ(認証済み主体。hello の id は表示名の紐付け用で
+    /// 認証の根拠にはしない)
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    pub enum Who {
+        Legacy,
+        Device(DeviceKeyId),
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;

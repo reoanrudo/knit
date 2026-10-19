@@ -8,6 +8,7 @@ pub mod hud;
 pub mod notice;
 pub mod history;
 pub mod pairing;
+pub mod registry;
 pub mod spkstate;
 pub mod retry;
 pub mod share;
