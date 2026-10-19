@@ -341,7 +341,16 @@ fn show_invitation(token: &str, preview: bool, first: bool) {
             // 招待を開くたびに「登録完了」はやり直し(前回の結果を持ち越さない)
             INVITE_REGISTERED.store(false, Ordering::Relaxed);
             *TERMINATED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            let invitation = match Invitation::open(token.into(), port) {
+            // 登録の発行は台帳(端末別トークンの採番)で行う。台帳が開けない場合は
+            // 従来の単一トークン配布に戻せないため、登録の受付自体を止める
+            let registry = match crate::ensure_registry(&token) {
+                Some(r) => r.clone(),
+                None => {
+                    error("端末登録の台帳を開けませんでした。データ置き場の確認後にやり直してください。");
+                    break;
+                }
+            };
+            let invitation = match Invitation::open(registry, port) {
                 Ok(i) => i,
                 Err(_) => {
                     error(

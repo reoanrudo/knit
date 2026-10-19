@@ -860,7 +860,10 @@ mod tests {
             let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             s.local_addr().unwrap().port()
         };
-        std::thread::spawn(move || respond("127.0.0.1", port, "room-token", |_| true, || false));
+        std::thread::spawn(move || {
+            let room = room_id("room-token");
+            respond("127.0.0.1", port, move || vec![room.clone()], |_| true, || false)
+        });
         std::thread::sleep(std::time::Duration::from_millis(100));
         let target: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let found = seek_first(target, "room-token", std::time::Duration::from_millis(500));

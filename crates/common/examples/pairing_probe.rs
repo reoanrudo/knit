@@ -5,7 +5,15 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("server") => {
-            let invitation = pairing::Invitation::open(credentials::generate()?, 24900)?;
+            // 検証用の一時台帳(実データ置き場は触らない)
+            let dir = std::env::temp_dir().join(format!("knit-pairing-probe-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir)?;
+            let registry = std::sync::Arc::new(knit_common::registry::DeviceRegistry::open(
+                &dir,
+                &credentials::generate()?,
+            )?);
+            let invitation = pairing::Invitation::open(registry, 24900)?;
             println!("TEST CODE: {}", invitation.code);
             loop {
                 match invitation
