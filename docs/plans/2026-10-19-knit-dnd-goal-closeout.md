@@ -14,10 +14,10 @@
 | 増分 | コミット | 証明 |
 |---|---|---|
 | ゴール文書・計測手順 | 7e462fc, 079f1cd, a4fb525 | G1〜G7 の表・N1 PoC の4点・声→条件の対応 |
-| N4a 耐久と掃除 | a6ced13 | fsync(実体+親)、再帰掃除、空ディレクトリ回収。単体+結合テスト |
+| N4a 耐久と掃除 | a6ced13 | fsync(実体+親。**Windows は std で不可のため rename のみ**)、再帰掃除、空ディレクトリ回収。単体+結合テスト |
 | N4b レジュームの芯 | fa000c1 | 版18、`.knit-resume`、offset+前置ハッシュ。2MB 中512KB送信→残り1.5MBで完了・内容一致 |
 | N4c レジュームの配線 | cd45263 | 本線 resume_query/state、送信4箇所、明示中止 RESUME_DROP、7日掃除 |
-| e2e 実証 | f32278d | 実 TCP+Noise で「切断→保持→再接続→完了」「中止→破棄」の2本 |
+| e2e 実証 | f32278d | 実 TCP+Noise で「切断→保持→再接続→完了」「中止→破棄」の2本(送信関数と受信スレッドの経路。本線の resume_query/state の往復は未通過) |
 | N5a 衝突の芯 | 7db6878 | Rename/Overwrite/Skip、件数通知、同一バッチ内は退避 |
 | N5b 永続化 | 0fa182e | Mac 設定・アーカイブ version 3・Windows 設定。旧版は既定 rename |
 | N3a 非ファイルの土台 | bf99574 | PayloadKind/Payload、64KiB 上限、検証3本 |
@@ -59,3 +59,6 @@
 - N3 は「土台まで」。ユーザーから見た「テキストを掴んで渡す」はまだ動かない
 - Windows の pairing テストが一度 ConnectionReset で落ちた(再実行で緑)。既存の不安定さで、今回の変更とは独立
 - 実機でしか分からない前提(Finder の待ち方・OLE の寿命・exFAT の mtime)は、設計の弱点として各文書に記載済み
+- **Windows の公開前 fsync は無い**(std でディレクトリを fsync できないため)。耐久の保証は macOS/Linux の話で、Windows は rename の原子性まで
+- e2e は `bulk::resume_positions`/`send_entries_from` を直接使う試験で、**本線の `resume_query`/`resume_state` の往復は通っていない**(その配線は型チェックと単体まで)
+- 「各1コミット」は実装本体の話で、N4c の実ソケット e2e は別コミット(f32278d)
