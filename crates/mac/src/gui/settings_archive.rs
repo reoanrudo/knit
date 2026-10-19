@@ -95,7 +95,7 @@ fn compose_archive(
     screen: Value,
 ) -> Value {
     json!({
-        "version": 2,
+        "version": 3,
         "preferences": filtered_preferences(preferences, false),
         "desktop": {
             "notify_connection": desktop.notify_connection,
@@ -103,6 +103,7 @@ fn compose_archive(
             "receive_folder": desktop.receive_folder,
             "open_receive_folder": desktop.open_receive_folder,
             "history_limit": desktop.history_limit,
+            "collision": desktop.collision,
         },
         "screen": screen,
     })
@@ -126,7 +127,7 @@ impl ImportPlan {
                 desktop: None,
                 screen: None,
             }),
-            Some(2) => {
+            Some(2) | Some(3) => {
                 check_keys(
                     map,
                     &["version", "preferences", "desktop", "screen"],
@@ -144,7 +145,7 @@ impl ImportPlan {
                     screen: Some(value["screen"].clone()),
                 })
             }
-            _ => Err("対応していないKnit設定アーカイブの版です（version 1 / 2のみ）".into()),
+            _ => Err("対応していないKnit設定アーカイブの版です（version 1 / 2 / 3）".into()),
         }
     }
 }
@@ -220,6 +221,7 @@ fn parse_desktop(value: &Value) -> Result<crate::desktop_settings::Settings, Str
             "receive_folder",
             "open_receive_folder",
             "history_limit",
+            "collision",
         ],
         "desktop",
     )?;
@@ -261,12 +263,27 @@ fn parse_desktop(value: &Value) -> Result<crate::desktop_settings::Settings, Str
         })
         .transpose()?
         .unwrap_or(50);
+    // 版 3 の新キー。無ければ既定(旧アーカイブとの互換性)
+    let collision = value
+        .get("collision")
+        .map(|v| {
+            match v.as_str() {
+                Some("rename") => Ok("rename".to_string()),
+                Some("overwrite") => Ok("overwrite".to_string()),
+                Some("skip") => Ok("skip".to_string()),
+                _ => Err("desktop.collision: rename/overwrite/skip のいずれかが必要です"
+                    .to_string()),
+            }
+        })
+        .transpose()?
+        .unwrap_or_else(|| "rename".to_string());
     Ok(crate::desktop_settings::Settings {
         notify_connection: boolean("notify_connection")?,
         notify_transfer: boolean("notify_transfer")?,
         receive_folder: receive_folder.into(),
         open_receive_folder,
         history_limit,
+        collision,
     })
 }
 
@@ -527,6 +544,20 @@ mod tests {
             .remove("history_limit");
         let desktop = ImportPlan::parse(&legacy).unwrap().desktop.unwrap();
         assert!(!desktop.open_receive_folder && desktop.history_limit == 50);
+        assert_eq!(desktop.collision, "rename", "旧版には無いので既定へ");
+        // 版 3: collision は明示できる
+        let mut v3 = archive();
+        v3["version"] = json!(3);
+        v3["desktop"]["collision"] = json!("skip");
+        assert_eq!(
+            ImportPlan::parse(&v3).unwrap().desktop.unwrap().collision,
+            "skip"
+        );
+        // 未知の値は拒否する
+        let mut invalid = archive();
+        invalid["version"] = json!(3);
+        invalid["desktop"]["collision"] = json!("delete");
+        assert!(ImportPlan::parse(&invalid).is_err());
         let mut invalid = archive();
         invalid["startup_enabled"] = json!(true);
         assert!(ImportPlan::parse(&invalid).is_err());
@@ -543,11 +574,12 @@ mod tests {
             &crate::desktop_settings::Settings::default(),
             json!({"version":1,"peers":{}}),
         );
-        assert_eq!(snapshot["version"], 2);
+        assert_eq!(snapshot["version"], 3, "新キー(collision)を含むため版を上げる");
+        assert_eq!(snapshot["desktop"]["collision"], "rename");
         assert!(snapshot["preferences"]["audio_output_uid"].is_string());
         assert_eq!(snapshot["screen"]["version"], 1);
         let desktop = snapshot["desktop"].as_object().unwrap();
-        assert_eq!(desktop.len(), 5);
+        assert_eq!(desktop.len(), 6, "collision を足した");
         assert!(!snapshot.to_string().contains("startup_enabled"));
         assert!(snapshot.get("authentication").is_none());
         assert!(ImportPlan::parse(&snapshot).is_ok());

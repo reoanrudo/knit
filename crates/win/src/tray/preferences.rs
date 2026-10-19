@@ -47,6 +47,9 @@ pub(super) fn restore() {
     let (unlock_on, unlock_secret) = unlock_from_json(&value);
     UNLOCK_SYNC.store(unlock_on, Ordering::Relaxed);
     *unlock_secret_slot() = unlock_secret;
+    if let Some(label) = value["collision"].as_str() {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(label));
+    }
 }
 
 /// JSON 値からロック解除連動の 2 設定を読む(型が違うキーは既定のまま。
@@ -278,7 +281,7 @@ pub(super) fn save() -> std::io::Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(serde_json::to_string_pretty(&serde_json::json!({"version":1,"audio_enabled":crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed),"share_clip":knit_common::share::user_clip(),"share_files":knit_common::share::user_files(),"host_mode":HOST_MODE.load(Ordering::Relaxed),"unlock_sync":UNLOCK_SYNC.load(Ordering::Relaxed),"unlock_secret":unlock_secret_slot().clone()}))?.as_bytes())?;
+    f.write_all(serde_json::to_string_pretty(&serde_json::json!({"version":1,"audio_enabled":crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed),"share_clip":knit_common::share::user_clip(),"share_files":knit_common::share::user_files(),"host_mode":HOST_MODE.load(Ordering::Relaxed),"unlock_sync":UNLOCK_SYNC.load(Ordering::Relaxed),"unlock_secret":unlock_secret_slot().clone(),"collision":knit_common::files::collision().label()}))?.as_bytes())?;
     f.sync_all()?;
     drop(f);
     #[link(name = "kernel32")]
@@ -379,6 +382,7 @@ mod profile_round_trip_tests {
         host: bool,
         unlock: bool,
         secret: String,
+        collision: String,
     }
 
     impl Snapshot {
@@ -390,6 +394,7 @@ mod profile_round_trip_tests {
                 host: HOST_MODE.load(Ordering::Relaxed),
                 unlock: UNLOCK_SYNC.load(Ordering::Relaxed),
                 secret: (*unlock_secret_slot()).clone(),
+                collision: knit_common::files::collision().label().to_string(),
             }
         }
     }
@@ -402,6 +407,9 @@ mod profile_round_trip_tests {
             HOST_MODE.store(self.host, Ordering::Relaxed);
             UNLOCK_SYNC.store(self.unlock, Ordering::Relaxed);
             *unlock_secret_slot() = self.secret.clone();
+            knit_common::files::set_collision(knit_common::files::Collision::from_label(
+                &self.collision,
+            ));
         }
     }
 
@@ -423,6 +431,7 @@ mod profile_round_trip_tests {
         HOST_MODE.store(true, Ordering::Relaxed);
         UNLOCK_SYNC.store(true, Ordering::Relaxed);
         *unlock_secret_slot() = "QUJD".into();
+        knit_common::files::set_collision(knit_common::files::Collision::Skip);
         save().expect("設定を保存できる");
 
         // すべて既定へ戻してから restore する(保存ファイルを実際に読んだことの証明)
@@ -432,6 +441,7 @@ mod profile_round_trip_tests {
         HOST_MODE.store(false, Ordering::Relaxed);
         UNLOCK_SYNC.store(false, Ordering::Relaxed);
         *unlock_secret_slot() = String::new();
+        knit_common::files::set_collision(knit_common::files::Collision::Rename);
         restore();
 
         assert!(!crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed));
@@ -440,6 +450,11 @@ mod profile_round_trip_tests {
         assert!(HOST_MODE.load(Ordering::Relaxed));
         assert!(UNLOCK_SYNC.load(Ordering::Relaxed));
         assert_eq!(*unlock_secret_slot(), "QUJD");
+        assert_eq!(
+            knit_common::files::collision(),
+            knit_common::files::Collision::Skip,
+            "同名衝突の扱いも往復する"
+        );
         // 起動時の役割判定は同じファイルを直接読むため、こちらでも一致する
         assert!(host_mode_pref());
 

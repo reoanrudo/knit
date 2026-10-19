@@ -17,6 +17,8 @@ pub struct Settings {
     pub open_receive_folder: bool,
     /// クリップボード履歴の保存件数上限。許容値は 10/50/100/200。
     pub history_limit: usize,
+    /// 同名のファイルがあったときの扱い。rename/overwrite/skip(既定 rename)
+    pub collision: String,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             receive_folder: String::new(),
             open_receive_folder: false,
             history_limit: 50,
+            collision: "rename".into(),
         }
     }
 }
@@ -39,6 +42,13 @@ fn settings_path() -> Result<PathBuf, String> {
     knit_common::envutil::config_dir()
         .map(|dir| dir.join("desktop-settings.json"))
         .ok_or_else(|| "設定フォルダを取得できません".into())
+}
+
+fn validate_collision(value: &str) -> Result<String, String> {
+    match value {
+        "rename" | "overwrite" | "skip" => Ok(value.to_string()),
+        _ => Err("collision は rename/overwrite/skip のいずれかで指定してください".into()),
+    }
 }
 
 fn validate_history_limit(limit: usize) -> Result<usize, String> {
@@ -85,6 +95,13 @@ fn decode_settings(bytes: &[u8]) -> Result<Settings, String> {
             .ok_or("history_limit は 10/50/100/200 のいずれかで指定してください")?
             as usize;
         settings.history_limit = validate_history_limit(limit)?;
+    }
+    if let Some(value) = map.get("collision") {
+        settings.collision = validate_collision(
+            value
+                .as_str()
+                .ok_or("collision は rename/overwrite/skip のいずれかで指定してください")?,
+        )?;
     }
     validate_path_syntax(&settings.receive_folder)?;
     Ok(settings)
@@ -201,12 +218,16 @@ fn transfer_active() -> bool {
 pub fn apply(next: Settings) -> Result<(), String> {
     validate_path_syntax(&next.receive_folder)?;
     validate_history_limit(next.history_limit)?;
+    validate_collision(&next.collision)?;
     // 最初の apply より前に実際の受信先を固定し、未初期化の Endpoint が
     // 保存直後だけ新フォルダを使ってしまう状態を防ぐ。
     let _ = receive_dir();
     let mut current = state().lock().unwrap_or_else(|e| e.into_inner());
     if sandboxed() {
         *current = next;
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(
+            &current.collision,
+        ));
         return Ok(());
     }
     if transfer_active() {
@@ -222,6 +243,7 @@ pub fn apply(next: Settings) -> Result<(), String> {
         "receive_folder": next.receive_folder,
         "open_receive_folder": next.open_receive_folder,
         "history_limit": next.history_limit,
+        "collision": next.collision,
     }))
     .map_err(|e| e.to_string())?;
     let path = settings_path()?;
@@ -236,6 +258,10 @@ pub fn apply(next: Settings) -> Result<(), String> {
     }
     atomic_write(&path, &bytes).map_err(|e| format!("設定を保存できません: {e}"))?;
     *current = next;
+    // 反映は保存が成功してから(失敗時に画面と実挙動が食い違わない)
+    knit_common::files::set_collision(knit_common::files::Collision::from_label(
+        &current.collision,
+    ));
     Ok(())
 }
 
@@ -580,6 +606,7 @@ mod tests {
             receive_folder: "/knit-test-nonexistent/receive".into(),
             open_receive_folder: true,
             history_limit: 100,
+            collision: "rename".into(),
         };
         assert!(receive_dir_change_requires_restart(&next));
         apply(next.clone()).unwrap();
@@ -602,5 +629,33 @@ mod tests {
         assert_eq!(startup_enabled(), !startup);
         set_startup_enabled(startup).unwrap();
         apply(old).unwrap();
+    }
+
+    /// 同名衝突の設定は検証つきで読み書きでき、適用で受信側のポリシーへ反映される
+    #[test]
+    fn collision_setting_round_trips_and_applies() {
+        let decode = decode_settings(
+            br#"{"version":1,"collision":"skip"}"#,
+        )
+        .unwrap();
+        assert_eq!(decode.collision, "skip");
+        assert!(decode_settings(br#"{"version":1,"collision":"delete"}"#).is_err());
+        assert!(decode_settings(br#"{"version":1,"collision":1}"#).is_err());
+        let old = snapshot();
+        let next = Settings {
+            collision: "overwrite".into(),
+            ..Settings::default()
+        };
+        apply(next).unwrap();
+        assert_eq!(snapshot().collision, "overwrite");
+        assert_eq!(
+            knit_common::files::collision(),
+            knit_common::files::Collision::Overwrite
+        );
+        apply(old).unwrap();
+        assert_eq!(
+            knit_common::files::collision(),
+            knit_common::files::Collision::Rename
+        );
     }
 }
