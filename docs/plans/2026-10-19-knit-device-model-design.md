@@ -46,7 +46,7 @@
 
 **台帳。** `DeviceRegistry`(crates/common/src/registry.rs 新)。devices.json(非秘密・write_atomic)に key_id・name・fp・added_at・**last_seen**(候補2から移植)。master も導出トークンも書かない(漏えても鍵は導出不能)。`enroll(name)` は常に新規 key_id 採番・"saved" ack 前にコミット(ack 欠落で二度と繋がらなくなる事故の防止。未使用エントリは UI から掃除)。`revoke(key_id)` は物理削除で冪等(NotFound も成功)。`revoke_legacy()` は旧形式の受付停止(devices.json の legacy_revoked に永続)。`note_seen` は接続成功時のみ記録(失効後の試行は記録しない=列挙の手がかりを出さない)。UI の「登録済み: N台」は台帳からのみ出す(二重管理しない)。
 
-**宛先解決。** Mac が接続側になる経路(client_attempt・bulk connect_loop)は `outgoing_token(peer_device_id)`。未紐付けの宛先(旧端末)は master をそのまま返す。discover は Mac の応答側だけ `discover_rooms()`(room_id(master)+全 room_id(導出トークン))にマルチルーム化。Win の seek 側・Win の応答側(KNIT_ROLE=server)は単一 room のまま。
+**宛先解決。** Mac が接続側になる経路(bulk connect_loop)は認証済みの主体から解く(`token_for(Who)`)。自己申告の hello id は根拠にしない(レビュー指摘の受諾。なりすまし id で bulk 経路を落とせない)。Legacy は master にフォールバック。discover は Mac の応答側だけ `discover_rooms()`(room_id(master)+全 room_id(導出トークン))にマルチルーム化。Win の seek 側・Win の応答側(KNIT_ROLE=server)は単一 room のまま。
 
 **後段への境界。** `PeerEntry.auth: Who` が認証済み主体の運び場所。許可行列・操作権リースはこの1フィールドから引く。
 
@@ -128,14 +128,15 @@
 ## 9. 設計の弱点・未検証の前提(正直に)
 
 1. **失効は次回接続まで届かない**: オフラインの失効済み端末との既存接続を切れるが、端末がオフラインなら「拒否」は次のハンドシェイクでしか起きない。L03 の「届いていない削除要求を成功としない」は UI 文言で誠実に扱う(last_seen で「失効後に一度も接続していない」を示せる。候補2から移植)。テクニカルには失効リストの配布も考えたが、複雑度に見合わないと判断
-2. **タイミング漏れ(graft)**: 全鍵試行の線形探索は「どの鍵で当たったか」を処理時間で漏らす素地がある。鍵数 cap 64 と FailThrottle(接続単位)で軽減するが除去はしない。テスト6で鍵位置別の応答時間分散を固定し、悪化を検知できるようにする
+2. **タイミング漏れ(graft)**: 全鍵試行の線形探索は「どの鍵で当たったか」を処理時間で漏らす素地がある。鍵数 cap 64 と FailThrottle(接続単位)で軽減するが除去はしない。回帰の監視は「総時間の上限テスト」(上限64鍵でも最下位鍵で即座に完了=2秒未満)で行う(位置別の分散表明は揺らぎやすいので採らない)
 3. **legacy(旧形式共有鍵)は revoke_legacy されるまで常設(判定者の留保)**: 移行完了を利用者の手動操作に頼る。UI に「旧形式での接続を受け付けています」を常時表示し、revoke_legacy へ導く。放置した部屋では M2 が解けたままの窓が残る
 4. **master 漏えい = 全端末トークンの導出可能性**: 台帳を非秘密(JSON)に保つ利点と引き換えに受け入れる。Mac の Keychain を割られた時点で「新しい鍵を配る」権限も漏れているため実害の差は小さい。端末側の漏えいは導出トークン1本分に隔離される(逆算不能・他端末の key_id は不明)
 5. **既存登録端末の移行**: 登録済みの Win 端末は旧トークン=legacy で自動共存するが、**失効の恩恵を受けるには再登録が必要**(再登録は新 key_id 採番)。UI の一覧に legacy 接続中の端末を「旧形式」と見分けられる表示を要する
 6. **実機2台での登録 UX は未検証**: ループバックテストが上限。実機確認手順を残タスクとして書く
 7. **Android の Keystore 保存**: android-bridge は validate_transport_key(32..=512)で導出トークンを保存可能。実機での discover・音声結合は今回の検証範囲外
 8. **Mac が本線クライアントになる経路は master のまま**: client_attempt/client_thread(接続先が誰か hello の前に分からない)は宛先別トークンを解決できないため master を使う。台帳端末が相手だと本線のハンドシェイクに失敗する(bulk 接続側はアクティブ宛先の解決済み)。役割反転運用は実験的位置づけであり、後続の「机」設計で解く
-9. **設定 GUI の一覧・失効は後続増分**: 今回の操作経路は knit-mac --registry(list / revoke / revoke-legacy)。本体起動中でも効く(台帳は mtime で再読込)。見た目の整備と「旧形式を受け付け中」の常時表示は UI 増分で載せる
+9. **設定 GUI の一覧・失効は後続増分**: 今回の操作経路は knit-mac --registry(list / revoke / revoke-legacy)。本体起動中でも効く(台帳は mtime で再読込し、外部失効は keepalive の1秒周期チェックで稼働セッションも切る)。見た目の整備と「旧形式を受け付け中」の常時表示は UI 増分で載せる
+10. **片側だけの旧版へのダウングレード**: 新 Mac は登録で master を配らないため、Mac だけ旧版へ戻すと、導出トークンで登録した Win は再登録まで接続できない(旧待受は psk(master) のみ)。両側を同じ版へ揃えるか、再登録で回復
 
 ## 10. 実装の順序(まとめ)
 

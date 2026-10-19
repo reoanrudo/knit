@@ -2719,7 +2719,7 @@ mod side_geometry_tests {
             screen: (1920.0, 1080.0),
             monitors: Vec::new(),
             writer: None,
-            gen: 1, auth: knit_common::secure::Who::Legacy,
+            gen: 1, auth: knit_common::secure::Who::Legacy, shut: None,
             side,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
@@ -2890,7 +2890,7 @@ mod missing_monitor_tests {
             screen: (1920.0, 1080.0),
             monitors: Vec::new(),
             writer: None,
-            gen: 1, auth: knit_common::secure::Who::Legacy,
+            gen: 1, auth: knit_common::secure::Who::Legacy, shut: None,
             side,
             ver: knit_common::proto::VERSION,
             edge_monitor: None,
@@ -3051,7 +3051,7 @@ mod peer_sides_save_tests {
         PeerEntry {
             id: id.into(), name: format!("{id}のPC"), alias: None,
             ip: "127.0.0.1".parse().unwrap(), screen: (1920.0, 1080.0),
-            monitors: Vec::new(), writer: None, gen: 42, side, auth: knit_common::secure::Who::Legacy,
+            monitors: Vec::new(), writer: None, gen: 42, side, auth: knit_common::secure::Who::Legacy, shut: None,
             edge_monitor: monitor, ver: knit_common::proto::VERSION,
         }
     }

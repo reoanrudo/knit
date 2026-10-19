@@ -1164,6 +1164,11 @@ mod tests {
         let tokens = registry.device_tokens();
         assert_eq!(tokens.len(), 1, "登録で台帳に1台載る");
         assert_eq!(received, tokens[0].1);
+        // 登録後のビーコンにも鍵材料は出ない(表示は匿名ラベルのまま)
+        let after = discover_probe(addr, Duration::from_millis(150), addr.port()).unwrap();
+        let beacon2 = serde_json::to_string(&after).unwrap();
+        assert!(!beacon2.contains(&tokens[0].1), "導出トークンはビーコンに漏れない");
+        assert!(!beacon2.contains(&received));
         // 通常は 0.3 秒ほどで届く。全テストを並列に走らせるとマシンが混むため
         // 余裕を持たせる(2秒だと手元の並列実行でも落ちることがあった。CI の
         // ランナーはさらに遅い)。届かないこと自体は従来どおり失敗にする
