@@ -25,32 +25,42 @@ pub enum SendFilesOutcome {
     Denied,
 }
 
+/// 相手の受理結果(XferAck)から、メニューに残す転送結果を決める(純関数)。
+/// 全件受理が確認できたときだけ `Placed`。相手側で保存できなかった `rejected>0` は
+/// 再送で直りうるので再試行可(`Failed`)にし、設定による拒否(`scope`)は再送しても
+/// 直らないので再試行不可にする。Ack が無い(旧版・待ち切れ)は転送自体は
+/// 終わっているため従来どおり `Placed` とする。
+fn outcome_for_ack(ack: Option<(usize, usize, bool)>, n: usize) -> notice::DeliveryResult {
+    match ack {
+        Some((accepted, 0, false)) if accepted == n => notice::DeliveryResult::Placed,
+        Some((accepted, rejected, false)) if rejected > 0 => notice::DeliveryResult::Failed {
+            reason: "相手側で保存できませんでした".to_string(),
+            retryable: true,
+            saved_count: accepted,
+        },
+        Some((accepted, _, true)) => notice::DeliveryResult::Failed {
+            reason: "相手側の設定で受け取りが拒否されました".to_string(),
+            retryable: false,
+            saved_count: accepted,
+        },
+        // 件数の不一致: 成功とは言えず、再送しても直る保証が無い
+        Some((accepted, _, _)) => notice::DeliveryResult::Failed {
+            reason: "相手側での保存を確認できませんでした".to_string(),
+            retryable: false,
+            saved_count: accepted,
+        },
+        None => notice::DeliveryResult::Placed,
+    }
+}
+
 /// ファイル群を Windows へ送る(FileBegin → FileChunk… → FileEnd)。
 /// GUI メニュー(NSOpenPanel)と Finder の ⌘C 検出の両方から呼ぶ。別スレッド実行。
 /// 掴んだまま境界を越える場合は offer_drag_to_win を使う
-/// 版 18: 相手が保持している部分から送信開始位置を決める。相手が旧版・
-/// 応答なし(1.5秒)のときは先頭から。**resume 対応の相手にだけ問い合わせる**
+/// 版 18: 相手が保持している部分から送信開始位置を決める(芯は common の
+/// resume_offsets_for。相手が旧版・応答なしのときは先頭から)
 fn resume_offsets_for(entries: &[knit_common::bulk::OutFile]) -> Vec<u64> {
     let features = knit_common::proto::peer_features(PEER_VERSION.load(Ordering::Relaxed));
-    if !features.resume
-        || entries.iter().all(|e| e.is_dir)
-        || knit_common::bulk::entries_total(entries) < 1024 * 1024
-    {
-        return vec![0; entries.len()];
-    }
-    let token = knit_common::bulk::next_resume_token();
-    send_msg(&Msg::XferResumeQuery {
-        token,
-        items: knit_common::bulk::resume_items(entries),
-    });
-    let positions =
-        knit_common::bulk::wait_resume_state(token, std::time::Duration::from_millis(1500));
-    let offsets = knit_common::bulk::resume_offsets_of(entries, &positions);
-    let resumed = offsets.iter().filter(|o| **o > 0).count();
-    if resumed > 0 {
-        eprintln!("[file] 続きから送信します(再開: {resumed} 件)");
-    }
-    offsets
+    knit_common::bulk::resume_offsets_for(entries, features, |msg| send_msg_reported(&msg))
 }
 
 pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
@@ -160,13 +170,16 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                     "[file] 送信完了({n} 件, {:.1}MB/s)",
                     total as f64 / 1024.0 / 1024.0 / secs
                 );
-                // 成功したら直前の失敗の記録を消す(メニューの「もう一度送る」が
-                // 残り続けて、同じファイルを二重に送ってしまうのを防ぐ)
+                // 相手の受理結果を待つ(版 15 以降の相手だけ返す。旧版はタイムアウト)。
+                // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
+                let ack = wait_xfer_ack(Duration::from_millis(2500));
+                // 記録は相手の結果を待ってから決める: 先に Placed を書くと、
+                // 一部が保存できなかった場合にメニューの「もう一度送る」が出なくなる
                 note_outcome(
                     &notice::DeliveryOutcome {
                         peer: peer.clone(),
                         count: n,
-                        result: notice::DeliveryResult::Placed,
+                        result: outcome_for_ack(ack, n),
                     },
                     &paths,
                 );
@@ -174,9 +187,6 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                 let mut all_skipped = cr.skipped.clone();
                 all_skipped.extend(rep.skipped.iter().cloned());
                 let skip_note = skip_note(&all_skipped);
-                // 相手の受理結果を待つ(版 15 以降の相手だけ返す。旧版はタイムアウト)。
-                // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
-                let ack = wait_xfer_ack(Duration::from_millis(2500));
                 match ack {
                     Some((_, _, true)) => {
                         notify(
@@ -1414,6 +1424,56 @@ mod last_outcome_tests {
             notice::Recovery::None,
             "再試行は促さない"
         );
+    }
+}
+
+#[cfg(test)]
+mod outcome_for_ack_tests {
+    use super::*;
+
+    /// 相手側で一部保存できなかった場合を Placed にすると、メニューの
+    /// 「もう一度送る」が出なくなる(監査 SHOULD 2)
+    #[test]
+    fn partial_save_failure_is_not_placed_and_offers_resend() {
+        let result = outcome_for_ack(Some((2, 1, false)), 3);
+        assert_ne!(
+            result,
+            notice::DeliveryResult::Placed,
+            "未確認の一部失敗を成功にしない"
+        );
+        assert!(notice::needs_attention(&result), "メニューに理由を出す");
+        assert_eq!(
+            notice::recovery_for(&result),
+            notice::Recovery::Resend,
+            "再送を促す"
+        );
+    }
+
+    /// 全件受理が確認できたときだけ Placed
+    #[test]
+    fn fully_accepted_ack_is_placed() {
+        assert_eq!(
+            outcome_for_ack(Some((3, 0, false)), 3),
+            notice::DeliveryResult::Placed
+        );
+    }
+
+    /// 設定による拒否(scope)は再送しても直らないので Resend を出さない
+    #[test]
+    fn scope_rejection_is_not_placed_and_does_not_offer_resend() {
+        let result = outcome_for_ack(Some((0, 3, true)), 3);
+        assert_ne!(result, notice::DeliveryResult::Placed, "拒否を成功にしない");
+        assert_eq!(
+            notice::recovery_for(&result),
+            notice::Recovery::None,
+            "再送は促さない"
+        );
+    }
+
+    /// Ack が無い旧版相手は、転送自体は終わっているので従来どおり Placed
+    #[test]
+    fn missing_ack_stays_placed() {
+        assert_eq!(outcome_for_ack(None, 3), notice::DeliveryResult::Placed);
     }
 }
 

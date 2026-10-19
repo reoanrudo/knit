@@ -139,4 +139,21 @@ mod tests {
         // panic させると 1 秒待つテストになるため、ここでは正常系だけを確認する。
         run_supervised("test", || {});
     }
+
+    #[test]
+    fn panic_restarts_the_body_once_then_finishes() {
+        // 1 回目だけ panic させ、再開した 2 回目で正常 return する。
+        // 再起動を待つ 1 秒のバックオフは next_restart_delay(0) の実装どおり。
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        run_supervised("test-restart", || {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("テスト用の panic");
+            }
+        });
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "panic 後に body が再実行される"
+        );
+    }
 }

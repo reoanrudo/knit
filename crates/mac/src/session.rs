@@ -143,11 +143,16 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             note_xfer_ack(accepted, rejected, scope);
                         }
                         // 版 18: 相手(送信側)からの再開位置の問い合わせに、
-                        // 保持している部分ファイルから応答する
+                        // 保持している部分ファイルから応答する。先頭ハッシュの
+                        // 計算は部分が大きいほど時間がかかるため、本線ループ
+                        // (入力の復帰・clipboard の受信)を止めないよう別スレッドで。
+                        // 応答はトークンで対応付けるため順序は問わない
                         Msg::XferResumeQuery { token, items } => {
-                            let dir = crate::desktop_settings::receive_dir();
-                            let items = knit_common::bulk::resume_positions(&dir, &items);
-                            send_msg(&Msg::XferResumeState { token, items });
+                            std::thread::spawn(move || {
+                                let dir = crate::desktop_settings::receive_dir();
+                                let items = knit_common::bulk::resume_positions(&dir, &items);
+                                send_msg(&Msg::XferResumeState { token, items });
+                            });
                         }
                         Msg::XferResumeState { token, items } => {
                             knit_common::bulk::note_resume_state(token, items);

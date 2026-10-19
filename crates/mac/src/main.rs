@@ -1356,7 +1356,8 @@ fn main() {
     // Msg::Unlock を送る(旧 Windows へ送らない・受け側の設定は Windows 任せ)
     std::thread::spawn(|| {
         let mut was = false;
-        loop {
+        // 1 秒周期のロック連動。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("画面ロック連動", move || loop {
             std::thread::sleep(Duration::from_secs(1));
             let now = screen_locked();
             if now && !was {
@@ -1384,7 +1385,7 @@ fn main() {
                 }
             }
             was = now;
-        }
+        });
     });
 
     // ネットワーク構成の監視(1 秒毎)。既定経路のローカル IP が変わったら
@@ -1397,7 +1398,8 @@ fn main() {
             Some(s.local_addr().ok()?.ip())
         }
         let mut last = route_ip();
-        loop {
+        // 1 秒周期の経路監視。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("ネットワーク監視", move || loop {
             std::thread::sleep(Duration::from_millis(1000));
             let now = route_ip();
             if now == last {
@@ -1416,14 +1418,16 @@ fn main() {
                 drop_stream("ネットワーク構成の変化を検知");
                 BULK_LINK.clear();
             }
-        }
+        });
     });
 
     doctor::start();
 
     // Tailscale 経路の診断(30 秒毎)。直結から中継(DERP)へ落ちると遅延が数倍になり
     // 「カクつき」の原因になるため、切り替わった時だけ通知する
-    std::thread::spawn(|| loop {
+    std::thread::spawn(|| {
+        // 30 秒周期の経路診断。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("Tailscale経路診断", move || loop {
         std::thread::sleep(Duration::from_secs(30));
         let peer = *PEER_IP.lock().unwrap_or_else(|e| e.into_inner());
         let Some(peer) = peer
@@ -1450,6 +1454,7 @@ fn main() {
                 );
             }
         }
+        });
     });
 
     // 音声受信・再生(Windows→Mac。独立ポート 24901。KNIT_AUDIO=0 で無効)
@@ -1506,7 +1511,8 @@ fn main() {
     }
     std::thread::spawn(|| {
         let mut last_cursor = (0.0f64, 0.0f64);
-        loop {
+        // 1 秒周期の診断出力。panic した時だけ supervisor が記録して再起動する。
+        supervise::run_supervised("診断カーソル監視", move || loop {
             std::thread::sleep(Duration::from_secs(1));
             // 設定での切替は即時に効かせる(1 秒の確認は軽いため常駐で問題ない)
             if !DIAG_ENABLED.load(Ordering::Relaxed) {
@@ -1537,7 +1543,7 @@ fn main() {
                 );
                 last_cursor = (p.x, p.y);
             }
-        }
+        });
     });
 
     // 起動時点のクリップボードは送らない(以後の変化だけを切替時に同期する)
@@ -1550,7 +1556,9 @@ fn main() {
         // tap 側の wake_watcher() が unpark で即座に起こすため、検出は遅れない。
         // (16ms 固定では、操作していない間も毎秒 62.5 回起き続けていた)
         file_drag::register_watcher();
-        loop {
+        // 掴み検出の待機ループ。panic した時だけ supervisor が記録して再起動する
+        // (ウォッチャの登録は 1 回だけでよいため、ループの外に置く)。
+        supervise::run_supervised("ファイル掴み検出", move || loop {
             let interval = FILE_DRAG
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1585,7 +1593,7 @@ fn main() {
                     }
                 }
             });
-        }
+        });
     });
 
     // WIN モード中のカーソル固定監視(改善ループ4):
@@ -1594,7 +1602,9 @@ fn main() {
     // 常時 200ms ごとに固定位置へ巻き戻す(境界の同時移動抑止の最終防衛)
     std::thread::spawn(|| {
         let mut fixes: u64 = 0;
-        loop {
+        // 150ms 周期のカーソル固定監視。panic した時だけ supervisor が
+        // 記録して再起動する。
+        supervise::run_supervised("カーソル固定監視", move || loop {
             std::thread::sleep(Duration::from_millis(150));
             // 自己修復: WIN モードでないのにカーソルが隠れたままの異常状態
             // (将来の同種バグや予期しない経路)を検知し、表示を復元する
@@ -1671,7 +1681,7 @@ fn main() {
                     DIAG_WARP_COUNT.store(fixes, Ordering::Relaxed);
                 }
             }
-        }
+        });
     });
 
     // イベントタップ(メインスレッドで RunLoop)

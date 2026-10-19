@@ -34,7 +34,8 @@ pub(crate) fn start() {
     std::thread::spawn(|| {
         let mut gov = Governor::new();
         let (mut orphan_win, mut frozen) = (Since(None), Since(None));
-        loop {
+        // 1 秒周期の見張り。panic した時だけ supervisor が記録して再起動する。
+        crate::supervise::run_supervised("ドクター監視", move || loop {
             std::thread::sleep(TICK);
             let mut findings = Vec::new();
             // Windows 操作中なのに接続が無い: 入力を握ったまま誰にも渡らない
@@ -80,6 +81,6 @@ pub(crate) fn start() {
                     "自動修復の待ち時間の短縮を停止しました(再接続は続いています)。",
                 );
             }
-        }
+        });
     });
 }
