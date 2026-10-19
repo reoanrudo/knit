@@ -1719,3 +1719,36 @@ pub fn start() {
     preferences::restore();
     std::thread::spawn(|| unsafe { tray_loop() });
 }
+
+#[cfg(test)]
+mod text_conversion_tests {
+    use super::{rgb, wide, wide_into};
+
+    /// Win32 へ渡す UTF-16 バッファは、満杯・空・長すぎる文字列でも
+    /// 必ず終端 NUL を残す(欠けると隣のメモリまで読まれる)
+    #[test]
+    fn utf16_buffers_keep_a_terminating_nul() {
+        assert_eq!(wide(""), vec![0u16]);
+        assert_eq!(wide("あ"), vec![0x3042, 0]);
+        let mut buf = [0xFFFFu16; 4];
+        wide_into(&mut buf, "abcdef");
+        assert_eq!(buf, [0x61, 0x62, 0x63, 0]);
+        // 収まらない分は切って、最後の 1 要素を終端 NUL に使う
+        let mut jp = [0xFFFFu16; 3];
+        wide_into(&mut jp, "あいうえお");
+        assert_eq!(jp, [0x3042, 0x3044, 0]);
+        let mut empty: [u16; 0] = [];
+        wide_into(&mut empty, "x"); // 長さ 0 でも panic しない
+    }
+
+    /// COLORREF は 0x00BBGGRR。RGB の R と B を入れ替えないと
+    /// アクセント色が赤青反転して描かれる
+    #[test]
+    fn colorref_swaps_red_and_blue_for_win32() {
+        assert_eq!(rgb(0x000000), 0x000000);
+        assert_eq!(rgb(0xFFFFFF), 0xFFFFFF);
+        assert_eq!(rgb(0x112233), 0x00332211);
+        assert_eq!(rgb(0xFF0000), 0x000000FF, "赤は最下位バイト");
+        assert_eq!(rgb(0x0000FF), 0x00FF0000, "青は最上位バイト");
+    }
+}
