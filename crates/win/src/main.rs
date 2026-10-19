@@ -507,7 +507,7 @@ fn main() {
 
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
-        token: token.clone(),
+        credential: bulk::EndpointCred::Single(token.clone()),
         dir: receive_dir(),
         on_event: win_on_bulk,
         log: |s| println!("{s}"),

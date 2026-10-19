@@ -286,7 +286,7 @@ fn spawn_role_threads(generation: usize) {
     let (screen_w, screen_h) = ROLE_SCREEN.get().copied().unwrap_or((0.0, 0.0));
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
         link: &BULK_LINK,
-        token: token.clone(),
+        credential: bulk::EndpointCred::Single(token.clone()),
         // EndpointはOnceLock。設定の保存先変更は次回起動から反映する。
         dir: desktop_settings::receive_dir(),
         on_event: mac_on_bulk,
