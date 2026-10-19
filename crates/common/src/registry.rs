@@ -155,17 +155,9 @@ impl DeviceRegistry {
         guard
     }
 
-    /// 台帳ファイルが別プロセス(--registry CLI 等)で書き換わっていれば読み直す。
-    /// 判定は mtime+サイズ(毎ロックの stat 1回で済む)。読み直しで壊れた内容を
-    /// 見たら退避して空で起動する(open と同じ扱い)
-    fn reload_if_changed(&self, inner: &mut Inner) {
-        let Ok(md) = std::fs::metadata(&self.path) else {
-            return;
-        };
-        let stamp = (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len());
-        if Some(stamp) == inner.stamp {
-            return;
-        }
+    /// 台帳ファイルを無条件に読み直す(壊れた内容なら退避して空)。
+    /// `open` と「書き込み直前」が使う
+    fn reload_from_file(&self, inner: &mut Inner) {
         let Ok(bytes) = std::fs::read(&self.path) else {
             return;
         };
@@ -177,7 +169,6 @@ impl DeviceRegistry {
                 inner.devices = devices;
                 inner.raw = Some(bytes);
                 inner.rooms = None;
-                inner.stamp = Some(stamp);
             }
             Err(e) => {
                 quarantine(&self.path);
@@ -186,9 +177,26 @@ impl DeviceRegistry {
                 inner.devices = Vec::new();
                 inner.raw = None;
                 inner.rooms = None;
-                inner.stamp = None;
             }
         }
+        inner.stamp = std::fs::metadata(&self.path)
+            .ok()
+            .map(|md| (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len()));
+    }
+
+    /// 台帳ファイルが別プロセス(--registry CLI 等)で書き換わっていれば読み直す。
+    /// 読み取り系の高速路。判定は mtime+サイズ(毎ロックの stat 1回で済む)。
+    /// 書き込み系(`commit`)は分解能の粗い環境(Windows CI 等)で「同一時刻・
+    /// 同一サイズ」の変更を取り逃すため、この判定を使わず必ず読み直す
+    fn reload_if_changed(&self, inner: &mut Inner) {
+        let Ok(md) = std::fs::metadata(&self.path) else {
+            return;
+        };
+        let stamp = (md.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), md.len());
+        if Some(stamp) == inner.stamp {
+            return;
+        }
+        self.reload_from_file(inner);
     }
 
     /// 台帳への書き込みを楽観排他で行う: 読み直し→変更→「ファイルが読んだ時の
@@ -207,7 +215,11 @@ impl DeviceRegistry {
             // 「確認→rename」の間に他プロセスが入る余地が無くなる)
             let guard = lock_ledger(&self.path);
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            self.reload_if_changed(&mut inner);
+            // 書き込みは mtime+サイズの判定を信用しない: Windows のファイル時刻は
+            // 分解能が粗く、「同一時刻・同一サイズ」の外部書き込み(別名端末の
+            // last_seen 更新など)を取り逃すと、古い状態で書き戻して失効や登録を
+            // 消してしまう。ロック下で毎回読み直し、続くバイト列比較で確認する
+            self.reload_from_file(&mut inner);
             let basis = inner.raw.clone();
             let (out, wrote) = f(&mut inner);
             let out = match out {
