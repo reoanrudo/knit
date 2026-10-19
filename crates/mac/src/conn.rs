@@ -479,7 +479,8 @@ fn activate_peer_locked(new: usize, reason: &str) {
 pub(crate) fn keepalive_inactive_peers() {
     std::thread::spawn(|| {
         use std::io::Write as _;
-        loop {
+        // 1 秒周期の生存確認。panic した時だけ supervisor が記録して再起動する。
+        crate::supervise::run_supervised("待機端末の監視", move || loop {
             cut_externally_revoked_peers();
         std::thread::sleep(Duration::from_secs(1));
             // bulk 張替延期の保留判定(受信中に切り替えた端末の clear 予約)。
@@ -558,7 +559,7 @@ pub(crate) fn keepalive_inactive_peers() {
                     eprintln!("[conn] 全ての端末がいなくなったため配置設定を整理しました");
                 }
             }
-        }
+        });
     });
 }
 

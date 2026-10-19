@@ -25,6 +25,7 @@ mod peers;
 mod screen_settings;
 mod session;
 mod state;
+mod supervise;
 mod tap;
 mod trackpad;
 mod updater;
@@ -1238,7 +1239,9 @@ fn main() {
         // 普通で、単調時計基準の pong 監視では気づけないため、即座に張り直す
         let mut wall = std::time::SystemTime::now();
         let mut mono = std::time::Instant::now();
-        loop {
+        // チャネルが閉じる(break)まで走る長命ループ。panic した時だけ
+        // supervisor が記録して再起動する。`rx` などは move で内側へ渡す。
+        supervise::run_supervised("送信", move || loop {
             let (wall_now, mono_now) = (std::time::SystemTime::now(), std::time::Instant::now());
             let slept = slept_duration(
                 wall_now.duration_since(wall).unwrap_or_default(),
@@ -1326,7 +1329,7 @@ fn main() {
                     }
                 }
             }
-        }
+        });
     });
 
     // 画面ロックの連動(1 秒毎)。Mac がロックされたら Windows 操作中でも制御を
