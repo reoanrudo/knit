@@ -438,6 +438,11 @@ fn main() {
             }
         }
     };
+    // 同名衝突の扱い(既定 rename)。設定画面ができるまでの入口
+    if let Ok(v) = std::env::var("KNIT_COLLISION") {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
+        eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
+    }
     let port: u16 = args
         .iter()
         .position(|a| a == "--port")

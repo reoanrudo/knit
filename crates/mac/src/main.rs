@@ -1064,6 +1064,11 @@ fn main() {
     };
 
     // 端末別資格の台帳を開く(master=解決済みトークン)。失敗しても起動は続く
+    // 同名衝突の扱い(既定 rename)。設定画面ができるまでの入口
+    if let Ok(v) = std::env::var("KNIT_COLLISION") {
+        knit_common::files::set_collision(knit_common::files::Collision::from_label(&v));
+        eprintln!("[file] 同名衝突の扱い: {}", knit_common::files::collision().label());
+    }
     ensure_registry(&token);
 
     if !no_gui && !gui::setup::ensure_permission() {
