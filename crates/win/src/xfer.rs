@@ -386,11 +386,19 @@ fn report_failed_files(failed: &[(String, String)]) {
 }
 
 /// 同名衝突で「名前 (n)」として保存した件数の通知用追記。無ければ空文字列
-fn rename_note(renamed: usize) -> String {
-    if renamed == 0 {
-        return String::new();
+/// 同名衝突の結果を通知に添える(黙って別名・上書き・スキップになるのを防ぐ)
+fn collision_note(renamed: usize, skipped: usize, replaced: usize) -> String {
+    let mut s = String::new();
+    if renamed > 0 {
+        s.push_str(&format!("。同名の {renamed} 件は「名前 (n)」として保存しました"));
     }
-    format!("。同名の {renamed} 件は「名前 (n)」として保存しました")
+    if replaced > 0 {
+        s.push_str(&format!("。同名の {replaced} 件は上書きしました"));
+    }
+    if skipped > 0 {
+        s.push_str(&format!("。同名の {skipped} 件はスキップしました"));
+    }
+    s
 }
 
 /// 大容量経路(ファイル・画像)。本線とは別の TCP 接続
@@ -432,10 +440,13 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             drag_id,
             failed,
             renamed,
+            skipped,
+            replaced,
             denied,
         } => {
             let _ = send_main_msg(&Msg::XferAck {
-                accepted: paths.len(),
+                // Skip は「保存しなかったが受理した」ため accepted に数える
+                accepted: paths.len() + skipped,
                 rejected: failed.len(),
                 scope: denied > 0,
             });
@@ -525,7 +536,7 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                         &format!(
                             "ファイルを受信: {n} 件({} へ保存しました){}",
                             dir.display(),
-                            rename_note(renamed)
+                            collision_note(renamed, skipped, replaced)
                         ),
                     );
                     return;
@@ -544,12 +555,12 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                 let message = match mismatch {
                     Some((expected, got)) => format!(
                         "ファイルは {got}/{expected} 件のみの受信です{}(Ctrl+V で貼り付け可)。実体は {}",
-                        rename_note(renamed),
+                        collision_note(renamed, skipped, replaced),
                         dir.display()
                     ),
                     None => format!(
                         "ファイルを受信: {n} 件{}(Ctrl+V で貼り付け可)。実体は {}",
-                        rename_note(renamed),
+                        collision_note(renamed, skipped, replaced),
                         dir.display()
                     ),
                 };

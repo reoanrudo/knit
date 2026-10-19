@@ -352,10 +352,84 @@
         }
     }
 
-    /// 受信ファイルの最終パスを予約する。実体はまだ作らない(原子的配置のため)。
+    /// 同名のファイルがあったときの扱い。既定は安全な Rename(上書きしない)
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Collision {
+        /// 「名前 (n).ext」へ退避する(既定)
+        Rename,
+        /// 既存を置き換える(利用者が明示したときだけ)
+        Overwrite,
+        /// 既存があるものは保存せず、データだけ受け取って捨てる
+        Skip,
+    }
+
+    impl Collision {
+        /// 設定文字列から読む(未知の値は安全側の Rename)
+        pub fn from_label(value: &str) -> Self {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "overwrite" | "上書き" => Collision::Overwrite,
+                "skip" | "スキップ" => Collision::Skip,
+                _ => Collision::Rename,
+            }
+        }
+
+        pub fn label(self) -> &'static str {
+            match self {
+                Collision::Rename => "rename",
+                Collision::Overwrite => "overwrite",
+                Collision::Skip => "skip",
+            }
+        }
+
+        fn code(self) -> u8 {
+            match self {
+                Collision::Rename => 0,
+                Collision::Overwrite => 1,
+                Collision::Skip => 2,
+            }
+        }
+
+        fn from_code(v: u8) -> Self {
+            match v {
+                1 => Collision::Overwrite,
+                2 => Collision::Skip,
+                _ => Collision::Rename,
+            }
+        }
+    }
+
+    static COLLISION: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    /// 受信側の同名衝突ポリシーを設定する(設定画面と環境変数から。即時反映)
+    pub fn set_collision(policy: Collision) {
+        COLLISION.store(policy.code(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn collision() -> Collision {
+        Collision::from_code(COLLISION.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// 予約した保存先。Overwrite/Skip では元の名前をそのまま返し、既存の有無を
+    /// existed で伝える(Rename は必ず空き名なので false)
+    pub struct Reserved {
+        pub path: PathBuf,
+        pub existed: bool,
+    }
+
+    /// 受信ファイルの最終パスを予約する(既定 = Rename)
+    pub fn unique_final(base: &Path, rel: &str, taken: &[PathBuf]) -> Option<PathBuf> {
+        unique_final_with(base, rel, taken, Collision::Rename).map(|r| r.path)
+    }
+
+    /// 衝突ポリシーを指定して最終パスを予約する。実体はまだ作らない。
     /// taken には同じバッチで既に予約済みのパスを渡す(一時ファイルだから
     /// ディスク上の存在確認だけでは重なりを検出できない)
-    pub fn unique_final(base: &Path, rel: &str, taken: &[PathBuf]) -> Option<PathBuf> {
+    pub fn unique_final_with(
+        base: &Path,
+        rel: &str,
+        taken: &[PathBuf],
+        policy: Collision,
+    ) -> Option<Reserved> {
         let rel_path = Path::new(rel);
         let name = rel_path.file_name()?.to_str()?.to_string();
         let parent_rel = rel_path.parent()?;
@@ -365,6 +439,17 @@
             base.join(parent_rel)
         };
         std::fs::create_dir_all(&parent).ok()?;
+        let desired = parent.join(&name);
+        if policy != Collision::Rename {
+            // 同じバッチ内で同名が来た場合は、転送中のファイル同士を潰さないよう
+            // 退避する(ディスク上の既存だけを対象に Overwrite/Skip を効かせる)
+            if !taken.contains(&desired) {
+                return Some(Reserved {
+                    existed: desired.exists(),
+                    path: desired,
+                });
+            }
+        }
         let p = Path::new(&name);
         let stem = p
             .file_stem()
@@ -377,7 +462,10 @@
         for i in 0..1000u32 {
             let cand = candidate(&parent, &stem, &ext, i);
             if !cand.exists() && !taken.contains(&cand) {
-                return Some(cand);
+                return Some(Reserved {
+                    path: cand,
+                    existed: false,
+                });
             }
         }
         None
@@ -421,6 +509,33 @@
             }
         }
         Err(last_err.unwrap_or_else(|| std::io::Error::other("publish: no free name")))
+    }
+
+    /// 衝突ポリシーを指定して公開する。Overwrite は既存を置き換える
+    /// (std の rename は両 OS で置換できる。掴まれている等で失敗したら
+    /// 受信フォルダ内に限り、消してからやり直す)
+    pub fn publish_with(
+        temp: &Path,
+        desired: &Path,
+        policy: Collision,
+    ) -> std::io::Result<PathBuf> {
+        match policy {
+            Collision::Overwrite => match std::fs::rename(temp, desired) {
+                Ok(()) => Ok(desired.to_path_buf()),
+                Err(first) => {
+                    if desired.exists() && std::fs::remove_file(desired).is_ok() {
+                        std::fs::rename(temp, desired)
+                            .map(|_| desired.to_path_buf())
+                            .map_err(|_| first)
+                    } else {
+                        Err(first)
+                    }
+                }
+            },
+            // Skip は受信側が公開前に捨てるため、ここへは来ない想定。
+            // 来たら安全側(退避名)で公開する
+            Collision::Skip | Collision::Rename => publish(temp, desired),
+        }
     }
 
     /// 相手のファイルの更新日時を復元する(秒精度。失敗しても転送成否には影響しない)。

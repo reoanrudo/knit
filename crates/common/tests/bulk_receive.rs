@@ -305,6 +305,68 @@ fn cancel_mid_transfer_reports_interrupted_and_cleanup_removes_all_drag_files() 
     );
 }
 
+/// 衝突ポリシーを固定して受信させる(グローバル設定を触らないので並列安全)
+fn deliver_with(
+    wire: &[u8],
+    dir: &std::path::Path,
+    policy: knit_common::files::Collision,
+) -> Vec<bulk::Event> {
+    let mut rx = bulk::Receiver::new(dir).with_collision(policy);
+    let mut reader = Cursor::new(wire);
+    let mut frame = Vec::new();
+    let mut events = Vec::new();
+    while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+        if let Some(e) = rx.feed(kind, &frame) {
+            events.push(e);
+        }
+    }
+    events
+}
+
+#[test]
+fn overwrite_policy_replaces_the_existing_file_and_counts_it() {
+    let temp = Temp::new("collide-overwrite");
+    let dst = temp.0.join("received");
+    std::fs::write(dst.join("同名.txt"), b"old").unwrap();
+    let src = temp.0.join("同名.txt");
+    std::fs::write(&src, b"new").unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+    let mut wire = Vec::new();
+    bulk::send_entries(&mut wire, &entries, false, None, &mut || false, &mut |_, _, _| {})
+        .unwrap();
+    let events = deliver_with(&wire, &dst, knit_common::files::Collision::Overwrite);
+    assert_eq!(std::fs::read(dst.join("同名.txt")).unwrap(), b"new", "既存を置き換える");
+    let bulk::Event::Files { paths, replaced, renamed, failed, .. } = &events[0] else {
+        panic!("完了イベントが無い");
+    };
+    assert_eq!(*replaced, 1, "置き換えた件数を報告する");
+    assert_eq!(*renamed, 0);
+    assert!(failed.is_empty());
+    assert_eq!(paths.len(), 1);
+}
+
+#[test]
+fn skip_policy_keeps_the_existing_file_and_reports_as_accepted() {
+    let temp = Temp::new("collide-skip");
+    let dst = temp.0.join("received");
+    std::fs::write(dst.join("同名.txt"), b"old").unwrap();
+    let src = temp.0.join("同名.txt");
+    std::fs::write(&src, b"new").unwrap();
+    let entries = bulk::collect(std::slice::from_ref(&src), true, true, false).unwrap();
+    let mut wire = Vec::new();
+    bulk::send_entries(&mut wire, &entries, false, None, &mut || false, &mut |_, _, _| {})
+        .unwrap();
+    let events = deliver_with(&wire, &dst, knit_common::files::Collision::Skip);
+    assert_eq!(std::fs::read(dst.join("同名.txt")).unwrap(), b"old", "既存は変えない");
+    let bulk::Event::Files { paths, skipped, replaced, failed, .. } = &events[0] else {
+        panic!("完了イベントが無い");
+    };
+    assert_eq!(*skipped, 1, "スキップした件数を報告する");
+    assert_eq!(*replaced, 0);
+    assert!(failed.is_empty(), "スキップは失敗ではない");
+    assert!(paths.is_empty(), "実体は作らない");
+}
+
 #[test]
 fn interrupted_nested_receive_removes_directories_it_created() {
     let temp = Temp::new("emptydirs");

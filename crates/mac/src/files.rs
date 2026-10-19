@@ -637,12 +637,15 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             paths,
             failed,
             renamed,
+            skipped,
+            replaced,
             denied,
             ..
         } => {
             report_failed_files(&failed);
             send_msg(&Msg::XferAck {
-                accepted: paths.len(),
+                // Skip は「保存しなかったが受理した」ため accepted に数える
+                accepted: paths.len() + skipped,
                 rejected: failed.len(),
                 scope: denied > 0,
             });
@@ -657,14 +660,19 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
             // 保存済み設定ではなく、今回のEndpointが実際に使っている起動時の場所。
             let place = desktop_settings::receive_dir().display().to_string();
             // 同名衝突で「名前 (n)」へ保存した分を通知に添える(黙って別名になるのを防ぐ)
-            let rename_note = rename_note(renamed);
+            let rename_note = collision_note(renamed, skipped, replaced);
             if ok {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 // 履歴ラベルはバッチ開始時点の端末で固定(受信中の切替で替えない)
                 history_push_files(&paths, &bulk_rx_device());
                 let total = knit_common::bulk::total_size(&paths);
                 // 保存失敗・拒否・同名変更の注意がある場合は設定にかかわらず通知。
-                let notify_done = if failed.is_empty() && denied == 0 && renamed == 0 {
+                let notify_done = if failed.is_empty()
+                    && denied == 0
+                    && renamed == 0
+                    && skipped == 0
+                    && replaced == 0
+                {
                     notify_transfer
                 } else {
                     notify
@@ -761,11 +769,19 @@ fn report_failed_files(failed: &[(String, String)]) {
 }
 
 /// 同名衝突で「名前 (n)」として保存した件数の通知用追記。無ければ空文字列
-fn rename_note(renamed: usize) -> String {
-    if renamed == 0 {
-        return String::new();
+/// 同名衝突の結果を通知に添える(黙って別名・上書き・スキップになるのを防ぐ)
+fn collision_note(renamed: usize, skipped: usize, replaced: usize) -> String {
+    let mut s = String::new();
+    if renamed > 0 {
+        s.push_str(&format!("。同名の {renamed} 件は「名前 (n)」として保存しました"));
     }
-    format!("。同名の {renamed} 件は「名前 (n)」として保存しました")
+    if replaced > 0 {
+        s.push_str(&format!("。同名の {replaced} 件は上書きしました"));
+    }
+    if skipped > 0 {
+        s.push_str(&format!("。同名の {skipped} 件はスキップしました"));
+    }
+    s
 }
 /// ファイル送信中(多重送信の抑制)
 pub(crate) static FILE_TX_BUSY: AtomicBool = AtomicBool::new(false);

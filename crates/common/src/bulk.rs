@@ -626,6 +626,10 @@
             drag_id: Option<u64>,
             failed: Vec<(String, String)>,
             renamed: usize,
+            /// 衝突ポリシー Skip で保存しなかった件数(受理として扱う)
+            skipped: usize,
+            /// 衝突ポリシー Overwrite で既存を置き換えた件数
+            replaced: usize,
             denied: usize,
         },
         /// バッチ全体がこの端末の共有設定で拒否された(files=false)。
@@ -649,7 +653,12 @@
             rel: String,
             mtime: u64,
             hasher: blake2::Blake2s256,
+            /// Overwrite で既存を置き換える(公開時に publish_with を使う)
+            replace: bool,
         },
+        /// 衝突ポリシー Skip で保存しないと決めたファイル。DATA は届くので
+        /// サイズだけ数えて捨てる(ストリームの位置を保つ)
+        Skip { remain: u64 },
         Image { data: Vec<u8>, remain: usize },
     }
 
@@ -682,6 +691,13 @@
         /// このバッチで新しく作ったディレクトリ(中断時に空なら片付ける)。
         /// 深さ順の削除は files::remove_empty_dirs が行う
         created_dirs: Vec<PathBuf>,
+        /// 同名衝突の扱い(テストは with_collision で固定する。None なら
+        /// プロセス共通の設定 files::collision() を読む)
+        collision: Option<crate::files::Collision>,
+        /// Skip した件数(BATCH_END で報告。XferAck では受理として数える)
+        skipped: usize,
+        /// Overwrite で既存を置き換えた件数(BATCH_END で報告)
+        replaced: usize,
         /// バッチの途中で切断(Drop)したときの部分報告先(spawn_reader が
         /// Endpoint の on_event を渡す。保存済み件数を Event::Interrupted で伝える)
         on_interrupted: Option<fn(Event)>,
@@ -705,9 +721,19 @@
                 failed: Vec::new(),
                 renamed: 0,
                 created_dirs: Vec::new(),
+                collision: None,
+                skipped: 0,
+                replaced: 0,
                 on_interrupted: None,
                 rx_hook: None,
             }
+        }
+
+        /// 同名衝突の扱いをこの受信器に固定する(テスト・特殊運用向け。
+        /// 通常はプロセス共通の設定を使う)
+        pub fn with_collision(mut self, policy: crate::files::Collision) -> Self {
+            self.collision = Some(policy);
+            self
         }
 
         /// 受信バイト毎に呼ぶ進捗通知を付ける(接続側スレッドで呼ばれるため軽く保つ)
@@ -890,12 +916,25 @@
                             self.created_dirs.push(d);
                         }
                     }
-                    let Some(final_path) =
-                        crate::files::unique_final(&self.dir, &rel, &self.paths)
-                    else {
+                    let policy = self.collision.unwrap_or_else(crate::files::collision);
+                    let Some(reserved) = crate::files::unique_final_with(
+                        &self.dir,
+                        &rel,
+                        &self.paths,
+                        policy,
+                    ) else {
                         fail(self, &rel, "保存名の衝突を解消できません");
                         return None;
                     };
+                    // Skip: 既存があるものは実体を作らず、届く DATA を数えて捨てる
+                    if policy == crate::files::Collision::Skip && reserved.existed {
+                        self.skipped += 1;
+                        self.sink = Sink::Skip { remain: size };
+                        return None;
+                    }
+                    let final_path = reserved.path;
+                    let replace =
+                        policy == crate::files::Collision::Overwrite && reserved.existed;
                     let parent = final_path.parent().unwrap_or(&self.dir).to_path_buf();
                     let Some((f, tmp)) = crate::files::create_temp(&parent) else {
                         fail(self, &rel, "一時ファイルを作成できません");
@@ -909,6 +948,7 @@
                         rel,
                         mtime,
                         hasher: blake2::Blake2s256::new(),
+                        replace,
                     };
                 }
                 DATA => match &mut self.sink {
@@ -928,6 +968,19 @@
                             *remain -= body.len() as u64;
                             self.written += body.len() as u64;
                             hasher.update(body);
+                            if let Some(hook) = self.rx_hook {
+                                hook(self.written);
+                            }
+                        }
+                    }
+                    Sink::Skip { remain } => {
+                        // Skip したファイルのデータは保存しないが、ストリーム位置と
+                        // 進捗は実データと同じに数える(送信側の送信量と一致させる)
+                        if body.len() as u64 > *remain {
+                            self.sink = Sink::None;
+                        } else {
+                            *remain -= body.len() as u64;
+                            self.written += body.len() as u64;
                             if let Some(hook) = self.rx_hook {
                                 hook(self.written);
                             }
@@ -953,6 +1006,7 @@
                         rel,
                         mtime,
                         hasher,
+                        replace,
                     } = std::mem::replace(&mut self.sink, Sink::None)
                     {
                         if remain > 0 {
@@ -992,8 +1046,20 @@
                             } else {
                                 crate::files::mark_untrusted(&tmp);
                                 let desired = self.paths.last().cloned();
-                                match desired.and_then(|d| crate::files::publish(&tmp, &d).ok()) {
+                                let published = match desired {
+                                    Some(d) if replace => crate::files::publish_with(
+                                        &tmp,
+                                        &d,
+                                        crate::files::Collision::Overwrite,
+                                    ),
+                                    Some(d) => crate::files::publish(&tmp, &d),
+                                    None => Err(std::io::Error::other("保存先がありません")),
+                                };
+                                match published.ok() {
                                     Some(actual) => {
+                                        if replace {
+                                            self.replaced += 1;
+                                        }
                                         // Windows は ADS の書き込みと rename で更新日時が動くため、
                                         // 公開が終わった最終パスへ設定する(ここが最後の書き込み)
                                         #[cfg(windows)]
@@ -1031,17 +1097,26 @@
                     let paths = std::mem::take(&mut self.paths);
                     let failed = std::mem::take(&mut self.failed);
                     let renamed = std::mem::take(&mut self.renamed);
+                    let skipped = std::mem::take(&mut self.skipped);
+                    let replaced = std::mem::take(&mut self.replaced);
                     let drop = std::mem::replace(&mut self.drop, false);
                     let drag_id = self.drag_id.take();
                     // 受信失敗で0件でも、操作IDを返して準備待ちを取り消せるようにする。
                     // denied(範囲外で捨てた件数)は受信ループが上書きして渡す
-                    if !paths.is_empty() || drag_id.is_some() || !failed.is_empty() {
+                    if !paths.is_empty()
+                        || skipped > 0
+                        || replaced > 0
+                        || drag_id.is_some()
+                        || !failed.is_empty()
+                    {
                         return Some(Event::Files {
                             paths,
                             drop,
                             drag_id,
                             failed,
                             renamed,
+                            skipped,
+                            replaced,
                             denied: 0,
                         });
                     }
@@ -1363,9 +1438,25 @@
                     let e = match e {
                         // 範囲外で捨てた分(運用上は転送中に設定が変わった場合)を
                         // 完了イベントに添えて呼び出し側へ渡す
-                        Event::Files { paths, drop, drag_id, failed, renamed, .. } => {
-                            Event::Files { paths, drop, drag_id, failed, renamed, denied: denied_files }
-                        }
+                        Event::Files {
+                            paths,
+                            drop,
+                            drag_id,
+                            failed,
+                            renamed,
+                            skipped,
+                            replaced,
+                            ..
+                        } => Event::Files {
+                            paths,
+                            drop,
+                            drag_id,
+                            failed,
+                            renamed,
+                            skipped,
+                            replaced,
+                            denied: denied_files,
+                        },
                         other => other,
                     };
                     denied_files = 0;
