@@ -334,3 +334,137 @@ mod tests {
         assert_eq!(unlock_from_json(&empty), (true, String::new()));
     }
 }
+
+#[cfg(test)]
+mod profile_round_trip_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// LOCALAPPDATA を一時領域へ差し替えるテスト同士を直列化する
+    /// (プロセス共通の環境変数を並走して書き換えない)
+    static PROFILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn temp_profile(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "knit-prefs-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// テスト前後でプロセス共通の設定値と環境変数を元へ戻す。
+    /// 失敗時に assert で抜けても Drop で戻す
+    struct Snapshot {
+        local_app_data: Option<std::ffi::OsString>,
+        audio: bool,
+        clip: bool,
+        files: bool,
+        host: bool,
+        unlock: bool,
+        secret: String,
+    }
+
+    impl Snapshot {
+        fn take() -> Self {
+            Self {
+                local_app_data: std::env::var_os("LOCALAPPDATA"),
+                audio: crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed),
+                clip: knit_common::share::user_clip(),
+                files: knit_common::share::user_files(),
+                host: HOST_MODE.load(Ordering::Relaxed),
+                unlock: UNLOCK_SYNC.load(Ordering::Relaxed),
+                secret: (*unlock_secret_slot()).clone(),
+            }
+        }
+    }
+
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            match &self.local_app_data {
+                Some(v) => std::env::set_var("LOCALAPPDATA", v),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            crate::audio::AUDIO_ENABLED.store(self.audio, Ordering::Relaxed);
+            knit_common::share::set_user_clip(self.clip);
+            knit_common::share::set_user_files(self.files);
+            HOST_MODE.store(self.host, Ordering::Relaxed);
+            UNLOCK_SYNC.store(self.unlock, Ordering::Relaxed);
+            *unlock_secret_slot() = self.secret.clone();
+        }
+    }
+
+    /// 保存→別の値→読込で全設定が戻る(音声・共有・役割・ロック解除の連動・
+    /// 保護済み secret の 6 項目)。ロック解除の secret は DPAPI を通さず、
+    /// 保存形式(base64 文字列)の往復だけを確かめる
+    #[test]
+    fn every_setting_round_trips_through_the_profile_file() {
+        let _serial = PROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snapshot = Snapshot::take();
+        let profile = temp_profile("roundtrip");
+        std::env::set_var("LOCALAPPDATA", &profile);
+
+        crate::audio::AUDIO_ENABLED.store(false, Ordering::Relaxed);
+        knit_common::share::set_user_clip(false);
+        knit_common::share::set_user_files(false);
+        HOST_MODE.store(true, Ordering::Relaxed);
+        UNLOCK_SYNC.store(true, Ordering::Relaxed);
+        *unlock_secret_slot() = "QUJD".into();
+        save().expect("設定を保存できる");
+
+        // すべて既定へ戻してから restore する(保存ファイルを実際に読んだことの証明)
+        crate::audio::AUDIO_ENABLED.store(true, Ordering::Relaxed);
+        knit_common::share::set_user_clip(true);
+        knit_common::share::set_user_files(true);
+        HOST_MODE.store(false, Ordering::Relaxed);
+        UNLOCK_SYNC.store(false, Ordering::Relaxed);
+        *unlock_secret_slot() = String::new();
+        restore();
+
+        assert!(!crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed));
+        assert!(!knit_common::share::user_clip());
+        assert!(!knit_common::share::user_files());
+        assert!(HOST_MODE.load(Ordering::Relaxed));
+        assert!(UNLOCK_SYNC.load(Ordering::Relaxed));
+        assert_eq!(*unlock_secret_slot(), "QUJD");
+        // 起動時の役割判定は同じファイルを直接読むため、こちらでも一致する
+        assert!(host_mode_pref());
+
+        let saved: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(profile.join("Knit/preferences.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["version"], 1);
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+
+    /// 壊れた設定ファイルは読めなかった部分だけ捨て、現在の設定を変えない
+    /// (起動途中で設定が勝手に既定へ戻る事故を防ぐ)
+    #[test]
+    fn a_broken_profile_file_keeps_the_current_settings() {
+        let _serial = PROFILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _snapshot = Snapshot::take();
+        let profile = temp_profile("broken");
+        std::env::set_var("LOCALAPPDATA", &profile);
+        let dir = profile.join("Knit");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("preferences.json"), b"{\"audio_enabled\":").unwrap();
+
+        crate::audio::AUDIO_ENABLED.store(false, Ordering::Relaxed);
+        knit_common::share::set_user_clip(false);
+        knit_common::share::set_user_files(false);
+        HOST_MODE.store(true, Ordering::Relaxed);
+        UNLOCK_SYNC.store(true, Ordering::Relaxed);
+        *unlock_secret_slot() = "QUJD".into();
+        restore();
+
+        assert!(!crate::audio::AUDIO_ENABLED.load(Ordering::Relaxed));
+        assert!(!knit_common::share::user_clip());
+        assert!(!knit_common::share::user_files());
+        assert!(HOST_MODE.load(Ordering::Relaxed));
+        assert!(UNLOCK_SYNC.load(Ordering::Relaxed));
+        assert_eq!(*unlock_secret_slot(), "QUJD");
+        let _ = std::fs::remove_dir_all(&profile);
+    }
+}

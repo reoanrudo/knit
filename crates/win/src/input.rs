@@ -730,3 +730,72 @@ pub(crate) fn refresh_vscreen() -> (i32, i32, i32, i32) {
     *VSCREEN.lock().unwrap_or_else(|e| e.into_inner()) = v;
     v
 }
+
+#[cfg(test)]
+mod extended_key_tests {
+    use super::is_extended_vk;
+    use knit_common::keymap::mac_kc_to_win_vk;
+
+    /// 拡張フラグが要る VK と要らない VK の境界。scan code を併記して注入する
+    /// ため、この判定を落とすと矢印がテンキー数字として届く
+    #[test]
+    fn navigation_numpad_slash_and_right_modifiers_are_extended() {
+        for vk in [
+            0x21, 0x22, 0x23, 0x24, // PageUp/PageDown/End/Home
+            0x25, 0x26, 0x27, 0x28, // 矢印
+            0x2D, 0x2E, // Insert/Delete
+            0x6F, // テンキー /
+            0x5B, 0x5C, // Win キー
+            0xA3, 0xA5, // 右 Ctrl/右 Alt
+        ] {
+            assert!(is_extended_vk(vk), "VK {vk:#04x} は拡張");
+        }
+        for vk in [
+            0x41, 0x30, // 英字・数字
+            0x0D, 0x09, 0x20, 0x1B, 0x08, // Enter/Tab/Space/Esc/Backspace
+            0x70, 0x83, // F1/F20
+            0x60, 0x69, 0x6A, 0x6B, 0x6D, 0x6E, // テンキー数字・* + - .
+            0xA0, 0xA1, 0xA2, 0xA4, // 左修飾
+            0xBD, 0xDC, // Mac の - と \
+        ] {
+            assert!(!is_extended_vk(vk), "VK {vk:#04x} は非拡張");
+        }
+    }
+
+    /// テンキー Enter は通常 Enter と同じ VK(0x0D)で、VK だけでは区別できない。
+    /// session 側が kc==76 のときだけ拡張フラグを足す前提をここで固定する
+    #[test]
+    fn numpad_enter_shares_vk_return_so_the_keycode_must_disambiguate() {
+        let vk = mac_kc_to_win_vk(76).expect("テンキー Enter");
+        assert_eq!(vk, 0x0D);
+        assert!(!is_extended_vk(vk), "通常 Enter(0x0D)も非拡張");
+    }
+}
+
+#[cfg(test)]
+mod input_buf_tests {
+    use super::{enter_key_buf, InputBuf, INPUT, INPUT_KEYBOARD};
+
+    /// INPUT の共用体レイアウト(type+pad+32byte)を手で組んでいるため、
+    /// ネイティブの INPUT とサイズが一致することを型で固定する
+    #[test]
+    fn input_buf_has_the_native_input_layout() {
+        assert_eq!(
+            std::mem::size_of::<InputBuf>(),
+            std::mem::size_of::<INPUT>(),
+            "SendInput へ渡すバッファは INPUT と同サイズ"
+        );
+    }
+
+    /// ロック解除の Enter 注入が keydown の VK_RETURN として組まれていること。
+    /// ここが up や別 VK になると解除連動が無言で効かなくなる
+    #[test]
+    fn enter_key_buf_is_a_keydown_for_vk_return() {
+        let buf = enter_key_buf();
+        assert_eq!(buf.itype, INPUT_KEYBOARD);
+        assert_eq!(buf._pad, 0);
+        assert_eq!(buf.body[0] & 0xFFFF, 0x0D, "低16bit が wVk");
+        assert_eq!(buf.body[1], 0, "KEYEVENTF_KEYUP を付けない");
+        assert_eq!(buf.extra, 0);
+    }
+}

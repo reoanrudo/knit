@@ -989,3 +989,139 @@ pub(super) unsafe fn sync_mac_prefs() {
     set_text(MAC_AUDIO_BUTTON.load(Ordering::Relaxed), &state("audio_muted", "相手側で音声を再生", true));
     set_text(MAC_SPK_BUTTON.load(Ordering::Relaxed), &state("spk_mute", "相手のスピーカーをミュート", false));
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::{box_pos, lay_center, side_from_center, side_label, BOX_H, BOX_W};
+
+    fn box_center(side: u8) -> (i32, i32) {
+        let (x, y) = box_pos(side);
+        (x + BOX_W / 2, y + BOX_H / 2)
+    }
+
+    /// 配置図の四角の中心から元の side が戻る(ドラッグ結果の保存が
+    /// 図の位置と食い違わないための往復)
+    #[test]
+    fn every_box_position_maps_back_to_its_own_side() {
+        for side in 0..=7u8 {
+            let (x, y) = box_center(side);
+            assert_eq!(side_from_center(x, y), Some(side), "side={side}");
+        }
+    }
+
+    /// 相手の中心付近(縦横 90px 以内)は「配置しない」に落とす不感帯。
+    /// 境界の 90px は無視し、91px から方向を決める
+    #[test]
+    fn the_center_dead_zone_ignores_small_drops() {
+        let (cx, cy) = lay_center();
+        assert_eq!(side_from_center(cx, cy), None);
+        for (dx, dy) in [
+            (90, 0),
+            (-90, 0),
+            (0, 90),
+            (0, -90),
+            (90, 90),
+            (90, -90),
+            (-90, 90),
+            (-90, -90),
+        ] {
+            assert_eq!(side_from_center(cx + dx, cy + dy), None, "境界 {dx},{dy}");
+        }
+        for (dx, dy, want) in [
+            (91, 0, 0),
+            (-91, 0, 1),
+            (0, -91, 2),
+            (0, 91, 3),
+            (91, -91, 4),
+            (91, 91, 5),
+            (-91, -91, 6),
+            (-91, 91, 7),
+        ] {
+            assert_eq!(
+                side_from_center(cx + dx, cy + dy),
+                Some(want),
+                "方向 {dx},{dy}"
+            );
+        }
+    }
+
+    /// 8 方向の表示名は Mac 側の side_label と同じ語彙。未知値は「右」へ落とす
+    #[test]
+    fn side_labels_match_the_mac_vocabulary() {
+        for (side, label) in [
+            (0, "右"),
+            (1, "左"),
+            (2, "上"),
+            (3, "下"),
+            (4, "右上"),
+            (5, "右下"),
+            (6, "左上"),
+            (7, "左下"),
+        ] {
+            assert_eq!(side_label(side), label, "side={side}");
+        }
+        assert_eq!(side_label(8), "右");
+        assert_eq!(side_label(u8::MAX), "右");
+    }
+}
+
+#[cfg(test)]
+mod connection_state_tests {
+    use super::{connection_state_text, delay_text, toggle_text};
+
+    /// 接続中は経路と遅延が分かる範囲でだけ括弧へ足す。プレビューは最優先
+    #[test]
+    fn connected_state_shows_route_and_latency_only_when_known() {
+        let text = |preview: bool, connected: bool, rtt: u64, route: Option<&str>| {
+            connection_state_text(preview, connected, rtt, route, false, true, None, None)
+        };
+        assert_eq!(
+            text(true, true, 12, Some("LAN 直")),
+            "設定画面のプレビュー"
+        );
+        assert_eq!(
+            text(false, true, 12, Some("LAN 直")),
+            "接続済み(LAN 直・遅延 12ms)"
+        );
+        assert_eq!(text(false, true, 12, None), "接続済み(遅延 12ms)");
+        assert_eq!(text(false, true, 0, Some("LAN 直")), "接続済み");
+    }
+
+    /// 未接続は「未登録→登録導線」「手動→待機中」「自動→再接続」の順で文言を選び、
+    /// 補足(missing)は retry より優先する(Mac 側と同じ優先順位)
+    #[test]
+    fn disconnected_state_picks_registration_then_the_waiting_reason() {
+        let text =
+            |manual: bool, registered: bool, retry: Option<&str>, missing: Option<&str>| {
+                connection_state_text(false, false, 0, None, manual, registered, retry, missing)
+            };
+        assert_eq!(
+            text(false, false, None, None),
+            "未接続(相手側の設定「接続」の「端末を登録…」で登録できます)"
+        );
+        assert_eq!(text(false, true, None, None), "未接続(自動で再接続します)");
+        assert_eq!(text(true, false, None, None), "未接続(直接つなぐで待機中)");
+        assert_eq!(
+            text(false, true, Some("3秒後に再試行"), None),
+            "未接続(自動で再接続します・3秒後に再試行)"
+        );
+        assert_eq!(
+            text(false, true, Some("再試行"), Some("見つかりません")),
+            "未接続(自動で再接続します・見つかりません)"
+        );
+        assert_eq!(
+            text(true, true, Some("再試行"), Some("見つかりません")),
+            "未接続(直接つなぐで待機中・見つかりません)"
+        );
+    }
+
+    /// トグルと滞在時間の表示。既定の 300ms にだけ目印を付ける
+    #[test]
+    fn toggle_and_delay_labels_mark_the_default_delay() {
+        assert_eq!(toggle_text(true, "音声転送"), "音声転送: オン");
+        assert_eq!(toggle_text(false, "音声転送"), "音声転送: オフ");
+        assert_eq!(delay_text(300), "300ms(既定)");
+        assert_eq!(delay_text(50), "50ms");
+        assert_eq!(delay_text(1000), "1000ms");
+    }
+}
