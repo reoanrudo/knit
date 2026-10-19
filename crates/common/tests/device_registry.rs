@@ -134,6 +134,24 @@ fn revocation_blocks_every_path_label() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// 動作中に devices.json が消えても、次の登録で台帳を作り直せる。
+/// 以前は削除前の生バイトを覚えたままで「他プロセスが書き換えた」と誤認し、
+/// commit が競合で永久に失敗していた
+#[test]
+fn enroll_recreates_the_ledger_after_it_is_deleted_while_running() {
+    let dir = temp_dir("ledger-deleted");
+    let master = knit_common::credentials::generate().unwrap();
+    let registry = DeviceRegistry::open(&dir, &master).unwrap();
+    registry.enroll("A").unwrap();
+    let ledger = dir.join("devices.json");
+    std::fs::remove_file(&ledger).unwrap();
+
+    let b = registry.enroll("B").unwrap();
+    assert!(ledger.exists(), "空から台帳を作り直す");
+    assert!(registry.key_ids().contains(&b.key_id), "新しい端末が載る");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// 1接続ぶんの accept_as(毎回 registry.accept_keys() を引き直す)+ echo。
 /// accept 側がエラーで終われば接続側も読み出し EOF で失敗する(ハングしない)
 fn path_probe(registry: &Arc<DeviceRegistry>, label: &'static [u8], token: &str) -> Result<(), String> {

@@ -410,7 +410,7 @@ fn interrupted_transfer_resumes_from_the_received_prefix() {
     assert!(failed.is_empty(), "続きの照合と全体ハッシュが通る");
 }
 
-/// 版18の交渉: 部分から位置と前置ハッシュを作り、entries に対応付ける。
+/// 版18の交渉: 部分から位置を作り、entries に対応付ける(前置は返さない)。
 /// 応答なしのタイムアウトは「先頭から」
 #[test]
 fn resume_negotiation_reports_positions_and_maps_offsets() {
@@ -428,7 +428,21 @@ fn resume_negotiation_reports_positions_and_maps_offsets() {
     let positions = bulk::resume_positions(&dir, &items);
     assert_eq!(positions.len(), 1);
     assert_eq!(positions[0].offset, 10);
-    assert_eq!(positions[0].prefix.len(), 64, "BLAKE2s の16進");
+    assert_eq!(positions[0].prefix, "", "前置ハッシュは返さない(部分を読まない)");
+    // 読めない部分でも位置は返る: prefix_hash を呼んでいた旧実装は
+    // ここで open に失敗して positions が空になっていた
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let partial = knit_common::files::find_partial(&dir, "a.bin", 100, 5)
+            .unwrap()
+            .0;
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = bulk::resume_positions(&dir, &items);
+        assert_eq!(unreadable.len(), 1, "内容を読まずに位置だけ返す");
+        assert_eq!(unreadable[0].offset, 10);
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let src = temp.0.join("src.bin");
     std::fs::write(&src, vec![1u8; 100]).unwrap();
@@ -481,6 +495,103 @@ fn explicit_cancel_asks_the_receiver_to_drop_partials() {
         }
     }
     assert!(saw_drop, "明示中止は部分の破棄を伝える");
+}
+
+#[test]
+fn resume_with_a_wrong_prefix_against_a_real_partial_fails_and_discards_it() {
+    let temp = Temp::new("resume-wrong-prefix");
+    let dst = temp.0.join("received");
+    let tmp = temp.0.join("held.part");
+    std::fs::write(&tmp, b"hello").unwrap();
+    knit_common::files::retain_partial(&dst, "p.bin", 10, 0, &tmp).unwrap();
+    let mut wire = Vec::new();
+    let head = r#"{"name":"p.bin","size":10,"mtime":0,"offset":5,"prefix":"00"}"#;
+    bulk::write_frame(&mut wire, bulk::FILE_BEGIN, head.as_bytes()).unwrap();
+    bulk::write_frame(&mut wire, bulk::BATCH_END, &[]).unwrap();
+    let events = deliver_resumed(&wire, &dst);
+    let bulk::Event::Files { failed, paths, .. } = &events[0] else {
+        panic!("失敗が報告されない");
+    };
+    assert_eq!(failed.len(), 1, "前置ハッシュ不一致は失敗");
+    assert!(paths.is_empty(), "公開しない");
+    assert!(
+        knit_common::files::find_partial(&dst, "p.bin", 10, 0).is_none(),
+        "不一致の部分は捨てる(次回は先頭から)"
+    );
+}
+
+/// 前置ハッシュを送らない相手(旧版・空)でも、一致する部分があれば続きから
+/// 受けてよい。正しさは FILE_END の全体ハッシュで守る
+#[test]
+fn resume_without_a_prefix_still_continues_from_the_partial() {
+    let temp = Temp::new("resume-no-prefix");
+    let dst = temp.0.join("received");
+    let data: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let offset = 1000u64;
+    let size = data.len() as u64;
+    let mtime = 1_700_000_000u64;
+    let store = dst.join(knit_common::files::RESUME_DIR);
+    std::fs::create_dir_all(&store).unwrap();
+    let held = store.join(".knit-00000000000000aa.part");
+    std::fs::write(&held, &data[..offset as usize]).unwrap();
+    knit_common::files::retain_partial(&dst, "big.bin", size, mtime, &held).unwrap();
+
+    let mut wire = Vec::new();
+    // 旧版の送信側: offset はあるが prefix は載せない
+    let head =
+        format!(r#"{{"name":"big.bin","size":{size},"mtime":{mtime},"offset":{offset}}}"#);
+    bulk::write_frame(&mut wire, bulk::FILE_BEGIN, head.as_bytes()).unwrap();
+    for chunk in data[offset as usize..].chunks(bulk::CHUNK) {
+        bulk::write_frame(&mut wire, bulk::DATA, chunk).unwrap();
+    }
+    use blake2::{Blake2s256, Digest};
+    let digest = Blake2s256::digest(&data);
+    bulk::write_frame(&mut wire, bulk::FILE_END, &digest[..]).unwrap();
+    bulk::write_frame(&mut wire, bulk::BATCH_END, &[]).unwrap();
+
+    let events = deliver_resumed(&wire, &dst);
+    let bulk::Event::Files { failed, .. } = &events[0] else {
+        panic!("完了イベントが無い");
+    };
+    assert!(failed.is_empty(), "前置が無くても全体ハッシュで守る");
+    assert_eq!(
+        std::fs::read(dst.join("big.bin")).unwrap(),
+        data,
+        "続きから完成して公開される"
+    );
+}
+
+#[test]
+fn resume_offsets_of_reserves_the_partial_for_the_first_of_duplicate_names() {
+    let entries = vec![
+        bulk::OutFile {
+            src: PathBuf::from("/tmp/one/a.txt"),
+            name: "a.txt".into(),
+            size: 10,
+            mtime: 0,
+            is_dir: false,
+        },
+        bulk::OutFile {
+            src: PathBuf::from("/tmp/two/a.txt"),
+            name: "a.txt".into(),
+            size: 10,
+            mtime: 0,
+            is_dir: false,
+        },
+        bulk::OutFile {
+            src: PathBuf::from("/tmp/c.txt"),
+            name: "c.txt".into(),
+            size: 10,
+            mtime: 0,
+            is_dir: false,
+        },
+    ];
+    let positions = vec![knit_common::proto::ResumePos {
+        rel: "a.txt".into(),
+        offset: 4,
+        prefix: "00".into(),
+    }];
+    assert_eq!(bulk::resume_offsets_of(&entries, &positions), vec![4, 0, 0]);
 }
 
 #[test]
@@ -552,6 +663,62 @@ fn skip_policy_keeps_the_existing_file_and_reports_as_accepted() {
 }
 
 #[test]
+fn skip_policy_skips_an_existing_empty_folder_instead_of_duplicating_it() {
+    let temp = Temp::new("collide-dir-skip");
+    let dst = temp.0.join("received");
+    std::fs::create_dir_all(dst.join("写真")).unwrap();
+    let mut wire = Vec::new();
+    let head = r#"{"name":"写真","size":0,"mtime":0,"dir":1}"#;
+    bulk::write_frame(&mut wire, bulk::FILE_BEGIN, head.as_bytes()).unwrap();
+    bulk::write_frame(&mut wire, bulk::BATCH_END, &[]).unwrap();
+    let events = deliver_with(&wire, &dst, knit_common::files::Collision::Skip);
+    let bulk::Event::Files { paths, skipped, .. } = &events[0] else {
+        panic!("完了イベントが無い");
+    };
+    assert_eq!(*skipped, 1, "既存フォルダはスキップとして数える");
+    assert!(paths.is_empty(), "実体は作らない");
+    assert!(!dst.join("写真 (1)").exists(), "複製フォルダを作らない");
+}
+
+#[test]
+fn resume_offsets_for_skips_the_query_for_small_batches_old_peers_and_dead_links() {
+    use std::cell::Cell;
+    let small = vec![bulk::OutFile {
+        src: PathBuf::from("/tmp/a.bin"),
+        name: "a.bin".into(),
+        size: 512 * 1024,
+        mtime: 0,
+        is_dir: false,
+    }];
+    let called = Cell::new(false);
+    let sent = bulk::resume_offsets_for(&small, knit_common::proto::peer_features(18), |_| {
+        called.set(true);
+        true
+    });
+    assert_eq!(sent, vec![0]);
+    assert!(!called.get(), "1MiB 未満は問い合わせない");
+
+    let big = vec![bulk::OutFile {
+        src: PathBuf::from("/tmp/b.bin"),
+        name: "b.bin".into(),
+        size: 4 * 1024 * 1024,
+        mtime: 0,
+        is_dir: false,
+    }];
+    let called = Cell::new(false);
+    let sent = bulk::resume_offsets_for(&big, knit_common::proto::peer_features(17), |_| {
+        called.set(true);
+        true
+    });
+    assert_eq!(sent, vec![0]);
+    assert!(!called.get(), "版 17 以前の相手には問い合わせない");
+
+    // 送信口が閉じている(切断)なら待たずに先頭から
+    let sent = bulk::resume_offsets_for(&big, knit_common::proto::peer_features(18), |_| false);
+    assert_eq!(sent, vec![0]);
+}
+
+#[test]
 fn interrupted_nested_receive_removes_directories_it_created() {
     let temp = Temp::new("emptydirs");
     let dst = temp.0.join("received");
@@ -593,6 +760,47 @@ fn receiver_reports_progress_bytes_while_writing() {
         let _ = rx.feed(kind, &frame);
     }
     assert_eq!(SEEN.load(Ordering::Relaxed), 300 * 1024, "累計バイトが届く");
+}
+
+/// 再開で飛ばした受信済みバイトは進捗の分母から除く。除かないと
+/// (送った分) / (全体) で止まり、完了しても 100% にならない
+#[test]
+fn sender_progress_reaches_100_percent_on_resumed_transfers() {
+    let temp = Temp::new("resume-progress");
+    let a = temp.0.join("a.bin");
+    let b = temp.0.join("b.bin");
+    std::fs::write(&a, vec![1u8; 1000]).unwrap();
+    std::fs::write(&b, vec![2u8; 2000]).unwrap();
+    let entries = bulk::collect(&[a, b], true, true, false).unwrap();
+    let mut wire = Vec::new();
+    let mut seen = Vec::new();
+    bulk::send_entries_from(
+        &mut wire,
+        &entries,
+        &[400, 500],
+        false,
+        None,
+        &mut || false,
+        &mut |sent, total, _| seen.push((sent, total)),
+    )
+    .unwrap();
+    // 全体 3000、再開 900、実際に送るのは 2100
+    assert!(
+        seen.iter().all(|(_, total)| *total == 2100),
+        "分母は残り送信量: {seen:?}"
+    );
+    assert_eq!(seen.last().unwrap(), &(2100, 2100), "完了時に 100% になる");
+}
+
+/// send_image は受信側(IMAGE_BEGIN)と同じ上限を超える入力を、フレームを
+/// 書く前に InvalidInput で断る
+#[test]
+fn send_image_rejects_oversize_input() {
+    let too_large = vec![0u8; bulk::MAX_IMAGE + 1];
+    let mut wire = Vec::new();
+    let err = bulk::send_image(&mut wire, &too_large).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(wire.is_empty(), "断ったらフレームを書き始めない");
 }
 
 #[test]

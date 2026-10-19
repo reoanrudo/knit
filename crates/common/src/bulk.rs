@@ -38,6 +38,10 @@
     /// クリップボード画像の上限(生 DIB)
     pub const MAX_IMAGE: usize = 64 * 1024 * 1024;
 
+    /// 受信先の空き容量を判定する余裕。従来の 1MiB では、書き込み直後に
+    /// OS や他アプリが使えなくなるほど際どいため 512MiB 残す
+    pub const DISK_MARGIN: u64 = 512 * 1024 * 1024;
+
     pub const KEEPALIVE: u8 = 0;
     pub const FILE_BEGIN: u8 = 1;
     pub const DATA: u8 = 2;
@@ -458,7 +462,9 @@
             .collect()
     }
 
-    /// 受信側: 保持している部分ファイルから再開位置を返す(offset>0 のみ)
+    /// 受信側: 保持している部分ファイルから再開位置を返す(offset>0 のみ)。
+    /// 前置ハッシュは返さない: 部分全体を読むと数 GiB で応答が間に合わないため、
+    /// 照合は送信側が自分のファイルから作った前置と、受信側の1回読みで行う
     pub fn resume_positions(
         dir: &std::path::Path,
         items: &[crate::proto::ResumeItem],
@@ -466,38 +472,36 @@
         items
             .iter()
             .filter_map(|it| {
-                let (path, offset) =
+                let (_, offset) =
                     crate::files::find_partial(dir, &it.rel, it.size, it.mtime)?;
-                let prefix = crate::files::prefix_hash(&path, offset)?;
-                if offset == 0 {
-                    return None;
-                }
                 Some(crate::proto::ResumePos {
                     rel: it.rel.clone(),
                     offset,
-                    prefix: crate::update::to_hex(&prefix),
+                    prefix: String::new(),
                 })
             })
             .collect()
     }
 
-    /// 送信側: 応答から entries に対応する送信開始位置を作る(見つからなければ 0)
+    /// 送信側: 応答から entries に対応する送信開始位置を作る(見つからなければ 0)。
+    /// 同一バッチ内の同名は最初の1件だけ部分を使う(2件目以降へ同じ offset を
+    /// 返すと、1件目の公開で部分が消えた後に「部分が無い」失敗になる)
     pub fn resume_offsets_of(
         entries: &[OutFile],
         positions: &[crate::proto::ResumePos],
     ) -> Vec<u64> {
+        let mut seen = std::collections::HashSet::new();
         entries
             .iter()
             .map(|e| {
-                if e.is_dir {
-                    0
-                } else {
-                    positions
-                        .iter()
-                        .find(|p| p.rel == e.name)
-                        .map(|p| p.offset.min(e.size))
-                        .unwrap_or(0)
+                if e.is_dir || !seen.insert(e.name.as_str()) {
+                    return 0;
                 }
+                positions
+                    .iter()
+                    .find(|p| p.rel == e.name)
+                    .map(|p| p.offset.min(e.size))
+                    .unwrap_or(0)
             })
             .collect()
     }
@@ -543,6 +547,44 @@
                 .unwrap_or_else(|e| e.into_inner());
             slot = next;
         }
+    }
+
+    /// 再開問い合わせの待ち時間。新版の相手はメタデータだけで応答する
+    /// (部分の内容は読まない)ため通常は即答。応答が無い(切断・相手のループ
+    /// 停止)ときはこの時間だけ待ち、先頭から送る。
+    /// shortcut: 旧版の相手(内容を読んで前置ハッシュを作る)は 8 秒を超える
+    /// 部分(HDD で約 800MB 超)で間に合わないことがある。実測で足りなければ
+    /// 非同期の二段応答へ
+    pub const RESUME_WAIT: std::time::Duration = std::time::Duration::from_millis(8000);
+
+    /// 送信側: 相手が保持している部分から送信開始位置を決める(版 18)。
+    /// 相手が旧版・問い合わせ不達のときは先頭から。`send` は問い合わせの
+    /// 送信口(端末ごとに違うため注入)。送れたら true
+    pub fn resume_offsets_for(
+        entries: &[OutFile],
+        features: crate::proto::PeerFeatures,
+        send: impl FnOnce(crate::proto::Msg) -> bool,
+    ) -> Vec<u64> {
+        if !features.resume
+            || entries.iter().all(|e| e.is_dir)
+            || entries_total(entries) < 1024 * 1024
+        {
+            return vec![0; entries.len()];
+        }
+        let token = next_resume_token();
+        if !send(crate::proto::Msg::XferResumeQuery {
+            token,
+            items: resume_items(entries),
+        }) {
+            return vec![0; entries.len()];
+        }
+        let positions = wait_resume_state(token, RESUME_WAIT);
+        let offsets = resume_offsets_of(entries, &positions);
+        let resumed = offsets.iter().filter(|o| **o > 0).count();
+        if resumed > 0 {
+            eprintln!("[bulk] 続きから送信します(再開: {resumed} 件)");
+        }
+        offsets
     }
 
     pub fn send_entries(
@@ -604,13 +646,27 @@
                 "file sharing is disabled on this device",
             ));
         }
-        let declared = entries_total(entries);
-        if declared > MAX_TOTAL {
+        let total = entries_total(entries);
+        if total > MAX_TOTAL {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("file batch exceeds size limit: {declared} (limit {MAX_TOTAL})"),
+                format!("file batch exceeds size limit: {total} (limit {MAX_TOTAL})"),
             ));
         }
+        // 進捗の分母は「これから送る分」: 再開で飛ばす受信済みバイトを引く
+        // (引かないと完了しても 100% に届かない)。上限判定は全体の total で行う
+        let resumed: u64 = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if e.is_dir {
+                    0
+                } else {
+                    offsets.get(i).copied().unwrap_or(0).min(e.size)
+                }
+            })
+            .fold(0, u64::saturating_add);
+        let declared = total.saturating_sub(resumed);
         if drag_id.is_some() && cancel() {
             return Err(cancelled_err());
         }
@@ -782,6 +838,17 @@
 
     /// クリップボード画像(DIB)を送る
     pub fn send_image(w: &mut impl Write, dib: &[u8]) -> std::io::Result<()> {
+        // 受信側(IMAGE_BEGIN)と同じ上限を送信側でも守る。呼び出し側の
+        // 判定に頼らず、ここで断ってからフレームを書き始める
+        if dib.len() > MAX_IMAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "clipboard image too large: {} (limit {MAX_IMAGE})",
+                    dib.len()
+                ),
+            ));
+        }
         if !crate::share::allow_clip() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -842,8 +909,6 @@
             hasher: blake2::Blake2s256,
             /// Overwrite で既存を置き換える(公開時に publish_with を使う)
             replace: bool,
-            /// 続きから受信している(.knit-resume の実体を直接使う)
-            resumed: bool,
         },
         /// 衝突ポリシー Skip で保存しないと決めたファイル。DATA は届くので
         /// サイズだけ数えて捨てる(ストリームの位置を保つ)
@@ -996,7 +1061,6 @@
                 rel,
                 mtime,
                 size,
-                resumed,
                 ..
             } = std::mem::replace(&mut self.sink, Sink::None)
             {
@@ -1008,7 +1072,6 @@
                 } else {
                     let _ = std::fs::remove_file(&tmp);
                 }
-                let _ = resumed;
                 self.paths.pop(); // 予約済みの最終名も取り下げる
                 if !reason.is_empty() {
                     self.failed.push((rel, reason.to_string()));
@@ -1085,12 +1148,23 @@
                                 self.created_dirs.push(d);
                             }
                         }
-                        let Some(final_path) =
-                            crate::files::unique_final(&self.dir, &rel, &self.paths)
-                        else {
+                        let policy = self.collision.unwrap_or_else(crate::files::collision);
+                        let Some(reserved) = crate::files::unique_final_with(
+                            &self.dir,
+                            &rel,
+                            &self.paths,
+                            policy,
+                        ) else {
                             fail(self, &rel, "保存名の衝突を解消できません");
                             return None;
                         };
+                        // 既存フォルダもファイルと同じ規則: Skip は作らず件数だけ、
+                        // Overwrite は既存のフォルダを使う(中身は消さない)
+                        if policy == crate::files::Collision::Skip && reserved.existed {
+                            self.skipped += 1;
+                            return None;
+                        }
+                        let final_path = reserved.path;
                         match std::fs::create_dir_all(&final_path) {
                             Ok(()) => {
                                 if is_renamed(&rel, &final_path) {
@@ -1132,9 +1206,9 @@
                         );
                         return None; // このファイルの DATA は空読みし、次へ続ける
                     };
-                    // 空き容量(余裕 1MiB)。取得できない環境は確認なしで続ける
+                    // 空き容量(余裕は DISK_MARGIN)。取得できない環境は確認なしで続ける
                     if let Some(avail) = crate::files::available_bytes(&self.dir) {
-                        if avail.saturating_sub(1024 * 1024) < size {
+                        if avail.saturating_sub(DISK_MARGIN) < size {
                             fail(self, &rel, "保存先の空き容量が不足");
                             return None;
                         }
@@ -1166,10 +1240,8 @@
                     let replace =
                         policy == crate::files::Collision::Overwrite && reserved.existed;
                     let parent = final_path.parent().unwrap_or(&self.dir).to_path_buf();
-                    // 続きから受ける(版 18)。offset は送信側の「受信済みバイト数」。
-                    // 部分の実体と前置ハッシュが一致するときだけ続き、不一致なら
-                    // 部分を捨てて失敗にする(壊れた続きを公開しない)
-                    let mut resumed = false;
+                    // 受信済みバイト数。部分の実体と前置ハッシュが一致するときだけ
+                    // 続き、不一致なら部分を捨てて失敗にする(壊れた続きを公開しない)
                     let mut hasher = blake2::Blake2s256::new();
                     let tmp = if self.resume && offset > 0 {
                         use blake2::Digest;
@@ -1179,24 +1251,21 @@
                             fail(self, &rel, "続きからの転送に一致する部分がありません");
                             return None;
                         };
-                        let prefix_ok = have == offset
-                            && prefix.is_some_and(|p| {
-                                crate::files::prefix_hash(&path, offset)
-                                    .map(|h| crate::update::to_hex(&h) == p)
-                                    .unwrap_or(false)
-                            });
-                        if !prefix_ok {
+                        if have != offset {
                             crate::files::discard_partial(&self.dir, &rel, size, mtime);
                             fail(self, &rel, "続きからの転送が一致しません");
                             return None;
                         }
-                        // 全体の内容ハッシュを検証できるよう、前置バイトを
-                        // ハッシュへ流す(部分の再読込はこの1回だけ)
+                        // 部分は1回だけ読み、全体ハッシュと前置ハッシュを同じ
+                        // 読みで作る(数 GiB の部分を2回読むと再開応答が間に合わない)。
+                        // 送信側が前置を送らない(旧版・空)ときは照合を省き、
+                        // FILE_END の全体ハッシュだけで正しさを守る
                         let Some(mut old) = std::fs::File::open(&path).ok() else {
                             fail(self, &rel, "続きの部分を開けません");
                             return None;
                         };
                         use std::io::Read;
+                        let mut prefix_hasher = blake2::Blake2s256::new();
                         let mut left = offset;
                         let mut buf = vec![0u8; 64 * 1024];
                         while left > 0 {
@@ -1208,8 +1277,16 @@
                                 }
                                 Ok(n) => {
                                     hasher.update(&buf[..n]);
+                                    prefix_hasher.update(&buf[..n]);
                                     left -= n as u64;
                                 }
+                            }
+                        }
+                        if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+                            if crate::update::to_hex(&prefix_hasher.finalize()) != p {
+                                crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                                fail(self, &rel, "続きからの転送が一致しません");
+                                return None;
                             }
                         }
                         let Some(f) = std::fs::OpenOptions::new().append(true).open(&path).ok()
@@ -1217,7 +1294,6 @@
                             fail(self, &rel, "続きの部分を開けません");
                             return None;
                         };
-                        resumed = true;
                         (f, path)
                     } else {
                         // 先頭からのやり直しは、古い部分を捨ててから始める
@@ -1240,7 +1316,6 @@
                         size,
                         hasher,
                         replace,
-                        resumed,
                     };
                 }
                 DATA => match &mut self.sink {
