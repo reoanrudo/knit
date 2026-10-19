@@ -18,7 +18,10 @@
     ///     大容量(実測: Wi-Fi 実効 30MB/s で 1GB=34秒・10GB=5分41秒)で
     ///     「渡し終わるまで押し続ける」問題を消すための能力。旧側は受理の行を知らないので
     ///     **版ゲートで送らない**(現行方式へ自動フォールバック)
-    pub const VERSION: u32 = 17;
+    /// 18: 中断したファイル転送の続きから再開する能力(bulk の FILE_BEGIN に
+    ///     "offset"/"prefix")。**版ゲートで送らない**(旧側は offset を知らず
+    ///     先頭から書くため、offset 付きの送信は resume 対応の相手だけへ)
+    pub const VERSION: u32 = 18;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
     /// 片側だけ更新された状態で接続拒否が続く事故を防ぐ
@@ -43,6 +46,9 @@
         /// 掴みドラッグの遅延提供(drag.lazy)ができる(版 17 以降)。
         /// ドロップを先に受理してから転送を流せる=押し続けなくてよい
         pub lazy: bool,
+        /// 中断した転送の続きから再開できる(版 18 以降)。部分ファイルを
+        /// 保持し、offset 付きの FILE_BEGIN を受ける
+        pub resume: bool,
     }
 
     pub fn peer_features(ver: u32) -> PeerFeatures {
@@ -51,7 +57,25 @@
             empty_dirs: ver >= 15,
             unlock: ver >= 16,
             lazy: ver >= 17,
+            resume: ver >= 18,
         }
+    }
+
+    /// 再開問い合わせの1項目(版 18)。相対名・宣言サイズ・更新日時の3つが
+    /// 一致する部分だけを「同じ転送の続き」とみなす
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct ResumeItem {
+        pub rel: String,
+        pub size: u64,
+        pub mtime: u64,
+    }
+
+    /// 再開位置の1項目(版 18)。prefix は先頭 offset バイトの BLAKE2s(16進)
+    #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct ResumePos {
+        pub rel: String,
+        pub offset: u64,
+        pub prefix: String,
     }
 
     /// 遅延提供(版 17)の目録の1項目。**名前とサイズだけ**を先に渡す
@@ -461,6 +485,20 @@
             #[serde(default)]
             scope: bool,
         },
+        /// 中断した転送の再開位置の問い合わせ(版 18。送信側→受信側)。
+        /// 受信側は保持している部分ファイルの位置と前置ハッシュを返す。
+        /// 旧側は未知行として無視するため、**resume 対応の相手にだけ送る**
+        #[serde(rename = "resume_query")]
+        XferResumeQuery {
+            token: u64,
+            items: Vec<ResumeItem>,
+        },
+        /// 再開位置の応答(版 18。受信側→送信側)。offset=0 は「先頭から」
+        #[serde(rename = "resume_state")]
+        XferResumeState {
+            token: u64,
+            items: Vec<ResumePos>,
+        },
         /// 設定の遠隔操作(Windows→Mac): Mac の設定一覧を要求する。
         /// 旧側は未知行として無視する拡張(版 14 のまま)
         #[serde(rename = "prefs_get")]
@@ -672,10 +710,22 @@ mod tests {
         assert!(!peer_features(16).lazy, "版 16 は遅延提供に非対応");
         assert!(peer_features(17).lazy, "版 17 は対応");
         assert!(peer_features(u32::MAX).lazy, "将来版も対応扱い");
-        assert_eq!(VERSION, 17, "自分の版");
+        assert_eq!(VERSION, 18, "自分の版");
         assert_eq!(MIN_VERSION, 11, "据え置き(旧版とも通信できる)");
         // 遅延提供は他の能力と独立(片方だけ実装した版を作らない)
         let f = peer_features(17);
+        assert!(f.dirs && f.empty_dirs && f.unlock && f.lazy);
+    }
+
+    /// 版 18 の再開(resume)。**旧版には offset 付き送信をしない**
+    /// (旧側は offset を知らず先頭から書くため、部分を続きと誤解しない)
+    #[test]
+    fn peer_features_gate_resume_from_version_18() {
+        assert!(!peer_features(17).resume, "版 17 は再開に非対応");
+        assert!(peer_features(18).resume, "版 18 は対応");
+        assert!(peer_features(u32::MAX).resume, "将来版も対応扱い");
+        // 版 17 の能力は据え置き(上げた版で古い能力を落とさない)
+        let f = peer_features(18);
         assert!(f.dirs && f.empty_dirs && f.unlock && f.lazy);
     }
 }

@@ -1400,7 +1400,9 @@ pub fn start(token: String, port: u16) {
         eprintln!("[audio] listening on {bind_ip}:{port}");
         // 本線と同じ連続失敗スロットル(認証失敗の連打を鈍らせる)
         let mut throttle = knit_common::secure::FailThrottle::new();
-        loop {
+        // 待受ループは長命。panic した時だけ supervisor が記録して再起動する
+        // (listener は閉じずにそのまま使い回すため、ポートの再 bind も不要)。
+        crate::supervise::run_supervised("音声受信", move || loop {
             let (stream, peer) = match listener.accept() {
                 Ok(x) => x,
                 Err(_) => {
@@ -1422,8 +1424,22 @@ pub fn start(token: String, port: u16) {
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(12)))
                 .ok();
-            let (r, mut w) = match knit_common::secure::accept(stream, &token, b"knit-audio") {
-                Ok(x) => x,
+            // 待受の鍵束は台帳の最新状態(登録・失効の即時反映)。台帳が無ければ
+            // 従来どおり単一トークン
+            let keys = match crate::registry() {
+                Some(r) => r.accept_keys(),
+                None => Ok(knit_common::secure::ServerKeys::single(&token)),
+            };
+            let keys = match keys {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("[audio] 待受鍵がありません: {e}");
+                    std::thread::sleep(throttle.fail());
+                    continue;
+                }
+            };
+            let (r, mut w) = match knit_common::secure::accept_as(stream, &keys, b"knit-audio") {
+                Ok((r, w, _who)) => (r, w),
                 Err(e) => {
                     eprintln!("[audio] 暗号化ハンドシェイク失敗: {e}");
                     std::thread::sleep(throttle.fail());
@@ -1534,7 +1550,7 @@ pub fn start(token: String, port: u16) {
                 diag_log(&mut last_diag, rate);
             }
             eprintln!("[audio] stream ended");
-        }
+        });
     });
 }
 

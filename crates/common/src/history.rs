@@ -450,11 +450,9 @@ pub fn save_bytes_to(path: &std::path::Path, bytes: &[u8]) {
         let _ = std::fs::create_dir_all(parent);
         restrict_dir(parent);
     }
-    // まず一時ファイルへ書いて差し替える(書きかけの破損を避ける)
-    let tmp = path.with_extension("json.tmp");
-    if write_private(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    // 一時名+rename は persist::write_atomic に共通化済み(pid+連番で衝突せず、
+    // fsync と 0600 も同じ)。ここで独自の tmp 名を作らない
+    let _ = crate::persist::write_atomic(path, bytes);
 }
 
 pub fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -1608,6 +1606,43 @@ mod tests {
         }
         let dmode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(dmode & 0o777, 0o700, "履歴ディレクトリは 700 になる");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// save_bytes_to は共通の write_atomic 経由で保存する(固定名の *.json.tmp を
+    /// 自前で作らない)。保存後に一時ファイルの残骸が無いことを固定する
+    #[test]
+    fn save_bytes_to_is_atomic_and_leaves_no_temp() {
+        let dir = std::env::temp_dir().join(format!("knit-hist-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("history.json");
+        save_bytes_to(&path, b"{\"entries\":[]}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"entries\":[]}");
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["history.json".to_string()], "一時ファイルは残らない");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧実装は固定名 history.json.tmp を使っていたため、別の書き手が同じ名前を
+    /// 使っていると潰していた。共通ヘルパの pid+連番の一時名なら触らない
+    #[test]
+    fn save_bytes_to_leaves_an_unrelated_fixed_temp_name_alone() {
+        let dir = std::env::temp_dir().join(format!("knit-hist-fixedtmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fixed = dir.join("history.json.tmp");
+        std::fs::write(&fixed, b"other writer").unwrap();
+        save_bytes_to(&dir.join("history.json"), b"new");
+        assert_eq!(
+            std::fs::read(&fixed).unwrap(),
+            b"other writer",
+            "固定名の一時ファイルを潰さない"
+        );
+        assert_eq!(std::fs::read(dir.join("history.json")).unwrap(), b"new");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

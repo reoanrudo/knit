@@ -147,6 +147,12 @@ static GUI_LASTLINE_ITEM: AtomicUsize = AtomicUsize::new(0);
 static GUI_RETRY_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// クリップボード履歴のサブメニュー(項目は refresh_status が変化時だけ作り直す)
 static GUI_HISTORY_MENU: AtomicUsize = AtomicUsize::new(0);
+/// 登録済みの端末サブメニュー(台帳の一覧と失効。履歴と同じ変化検知で作り直す)
+static GUI_REGISTRY_MENU: AtomicUsize = AtomicUsize::new(0);
+static GUI_REGISTRY_ITEM: AtomicUsize = AtomicUsize::new(0);
+static GUI_REGISTRY_OPEN: AtomicBool = AtomicBool::new(false);
+/// 直前にメニューへ反映した台帳の内容(変化検知用)
+static GUI_REGISTRY_SEEN: Mutex<Option<(Vec<(String, String)>, bool)>> = Mutex::new(None);
 static GUI_UPDATE_ITEM: AtomicUsize = AtomicUsize::new(0);
 /// メニューの「接続を診断…」項目(実行中は題名を「診断中…」へ書き換える。
 /// 設定画面の診断ボタン(prefs::DIAG_BUTTON)と同じ作法)
@@ -2519,7 +2525,201 @@ fn refresh_status() {
             }
         }
 
+        // 登録済みの端末(台帳の変化だけ検知して作り直す。開示中は閉じた時に反映)
+        let reg_menu = GUI_REGISTRY_MENU.load(Ordering::Relaxed) as ID;
+        if !reg_menu.is_null() && !GUI_REGISTRY_OPEN.load(Ordering::Relaxed) {
+            let sig = registry_signature();
+            let changed = GUI_REGISTRY_SEEN
+                .lock()
+                .map(|seen| *seen != sig)
+                .unwrap_or(false);
+            if changed {
+                if let Ok(mut seen) = GUI_REGISTRY_SEEN.lock() {
+                    *seen = sig;
+                }
+                rebuild_registry_menu(reg_menu);
+            }
+        }
+
     }
+}
+
+/// 登録済み端末のメニュー行の題名(表示名 + 略号)。純関数(単体テスト対象)
+fn registry_entry_title(name: &str, fp: &str) -> String {
+    let name = name.trim();
+    let name = if name.is_empty() { "端末" } else { name };
+    format!("{name}({fp}) を失効…")
+}
+
+/// 台帳の現在の内容(メニューへ反映済みのものと比較するための署名)。
+/// key_id と題名・旧形式の受付状態だけを持つ(秘密は含まない)
+fn registry_signature() -> Option<(Vec<(String, String)>, bool)> {
+    let reg = crate::registry()?;
+    Some((
+        reg.devices()
+            .into_iter()
+            .map(|d| (d.key_id.to_string(), registry_entry_title(&d.name, &d.fp)))
+            .collect(),
+        reg.legacy_accepts(),
+    ))
+}
+
+/// NSMenuDelegate(menuWillOpen:/menuDidClose:)の送り主が登録済み端末サブメニューか
+pub(super) unsafe fn registry_menu_tracking(menu: ID) -> bool {
+    let m = GUI_REGISTRY_MENU.load(Ordering::Relaxed) as ID;
+    !m.is_null() && menu == m
+}
+
+pub(super) unsafe fn registry_menu_opened() {
+    GUI_REGISTRY_OPEN.store(true, Ordering::Relaxed);
+}
+
+/// 閉じた時に最新の台帳を 1 回だけ反映する(開示中の removeAllItems は避ける)
+pub(super) unsafe fn registry_menu_closed() {
+    GUI_REGISTRY_OPEN.store(false, Ordering::Relaxed);
+    let m = GUI_REGISTRY_MENU.load(Ordering::Relaxed) as ID;
+    if !m.is_null() {
+        rebuild_registry_menu(m);
+    }
+}
+
+/// 登録済み端末サブメニューを作り直す。旧形式の受付状態を先頭の1行に、
+/// 端末ごとの失効行を並べる
+unsafe fn rebuild_registry_menu(menu: ID) {
+    msg0(menu, sel(c"removeAllItems"));
+    let holder = GUI_REGISTRY_ITEM.load(Ordering::Relaxed) as ID;
+    let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
+    let Some(reg) = crate::registry() else {
+        // 台帳が無効(開けなかった)環境では、機能ごと隠す
+        if !holder.is_null() {
+            msg1_void_u8(holder, sel(c"setHidden:"), 1);
+        }
+        return;
+    };
+    let devices = reg.devices();
+    if !holder.is_null() {
+        msg1_void_id(
+            holder,
+            sel(c"setTitle:"),
+            nsstring(&format!("登録済みの端末({}台)", devices.len())),
+        );
+        msg1_void_u8(holder, sel(c"setHidden:"), 0);
+    }
+    // 旧形式(共通キー)の受付状態。受け付け中だけ「拒否する」操作を出す
+    if reg.legacy_accepts() {
+        let item = menu_item("旧形式(共通キー)での接続: 受け付けています", Some(c"sdRefuseLegacy:"), "");
+        if !item.is_null() {
+            msg1_void_id(item, sel(c"setTarget:"), target);
+            msg1_void_id(
+                item,
+                sel(c"setToolTip:"),
+                nsstring("端末別の鍵で登録済みの端末はそのまま使えます。旧形式しか持たない端末は再登録が必要です"),
+            );
+            add_item(menu, item);
+        }
+    } else {
+        let item = menu_item("旧形式(共通キー)での接続: 拒否中", None, "");
+        if !item.is_null() {
+            msg1_void_u8(item, sel(c"setEnabled:"), 0);
+            add_item(menu, item);
+        }
+    }
+    add_item(
+        menu,
+        msg0(objc_getClass(c"NSMenuItem".as_ptr()), sel(c"separatorItem")),
+    );
+    if devices.is_empty() {
+        let item = menu_item("登録済みの端末はありません(「端末を登録…」から追加)", None, "");
+        if !item.is_null() {
+            msg1_void_u8(item, sel(c"setEnabled:"), 0);
+            add_item(menu, item);
+        }
+        return;
+    }
+    for d in devices {
+        let item = menu_item(&registry_entry_title(&d.name, &d.fp), Some(c"sdRevokeDevice:"), "");
+        if item.is_null() {
+            continue;
+        }
+        msg1_void_id(item, sel(c"setTarget:"), target);
+        msg1_void_id(item, sel(c"setRepresentedObject:"), crate::nsstring(&d.key_id.to_string()));
+        add_item(menu, item);
+    }
+}
+
+/// メニューから1端末を失効させる(確認してから。取り消し不可)
+unsafe extern "C" fn imp_revoke_device(_s: ID, _c: SEL, sender: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(reg) = crate::registry() else { return };
+    let obj = msg0(sender, sel(c"representedObject"));
+    if obj.is_null() {
+        return;
+    }
+    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
+    if utf8.is_null() {
+        return;
+    }
+    let text = std::ffi::CStr::from_ptr(utf8).to_string_lossy().to_string();
+    let Some(key_id) = knit_common::secure::DeviceKeyId::parse(&text) else { return };
+    let Some(dev) = reg.devices().into_iter().find(|d| d.key_id == key_id) else { return };
+    let body = format!(
+        "「{}」(略号 {})からの接続を、本線・音声・ファイルのすべてで受け付けなくなります。
+相手の端末に保存された情報は消えません。この操作は取り消せません。",
+        dev.name, dev.fp
+    );
+    if setup::alert("この端末を失効させますか?", &body, &["キャンセル", "失効させる"], None) != 1001
+    {
+        return;
+    }
+    match crate::conn::registry_revoke(reg, &key_id) {
+        Ok(knit_common::registry::RevokeOutcome::Revoked) => {
+            // 全端末がいなくなった時だけ配置を整理する(通常切断と同じ規則。
+            // cut_sessions_where はロック保持中の保存を避けるため、ここで行う)
+            if crate::conn::peers_is_empty() {
+                crate::tap::save_peer_sides();
+            }
+            crate::notify("Knit", &format!("「{}」を失効しました(以後の接続は拒否されます)", dev.name));
+            eprintln!("[registry] 端末を失効しました(key_id={key_id})");
+        }
+        Ok(knit_common::registry::RevokeOutcome::NotFound) => {
+            crate::notify("Knit", "この端末は既に登録がありません");
+        }
+        Err(e) => {
+            crate::notify("Knit", &format!("失効に失敗しました: {e}"));
+            eprintln!("[registry] 失効に失敗: {e}");
+        }
+    }
+    refresh_status();
+}
+
+/// 旧形式(共通キー)での接続を拒否する(確認してから。取り消し不可)
+unsafe extern "C" fn imp_refuse_legacy(_s: ID, _c: SEL, _sender: ID) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(reg) = crate::registry() else { return };
+    if !reg.legacy_accepts() {
+        return;
+    }
+    let body = "共通キー(旧トークン)での接続を以後受け付けなくなります。
+端末別の鍵で登録済みの端末はそのまま使えます。旧形式しか持たない端末は再登録が必要です。この操作は取り消せません。";
+    if setup::alert("旧形式での接続を拒否しますか?", body, &["キャンセル", "拒否する"], None) != 1001
+    {
+        return;
+    }
+    match reg.revoke_legacy() {
+        Ok(()) => {
+            crate::notify("Knit", "旧形式での接続を拒否しました");
+            eprintln!("[registry] legacy の受付を閉じました");
+        }
+        Err(e) => {
+            crate::notify("Knit", &format!("旧形式の拒否に失敗しました: {e}"));
+            eprintln!("[registry] legacy の拒否に失敗: {e}");
+        }
+    }
+    refresh_status();
 }
 
 /// NSMenuDelegate(menuWillOpen:/menuDidClose:)の送り主が履歴サブメニューか。
@@ -2793,6 +2993,8 @@ unsafe fn make_target() -> ID {
         (c"sdHistoryClear:", imp_history_clear as *const () as usize),
         (c"sdCancelXfer:", imp_cancel_xfer as *const () as usize),
         (c"sdPeerActivate:", imp_peer_activate as *const () as usize),
+        (c"sdRevokeDevice:", imp_revoke_device as *const () as usize),
+        (c"sdRefuseLegacy:", imp_refuse_legacy as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
         (c"sdSaveHost:", imp_save_host as *const () as usize),
         (c"sdCheckUpdate:", imp_check_update as *const () as usize),
@@ -2981,6 +3183,24 @@ pub fn start() -> bool {
                 add_item(menu, holder);
                 GUI_HISTORY_ITEM.store(holder as usize, Ordering::Relaxed);
                 GUI_HISTORY_MENU.store(history_menu as usize, Ordering::Relaxed);
+            }
+        }
+
+        // 登録済みの端末(端末別資格の一覧と失効)。台帳が無効な環境では
+        // refresh/再構築が行ごと隠す(サブメニュー自体は作る)
+        let reg_menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
+        if !reg_menu.is_null() {
+            msg1_void_u8(reg_menu, sel(c"setAutoenablesItems:"), 0);
+            msg1_void_id(reg_menu, sel(c"setDelegate:"), target);
+            let holder = menu_item("登録済みの端末", None, "");
+            if !holder.is_null() {
+                msg1_void_id(holder, sel(c"setSubmenu:"), reg_menu);
+                add_item(menu, holder);
+                GUI_REGISTRY_ITEM.store(holder as usize, Ordering::Relaxed);
+                GUI_REGISTRY_MENU.store(reg_menu as usize, Ordering::Relaxed);
+                // 台帳が無効な環境(開けなかった)では項目ごと隠す。初期表示を
+                // 空のサブメニューのまま残さない
+                rebuild_registry_menu(reg_menu);
             }
         }
 
@@ -3195,6 +3415,14 @@ mod history_rebuild_defer_tests {
 #[cfg(test)]
 mod state_title_defer_tests {
     use super::state_title_set_now;
+
+    /// 登録済み端末の行の題名(名前が空なら「端末」)
+    #[test]
+    fn registry_entry_title_uses_name_and_fingerprint() {
+        use super::registry_entry_title;
+        assert_eq!(registry_entry_title("事務室PC", "AB12CD34"), "事務室PC(AB12CD34) を失効…");
+        assert_eq!(registry_entry_title("  ", "AB12CD34"), "端末(AB12CD34) を失効…");
+    }
 
     #[test]
     fn state_title_set_is_deferred_while_the_menu_is_tracking() {

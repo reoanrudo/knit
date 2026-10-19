@@ -142,6 +142,21 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                             // 送信スレッドの通知分岐に使う
                             note_xfer_ack(accepted, rejected, scope);
                         }
+                        // 版 18: 相手(送信側)からの再開位置の問い合わせに、
+                        // 保持している部分ファイルから応答する。先頭ハッシュの
+                        // 計算は部分が大きいほど時間がかかるため、本線ループ
+                        // (入力の復帰・clipboard の受信)を止めないよう別スレッドで。
+                        // 応答はトークンで対応付けるため順序は問わない
+                        Msg::XferResumeQuery { token, items } => {
+                            std::thread::spawn(move || {
+                                let dir = crate::desktop_settings::receive_dir();
+                                let items = knit_common::bulk::resume_positions(&dir, &items);
+                                send_msg(&Msg::XferResumeState { token, items });
+                            });
+                        }
+                        Msg::XferResumeState { token, items } => {
+                            knit_common::bulk::note_resume_state(token, items);
+                        }
                         Msg::PrefsGet => {
                             send_msg(&Msg::Prefs { json: gui::prefs_snapshot_json() });
                         }
@@ -414,6 +429,7 @@ fn handshake_and_hello(
         f64,
         f64,
         u32,
+        knit_common::secure::Who,
     ),
     String,
 > {
@@ -421,7 +437,14 @@ fn handshake_and_hello(
     stream.set_nodelay(true).ok();
     stream.set_read_timeout(Some(Duration::from_secs(12))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-    let (r, hw) = secure::accept(stream, token, b"knit-main")
+    // 待受の鍵束。台帳があれば最新の状態(登録・失効の即時反映)、無ければ
+    // 従来どおり単一トークン(テスト・台帳を開けなかった場合)
+    let keys = match crate::registry() {
+        Some(r) => r.accept_keys(),
+        None => Ok(secure::ServerKeys::single(token)),
+    };
+    let (r, hw, who) = keys
+        .and_then(|k| secure::accept_as(stream, &k, b"knit-main"))
         .map_err(|e| format!("暗号化ハンドシェイク失敗 ({peer}): {e}(トークン不一致の可能性)"))?;
     let mut reader = std::io::BufReader::new(r);
     let mut line = String::new();
@@ -470,6 +493,7 @@ fn handshake_and_hello(
                 w.clamp(1, 32768) as f64,
                 h.clamp(1, 32768) as f64,
                 ver,
+                who,
             ))
         }
         _ => Err("invalid hello".into()),
@@ -605,7 +629,7 @@ pub(crate) fn server_thread(
                 let _ = hs_tx.send(out);
             });
         }
-        let (mut reader, mut w, disp, dev, mons, win_w, win_h, peer_ver) = match hs_rx
+        let (mut reader, mut w, disp, dev, mons, win_w, win_h, peer_ver, who) = match hs_rx
             .recv_timeout(Duration::from_secs(15))
         {
             Ok(Ok(x)) => x,
@@ -654,12 +678,17 @@ pub(crate) fn server_thread(
                 let replacing = entries.get(previous).is_some_and(|p| p.id == dev);
                 let taken = entries.iter().map(|p| p.side).collect::<Vec<_>>();
                 let (side, edge_monitor) = assign_side_for_new_peer(&dev, &taken);
+                // writer の複製を切断用ハンドルとして持つ(貸与中でも切れる)
+                let shut = w.shutdown_handle().ok();
                 let select = peers::insert(&mut entries, previous, PeerEntry {
                     id: dev.clone(), name: disp.clone(), ip: peer.ip(),
                     screen: (win_w, win_h), monitors: mons, writer: Some(w),
                     gen: my_gen, side, edge_monitor, ver: peer_ver,
                     // 保存済みのエイリアス(表示名)があれば接続時点で載せる
                     alias: tap::saved_peer_alias(&dev),
+                    // どの鍵で認証したか(端末別 or 従来の単一トークン)
+                    auth: who.clone(),
+                    shut,
                 });
                 if replacing {
                     if let Some(old) = slot.take() { old.shutdown(); }
@@ -670,6 +699,20 @@ pub(crate) fn server_thread(
                 drop(slot);
                 if select {
                     activate_peer_id_locked(&dev, if first { "初回接続" } else { "再接続" });
+                }
+            }
+            // 台帳へ接続成功を記録する(last_seen と表示名の更新、宛先別トークンの
+            // 紐付け。失効後の試行は accept が弾くため、ここへは届かない)。
+            // 保存に失敗しても接続は止めない(表示の新しさだけが遅れる)
+            if let knit_common::secure::Who::Device(ref key) = who {
+                if let Some(r) = crate::registry() {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    if let Err(e) = r.note_seen(key, &disp, now) {
+                        eprintln!("[registry] 接続記録の保存に失敗: {e}");
+                    }
                 }
             }
             let _ = session_receive_loop(&mut reader, &dev, my_gen);
@@ -834,12 +877,44 @@ pub(crate) fn client_thread(
         // 発見が応答しない環境(Tailscale・AP 隔離・相手が再起動中)では、従来は
         // 発見の満了 600ms を待ってから最初のダイヤルを撃っていた
         let known = knit_common::connect::known_candidates(host.as_deref(), port);
+        // 既知候補を「接続済みの相手(認証結果から宛先トークンを解ける)」と
+        // 「まだ分からない候補(従来のトークン)」に分け、認証済みを先に試す。
+        // クライアント役の通常運用は宛先1台。複数台が混在する構成では同じ群の
+        // 先頭のトークンを使う(設計書 §9-8 の残り)
+        let mut authed: Vec<std::net::SocketAddr> = Vec::new();
+        let mut unknown: Vec<std::net::SocketAddr> = Vec::new();
+        let mut authed_token: Option<String> = None;
+        for a in &known {
+            match crate::conn::known_peer_token(a.ip()) {
+                Some(tok) => {
+                    authed.push(*a);
+                    authed_token.get_or_insert(tok);
+                }
+                None => unknown.push(*a),
+            }
+        }
         let t0 = std::time::Instant::now();
-        match knit_common::connect::connect_first(&known, port, &token, Duration::from_secs(3)) {
-            Some((s, a)) => {
+        let mut chosen: Option<(std::net::TcpStream, std::net::SocketAddr, String)> = None;
+        for (addrs, tok) in [
+            (authed, authed_token),
+            (unknown, Some(token.clone())),
+        ] {
+            let Some(tok) = tok else { continue };
+            if addrs.is_empty() {
+                continue;
+            }
+            if let Some((s, a)) =
+                knit_common::connect::connect_first(&addrs, port, &tok, Duration::from_secs(3))
+            {
+                chosen = Some((s, a, tok));
+                break;
+            }
+        }
+        match chosen {
+            Some((s, a, tok)) => {
                 eprintln!("[conn] connected ({a}) in {}ms", t0.elapsed().as_millis());
                 *PEER_IP.lock().unwrap_or_else(|e| e.into_inner()) = Some(a.ip());
-                match client_attempt(s, &token, screen_w, screen_h) {
+                match client_attempt(s, &tok, screen_w, screen_h) {
                     Ok(()) => backoff.reset(),
                     Err(e) => eprintln!("[conn] {e}"),
                 }

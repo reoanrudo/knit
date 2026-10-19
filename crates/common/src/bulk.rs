@@ -38,6 +38,10 @@
     /// クリップボード画像の上限(生 DIB)
     pub const MAX_IMAGE: usize = 64 * 1024 * 1024;
 
+    /// 受信先の空き容量を判定する余裕。従来の 1MiB では、書き込み直後に
+    /// OS や他アプリが使えなくなるほど際どいため 512MiB 残す
+    pub const DISK_MARGIN: u64 = 512 * 1024 * 1024;
+
     pub const KEEPALIVE: u8 = 0;
     pub const FILE_BEGIN: u8 = 1;
     pub const DATA: u8 = 2;
@@ -48,6 +52,10 @@
     pub const IMAGE_BEGIN: u8 = 7;
     pub const IMAGE_END: u8 = 8;
     pub const DROP_ID_BEGIN: u8 = 9;
+    /// 版 18: 明示中止(送信側が利用者の中止で止めた)ときに、受信側の
+    /// 部分ファイルを捨てる。切断(応答なし)では送られないため残り、次回
+    /// 続きから送れる。旧側は未知の種別として無視する
+    pub const RESUME_DROP: u8 = 10;
 
     pub fn write_frame(w: &mut impl Write, kind: u8, body: &[u8]) -> std::io::Result<()> {
         let mut head = [0u8; 5];
@@ -441,9 +449,192 @@
     /// 中止はエラー(Interrupted)として返り、呼び出し元で接続を捨てて相手側の
     /// 切断時クリーンアップに委ねる。戻り値は送信結果(件数とスキップ)
     #[allow(clippy::too_many_arguments)]
+    /// 再開問い合わせの項目(版 18)。フォルダは対象外(空フォルダは部分を持たない)
+    pub fn resume_items(entries: &[OutFile]) -> Vec<crate::proto::ResumeItem> {
+        entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| crate::proto::ResumeItem {
+                rel: e.name.clone(),
+                size: e.size,
+                mtime: e.mtime,
+            })
+            .collect()
+    }
+
+    /// 受信側: 保持している部分ファイルから再開位置を返す(offset>0 のみ)。
+    /// 前置ハッシュは返さない: 部分全体を読むと数 GiB で応答が間に合わないため、
+    /// 照合は送信側が自分のファイルから作った前置と、受信側の1回読みで行う
+    pub fn resume_positions(
+        dir: &std::path::Path,
+        items: &[crate::proto::ResumeItem],
+    ) -> Vec<crate::proto::ResumePos> {
+        items
+            .iter()
+            .filter_map(|it| {
+                let (_, offset) =
+                    crate::files::find_partial(dir, &it.rel, it.size, it.mtime)?;
+                Some(crate::proto::ResumePos {
+                    rel: it.rel.clone(),
+                    offset,
+                    prefix: String::new(),
+                })
+            })
+            .collect()
+    }
+
+    /// 送信側: 応答から entries に対応する送信開始位置を作る(見つからなければ 0)。
+    /// 同一バッチ内の同名は最初の1件だけ部分を使う(2件目以降へ同じ offset を
+    /// 返すと、1件目の公開で部分が消えた後に「部分が無い」失敗になる)
+    pub fn resume_offsets_of(
+        entries: &[OutFile],
+        positions: &[crate::proto::ResumePos],
+    ) -> Vec<u64> {
+        let mut seen = std::collections::HashSet::new();
+        entries
+            .iter()
+            .map(|e| {
+                if e.is_dir || !seen.insert(e.name.as_str()) {
+                    return 0;
+                }
+                positions
+                    .iter()
+                    .find(|p| p.rel == e.name)
+                    .map(|p| p.offset.min(e.size))
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    static RESUME_TOKEN: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    static RESUME_STATE: std::sync::Mutex<
+        Option<(u64, Vec<crate::proto::ResumePos>)>,
+    > = std::sync::Mutex::new(None);
+    static RESUME_STATE_CV: std::sync::Condvar = std::sync::Condvar::new();
+
+    /// 再開問い合わせの識別子(応答と対応付ける)
+    pub fn next_resume_token() -> u64 {
+        RESUME_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 本線受信ループから呼ぶ: 再開位置の応答を記録して待ち手を起こす
+    pub fn note_resume_state(token: u64, items: Vec<crate::proto::ResumePos>) {
+        let mut slot = RESUME_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some((token, items));
+        RESUME_STATE_CV.notify_all();
+    }
+
+    /// 再開位置の応答を待つ(タイムアウトは「応答なし=先頭から」)
+    pub fn wait_resume_state(
+        token: u64,
+        timeout: std::time::Duration,
+    ) -> Vec<crate::proto::ResumePos> {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut slot = RESUME_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some((got, items)) = slot.as_ref() {
+                if *got == token {
+                    return items.clone();
+                }
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Vec::new();
+            }
+            let (next, _) = RESUME_STATE_CV
+                .wait_timeout(slot, deadline.saturating_duration_since(now))
+                .unwrap_or_else(|e| e.into_inner());
+            slot = next;
+        }
+    }
+
+    /// 再開問い合わせの待ち時間。新版の相手はメタデータだけで応答する
+    /// (部分の内容は読まない)ため通常は即答。応答が無い(切断・相手のループ
+    /// 停止)ときはこの時間だけ待ち、先頭から送る。
+    /// shortcut: 旧版の相手(内容を読んで前置ハッシュを作る)は 8 秒を超える
+    /// 部分(HDD で約 800MB 超)で間に合わないことがある。実測で足りなければ
+    /// 非同期の二段応答へ
+    pub const RESUME_WAIT: std::time::Duration = std::time::Duration::from_millis(8000);
+
+    /// 送信側: 相手が保持している部分から送信開始位置を決める(版 18)。
+    /// 相手が旧版・問い合わせ不達のときは先頭から。`send` は問い合わせの
+    /// 送信口(端末ごとに違うため注入)。送れたら true
+    pub fn resume_offsets_for(
+        entries: &[OutFile],
+        features: crate::proto::PeerFeatures,
+        send: impl FnOnce(crate::proto::Msg) -> bool,
+    ) -> Vec<u64> {
+        if !features.resume
+            || entries.iter().all(|e| e.is_dir)
+            || entries_total(entries) < 1024 * 1024
+        {
+            return vec![0; entries.len()];
+        }
+        let token = next_resume_token();
+        if !send(crate::proto::Msg::XferResumeQuery {
+            token,
+            items: resume_items(entries),
+        }) {
+            return vec![0; entries.len()];
+        }
+        let positions = wait_resume_state(token, RESUME_WAIT);
+        let offsets = resume_offsets_of(entries, &positions);
+        let resumed = offsets.iter().filter(|o| **o > 0).count();
+        if resumed > 0 {
+            eprintln!("[bulk] 続きから送信します(再開: {resumed} 件)");
+        }
+        offsets
+    }
+
     pub fn send_entries(
         w: &mut impl Write,
         entries: &[OutFile],
+        drop: bool,
+        drag_id: Option<u64>,
+        cancel: &mut dyn FnMut() -> bool,
+        progress: &mut dyn FnMut(u64, u64, &str),
+    ) -> std::io::Result<SendReport> {
+        send_entries_impl(w, entries, &[], drop, drag_id, cancel, progress)
+    }
+
+    /// 中断した転送の続きから送る(版 18)。`offsets[i]` は entries[i] の
+    /// 受信済みバイト数。0 より大きいときは FILE_BEGIN に offset と前置
+    /// ハッシュを載せ、先頭のその分を読まずに飛ばす。
+    /// **相手が resume 対応のときだけ使う**(旧側は先頭から書くため)
+    pub fn send_entries_from(
+        w: &mut impl Write,
+        entries: &[OutFile],
+        offsets: &[u64],
+        drop: bool,
+        drag_id: Option<u64>,
+        cancel: &mut dyn FnMut() -> bool,
+        progress: &mut dyn FnMut(u64, u64, &str),
+    ) -> std::io::Result<SendReport> {
+        // 利用者の中止(切断ではない)を区別して、受信側の部分を捨てさせる。
+        // 切断のときは送れないので残り、次回の続きから使われる
+        let mut cancelled = false;
+        let mut cancel = || {
+            let hit = cancel();
+            if hit {
+                cancelled = true;
+            }
+            hit
+        };
+        let result =
+            send_entries_impl(w, entries, offsets, drop, drag_id, &mut cancel, progress);
+        if cancelled {
+            if let Ok(body) = serde_json::to_vec(&resume_items(entries)) {
+                let _ = write_frame(w, RESUME_DROP, &body);
+            }
+        }
+        result
+    }
+
+    fn send_entries_impl(
+        w: &mut impl Write,
+        entries: &[OutFile],
+        offsets: &[u64],
         drop: bool,
         drag_id: Option<u64>,
         cancel: &mut dyn FnMut() -> bool,
@@ -455,13 +646,27 @@
                 "file sharing is disabled on this device",
             ));
         }
-        let declared = entries_total(entries);
-        if declared > MAX_TOTAL {
+        let total = entries_total(entries);
+        if total > MAX_TOTAL {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!("file batch exceeds size limit: {declared} (limit {MAX_TOTAL})"),
+                format!("file batch exceeds size limit: {total} (limit {MAX_TOTAL})"),
             ));
         }
+        // 進捗の分母は「これから送る分」: 再開で飛ばす受信済みバイトを引く
+        // (引かないと完了しても 100% に届かない)。上限判定は全体の total で行う
+        let resumed: u64 = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                if e.is_dir {
+                    0
+                } else {
+                    offsets.get(i).copied().unwrap_or(0).min(e.size)
+                }
+            })
+            .fold(0, u64::saturating_add);
+        let declared = total.saturating_sub(resumed);
         if drag_id.is_some() && cancel() {
             return Err(cancelled_err());
         }
@@ -473,11 +678,16 @@
         let mut buf = vec![0u8; CHUNK];
         let mut report = SendReport::default();
         let mut sent_bytes = 0u64;
-        for e in entries {
+        for (i, e) in entries.iter().enumerate() {
             if cancel() {
                 return Err(cancelled_err());
             }
             progress(sent_bytes, declared, &e.name);
+            let offset = if e.is_dir {
+                0
+            } else {
+                offsets.get(i).copied().unwrap_or(0).min(e.size)
+            };
             if e.is_dir {
                 // 空フォルダ。データは無く、受け側がディレクトリを作る(版 15 以降)
                 let head = serde_json::json!({ "name": e.name, "size": 0, "mtime": 0, "dir": 1 })
@@ -508,11 +718,42 @@
                     ),
                 ));
             }
-            let head = serde_json::json!({ "name": e.name, "size": size, "mtime": e.mtime })
-                .to_string();
-            write_frame(w, FILE_BEGIN, head.as_bytes())?;
+            // 続きから: 前置(受信済み)バイトを読んでハッシュへ流し、位置を
+            // offset へ進める。前置ハッシュは受信側の部分と突き合わせる
             let mut hasher = blake2::Blake2s256::new();
-            let mut remain = size;
+            let mut prefix_hex = String::new();
+            if offset > 0 {
+                use blake2::Digest;
+                use std::io::Read;
+                let mut left = offset;
+                let mut pbuf = vec![0u8; CHUNK.min(64 * 1024)];
+                while left > 0 {
+                    let want = left.min(pbuf.len() as u64) as usize;
+                    let n = f.read(&mut pbuf[..want])?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "file shortened before resume point",
+                        ));
+                    }
+                    hasher.update(&pbuf[..n]);
+                    left -= n as u64;
+                }
+                // 前置だけのハッシュ(ここで finalize したいので複製する)
+                let probe = hasher.clone();
+                prefix_hex = crate::update::to_hex(&probe.finalize());
+                std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(offset))?;
+            }
+            let head = serde_json::json!({
+                "name": e.name,
+                "size": size,
+                "mtime": e.mtime,
+                "offset": offset,
+                "prefix": if offset > 0 { serde_json::json!(prefix_hex) } else { serde_json::Value::Null },
+            })
+            .to_string();
+            write_frame(w, FILE_BEGIN, head.as_bytes())?;
+            let mut remain = size.saturating_sub(offset);
             while remain > 0 {
                 let n = f.read(&mut buf[..(remain.min(CHUNK as u64) as usize)])?;
                 if n == 0 {
@@ -597,6 +838,17 @@
 
     /// クリップボード画像(DIB)を送る
     pub fn send_image(w: &mut impl Write, dib: &[u8]) -> std::io::Result<()> {
+        // 受信側(IMAGE_BEGIN)と同じ上限を送信側でも守る。呼び出し側の
+        // 判定に頼らず、ここで断ってからフレームを書き始める
+        if dib.len() > MAX_IMAGE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "clipboard image too large: {} (limit {MAX_IMAGE})",
+                    dib.len()
+                ),
+            ));
+        }
         if !crate::share::allow_clip() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -626,6 +878,10 @@
             drag_id: Option<u64>,
             failed: Vec<(String, String)>,
             renamed: usize,
+            /// 衝突ポリシー Skip で保存しなかった件数(受理として扱う)
+            skipped: usize,
+            /// 衝突ポリシー Overwrite で既存を置き換えた件数
+            replaced: usize,
             denied: usize,
         },
         /// バッチ全体がこの端末の共有設定で拒否された(files=false)。
@@ -648,8 +904,15 @@
             /// 無害化済みの相対名(失敗報告・ログ用)
             rel: String,
             mtime: u64,
+            /// 宣言サイズ(中断時に部分ファイルを続き用に残すための識別子)
+            size: u64,
             hasher: blake2::Blake2s256,
+            /// Overwrite で既存を置き換える(公開時に publish_with を使う)
+            replace: bool,
         },
+        /// 衝突ポリシー Skip で保存しないと決めたファイル。DATA は届くので
+        /// サイズだけ数えて捨てる(ストリームの位置を保つ)
+        Skip { remain: u64 },
         Image { data: Vec<u8>, remain: usize },
     }
 
@@ -679,6 +942,19 @@
         failed: Vec<(String, String)>,
         /// 同名衝突で「名前 (n)」へ保存した件数(BATCH_END で UI へ報告する)
         renamed: usize,
+        /// このバッチで新しく作ったディレクトリ(中断時に空なら片付ける)。
+        /// 深さ順の削除は files::remove_empty_dirs が行う
+        created_dirs: Vec<PathBuf>,
+        /// 同名衝突の扱い(テストは with_collision で固定する。None なら
+        /// プロセス共通の設定 files::collision() を読む)
+        collision: Option<crate::files::Collision>,
+        /// Skip した件数(BATCH_END で報告。XferAck では受理として数える)
+        skipped: usize,
+        /// Overwrite で既存を置き換えた件数(BATCH_END で報告)
+        replaced: usize,
+        /// 中断した転送の続きを受ける(版 18)。オフのときは従来どおり
+        /// 途中の実体を捨てる
+        resume: bool,
         /// バッチの途中で切断(Drop)したときの部分報告先(spawn_reader が
         /// Endpoint の on_event を渡す。保存済み件数を Event::Interrupted で伝える)
         on_interrupted: Option<fn(Event)>,
@@ -701,9 +977,28 @@
                 batch_open: false,
                 failed: Vec::new(),
                 renamed: 0,
+                created_dirs: Vec::new(),
+                collision: None,
+                skipped: 0,
+                replaced: 0,
+                resume: false,
                 on_interrupted: None,
                 rx_hook: None,
             }
+        }
+
+        /// 同名衝突の扱いをこの受信器に固定する(テスト・特殊運用向け。
+        /// 通常はプロセス共通の設定を使う)
+        pub fn with_collision(mut self, policy: crate::files::Collision) -> Self {
+            self.collision = Some(policy);
+            self
+        }
+
+        /// 中断した転送の続きから受ける(版 18 の相手にだけ使う)。
+        /// オンのときも、送信側が offset を送らなければ従来どおり先頭から
+        pub fn with_resume(mut self, on: bool) -> Self {
+            self.resume = on;
+            self
         }
 
         /// 受信バイト毎に呼ぶ進捗通知を付ける(接続側スレッドで呼ばれるため軽く保つ)
@@ -737,17 +1032,52 @@
             self.limit = v;
         }
 
+        /// このバッチで作ったディレクトリのうち、公開済みのファイル/フォルダと
+        /// その祖先を除いて、空のものを片付ける(完了した空フォルダを消さない)
+        fn cleanup_created_dirs(&mut self) {
+            let published = self.paths.clone();
+            let mut dirs = std::mem::take(&mut self.created_dirs);
+            dirs.retain(|d| !published.iter().any(|p| p == d || p.starts_with(d)));
+            crate::files::remove_empty_dirs(&mut dirs);
+            self.created_dirs = dirs;
+        }
+
+        /// 明示中止(RESUME_DROP)のとき、書き込み途中の実体を部分として残さず
+        /// 消す。切断(Drop)のときの保持とは別の経路
+        pub fn discard_in_progress(&mut self) {
+            if let Sink::File { f, tmp, .. } = std::mem::replace(&mut self.sink, Sink::None) {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp);
+                self.paths.pop();
+            }
+        }
+
         /// 書き込み途中のファイルを破棄する(Drop・境界から呼ぶ。完了済みは残す)。
         /// reason が空でなければ失敗報告へ積む
         fn discard_open_file(&mut self, reason: &str) {
-            if let Sink::File { f, tmp, rel, .. } = std::mem::replace(&mut self.sink, Sink::None) {
+            if let Sink::File {
+                f,
+                tmp,
+                rel,
+                mtime,
+                size,
+                ..
+            } = std::mem::replace(&mut self.sink, Sink::None)
+            {
                 drop(f); // Windows でも削除できるよう、ハンドルを先に閉じる
-                let _ = std::fs::remove_file(&tmp);
+                // 中断(理由なし)は続きから送れるよう部分を残す。明示的な失敗は
+                // 壊れた実体なので捨てる。resume がオフなら従来どおり捨てる
+                if self.resume && reason.is_empty() {
+                    let _ = crate::files::retain_partial(&self.dir, &rel, size, mtime, &tmp);
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                }
                 self.paths.pop(); // 予約済みの最終名も取り下げる
                 if !reason.is_empty() {
                     self.failed.push((rel, reason.to_string()));
                 }
             }
+            self.cleanup_created_dirs();
         }
 
         pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
@@ -786,6 +1116,10 @@
                     let name = v["name"].as_str().unwrap_or("file");
                     let size = v["size"].as_u64().unwrap_or(0);
                     let mtime = v["mtime"].as_u64().unwrap_or(0);
+                    // 版 18: 続きから(受信済みバイト数と前置ハッシュ)。
+                    // 旧版の送信側は送らないので 0/None になる
+                    let offset = v["offset"].as_u64().unwrap_or(0).min(size);
+                    let prefix = v["prefix"].as_str();
                     // 空フォルダ(版 15 以降)。ディレクトリとして作って公開する。
                     // DATA は続かない(送信側が出さない)
                     if v["dir"].as_u64() == Some(1) {
@@ -807,17 +1141,39 @@
                             );
                             return None;
                         };
-                        let Some(final_path) =
-                            crate::files::unique_final(&self.dir, &rel, &self.paths)
-                        else {
+                        // 中断時に空ディレクトリを残さないため、このバッチで新しく
+                        // 作るディレクトリを覚えておく(unique_final が作る前に判定)
+                        for d in crate::files::missing_parent_dirs(&self.dir, &rel) {
+                            if !self.created_dirs.contains(&d) {
+                                self.created_dirs.push(d);
+                            }
+                        }
+                        let policy = self.collision.unwrap_or_else(crate::files::collision);
+                        let Some(reserved) = crate::files::unique_final_with(
+                            &self.dir,
+                            &rel,
+                            &self.paths,
+                            policy,
+                        ) else {
                             fail(self, &rel, "保存名の衝突を解消できません");
                             return None;
                         };
+                        // 既存フォルダもファイルと同じ規則: Skip は作らず件数だけ、
+                        // Overwrite は既存のフォルダを使う(中身は消さない)
+                        if policy == crate::files::Collision::Skip && reserved.existed {
+                            self.skipped += 1;
+                            return None;
+                        }
+                        let final_path = reserved.path;
                         match std::fs::create_dir_all(&final_path) {
                             Ok(()) => {
                                 if is_renamed(&rel, &final_path) {
                                     self.renamed += 1;
                                 }
+                                if !self.created_dirs.contains(&final_path) {
+                                    self.created_dirs.push(final_path.clone());
+                                }
+                                crate::files::sync_dir(final_path.parent().unwrap_or(&self.dir));
                                 self.paths.push(final_path);
                             }
                             Err(_) => fail(self, &rel, "フォルダを作成できません"),
@@ -850,32 +1206,116 @@
                         );
                         return None; // このファイルの DATA は空読みし、次へ続ける
                     };
-                    // 空き容量(余裕 1MiB)。取得できない環境は確認なしで続ける
+                    // 空き容量(余裕は DISK_MARGIN)。取得できない環境は確認なしで続ける
                     if let Some(avail) = crate::files::available_bytes(&self.dir) {
-                        if avail.saturating_sub(1024 * 1024) < size {
+                        if avail.saturating_sub(DISK_MARGIN) < size {
                             fail(self, &rel, "保存先の空き容量が不足");
                             return None;
                         }
                     }
-                    let Some(final_path) =
-                        crate::files::unique_final(&self.dir, &rel, &self.paths)
-                    else {
+                    // 中断時に空ディレクトリを残さないため、このバッチで新しく
+                    // 作るディレクトリを覚えておく(unique_final が作る前に判定)
+                    for d in crate::files::missing_parent_dirs(&self.dir, &rel) {
+                        if !self.created_dirs.contains(&d) {
+                            self.created_dirs.push(d);
+                        }
+                    }
+                    let policy = self.collision.unwrap_or_else(crate::files::collision);
+                    let Some(reserved) = crate::files::unique_final_with(
+                        &self.dir,
+                        &rel,
+                        &self.paths,
+                        policy,
+                    ) else {
                         fail(self, &rel, "保存名の衝突を解消できません");
                         return None;
                     };
-                    let parent = final_path.parent().unwrap_or(&self.dir).to_path_buf();
-                    let Some((f, tmp)) = crate::files::create_temp(&parent) else {
-                        fail(self, &rel, "一時ファイルを作成できません");
+                    // Skip: 既存があるものは実体を作らず、届く DATA を数えて捨てる
+                    if policy == crate::files::Collision::Skip && reserved.existed {
+                        self.skipped += 1;
+                        self.sink = Sink::Skip { remain: size };
                         return None;
+                    }
+                    let final_path = reserved.path;
+                    let replace =
+                        policy == crate::files::Collision::Overwrite && reserved.existed;
+                    let parent = final_path.parent().unwrap_or(&self.dir).to_path_buf();
+                    // 受信済みバイト数。部分の実体と前置ハッシュが一致するときだけ
+                    // 続き、不一致なら部分を捨てて失敗にする(壊れた続きを公開しない)
+                    let mut hasher = blake2::Blake2s256::new();
+                    let tmp = if self.resume && offset > 0 {
+                        use blake2::Digest;
+                        let Some((path, have)) =
+                            crate::files::find_partial(&self.dir, &rel, size, mtime)
+                        else {
+                            fail(self, &rel, "続きからの転送に一致する部分がありません");
+                            return None;
+                        };
+                        if have != offset {
+                            crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                            fail(self, &rel, "続きからの転送が一致しません");
+                            return None;
+                        }
+                        // 部分は1回だけ読み、全体ハッシュと前置ハッシュを同じ
+                        // 読みで作る(数 GiB の部分を2回読むと再開応答が間に合わない)。
+                        // 送信側が前置を送らない(旧版・空)ときは照合を省き、
+                        // FILE_END の全体ハッシュだけで正しさを守る
+                        let Some(mut old) = std::fs::File::open(&path).ok() else {
+                            fail(self, &rel, "続きの部分を開けません");
+                            return None;
+                        };
+                        use std::io::Read;
+                        let mut prefix_hasher = blake2::Blake2s256::new();
+                        let mut left = offset;
+                        let mut buf = vec![0u8; 64 * 1024];
+                        while left > 0 {
+                            let want = left.min(buf.len() as u64) as usize;
+                            match old.read(&mut buf[..want]) {
+                                Ok(0) | Err(_) => {
+                                    fail(self, &rel, "続きの部分を読めません");
+                                    return None;
+                                }
+                                Ok(n) => {
+                                    hasher.update(&buf[..n]);
+                                    prefix_hasher.update(&buf[..n]);
+                                    left -= n as u64;
+                                }
+                            }
+                        }
+                        if let Some(p) = prefix.filter(|p| !p.is_empty()) {
+                            if crate::update::to_hex(&prefix_hasher.finalize()) != p {
+                                crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                                fail(self, &rel, "続きからの転送が一致しません");
+                                return None;
+                            }
+                        }
+                        let Some(f) = std::fs::OpenOptions::new().append(true).open(&path).ok()
+                        else {
+                            fail(self, &rel, "続きの部分を開けません");
+                            return None;
+                        };
+                        (f, path)
+                    } else {
+                        // 先頭からのやり直しは、古い部分を捨ててから始める
+                        if self.resume && offset == 0 {
+                            crate::files::discard_partial(&self.dir, &rel, size, mtime);
+                        }
+                        let Some(pair) = crate::files::create_temp(&parent) else {
+                            fail(self, &rel, "一時ファイルを作成できません");
+                            return None;
+                        };
+                        pair
                     };
                     self.paths.push(final_path);
                     self.sink = Sink::File {
-                        f,
-                        remain: size,
-                        tmp,
+                        f: tmp.0,
+                        remain: size.saturating_sub(offset),
+                        tmp: tmp.1,
                         rel,
                         mtime,
-                        hasher: blake2::Blake2s256::new(),
+                        size,
+                        hasher,
+                        replace,
                     };
                 }
                 DATA => match &mut self.sink {
@@ -895,6 +1335,19 @@
                             *remain -= body.len() as u64;
                             self.written += body.len() as u64;
                             hasher.update(body);
+                            if let Some(hook) = self.rx_hook {
+                                hook(self.written);
+                            }
+                        }
+                    }
+                    Sink::Skip { remain } => {
+                        // Skip したファイルのデータは保存しないが、ストリーム位置と
+                        // 進捗は実データと同じに数える(送信側の送信量と一致させる)
+                        if body.len() as u64 > *remain {
+                            self.sink = Sink::None;
+                        } else {
+                            *remain -= body.len() as u64;
+                            self.written += body.len() as u64;
                             if let Some(hook) = self.rx_hook {
                                 hook(self.written);
                             }
@@ -920,6 +1373,8 @@
                         rel,
                         mtime,
                         hasher,
+                        replace,
+                        ..
                     } = std::mem::replace(&mut self.sink, Sink::None)
                     {
                         if remain > 0 {
@@ -940,16 +1395,39 @@
                             if hash_ok {
                                 crate::files::set_mtime_file(&f, mtime);
                             }
+                            // 公開の前に実体をディスクへ落とす(電源断・強制終了で
+                            // 「公開済みなのに中身が無い/古い」を防ぐ)。Windows は
+                            // 公開後に ADS と mtime を書くため、ここでは閉じるだけ
+                            #[cfg(not(windows))]
+                            let synced = f.sync_all().is_ok();
+                            #[cfg(windows)]
+                            let synced = true;
                             drop(f); // リネームの前に閉じる
                             if !hash_ok {
                                 let _ = std::fs::remove_file(&tmp);
                                 self.paths.pop();
                                 self.failed.push((rel, "内容の検証に失敗".into()));
+                            } else if !synced {
+                                let _ = std::fs::remove_file(&tmp);
+                                self.paths.pop();
+                                self.failed.push((rel, "保存を完了できません".into()));
                             } else {
                                 crate::files::mark_untrusted(&tmp);
                                 let desired = self.paths.last().cloned();
-                                match desired.and_then(|d| crate::files::publish(&tmp, &d).ok()) {
+                                let published = match desired {
+                                    Some(d) if replace => crate::files::publish_with(
+                                        &tmp,
+                                        &d,
+                                        crate::files::Collision::Overwrite,
+                                    ),
+                                    Some(d) => crate::files::publish(&tmp, &d),
+                                    None => Err(std::io::Error::other("保存先がありません")),
+                                };
+                                match published.ok() {
                                     Some(actual) => {
+                                        if replace {
+                                            self.replaced += 1;
+                                        }
                                         // Windows は ADS の書き込みと rename で更新日時が動くため、
                                         // 公開が終わった最終パスへ設定する(ここが最後の書き込み)
                                         #[cfg(windows)]
@@ -959,8 +1437,12 @@
                                             self.renamed += 1;
                                         }
                                         if let Some(last) = self.paths.last_mut() {
-                                            *last = actual;
+                                            *last = actual.clone();
                                         }
+                                        // 公開した名前をディレクトリごとディスクへ
+                                        crate::files::sync_dir(
+                                            actual.parent().unwrap_or(&self.dir),
+                                        );
                                     }
                                     None => {
                                         let _ = std::fs::remove_file(&tmp);
@@ -983,17 +1465,26 @@
                     let paths = std::mem::take(&mut self.paths);
                     let failed = std::mem::take(&mut self.failed);
                     let renamed = std::mem::take(&mut self.renamed);
+                    let skipped = std::mem::take(&mut self.skipped);
+                    let replaced = std::mem::take(&mut self.replaced);
                     let drop = std::mem::replace(&mut self.drop, false);
                     let drag_id = self.drag_id.take();
                     // 受信失敗で0件でも、操作IDを返して準備待ちを取り消せるようにする。
                     // denied(範囲外で捨てた件数)は受信ループが上書きして渡す
-                    if !paths.is_empty() || drag_id.is_some() || !failed.is_empty() {
+                    if !paths.is_empty()
+                        || skipped > 0
+                        || replaced > 0
+                        || drag_id.is_some()
+                        || !failed.is_empty()
+                    {
                         return Some(Event::Files {
                             paths,
                             drop,
                             drag_id,
                             failed,
                             renamed,
+                            skipped,
+                            replaced,
                             denied: 0,
                         });
                     }
@@ -1038,6 +1529,8 @@
                         let _ = std::fs::remove_dir_all(&p);
                     }
                 }
+                // 全件消した後、このバッチで作った空ディレクトリも片付ける
+                self.cleanup_created_dirs();
             } else if !self.paths.is_empty() {
                 // ドラッグ以外の中断(⌘C 送信中の切断・中止): FILE_END まで完了した
                 // 分は保持されるが、BATCH_END を迎えていないため完了通知は出ない。
@@ -1182,10 +1675,41 @@
         }
     }
 
+    /// 経路の資格。単一トークン運用(Windows・テスト)と台帳運用(Mac)を1つの型で表す。
+    /// 待受(accept)と接続(connect)で鍵が違う形に対応するため、String ではなく
+    /// この型を持つ(台帳運用は accept に鍵束を、connect に宛先別トークンを渡す)
+    pub enum EndpointCred {
+        /// 単一トークン。accept も connect も同じ鍵(従来運用)
+        Single(String),
+        /// 台帳運用。accept_keys は毎接続で最新の鍵束を返し(失効の即時反映)、
+        /// connect_token は宛先(アクティブ端末)に応じたトークンを返す
+        Multi {
+            accept_keys: fn() -> std::io::Result<crate::secure::ServerKeys>,
+            connect_token: fn() -> String,
+        },
+    }
+
+    impl EndpointCred {
+        /// 待受が使う鍵束
+        pub fn accept_keys(&self) -> std::io::Result<crate::secure::ServerKeys> {
+            match self {
+                EndpointCred::Single(t) => Ok(crate::secure::ServerKeys::single(t)),
+                EndpointCred::Multi { accept_keys, .. } => accept_keys(),
+            }
+        }
+        /// 接続が使うトークン
+        pub fn connect_token(&self) -> String {
+            match self {
+                EndpointCred::Single(t) => t.clone(),
+                EndpointCred::Multi { connect_token, .. } => connect_token(),
+            }
+        }
+    }
+
     /// 経路ごとの設定(受信先・完了時の処理・ログ出力先)
     pub struct Endpoint {
         pub link: &'static Link,
-        pub token: String,
+        pub credential: EndpointCred,
         pub dir: PathBuf,
         pub on_event: fn(Event),
         pub log: fn(&str),
@@ -1233,7 +1757,10 @@
     fn spawn_reader(ep: &'static Endpoint, s: crate::secure::Reader, gen: u64, reply_keepalive: bool) {
         std::thread::spawn(move || {
             let mut r = std::io::BufReader::with_capacity(CHUNK + 16, s);
+            // 版 18: 中断した転送の部分を保持して続きから受ける
+            // (送信側が問い合わせてこない相手では、従来どおり捨てる動作になる)
             let mut rx = Receiver::new(&ep.dir)
+                .with_resume(true)
                 .with_rx_progress(ep.on_rx_bytes)
                 .with_interrupted_report(ep.on_event);
             let mut buf = Vec::new();
@@ -1244,6 +1771,19 @@
             let mut denied_files = 0usize;
             let mut tainted_logged = false;
             while let Ok(kind) = read_frame(&mut r, &mut buf) {
+                // 明示中止: このバッチの部分ファイルを捨てる(共有範囲の判定より先)
+                if kind == RESUME_DROP {
+                    // 書き込み途中の実体と、保持済みの部分の両方を捨てる
+                    rx.discard_in_progress();
+                    if let Ok(items) =
+                        serde_json::from_slice::<Vec<crate::proto::ResumeItem>>(&buf)
+                    {
+                        for it in items {
+                            crate::files::discard_partial(&ep.dir, &it.rel, it.size, it.mtime);
+                        }
+                    }
+                    continue;
+                }
                 // 共有範囲の外の受信は、ディスクへ書かず読み捨てる(接続は保つ)
                 if kind == IMAGE_BEGIN {
                     in_image = true;
@@ -1282,9 +1822,25 @@
                     let e = match e {
                         // 範囲外で捨てた分(運用上は転送中に設定が変わった場合)を
                         // 完了イベントに添えて呼び出し側へ渡す
-                        Event::Files { paths, drop, drag_id, failed, renamed, .. } => {
-                            Event::Files { paths, drop, drag_id, failed, renamed, denied: denied_files }
-                        }
+                        Event::Files {
+                            paths,
+                            drop,
+                            drag_id,
+                            failed,
+                            renamed,
+                            skipped,
+                            replaced,
+                            ..
+                        } => Event::Files {
+                            paths,
+                            drop,
+                            drag_id,
+                            failed,
+                            renamed,
+                            skipped,
+                            replaced,
+                            denied: denied_files,
+                        },
                         other => other,
                     };
                     denied_files = 0;
@@ -1413,8 +1969,18 @@
             let Ok(ctl) = s.try_clone() else { continue };
             ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
-            let (r, w) = match crate::secure::accept(s, &ep.token, LABEL) {
-                Ok(x) => x,
+            // 鍵束が作れない(旧形式を閉じて登録0台等)場合は待受を続けつつ
+            // 全接続を拒否する(ログで状態が見えるように)
+            let keys = match ep.credential.accept_keys() {
+                Ok(k) => k,
+                Err(e) => {
+                    (ep.log)(&format!("[bulk] 待受鍵がありません: {e}"));
+                    std::thread::sleep(throttle.fail());
+                    continue;
+                }
+            };
+            let (r, w) = match crate::secure::accept_as(s, &keys, LABEL) {
+                Ok((r, w, _who)) => (r, w),
                 Err(e) => {
                     (ep.log)(&format!("[bulk] handshake 失敗 ({peer}): {e}"));
                     std::thread::sleep(throttle.fail());
@@ -1473,7 +2039,7 @@
             let Ok(ctl) = s.try_clone() else { continue };
             ctl.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .ok();
-            let (r, w) = match crate::secure::connect(s, &ep.token, LABEL) {
+            let (r, w) = match crate::secure::connect(s, &ep.credential.connect_token(), LABEL) {
                 Ok(x) => x,
                 Err(e) => {
                     (ep.log)(&format!("[bulk] handshake 失敗: {e}"));

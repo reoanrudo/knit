@@ -12,9 +12,12 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         .parent()
         .ok_or_else(|| std::io::Error::other("保存先がありません"))?;
     std::fs::create_dir_all(parent)?;
-    // 一時ファイル名に pid を含める: 同一端末で複数プロセスが走っても
+    // 一時ファイル名に pid と呼び出し連番を含める: 同一端末の別プロセスは
+    // pid で、同一プロセス内の別インスタンス(台帳の2ハンドル等)は連番で
     // 互いの一時ファイルを潰さないため
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{seq}.tmp", std::process::id()));
     {
         use std::io::Write;
         // 作成時点から所有者のみにする(既定 644 で作って chmod する間に、共有

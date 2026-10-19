@@ -11,6 +11,15 @@ use knit_common::proto::Msg;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// 版 18: 相手(Mac)が保持している部分から送信開始位置を決める(芯は common の
+/// resume_offsets_for。相手が旧版・応答なしのときは先頭から)
+pub(crate) fn resume_offsets_for(entries: &[bulk::OutFile]) -> Vec<u64> {
+    let features = knit_common::proto::peer_features(
+        dragdrop::edge::PEER_VERSION.load(Ordering::Relaxed),
+    );
+    bulk::resume_offsets_for(entries, features, |msg| send_main_msg(&msg))
+}
+
 /// 進行中の Mac へのファイル送信(トレイ表示と Esc キャンセルで使う)
 struct XferTx {
     id: u64,
@@ -265,11 +274,13 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
     }
     begin_tx(id, total, &entries[0].name);
     clear_xfer_ack();
+    let offsets = resume_offsets_for(&entries);
     let send = || {
         BULK_LINK.send(|w| {
-            bulk::send_entries(
+            bulk::send_entries_from(
                 w,
                 &entries,
+                &offsets,
                 false,
                 None,
                 &mut || knit_common::xfer::take(id),
@@ -386,11 +397,19 @@ fn report_failed_files(failed: &[(String, String)]) {
 }
 
 /// 同名衝突で「名前 (n)」として保存した件数の通知用追記。無ければ空文字列
-fn rename_note(renamed: usize) -> String {
-    if renamed == 0 {
-        return String::new();
+/// 同名衝突の結果を通知に添える(黙って別名・上書き・スキップになるのを防ぐ)
+fn collision_note(renamed: usize, skipped: usize, replaced: usize) -> String {
+    let mut s = String::new();
+    if renamed > 0 {
+        s.push_str(&format!("。同名の {renamed} 件は「名前 (n)」として保存しました"));
     }
-    format!("。同名の {renamed} 件は「名前 (n)」として保存しました")
+    if replaced > 0 {
+        s.push_str(&format!("。同名の {replaced} 件は上書きしました"));
+    }
+    if skipped > 0 {
+        s.push_str(&format!("。同名の {skipped} 件はスキップしました"));
+    }
+    s
 }
 
 /// 大容量経路(ファイル・画像)。本線とは別の TCP 接続
@@ -432,10 +451,13 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             drag_id,
             failed,
             renamed,
+            skipped,
+            replaced,
             denied,
         } => {
             let _ = send_main_msg(&Msg::XferAck {
-                accepted: paths.len(),
+                // Skip は「保存しなかったが受理した」ため accepted に数える
+                accepted: paths.len() + skipped,
                 rejected: failed.len(),
                 scope: denied > 0,
             });
@@ -475,13 +497,6 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
             };
             // 予告より受け取れた件数が少ない場合は、その分を通知に含める
             let mut mismatch: Option<(usize, usize)> = None;
-            let saved_dir = || {
-                std::env::var_os("USERPROFILE")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default()
-                    .join("Downloads")
-                    .join("Knit")
-            };
             match outcome {
                 Claim::Carried if dragdrop::lazy_started(drag_id.unwrap_or(0)) => {
                     // 遅延提供で既にドラッグが走っている(目録だけで開始済み)。
@@ -519,13 +534,13 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                     // 履歴には載せる(メニューから選び直せるように。
                     // 相手の受信も履歴に載るため挙動を揃える)
                     history_push_files(&paths, &crate::conn::peer_display());
-                    let dir = saved_dir();
+                    let dir = crate::receive_dir();
                     tray::notify(
                         "Knit",
                         &format!(
                             "ファイルを受信: {n} 件({} へ保存しました){}",
                             dir.display(),
-                            rename_note(renamed)
+                            collision_note(renamed, skipped, replaced)
                         ),
                     );
                     return;
@@ -540,16 +555,16 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                 history_push_files(&paths, &crate::conn::peer_display());
                 println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                let dir = saved_dir();
+                let dir = crate::receive_dir();
                 let message = match mismatch {
                     Some((expected, got)) => format!(
                         "ファイルは {got}/{expected} 件のみの受信です{}(Ctrl+V で貼り付け可)。実体は {}",
-                        rename_note(renamed),
+                        collision_note(renamed, skipped, replaced),
                         dir.display()
                     ),
                     None => format!(
                         "ファイルを受信: {n} 件{}(Ctrl+V で貼り付け可)。実体は {}",
-                        rename_note(renamed),
+                        collision_note(renamed, skipped, replaced),
                         dir.display()
                     ),
                 };

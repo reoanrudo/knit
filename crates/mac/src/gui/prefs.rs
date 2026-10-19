@@ -641,6 +641,10 @@ pub(super) unsafe extern "C" fn peer_menu_open(_s: ID, _c: SEL, menu: ID) {
         super::history_menu_opened();
         return;
     }
+    if super::registry_menu_tracking(menu) {
+        super::registry_menu_opened();
+        return;
+    }
     if super::main_menu_tracking(menu) {
         super::main_menu_opened();
         return;
@@ -651,6 +655,10 @@ pub(super) unsafe extern "C" fn peer_menu_open(_s: ID, _c: SEL, menu: ID) {
 pub(super) unsafe extern "C" fn peer_menu_close(_s: ID, _c: SEL, menu: ID) {
     if super::history_menu_tracking(menu) {
         super::history_menu_closed();
+        return;
+    }
+    if super::registry_menu_tracking(menu) {
+        super::registry_menu_closed();
         return;
     }
     if super::main_menu_tracking(menu) {
@@ -2173,7 +2181,7 @@ mod layout_values_tests {
             screen: (800.0, 600.0),
             monitors: vec![],
             writer: None,
-            gen: 1,
+            gen: 1, auth: knit_common::secure::Who::Legacy, shut: None,
             side,
             edge_monitor,
             ver: 13,
