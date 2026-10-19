@@ -306,6 +306,27 @@ fn cancel_mid_transfer_reports_interrupted_and_cleanup_removes_all_drag_files() 
 }
 
 #[test]
+fn interrupted_nested_receive_removes_directories_it_created() {
+    let temp = Temp::new("emptydirs");
+    let dst = temp.0.join("received");
+    let mut wire = Vec::new();
+    let head = r#"{"name":"資料/sub/x.txt","size":10,"mtime":0}"#;
+    bulk::write_frame(&mut wire, bulk::FILE_BEGIN, head.as_bytes()).unwrap();
+    {
+        let mut rx = bulk::Receiver::new(&dst);
+        let mut reader = Cursor::new(&wire);
+        let mut frame = Vec::new();
+        while let Ok(kind) = bulk::read_frame(&mut reader, &mut frame) {
+            let _ = rx.feed(kind, &frame);
+        }
+    }
+    assert!(
+        !dst.join("資料").exists(),
+        "中断した受信で、このバッチが作った空ディレクトリを残さない"
+    );
+}
+
+#[test]
 fn receiver_reports_progress_bytes_while_writing() {
     use std::sync::atomic::{AtomicU64, Ordering};
     let temp = Temp::new("progress");

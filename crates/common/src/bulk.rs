@@ -679,6 +679,9 @@
         failed: Vec<(String, String)>,
         /// 同名衝突で「名前 (n)」へ保存した件数(BATCH_END で UI へ報告する)
         renamed: usize,
+        /// このバッチで新しく作ったディレクトリ(中断時に空なら片付ける)。
+        /// 深さ順の削除は files::remove_empty_dirs が行う
+        created_dirs: Vec<PathBuf>,
         /// バッチの途中で切断(Drop)したときの部分報告先(spawn_reader が
         /// Endpoint の on_event を渡す。保存済み件数を Event::Interrupted で伝える)
         on_interrupted: Option<fn(Event)>,
@@ -701,6 +704,7 @@
                 batch_open: false,
                 failed: Vec::new(),
                 renamed: 0,
+                created_dirs: Vec::new(),
                 on_interrupted: None,
                 rx_hook: None,
             }
@@ -737,6 +741,16 @@
             self.limit = v;
         }
 
+        /// このバッチで作ったディレクトリのうち、公開済みのファイル/フォルダと
+        /// その祖先を除いて、空のものを片付ける(完了した空フォルダを消さない)
+        fn cleanup_created_dirs(&mut self) {
+            let published = self.paths.clone();
+            let mut dirs = std::mem::take(&mut self.created_dirs);
+            dirs.retain(|d| !published.iter().any(|p| p == d || p.starts_with(d)));
+            crate::files::remove_empty_dirs(&mut dirs);
+            self.created_dirs = dirs;
+        }
+
         /// 書き込み途中のファイルを破棄する(Drop・境界から呼ぶ。完了済みは残す)。
         /// reason が空でなければ失敗報告へ積む
         fn discard_open_file(&mut self, reason: &str) {
@@ -748,6 +762,7 @@
                     self.failed.push((rel, reason.to_string()));
                 }
             }
+            self.cleanup_created_dirs();
         }
 
         pub fn feed(&mut self, kind: u8, body: &[u8]) -> Option<Event> {
@@ -807,6 +822,13 @@
                             );
                             return None;
                         };
+                        // 中断時に空ディレクトリを残さないため、このバッチで新しく
+                        // 作るディレクトリを覚えておく(unique_final が作る前に判定)
+                        for d in crate::files::missing_parent_dirs(&self.dir, &rel) {
+                            if !self.created_dirs.contains(&d) {
+                                self.created_dirs.push(d);
+                            }
+                        }
                         let Some(final_path) =
                             crate::files::unique_final(&self.dir, &rel, &self.paths)
                         else {
@@ -818,6 +840,10 @@
                                 if is_renamed(&rel, &final_path) {
                                     self.renamed += 1;
                                 }
+                                if !self.created_dirs.contains(&final_path) {
+                                    self.created_dirs.push(final_path.clone());
+                                }
+                                crate::files::sync_dir(final_path.parent().unwrap_or(&self.dir));
                                 self.paths.push(final_path);
                             }
                             Err(_) => fail(self, &rel, "フォルダを作成できません"),
@@ -855,6 +881,13 @@
                         if avail.saturating_sub(1024 * 1024) < size {
                             fail(self, &rel, "保存先の空き容量が不足");
                             return None;
+                        }
+                    }
+                    // 中断時に空ディレクトリを残さないため、このバッチで新しく
+                    // 作るディレクトリを覚えておく(unique_final が作る前に判定)
+                    for d in crate::files::missing_parent_dirs(&self.dir, &rel) {
+                        if !self.created_dirs.contains(&d) {
+                            self.created_dirs.push(d);
                         }
                     }
                     let Some(final_path) =
@@ -940,11 +973,22 @@
                             if hash_ok {
                                 crate::files::set_mtime_file(&f, mtime);
                             }
+                            // 公開の前に実体をディスクへ落とす(電源断・強制終了で
+                            // 「公開済みなのに中身が無い/古い」を防ぐ)。Windows は
+                            // 公開後に ADS と mtime を書くため、ここでは閉じるだけ
+                            #[cfg(not(windows))]
+                            let synced = f.sync_all().is_ok();
+                            #[cfg(windows)]
+                            let synced = true;
                             drop(f); // リネームの前に閉じる
                             if !hash_ok {
                                 let _ = std::fs::remove_file(&tmp);
                                 self.paths.pop();
                                 self.failed.push((rel, "内容の検証に失敗".into()));
+                            } else if !synced {
+                                let _ = std::fs::remove_file(&tmp);
+                                self.paths.pop();
+                                self.failed.push((rel, "保存を完了できません".into()));
                             } else {
                                 crate::files::mark_untrusted(&tmp);
                                 let desired = self.paths.last().cloned();
@@ -959,8 +1003,12 @@
                                             self.renamed += 1;
                                         }
                                         if let Some(last) = self.paths.last_mut() {
-                                            *last = actual;
+                                            *last = actual.clone();
                                         }
+                                        // 公開した名前をディレクトリごとディスクへ
+                                        crate::files::sync_dir(
+                                            actual.parent().unwrap_or(&self.dir),
+                                        );
                                     }
                                     None => {
                                         let _ = std::fs::remove_file(&tmp);
@@ -1038,6 +1086,8 @@
                         let _ = std::fs::remove_dir_all(&p);
                     }
                 }
+                // 全件消した後、このバッチで作った空ディレクトリも片付ける
+                self.cleanup_created_dirs();
             } else if !self.paths.is_empty() {
                 // ドラッグ以外の中断(⌘C 送信中の切断・中止): FILE_END まで完了した
                 // 分は保持されるが、BATCH_END を迎えていないため完了通知は出ない。
