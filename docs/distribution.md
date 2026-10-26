@@ -119,14 +119,23 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 配布先によっては逆方向(Win=サーバ/Mac=クライアント)が好ましい場合もあるため、
 両対応しています。**どちらの方向も実機で動作検証済みです**(開発環境の自動検証 7 項目に合格)。
 
+**切り替えは GUI から 1 操作**(usage.md「接続の方向」参照)。どちらか 1 台の設定で役割を
+選ぶと相手へ切り替えが送られ、**両方の PC で Knit が自動で再起動**して適用されます:
+
+- Mac: 設定「接続」の役割「Windows がホスト — この Mac が接続しに行きます」
+- Windows: 設定の「接続の方向」で「このPCがホスト — 相手の端末が接続しに来ます」
+
+`.env` の `KNIT_ROLE`(Mac=`client` / Windows=`server`)は**固定用**です(配布先で
+GUI から変えられたくないとき)。環境変数で固定中は GUI の切替が無効になり、
+「環境変数 KNIT_ROLE で役割を固定中のため、ここでは切り替えられません」と案内します。
+Mac が接続しに行く側のときの接続先は、設定の接続先欄または `KNIT_HOST` で指定します。
+
 | | 既定(Mac=サーバ) | 逆方向(Win=サーバ) |
 |---|---|---|
-| Mac | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=client` と `KNIT_HOST=<Windows側Tailscale IP>` |
-| Windows | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=server` |
-| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="knit-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
+| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="knit-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10`(TCP 24900〜24902 と UDP 24903 は §9 も参照) |
 
 設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/knit/env)。
-変更後は**両側の再起動**が必要(片方だけ変えると切断が続く)。
+`.env` を書き換えた場合は**両側の再起動**が必要(片方だけ変えると切断が続く)。
 Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接続元を即拒否します。
 
 ## 6.5 音声転送(Windows→Mac)
