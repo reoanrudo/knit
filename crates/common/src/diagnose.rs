@@ -85,6 +85,13 @@ pub fn judge(f: &Facts) -> Cause {
     Cause::PeerNotFound
 }
 
+/// 待受役(サーバ側)か。Facts に役割を持たせずに済ませる代理シグナル: bulk(24902)の
+/// 待受は両 OS の診断とも待受役のときだけ Some になる(mac/win の diag.rs)。audio は
+/// KNIT_AUDIO=0 でも None になるが bulk は役割だけで決まる
+fn host_role(f: &Facts) -> bool {
+    f.bulk_listening.is_some()
+}
+
 /// ミリ秒の整形(1分以上は「分」)
 pub fn fmt_ms(ms: u64) -> String {
     if ms >= 60_000 {
@@ -230,7 +237,11 @@ pub fn report(f: &Facts) -> (Cause, String) {
     // 4. 相手への到達(接続中は自明のため未確認を Info にする)
     checks.push(Check {
         label: "相手への到達",
-        status: if f.connected && f.peer_reachable.is_none() {
+        // 待受役で切断中: 相手(接続しに来る側)は 24900 を待受けないため probe は
+        // 常に失敗する。「届かない」ではなく未確認として出す(逆方向構成対応)
+        status: if (f.connected && f.peer_reachable.is_none())
+            || (host_role(f) && !f.connected && f.peer_reachable == Some(false))
+        {
             Status::Info
         } else {
             match f.peer_reachable {
@@ -241,6 +252,8 @@ pub fn report(f: &Facts) -> (Cause, String) {
         },
         detail: if f.connected && f.peer_reachable.is_none() {
             "接続中のため確認不要".into()
+        } else if host_role(f) && !f.connected && f.peer_reachable == Some(false) {
+            "相手は接続しに来る側のため未確認".into()
         } else {
             f.peer
                 .map(|p| format!("{} の {} 番へ確認", p.ip(), crate::proto::PORT))
@@ -305,15 +318,34 @@ fn advice_for(cause: Cause, f: &Facts, os: Os) -> String {
         },
         Cause::PeerUnreachable => {
             let peer = f.peer.map(|p| p.to_string()).unwrap_or_default();
-            let fw = match os {
-                Os::Mac => "システム設定 > ネットワーク > ファイアウォール",
-                Os::Windows => "Windowsセキュリティ > ファイアウォールとネットワーク保護",
-            };
-            format!(
-                "{peer} に届きません。両PCが同じWi-Fi/LANにいるか、相手が起動しているか確認してください。\
-                 同じネットワークのはずなら、ファイアウォールの設定({fw})が \
-                 Knitの受信をブロックしていないか確認します。"
-            )
+            if host_role(f) {
+                // 待受役(逆方向構成の Windows や既定構成の Mac): 相手は接続しに来る側で
+                // 24900 を待受けないため probe は常に失敗する。「相手に届かない」ではなく
+                // 「相手からの接続を待っている」が実態。自側の受信許可を案内する
+                let fw = match os {
+                    Os::Mac => "システム設定 > ネットワーク > ファイアウォール",
+                    Os::Windows => {
+                        "Windowsセキュリティ > ファイアウォールとネットワーク保護の受信許可\
+                         (TCP 24900〜24902・UDP 24903)"
+                    }
+                };
+                format!(
+                    "{peer} からの接続を待っています(相手は接続しに来る側のため、こちらから\
+                     届く確認はできません)。相手が起動しているか確認してください。\
+                     つながらないままのときは、このPCの受信({fw})が Knitをブロックして\
+                     いないか確認します。"
+                )
+            } else {
+                let fw = match os {
+                    Os::Mac => "システム設定 > ネットワーク > ファイアウォール",
+                    Os::Windows => "Windowsセキュリティ > ファイアウォールとネットワーク保護",
+                };
+                format!(
+                    "{peer} に届きません。両PCが同じWi-Fi/LANにいるか、相手が起動しているか確認してください。\
+                     同じネットワークのはずなら、ファイアウォールの設定({fw})が \
+                     Knitの受信をブロックしていないか確認します。"
+                )
+            }
         }
         Cause::PeerProbeOkButNoSession => {
             let peer = f.peer.map(|p| p.to_string()).unwrap_or_default();
@@ -800,5 +832,41 @@ mod tests {
         assert!(section.contains("line39"), "末尾行を含む");
         assert!(!section.contains("line5\n"), "古い通常行は含めない");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn host_role_waits_for_inbound_instead_of_peer_reachability() {
+        // 待受役(逆方向の Windows・既定の Mac)で切断中: 相手は接続しに来る側のため
+        // 24900 への probe は常に失敗する。「届かない」ではなく「待っている」と
+        // 出す(チェック表は未確認、advice は自側の受信許可を案内)
+        let mut f = base();
+        f.bulk_listening = Some(true);
+        f.peer_reachable = Some(false);
+        let (cause, text) = report(&f);
+        assert!(matches!(cause, Cause::PeerUnreachable));
+        assert!(text.contains("からの接続を待っています"));
+        assert!(text.contains("相手は接続しに来る側のため未確認"));
+        assert!(!text.contains("に届きません。両PCが"));
+    }
+
+    #[test]
+    fn client_role_keeps_peer_unreachable_advice() {
+        // 接続しに行く側は従来どおり「届きません」で相手側を疑う案内のまま
+        let mut f = base();
+        f.peer_reachable = Some(false);
+        let (_, text) = report(&f);
+        assert!(text.contains("に届きません"));
+    }
+
+    #[test]
+    fn windows_host_advice_names_inbound_ports() {
+        // 逆方向(Win=サーバ)で切断が続くとき、対処に必要な受信ポートの
+        // 一覧(TCP 24900〜24902・UDP 24903)が案内に載る(distribution.md §9 と同一)
+        let mut f = base();
+        f.bulk_listening = Some(true);
+        f.peer_reachable = Some(false);
+        let advice = advice_for(Cause::PeerUnreachable, &f, Os::Windows);
+        assert!(advice.contains("TCP 24900〜24902・UDP 24903"));
+        assert!(advice.contains("からの接続を待っています"));
     }
 }

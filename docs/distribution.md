@@ -112,18 +112,35 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 
 ## 6. 接続方向の選択(配布先のネットワークに応じて)
 
+この節の「逆方向」は**構成**(Win=サーバ)を指す。機能説明で使う「逆方向(Windows→Mac)」は
+**データの向き**であり、構成とは無関係にどちらの構成でも使える(usage.md 参照)。
+
 既定は **Mac=サーバ(待受)/ Windows=クライアント(接続)** です。
 配布先によっては逆方向(Win=サーバ/Mac=クライアント)が好ましい場合もあるため、
 両対応しています。**どちらの方向も実機で動作検証済みです**(開発環境の自動検証 7 項目に合格)。
 
+**切り替えは GUI から 1 操作**(usage.md「接続の方向」参照)。どちらか 1 台の設定で役割を
+選ぶと相手へ切り替えが送られ、**両方の PC で Knit が自動で再起動**して適用されます:
+
+- Mac: 設定「接続」の役割「Windows がホスト — この Mac が接続しに行きます」
+- Windows: 設定の「接続の方向」で「このPCがホスト — 相手の端末が接続しに来ます」
+
+`.env` の `KNIT_ROLE`(Mac=`client` / Windows=`server`)は**固定用**です(配布先で
+GUI から変えられたくないとき)。環境変数で固定中は GUI の切替が無効になり、
+「環境変数 KNIT_ROLE で役割を固定中のため、ここでは切り替えられません」と案内します。
+Mac が接続しに行く側のときの接続先は、設定の接続先欄または `KNIT_HOST` で指定します。
+同じ LAN なら自動発見もそのまま使えます(発見の応答は待受側=Windows だけが行い、
+接続しに行く Mac が探します)。
+
 | | 既定(Mac=サーバ) | 逆方向(Win=サーバ) |
 |---|---|---|
-| Mac | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=client` と `KNIT_HOST=<Windows側Tailscale IP>` |
-| Windows | KNIT_ROLE 未設定 | `.env` に `KNIT_ROLE=server` |
-| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="knit-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10` |
+| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回)。本線 24900・bulk 24902・発見 24903 の全経路を開ける: `netsh advfirewall firewall add rule name="knit-in-tcp" dir=in action=allow protocol=TCP localport=24900-24902 remoteip=100.64.0.0/10` と `netsh advfirewall firewall add rule name="knit-in-udp" dir=in action=allow protocol=UDP localport=24903 remoteip=100.64.0.0/10` |
 
 設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/knit/env)。
-変更後は**両側の再起動**が必要(片方だけ変えると切断が続く)。
+`.env` を書き換えた場合は**両側の再起動**が必要(片方だけ変えると切断が続く)。
+**Tailscale 経由で逆方向を使う場合は両側の .env に `KNIT_ALLOW_TS=1` が別途必要**です
+(接続元の既定制限は LAN・有線直結のみで、100.x の接続元は既定で拒否されます。
+usage.md の環境変数一覧参照)。
 Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接続元を即拒否します。
 
 ## 6.5 音声転送(Windows→Mac)
@@ -144,7 +161,8 @@ Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接�
 - 注意: Windows の**システム通知音**は環境によって既定デバイス以外へ流れる場合がある
   (実機では通知音はごく僅かしか取得できず、メディア再生は全量取得を確認済み)。
   音が来ない場合は Windows のサウンド設定で既定デバイスを確認する
-- 逆方向(Win=サーバ)モードでは KNIT_AUDIO_HOST=<Mac側IP> の指定が必要
+- 逆方向(Win=サーバ)モードでも音声は既定で有効。送り先は受理した相手(Mac)の
+  アドレスへ自動追従する(`KNIT_AUDIO_HOST` は送り先を明示上書きしたいときの口)
 - **音声出力の集中(接続中スピーカーミュート、既定 ON)**: 接続中は Windows 側の
   スピーカーを自動ミュートし、**Mac のみで音を鳴らす**(二重発音の防止)。
   切断すると元の状態へ自動復元する。Mac メニュー「Windowsスピーカー」で
@@ -198,7 +216,7 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
 | Mac 起動直後に終了(`[fatal] KNIT_TOKEN が未設定`) | gen-token.sh 未実行 or .env 未封入 |
 | `[conn] invalid hello` が続く | トークン不一致。両側の .env を確認 |
 | `[fatal] listen ... failed` | Tailscale IP 変更後の KNIT_BIND 指定が旧IPのまま。install-mac.sh を再実行 |
-| `[conn] rejected: ... は Tailscale 範囲外です` | 接続元が tailnet 外。Tailscale の接続状態を確認 |
+| `[conn] rejected: ... は許可範囲外です(Tailscale は KNIT_ALLOW_TS=1、他ネットワークは KNIT_ALLOW_ANY=1 で許可)` | 接続元が既定の許可範囲(LAN・有線直結)外。Tailscale 経由なら**両側**の .env に `KNIT_ALLOW_TS=1`(usage.md の環境変数一覧参照) |
 | 接続したのに操作できない | Windows 側が SSH 起動(別デスクトップ)の疑い。schtasks 起動に戻す |
 | メニューバーに表示されない | AppKit が使えないセッション(ssh 経由等)。CUI で稼働は継続する。`[gui]` ログを確認 |
 
