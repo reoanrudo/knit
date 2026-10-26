@@ -138,6 +138,9 @@ Mac が接続しに行く側のときの接続先は、設定の接続先欄ま�
 
 設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/knit/env)。
 `.env` を書き換えた場合は**両側の再起動**が必要(片方だけ変えると切断が続く)。
+**Tailscale 経由で逆方向を使う場合は両側の .env に `KNIT_ALLOW_TS=1` が別途必要**です
+(接続元の既定制限は LAN・有線直結のみで、100.x の接続元は既定で拒否されます。
+usage.md の環境変数一覧参照)。
 Windows 側はサーバモードでも Tailscale CGNAT(100.64.0.0/10)外の接続元を即拒否します。
 
 ## 6.5 音声転送(Windows→Mac)
@@ -213,7 +216,7 @@ Deskflow 系の定番機能。**Mac でファイルを ⌘C → 画面端で切�
 | Mac 起動直後に終了(`[fatal] KNIT_TOKEN が未設定`) | gen-token.sh 未実行 or .env 未封入 |
 | `[conn] invalid hello` が続く | トークン不一致。両側の .env を確認 |
 | `[fatal] listen ... failed` | Tailscale IP 変更後の KNIT_BIND 指定が旧IPのまま。install-mac.sh を再実行 |
-| `[conn] rejected: ... は Tailscale 範囲外です` | 接続元が tailnet 外。Tailscale の接続状態を確認 |
+| `[conn] rejected: ... は許可範囲外です(Tailscale は KNIT_ALLOW_TS=1、他ネットワークは KNIT_ALLOW_ANY=1 で許可)` | 接続元が既定の許可範囲(LAN・有線直結)外。Tailscale 経由なら**両側**の .env に `KNIT_ALLOW_TS=1`(usage.md の環境変数一覧参照) |
 | 接続したのに操作できない | Windows 側が SSH 起動(別デスクトップ)の疑い。schtasks 起動に戻す |
 | メニューバーに表示されない | AppKit が使えないセッション(ssh 経由等)。CUI で稼働は継続する。`[gui]` ログを確認 |
 
