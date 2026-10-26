@@ -132,7 +132,7 @@ Mac が接続しに行く側のときの接続先は、設定の接続先欄ま�
 
 | | 既定(Mac=サーバ) | 逆方向(Win=サーバ) |
 |---|---|---|
-| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回): `netsh advfirewall firewall add rule name="knit-in" dir=in action=allow protocol=TCP localport=24900 remoteip=100.64.0.0/10`(TCP 24900〜24902 と UDP 24903 は §9 も参照) |
+| 追加作業 | なし(待受は全インターフェース。受信の防御は接続元制限と暗号化が担う。※ Tailscale IP へ限定すると AP 隔離の環境で LAN 直の受け口が消え、Windows の経路昇格が成功しないため再接続ループになる実績あり) | Windows 側に Tailscale 網限定の受信許可が必要(管理者権限で 1 回)。本線 24900・bulk 24902・発見 24903 の全経路を開ける: `netsh advfirewall firewall add rule name="knit-in-tcp" dir=in action=allow protocol=TCP localport=24900-24902 remoteip=100.64.0.0/10` と `netsh advfirewall firewall add rule name="knit-in-udp" dir=in action=allow protocol=UDP localport=24903 remoteip=100.64.0.0/10` |
 
 設定は両側とも .env(環境変数 > exe同階層の .env > ~/.config/knit/env)。
 `.env` を書き換えた場合は**両側の再起動**が必要(片方だけ変えると切断が続く)。
