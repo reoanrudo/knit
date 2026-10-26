@@ -33,7 +33,7 @@ pub fn run() -> String {
     // ファイル・画像経路(bulk)の待受。クライアント役は待受自体が無いため
     // 未測定(None)として行を出さない
     let bulk_listening = (!is_client_role()).then(knit_common::bulk::serving);
-    // 音声(24901)の待受もサーバ役+音声有効のときだけ(main の起動条件と同じ)
+    // 音声(24901)の待受は音声有効なとき常に測る(役割無条件。main と同じ条件)
     let audio_listening = audio_server_role().then(probe_audio_listening);
     // 自動発見(UDP 24903)の応答待受もサーバ役だけ
     let discover_listening = (!is_client_role()).then(probe_discover_listening);
@@ -68,10 +68,11 @@ fn probe_listening() -> bool {
 }
 
 /// 音声受信(24901)の待受を持つか。main の起動条件と同じ
-///(サーバ役 + KNIT_AUDIO≠0 + 共有範囲で音声が許可されている)
+///(KNIT_AUDIO≠0 + 共有範囲で音声が許可されている)。音声の待受は**役割に無関係**
+///(Windows が常に接続しに来るため、クライアント役=逆方向構成でも待受ける。
+/// main.rs の audio::start と同じ条件に揃える。かつてのサーバ役限定は旧実装)
 fn audio_server_role() -> bool {
-    !is_client_role()
-        && knit_common::envutil::get("KNIT_AUDIO").as_deref() != Some("0")
+    knit_common::envutil::get("KNIT_AUDIO").as_deref() != Some("0")
         && knit_common::share::allow_audio()
 }
 
