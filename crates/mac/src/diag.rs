@@ -22,7 +22,10 @@ pub fn run() -> String {
     };
     let peer = credentials::load_peer();
     let has_peer = peer.is_some();
-    let listening = probe_listening();
+    // 待受要件は待受役のときだけ。クライアント役(逆方向構成)は自分が待受けない
+    // ため常に満たす(win/src/diag.rs と同じ扱い。無条件 probe だと逆方向で
+    // 切断中に「常駐が止まっています」と誤診する)
+    let listening = is_client_role() || probe_listening();
     let peer_reachable = peer.map(|mut p| {
         p.set_port(proto::PORT);
         probe_peer(p)
