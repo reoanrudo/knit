@@ -1,4 +1,4 @@
-//! この Mac だけで使う通知・受信先・ログイン時起動の設定。
+//! この Mac だけで使う受信先・ログイン時起動の設定。
 //! 受信先は最初の receive_dir() で固定する。apply は保存だけを行い、実際の
 //! Endpoint は次回起動から変更する（役割切替での再接続でも変更しない）。
 use serde_json::{json, Value};
@@ -9,8 +9,6 @@ use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    pub notify_connection: bool,
-    pub notify_transfer: bool,
     /// 空文字列は ~/Downloads/Knit。指定する場合は既存の絶対パス。
     pub receive_folder: String,
     /// ファイル受信完了後に受信フォルダをFinderで開くか。
@@ -24,8 +22,6 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            notify_connection: true,
-            notify_transfer: true,
             receive_folder: String::new(),
             open_receive_folder: false,
             history_limit: 50,
@@ -68,16 +64,6 @@ fn decode_settings(bytes: &[u8]) -> Result<Settings, String> {
         return Err("対応していない設定ファイルの版です".into());
     }
     let mut settings = Settings::default();
-    for (key, dest) in [
-        ("notify_connection", &mut settings.notify_connection),
-        ("notify_transfer", &mut settings.notify_transfer),
-    ] {
-        if let Some(value) = map.get(key) {
-            *dest = value
-                .as_bool()
-                .ok_or_else(|| format!("{key} は真偽値で指定してください"))?;
-        }
-    }
     if let Some(value) = map.get("receive_folder") {
         settings.receive_folder = value
             .as_str()
@@ -238,8 +224,6 @@ pub fn apply(next: Settings) -> Result<(), String> {
     validate_receive_dir(&next)?;
     let bytes = serde_json::to_vec_pretty(&json!({
         "version": 1,
-        "notify_connection": next.notify_connection,
-        "notify_transfer": next.notify_transfer,
         "receive_folder": next.receive_folder,
         "open_receive_folder": next.open_receive_folder,
         "history_limit": next.history_limit,
@@ -542,15 +526,14 @@ mod tests {
     #[test]
     fn settings_defaults_and_json_validation() {
         assert_eq!(decode_settings(b"{}").unwrap(), Settings::default());
+        // 旧設定ファイルに残る notify_* キーは未知キーとして黙って無視する
         let next = decode_settings(br#"{"version":1,"notify_connection":false,"notify_transfer":false,"receive_folder":"/Volumes/Inbox","open_receive_folder":true,"history_limit":200}"#).unwrap();
-        assert!(!next.notify_connection && !next.notify_transfer);
         assert_eq!(next.receive_folder, "/Volumes/Inbox");
         assert!(next.open_receive_folder);
         assert_eq!(next.history_limit, 200);
         for invalid in [
             "[]",
             "{\"version\":2}",
-            "{\"notify_transfer\":\"false\"}",
             "{\"receive_folder\":\"relative\"}",
             "{\"open_receive_folder\":\"true\"}",
             "{\"history_limit\":30}",
@@ -601,8 +584,6 @@ mod tests {
         let old = snapshot();
         let dir = receive_dir();
         let next = Settings {
-            notify_connection: false,
-            notify_transfer: false,
             receive_folder: "/knit-test-nonexistent/receive".into(),
             open_receive_folder: true,
             history_limit: 100,

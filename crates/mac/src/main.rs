@@ -92,21 +92,6 @@ fn notify(title: &str, body: &str) {
     });
 }
 
-/// 接続成功など、明示的に分類した通常通知だけを設定で抑制する。
-/// 失敗・切断・警告は従来のnotifyを直接呼び、必ず表示する。
-pub(crate) fn notify_connection(title: &str, body: &str) {
-    if desktop_settings::snapshot().notify_connection {
-        notify(title, body);
-    }
-}
-
-/// 転送が欠けずに成功した通常通知用。部分失敗・スキップ・警告には使わない。
-pub(crate) fn notify_transfer(title: &str, body: &str) {
-    if desktop_settings::snapshot().notify_transfer {
-        notify(title, body);
-    }
-}
-
 /// バイト数を通知・表示用に整形する(2048→"2 KB"、3_500_000→"3.3 MB")
 pub fn human_bytes(n: u64) -> String {
     if n >= 1024 * 1024 * 1024 {

@@ -321,7 +321,8 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
             all_skipped.extend(rep.skipped.iter().cloned());
             let note = skip_note(&all_skipped);
             // 相手の受理結果を待つ(版 15 以降の相手だけ返す)。
-            // scope=true は設定による拒否、rejected>0 は相手側での保存失敗
+            // scope=true は設定による拒否、rejected>0 は相手側での保存失敗。
+            // 全件成功の完了通知は廃止(頻出通知の削除)。問題があるときだけ出す
             match wait_xfer_ack(Duration::from_millis(2500)) {
                 Some((_, _, true)) => {
                     tray::notify(
@@ -335,12 +336,7 @@ pub(crate) fn send_files_to_mac(paths: &[String]) {
                         &format!("{n} 件を {} へ送信しましたが、{rejected} 件は相手側で保存できませんでした(相手側の通知と受信フォルダを確認してください){note}", crate::conn::peer_display()),
                     );
                 }
-                _ => {
-                    tray::notify(
-                        "Knit",
-                        &format!("{n} 件({})を {} へ送信しました{note}", human_bytes(total), crate::conn::peer_display()),
-                    );
-                }
+                _ => {}
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
@@ -555,20 +551,19 @@ pub(crate) fn win_on_bulk(e: bulk::Event) {
                 LAST_SYNC_SEQ.store(clipboard_seq(), Ordering::Relaxed);
                 history_push_files(&paths, &crate::conn::peer_display());
                 println!("[file] 受信完了: {n} 件(クリップボードに載せました)");
-                let dir = crate::receive_dir();
-                let message = match mismatch {
-                    Some((expected, got)) => format!(
-                        "ファイルは {got}/{expected} 件のみの受信です{}(Ctrl+V で貼り付け可)。実体は {}",
-                        collision_note(renamed, skipped, replaced),
-                        dir.display()
-                    ),
-                    None => format!(
-                        "ファイルを受信: {n} 件{}(Ctrl+V で貼り付け可)。実体は {}",
-                        collision_note(renamed, skipped, replaced),
-                        dir.display()
-                    ),
-                };
-                tray::notify("Knit", &message);
+                // 問題のない受信の完了通知は廃止(頻出通知の削除)。件数が合わない
+                // など注意が必要なときだけ知らせる
+                if let Some((expected, got)) = mismatch {
+                    let dir = crate::receive_dir();
+                    tray::notify(
+                        "Knit",
+                        &format!(
+                            "ファイルは {got}/{expected} 件のみの受信です{}(Ctrl+V で貼り付け可)。実体は {}",
+                            collision_note(renamed, skipped, replaced),
+                            dir.display()
+                        ),
+                    );
+                }
             } else {
                 // クリップボードに載せられなくても沈黙しない。dragdrop::fallback
                 // の失敗側と同じ文言で扱いを揃える(実体は Downloads\Knit に残る)

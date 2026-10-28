@@ -350,10 +350,8 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
     false
 }
 
-/// セッション終了の共通後処理(スロット解除・切断通知・WIN 中なら正規 leave)。
-/// auto_fallback=true は待機中の別端末へ自動で切り替わる見込みがあるため、
-/// 切断通知を出さない(直後の切替通知と二重になる)
-pub(crate) fn on_disconnect(auto_fallback: bool) {
+/// セッション終了の共通後処理(スロット解除・WIN 中なら正規 leave)。
+pub(crate) fn on_disconnect() {
     incoming_drag::reset();
     {
         let mut guard = STREAM_SLOT
@@ -394,16 +392,6 @@ pub(crate) fn on_disconnect(auto_fallback: bool) {
     }
     eprintln!("[conn] lost. waiting for reconnect...");
     eprintln!("[conn-metric] lost unix_ms={}", crate::state::wall_ms());
-    // ネットワークのフラップで通知が連打されるのを防ぐ(再接続通知と同じ
-    // 60 秒の間引き)。自動切替が決まっているときは切替通知だけを出す
-    static LAST_DISCONNECT_NOTIFY_MS: AtomicU64 = AtomicU64::new(0);
-    if !auto_fallback {
-        let now = now_ms();
-        if now.saturating_sub(LAST_DISCONNECT_NOTIFY_MS.load(Ordering::Relaxed)) >= 60_000 {
-            LAST_DISCONNECT_NOTIFY_MS.store(now, Ordering::Relaxed);
-            notify("Knit", "切断しました(自動で再接続します)");
-        }
-    }
     BULK_LINK.clear();
 }
 
@@ -741,7 +729,7 @@ pub(crate) fn server_thread(
             }
             if let peers::Departure::Active { next } = departure {
                 // 待機端末へ自動で切り替わる場合は切断通知を出さない(二重になる)
-                on_disconnect(next.is_some());
+                on_disconnect();
                 if let Some(id) = next { activate_peer_id_locked(&id, "自動切替"); }
             }
 
@@ -826,21 +814,9 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
     // 現在の ⌘キー設定を同期(クライアントモードの確立時)
     send_cfg();
     eprintln!("[conn] established");
-    let peer = PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default();
-    crate::notify_connection(
-        "Knit",
-        &format!(
-            "{} と接続しました",
-            if peer.is_empty() {
-                "端末".into()
-            } else {
-                peer
-            }
-        ),
-    );
     // クライアントモードは単一接続のため my_id 空(=常にアクティブ扱い)
     let bye = session_receive_loop(&mut reader, "", 0);
-    on_disconnect(false);
+    on_disconnect();
     if bye {
         // 相手の Bye による正常終了(役割切替の再接続待ち等)。Ok として返し、
         // 呼び出し側のバックオフをリセットさせる(異常切断だけ待ち時間を進める)

@@ -763,7 +763,6 @@ fn run_session(
         .get_ref()
         .set_read_timeout(Some(Duration::from_secs(9)));
     eprintln!("[android] {name} を接続先に加えました(画面 {w}x{h}、移動の補正 {gain:.3})");
-    crate::notify("Knit", &format!("{name} を接続しました"));
     // クリップボードのファイル・画像共有の送り先として登録(セッション終了で外れる)
     register_push_target(adb, serial, &name);
 

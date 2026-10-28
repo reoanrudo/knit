@@ -42,10 +42,6 @@ fn mark_connected() {
         METRIC_MAX_GAP_MS.fetch_max(gap, Ordering::Relaxed);
     }
     METRIC_CONNECTS.fetch_add(1, Ordering::Relaxed);
-    if since != 0 && now.saturating_sub(since) > 60_000 {
-        // 再接続した相手の実名(hello の name。未受信の間は汎用の「端末」)で知らせる
-        conn_notify(true, &format!("{} と再接続しました", peer_display()));
-    }
 }
 
 /// 切断を記録する(次の再接続までの表示と、長い断の判定に使う)
@@ -96,31 +92,6 @@ pub fn not_found_line() -> Option<String> {
         CONNECTED.load(Ordering::Relaxed),
         now_ms(),
     )
-}
-
-/// 接続・切断通知の間引き(断続的な切替で連打しない。種別が変われば都度出す)
-static CONN_NOTIFY: std::sync::Mutex<Option<(bool, Instant)>> = std::sync::Mutex::new(None);
-
-/// 接続・切断の通知(種別が同じものは 60 秒に 1 回に間引く)。
-/// 初回や状態が変わったときは必ず出る
-fn conn_notify(connected: bool, text: &str) {
-    let now = Instant::now();
-    let due = {
-        let mut g = CONN_NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
-        let ok = match *g {
-            Some((same_kind, at)) => {
-                same_kind != connected || now.duration_since(at) >= Duration::from_secs(60)
-            }
-            None => true,
-        };
-        if ok {
-            *g = Some((connected, now));
-        }
-        ok
-    };
-    if due {
-        tray::notify("Knit", text);
-    }
 }
 
 /// 接続モード(既定): 相手(Mac)へ接続し続ける。切断は指数バックオフで再接続
@@ -426,13 +397,6 @@ pub(crate) fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         throttle.success();
         registration_authenticated(token);
         println!("[conn] established");
-        conn_notify(
-            true,
-            &format!(
-                "{} と接続しました",
-                PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default()
-            ),
-        );
         audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
         if let Err(e) = session(pre, wr) {
             println!("[disc] {e}");
@@ -452,7 +416,6 @@ pub(crate) fn server_loop(token: &str, port: u16, w: i32, h: i32) {
         RX_BYTES.store(0, Ordering::Relaxed);
         speaker_disconnect_if_audio_down();
         println!("[conn] lost. waiting for reconnect...");
-        conn_notify(false, "切断しました(自動で再接続します)");
     }
 }
 
@@ -529,13 +492,6 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     }
     mark_connected();
     registration_authenticated(token);
-    conn_notify(
-        true,
-        &format!(
-            "{} と接続しました",
-            PEER_NAME.lock().map(|n| n.clone()).unwrap_or_default()
-        ),
-    );
     audio::speaker_connect_mute(SPK_MUTE_MODE.load(Ordering::Relaxed));
     let r = session(pre, writer);
     note_disconnected();
@@ -553,7 +509,6 @@ fn client_session(stream: TcpStream, token: &str, w: i32, h: i32) -> std::io::Re
     *WTX.lock().unwrap_or_else(|e| e.into_inner()) = None;
     BULK_LINK.clear();
     speaker_disconnect_if_audio_down();
-    conn_notify(false, "切断しました(自動で再接続します)");
     r
 }
 

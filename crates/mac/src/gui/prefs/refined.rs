@@ -26,7 +26,7 @@ static GAIN_VALUE: AtomicUsize = AtomicUsize::new(0);
 static OUTPUT: AtomicUsize = AtomicUsize::new(0);
 static FOLDER: AtomicUsize = AtomicUsize::new(0);
 static LANGUAGE: AtomicUsize = AtomicUsize::new(0);
-static SWITCHES: [AtomicUsize; 10] = [const { AtomicUsize::new(0) }; 10];
+static SWITCHES: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
 /// その他ページの切替キーポップアップ(既存4候補+「ほかのキー…」)
 static HOTKEY: AtomicUsize = AtomicUsize::new(0);
 /// 切替キーの env 固定(KNIT_HOTKEY_KC)の注記行(固定が無いときは空=見えない)
@@ -84,14 +84,6 @@ fn merge_values(d: &mut Draft, b: &mut Draft, current: &Draft) -> bool {
     merge!(startup);
     merge!(hotkey);
     merge!(update_check);
-    if d.desktop.notify_connection == b.desktop.notify_connection {
-        d.desktop.notify_connection = current.desktop.notify_connection;
-        b.desktop.notify_connection = current.desktop.notify_connection;
-    }
-    if d.desktop.notify_transfer == b.desktop.notify_transfer {
-        d.desktop.notify_transfer = current.desktop.notify_transfer;
-        b.desktop.notify_transfer = current.desktop.notify_transfer;
-    }
     if d.desktop.receive_folder == b.desktop.receive_folder {
         d.desktop.receive_folder = current.desktop.receive_folder.clone();
         b.desktop.receive_folder = current.desktop.receive_folder.clone();
@@ -952,7 +944,7 @@ unsafe fn build_sharing(p: ID) {
         },
     );
     line(p, 458.0, 246.0, 366.0);
-    toggle(p, "受信後にフォルダを開く", 8, 458.0, 214.0, 366.0);
+    toggle(p, "受信後にフォルダを開く", 6, 458.0, 214.0, 366.0);
     label(p, "履歴", 458.0, 196.0, 366.0, 15.0, false);
     toggle(p, "コピーを保存", 4, 458.0, 150.0, 250.0);
     label(p, "保存件数", 716.0, 153.0, 100.0, 14.0, false);
@@ -1068,7 +1060,7 @@ unsafe fn build_general(p: ID) {
         );
         enabled(object(&HOTKEY), false);
     }
-    toggle(p, "更新を自動で確認", 9, 90.0, 584.0, 678.0);
+    toggle(p, "更新を自動で確認", 7, 90.0, 584.0, 678.0);
     line(p, 74.0, 560.0, 710.0);
     // キー変換のプレビュー(現在の CMD_ALT で sync が組み立て直す)
     let conv_caption = label(p, "キー変換", 74.0, 526.0, 700.0, 15.0, false);
@@ -1085,18 +1077,14 @@ unsafe fn build_general(p: ID) {
         );
     }
     line(p, 74.0, 402.0, 710.0);
-    label(p, "通知", 74.0, 368.0, 700.0, 15.0, false);
-    toggle(p, "接続", 6, 90.0, 322.0, 678.0);
-    toggle(p, "転送完了", 7, 90.0, 274.0, 678.0);
-    line(p, 74.0, 252.0, 710.0);
-    label(p, "設定", 74.0, 218.0, 700.0, 15.0, false);
+    label(p, "設定", 74.0, 368.0, 700.0, 15.0, false);
     command(
         p,
         "書き出す…",
         c"sdRefinedExport:",
         NSRect {
             x: 90.0,
-            y: 174.0,
+            y: 324.0,
             w: 330.0,
             h: 30.0,
         },
@@ -1107,32 +1095,32 @@ unsafe fn build_general(p: ID) {
         c"sdRefinedImport:",
         NSRect {
             x: 438.0,
-            y: 174.0,
+            y: 324.0,
             w: 330.0,
             h: 30.0,
         },
     );
-    label(p, "メンテナンス", 74.0, 130.0, 700.0, 15.0, false);
-    label(p, "ログ", 90.0, 90.0, 420.0, 14.0, false);
+    label(p, "メンテナンス", 74.0, 280.0, 700.0, 15.0, false);
+    label(p, "ログ", 90.0, 240.0, 420.0, 14.0, false);
     command(
         p,
         "保存…",
         c"sdRefinedLog:",
         NSRect {
             x: 642.0,
-            y: 84.0,
+            y: 234.0,
             w: 126.0,
             h: 30.0,
         },
     );
-    label(p, "Knit", 90.0, 50.0, 420.0, 14.0, false);
+    label(p, "Knit", 90.0, 200.0, 420.0, 14.0, false);
     command(
         p,
         "再起動…",
         c"sdRefinedRestart:",
         NSRect {
             x: 642.0,
-            y: 44.0,
+            y: 194.0,
             w: 126.0,
             h: 30.0,
         },
@@ -1143,7 +1131,7 @@ unsafe fn build_general(p: ID) {
         c"sdRefinedReset:",
         NSRect {
             x: 74.0,
-            y: 8.0,
+            y: 158.0,
             w: 134.0,
             h: 30.0,
         },
@@ -1243,8 +1231,6 @@ unsafe fn sync_controls() {
         d.files,
         d.history,
         d.startup,
-        d.desktop.notify_connection,
-        d.desktop.notify_transfer,
         d.desktop.open_receive_folder,
         d.update_check,
     ];
@@ -1586,10 +1572,8 @@ pub(in crate::gui) unsafe extern "C" fn toggle_changed(_s: ID, _c: SEL, sender: 
         3 => d.files = on,
         4 => d.history = on,
         5 => d.startup = on,
-        6 => d.desktop.notify_connection = on,
-        7 => d.desktop.notify_transfer = on,
-        8 => d.desktop.open_receive_folder = on,
-        9 => d.update_check = on,
+        6 => d.desktop.open_receive_folder = on,
+        7 => d.update_check = on,
         _ => {}
     });
     sync();
@@ -2503,10 +2487,10 @@ mod tests {
         let mut draft = baseline.clone();
         draft.desktop.receive_folder = "/chosen".into();
         let mut current = baseline.clone();
-        current.desktop.notify_transfer = false;
+        current.desktop.history_limit = 200;
         merge_values(&mut draft, &mut baseline, &current);
         assert_eq!(draft.desktop.receive_folder, "/chosen");
-        assert!(!draft.desktop.notify_transfer);
+        assert_eq!(draft.desktop.history_limit, 200);
     }
     #[test]
     fn new_desktop_fields_merge_independently_of_edits() {

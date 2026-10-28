@@ -201,25 +201,22 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                         );
                     }
                     _ => {
-                        // 読取スキップや受理未確認（旧版・Ack待ち切れ）は常時通知。
-                        // 相手が全件保存したと確認できた成功だけを抑制対象にする。
-                        let notify_done = if all_skipped.is_empty()
+                        // 全件成功の完了通知は廃止(頻出通知の削除)。読取スキップや
+                        // 受理未確認（旧版・Ack待ち切れ）が残るときだけ知らせる
+                        let clean = all_skipped.is_empty()
                             && ack.is_some_and(|(accepted, rejected, scope)| {
                                 accepted == n && rejected == 0 && !scope
-                            })
-                        {
-                            notify_transfer
-                        } else {
-                            notify
-                        };
-                        notify_done(
-                            "Knit",
-                            &format!(
-                                "{n} 件({})を {peer} へ送信しました({:.1}MB/s・Ctrl+V で貼り付け){skip_note}",
-                                human_bytes(total),
-                                total as f64 / 1024.0 / 1024.0 / secs
-                            ),
-                        );
+                            });
+                        if !clean {
+                            notify(
+                                "Knit",
+                                &format!(
+                                    "{n} 件({})を {peer} へ送信しました({:.1}MB/s・Ctrl+V で貼り付け){skip_note}",
+                                    human_bytes(total),
+                                    total as f64 / 1024.0 / 1024.0 / secs
+                                ),
+                            );
+                        }
                     }
                 }
             }
@@ -623,9 +620,10 @@ pub(crate) fn send_drag_files_to_win(paths: Vec<std::path::PathBuf>, id: u64) {
                 let n = notice::compose_notice(&outcome);
                 // メニューの回復動線へ記録する(成功なら消える)
                 note_outcome(&outcome, &paths);
-                match n.kind {
-                    notice::NoticeKind::Always => notify(&n.title, &n.body),
-                    notice::NoticeKind::Suppressible => notify_transfer(&n.title, &n.body),
+                // Suppressible(欠けのない成功)の完了通知は廃止(頻出通知の削除)。
+                // 注意が必要な結果(Always)だけ出す
+                if n.kind == notice::NoticeKind::Always {
+                    notify(&n.title, &n.body);
                 }
             }
             Err(e) => {
@@ -704,25 +702,23 @@ pub(crate) fn mac_on_bulk(e: bulk::Event) {
                 eprintln!("[file] win->mac 受信: {n} 件(⌘V で貼り付け可)");
                 // 履歴ラベルはバッチ開始時点の端末で固定(受信中の切替で替えない)
                 history_push_files(&paths, &bulk_rx_device());
-                let total = knit_common::bulk::total_size(&paths);
-                // 保存失敗・拒否・同名変更の注意がある場合は設定にかかわらず通知。
-                let notify_done = if failed.is_empty()
-                    && denied == 0
-                    && renamed == 0
-                    && skipped == 0
-                    && replaced == 0
+                // 問題のない受信の完了通知は廃止(頻出通知の削除)。保存失敗・拒否・
+                // 同名変更などの注意があるときだけ知らせる
+                if !failed.is_empty()
+                    || denied != 0
+                    || renamed != 0
+                    || skipped != 0
+                    || replaced != 0
                 {
-                    notify_transfer
-                } else {
-                    notify
-                };
-                notify_done(
-                    "Knit",
-                    &format!(
-                        "ファイルを受信: {n} 件({}){rename_note}(⌘V で貼り付け可)。実体は {place}",
-                        human_bytes(total),
-                    ),
-                );
+                    let total = knit_common::bulk::total_size(&paths);
+                    notify(
+                        "Knit",
+                        &format!(
+                            "ファイルを受信: {n} 件({}){rename_note}(⌘V で貼り付け可)。実体は {place}",
+                            human_bytes(total),
+                        ),
+                    );
+                }
                 // 設定が有効なら受信フォルダをFinderで開く(失敗は静かに諦める)
                 if desktop_settings::snapshot().open_receive_folder {
                     if let Err(e) = std::process::Command::new("/usr/bin/open")

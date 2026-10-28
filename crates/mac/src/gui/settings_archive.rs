@@ -98,8 +98,6 @@ fn compose_archive(
         "version": 3,
         "preferences": filtered_preferences(preferences, false),
         "desktop": {
-            "notify_connection": desktop.notify_connection,
-            "notify_transfer": desktop.notify_transfer,
             "receive_folder": desktop.receive_folder,
             "open_receive_folder": desktop.open_receive_folder,
             "history_limit": desktop.history_limit,
@@ -216,6 +214,8 @@ fn parse_desktop(value: &Value) -> Result<crate::desktop_settings::Settings, Str
     check_keys(
         map,
         &[
+            // 旧アーカイブに残る通知設定(notify_*)は読み捨てる(通知は廃止済み)。
+            // 許可リストに置かないと旧書き出しファイルの読み込みが失敗する
             "notify_connection",
             "notify_transfer",
             "receive_folder",
@@ -225,11 +225,6 @@ fn parse_desktop(value: &Value) -> Result<crate::desktop_settings::Settings, Str
         ],
         "desktop",
     )?;
-    let boolean = |key: &str| {
-        value[key]
-            .as_bool()
-            .ok_or_else(|| format!("desktop.{key}: 真偽値が必要です"))
-    };
     let receive_folder = value["receive_folder"]
         .as_str()
         .ok_or("desktop.receive_folder: 文字列が必要です")?;
@@ -278,8 +273,6 @@ fn parse_desktop(value: &Value) -> Result<crate::desktop_settings::Settings, Str
         .transpose()?
         .unwrap_or_else(|| "rename".to_string());
     Ok(crate::desktop_settings::Settings {
-        notify_connection: boolean("notify_connection")?,
-        notify_transfer: boolean("notify_transfer")?,
         receive_folder: receive_folder.into(),
         open_receive_folder,
         history_limit,
@@ -508,7 +501,6 @@ mod tests {
         assert!(desktop.open_receive_folder);
         assert_eq!(desktop.history_limit, 100);
         for pointer in [
-            "/desktop/notify_connection",
             "/desktop/open_receive_folder",
             "/desktop/history_limit",
             "/preferences/audio_gain",
@@ -579,7 +571,9 @@ mod tests {
         assert!(snapshot["preferences"]["audio_output_uid"].is_string());
         assert_eq!(snapshot["screen"]["version"], 1);
         let desktop = snapshot["desktop"].as_object().unwrap();
-        assert_eq!(desktop.len(), 6, "collision を足した");
+        assert_eq!(desktop.len(), 4, "通知設定(notify_*)の廃止で 6→4");
+        assert!(snapshot["desktop"].get("notify_connection").is_none());
+        assert!(snapshot["desktop"].get("notify_transfer").is_none());
         assert!(!snapshot.to_string().contains("startup_enabled"));
         assert!(snapshot.get("authentication").is_none());
         assert!(ImportPlan::parse(&snapshot).is_ok());

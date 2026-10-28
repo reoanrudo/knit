@@ -454,10 +454,6 @@ fn activate_peer_locked(new: usize, reason: &str) {
     send_cfg();
     if active_peer_is_android_app() { send_msg(&Msg::Selected {on:true}); }
     eprintln!("[conn] 接続先を {name} へ切り替え({reason})");
-    // 再接続・経路昇格の置き換えは頻発するため通知は出さない(明示的な切替だけ知らせる)
-    if !reason.contains("再接続") {
-        notify("Knit", &format!("{name} へ切り替えました({reason})"));
-    }
 }
 
 /// 非アクティブピアへの間欠 ping(生存確認)。書けなくなった相手は一覧から外す。
@@ -827,7 +823,7 @@ pub fn not_found_line() -> Option<String> {
     )
 }
 
-/// 接続が確立した時の共通処理(状態・時刻の記録と、長い断の後の再接続通知)
+/// 接続が確立した時の共通処理(状態・時刻の記録と安定性の計測)
 pub(crate) fn mark_connected() {
     CONNECTED.store(true, Ordering::Relaxed);
     NEXT_RETRY_AT_MS.store(0, Ordering::Relaxed);
@@ -848,14 +844,6 @@ pub(crate) fn mark_connected() {
         METRIC_MAX_GAP_MS.fetch_max(gap, Ordering::Relaxed);
     }
     METRIC_CONNECTS.fetch_add(1, Ordering::Relaxed);
-    if since != 0 && now.saturating_sub(since) > 60_000 {
-        // 再接続した相手の実名(hello の name。未受信の間は汎用の「端末」)で知らせる
-        let peer = PEER_NAME.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        notify_connection(
-            "Knit",
-            &format!("{} と再接続しました", if peer.is_empty() { "端末".to_string() } else { peer }),
-        );
-    }
 }
 
 #[cfg(test)]
