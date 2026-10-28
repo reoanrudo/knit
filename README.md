@@ -72,7 +72,9 @@ Barrier・Synergy・Input Leap のスリープ復帰・切断系の不満は Red
 
 **旧ソフトが起きたままだと画面端でカーソルを取り合います**(切替が誤動作するため、同時には動かさないでください)。
 用語の対応: Barrier の Server/Client は Knit では設定画面の「ホスト」・環境変数 `KNIT_ROLE` の `server`/`client` に
-あたります(Server=操作する Mac 側なのは Barrier と同じ)。
+あたります(既定では Server=操作する Mac 側なのは Barrier と同じ)。ホスト/クライアントは TCP の
+待受/接続の役割のみで、操作の向き(Mac の入力で Windows を操作)は構成によらず同じ。
+逆方向(Win=サーバ)構成の選び方は [distribution.md](docs/distribution.md) §6。
 
 | よくある不満 | Knit の動き |
 |---|---|
