@@ -23,3 +23,7 @@ Knit は MIT ライセンスです。GPL など互換性のないライセンス
 |---|---|---|
 | [Windows の電力スロットリング解除](cleanroom/2026-10-29-win-power-throttling.md) | TwinDesk issue #16(公開の不具合報告) | TwinDesk のソースを読んでいないエージェント |
 | [Mac のスリープ/一時的な目覚めの扱い](cleanroom/2026-10-29-mac-sleep-gate.md) | Power Nap 中の再接続の空回り(一般に知られた macOS の挙動) | Codex(gpt-6.1-terra)。TwinDesk のソースを読んでいない |
+| [クリップボードの論理時計](cleanroom/2026-10-29-clip-ordering.md) | 「最後のコピーが勝つ」(HLC の論文) | Codex(gpt-6.1-terra) |
+| [登録失敗の段階別案内](cleanroom/2026-10-29-pairing-stages.md) | 登録失敗時の案内の改善 | Codex(gpt-6.1-terra) |
+| [耐性テスト](cleanroom/2026-10-29-robustness-checks.md) | 公開 issue の症状(無通信切断・高速移動の誤切替) | Codex(gpt-6.1-terra) |
+| [拡張ディスプレイ 第1段](cleanroom/2026-10-29-extended-display-stage1.md) | 拡張ディスプレイ機能。DeskPad のヘッダ(MIT)を同梱 | Codex(gpt-6.1-terra) |
