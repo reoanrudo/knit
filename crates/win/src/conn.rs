@@ -24,9 +24,12 @@ static DISCONNECTED_SINCE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 static NEXT_RETRY_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+pub(crate) static CONNECTION_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 接続が確立した時の共通処理(時刻の記録と、長い断の後の再接続通知)
 fn mark_connected() {
-    CONNECTED.store(true, Ordering::Relaxed);
+    CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
+    CONNECTED.store(true, Ordering::Release);
     NEXT_RETRY_AT_MS.store(0, Ordering::Relaxed);
     let now = now_ms();
     let since = DISCONNECTED_SINCE_MS.swap(0, Ordering::Relaxed);
@@ -46,7 +49,8 @@ fn mark_connected() {
 
 /// 切断を記録する(次の再接続までの表示と、長い断の判定に使う)
 fn note_disconnected() {
-    CONNECTED.store(false, Ordering::Relaxed);
+    CONNECTED.store(false, Ordering::Release);
+    CONNECTION_EPOCH.fetch_add(1, Ordering::AcqRel);
     // ログの時刻は壁時計、以後の継続時間の計測は単調時計(DISCONNECTED_SINCE_MS)
     println!("[conn-metric] lost unix_ms={}", wall_ms());
     DISCONNECTED_SINCE_MS

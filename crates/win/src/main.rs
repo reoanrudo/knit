@@ -13,6 +13,8 @@ mod conn;
 mod diag;
 mod doctor;
 mod dragdrop;
+mod extend;
+mod extend_math;
 mod helper;
 mod input;
 mod inputdesk;
@@ -490,6 +492,7 @@ fn main() {
 
     // タスクトレイ常駐(状態表示・バルーン通知・終了)。失敗しても本体は継続
     tray::start();
+    extend::start(token.clone(), port);
     // 同名衝突の扱い(既定 rename)。preferences::restore が保存値(初回保存以降は
     // 必ず collision キーを持つ)を当てた**後**に読むことで環境変数を優先する
     // (KNIT_ROLE と同じ扱い。.env も見る)
