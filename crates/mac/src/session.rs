@@ -180,7 +180,7 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 eprintln!("[mode] MAC (return)");
                             }
                         }
-                        Msg::Clip { text } => {
+                        Msg::Clip { text, ts } => {
                             if !CLIP_SHARE.load(Ordering::Relaxed) || !knit_common::share::allow_clip() {
                                 continue;
                             }
@@ -200,6 +200,16 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 continue;
                             }
                             {
+                                let mut clip_state = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner());
+                                let pt = knit_common::clipclock::wall_ms();
+                                let count = with_pool(clipboard_change_count);
+                                if knit_common::clipclock::has_pending_local_copy(count, LAST_SYNC_COUNT.load(Ordering::Relaxed)) {
+                                    clip_state.local_copy(pt);
+                                }
+                                if !clip_state.receive(ts, pt) {
+                                    eprintln!("[clip] 古いコピーのため適用しません");
+                                    continue;
+                                }
                                 // Windows の CRLF は Mac 向けに LF へ正規化
                                 let text = if text.contains("\r\n") {
                                     text.replace("\r\n", "\n")

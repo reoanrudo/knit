@@ -839,7 +839,8 @@ fn run_session(
                         continue;
                     }
                     *last = Some(text.clone());
-                    let _ = tx.send(encode(&Msg::Clip { text }));
+                    // Mac の受信側が共有時計で採番するため、ここでは二重に採番しない。
+                    let _ = tx.send(encode(&Msg::Clip { text, ts: None }));
                 }
             }
             stop();
@@ -1333,8 +1334,14 @@ fn input_loop(
                 .and_then(|_| {
                     ctl.write_all(&scrcpy::uhid_input(hid::MOUSE_ID, &ptr.release_all()))
                 })),
-            Msg::Clip { text } => {
+            Msg::Clip { text, ts } => {
                 if clip_share.load(Ordering::Relaxed) {
+                    // Mac が送信時に採番済み。同じ時刻は中継し、より古いものは捨てる。
+                    let state = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner());
+                    if ts.as_ref().zip(state.latest().as_ref()).is_some_and(|(incoming, latest)| incoming < latest) {
+                        eprintln!("[clip] 古いコピーのため適用しません");
+                        continue;
+                    }
                     *last_clip.lock().unwrap_or_else(|e| e.into_inner()) = Some(text.clone());
                     ctl.write_all(&scrcpy::set_clipboard(&text))
                 } else {
@@ -1864,6 +1871,7 @@ mod tests {
         h.send(&key(false));
         h.send(&Msg::Clip {
             text: "knit-e2e".into(),
+            ts: None,
         });
         h.send(&Msg::Ping { ts: 42 });
         let mut got_pong = false;

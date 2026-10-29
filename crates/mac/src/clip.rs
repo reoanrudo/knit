@@ -820,7 +820,9 @@ pub(crate) fn sync_clipboard_to_win() {
             if claim_history(&HISTORY_CLAIM_COUNT, cnt) {
                 history_push(&text, "Mac");
             }
-            send_msg(&Msg::Clip { text });
+            let ts = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner())
+                .local_copy(knit_common::clipclock::wall_ms());
+            send_msg(&Msg::Clip { text, ts: Some(ts) });
         })
     });
 }
