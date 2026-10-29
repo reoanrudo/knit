@@ -27,3 +27,4 @@ Knit は MIT ライセンスです。GPL など互換性のないライセンス
 | [登録失敗の段階別案内](cleanroom/2026-10-29-pairing-stages.md) | 登録失敗時の案内の改善 | Codex(gpt-6.1-terra) |
 | [耐性テスト](cleanroom/2026-10-29-robustness-checks.md) | 公開 issue の症状(無通信切断・高速移動の誤切替) | Codex(gpt-6.1-terra) |
 | [拡張ディスプレイ 第1段](cleanroom/2026-10-29-extended-display-stage1.md) | 拡張ディスプレイ機能。DeskPad のヘッダ(MIT)を同梱 | Codex(gpt-6.1-terra) |
+| [拡張ディスプレイ 第2段](cleanroom/2026-10-29-extended-display-stage2.md) | Windows 側の受信・表示(Microsoft Learn の公開資料) | Codex(gpt-6.1-terra) |

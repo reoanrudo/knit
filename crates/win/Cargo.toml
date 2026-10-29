@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 knit-common = { path = "../common" }
 serde_json = { workspace = true }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
 
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

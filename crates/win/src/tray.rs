@@ -224,6 +224,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+const MENU_EXTEND: u32 = 1091;
 const MENU_QUIT: u32 = 1001;
 const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
@@ -663,6 +664,7 @@ unsafe fn handle_command(id: u32) {
         }
         3000..=3004 => settings_ui::select((id - settings_ui::NAV_FIRST) as usize),
         MENU_STATUS => open_status_window(),
+        MENU_EXTEND => crate::extend::show(),
         MENU_AUDIO if !knit_common::share::env_cap().audio => {
             notify("このPCでは音声を共有できません", "KNIT_SHARE の設定で制限されています。");
         }
@@ -1528,6 +1530,10 @@ unsafe fn open_menu(hwnd: HWND) {
             let head = wide("クリップボード履歴(まだありません。コピーすると記録されます)");
             AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, head.as_ptr());
         }
+    }
+    if crate::extend::enabled() {
+        let extend_w = wide("拡張ディスプレイを表示");
+        AppendMenuW(menu, MF_STRING, MENU_EXTEND as usize, extend_w.as_ptr());
     }
     let audio_w = wide(&audio_line());
     AppendMenuW(menu, MF_STRING, MENU_AUDIO as usize, audio_w.as_ptr());
