@@ -28,6 +28,63 @@ const APPROVAL_WINDOW: Duration = Duration::from_secs(120);
 /// 持ち主へ「許可しますか」を尋ねる関数(名前・確認番号・相手のアドレス・相手がまだいるかの確認)
 type AskFn = dyn Fn(String, String, SocketAddr, &dyn Fn() -> bool) -> io::Result<bool>;
 
+/// 登録処理でエラーが起きた段階。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Stage {
+    Connect,
+    Invitation,
+    Exchange,
+    Approval,
+    Save,
+}
+
+#[derive(Debug)]
+struct PairError {
+    stage: Stage,
+    source: io::Error,
+}
+impl std::fmt::Display for PairError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+impl std::error::Error for PairError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+fn with_stage(stage: Stage, error: io::Error) -> io::Error {
+    if stage_of(&error).is_some() {
+        return error;
+    }
+    io::Error::new(
+        error.kind(),
+        PairError {
+            stage,
+            source: error,
+        },
+    )
+}
+pub fn stage_of(error: &io::Error) -> Option<Stage> {
+    error
+        .get_ref()?
+        .downcast_ref::<PairError>()
+        .map(|e| e.stage)
+}
+pub fn pairing_hint(stage: Option<Stage>, kind: io::ErrorKind) -> &'static str {
+    match stage {
+        Some(Stage::Connect) => "相手の端末から応答がありません。相手で Knit が起動しているか、IP アドレス、同じネットワークにいるかを確認してください。",
+        Some(Stage::Invitation) => "相手の端末で登録画面が開かれていません。相手の設定「接続」から「端末を登録…」を開いてください。",
+        Some(Stage::Exchange) => "コードが違うか、期限が切れています。相手の画面に出ている新しいコードでやり直してください。",
+        Some(Stage::Approval) if kind == io::ErrorKind::PermissionDenied => "相手の端末で拒否されました。",
+        Some(Stage::Approval) => "相手の端末で「許可」が押されませんでした。相手の画面を確認して、もう一度やり直してください。",
+        Some(Stage::Save) => "登録情報を保存できませんでした。Windowsのユーザーと保存先を確認してください。",
+        None if matches!(kind, io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => "相手の端末に接続できません。登録画面・ネットワーク・IPを確認してください。",
+        None if kind == io::ErrorKind::PermissionDenied => "相手の端末で許可されませんでした。もう一度やり直してください。",
+        None => "登録できませんでした。相手の画面を確認し、期限切れなら新しく開いてやり直してください。",
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
     pub name: String,
@@ -243,7 +300,12 @@ impl Invitation {
                               -> io::Result<bool> {
                             let (decision, answer) = mpsc::channel();
                             ask_tx
-                                .send(Event::Approval(Approval { name, sas, peer: from, decision }))
+                                .send(Event::Approval(Approval {
+                                    name,
+                                    sas,
+                                    peer: from,
+                                    decision,
+                                }))
                                 .map_err(|_| invalid("no approver"))?;
                             let wait_until = SystemTime::now() + APPROVAL_WINDOW;
                             while !remaining(wait_until, SystemTime::now()).is_zero()
@@ -380,7 +442,18 @@ fn serve_one(
         Err(e) => return Err(untried_connection(e, wire.received != 0)),
     };
     if incoming.starts_with(SAS_MARK) {
-        return serve_sas(wire, &incoming, peer, id, registry, port, stop, session_until, server_name, ask);
+        return serve_sas(
+            wire,
+            &incoming,
+            peer,
+            id,
+            registry,
+            port,
+            stop,
+            session_until,
+            server_name,
+            ask,
+        );
     }
     let (state, message) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.as_bytes()),
@@ -394,7 +467,14 @@ fn serve_one(
     let mut channel = Channel::handshake(wire, &key, false)?;
     // 6桁コード方式では相手の名前を受け取らない。台帳には仮の名前で載せ、
     // 初回接続の hello(note_seen)で本名へ更新する
-    serve_credential(&mut channel, registry, "登録した端末", port, stop, session_until)
+    serve_credential(
+        &mut channel,
+        registry,
+        "登録した端末",
+        port,
+        stop,
+        session_until,
+    )
 }
 
 /// 認証済みの暗号化経路で長期キーを渡す(6桁方式と承認方式で共通)。
@@ -460,7 +540,9 @@ fn public_of(secret: &[u8; 32]) -> [u8; 32] {
     X25519_BASEPOINT.mul_clamped(*secret).to_bytes()
 }
 fn shared_secret(secret: &[u8; 32], peer_public: &[u8; 32]) -> io::Result<[u8; 32]> {
-    let shared = MontgomeryPoint(*peer_public).mul_clamped(*secret).to_bytes();
+    let shared = MontgomeryPoint(*peer_public)
+        .mul_clamped(*secret)
+        .to_bytes();
     // 位数の小さい点(全ゼロの共有値)は、相手が鍵交換を無効にしようとしている
     if shared == [0; 32] {
         return Err(invalid("weak key exchange"));
@@ -538,27 +620,43 @@ fn serve_sas(
         return Err(invalid("commitment mismatch"));
     }
     let shared = shared_secret(&secret, &pk_a)?;
-    let (sas, key) = sas_and_key(id.as_bytes(), (&pk_a, &nonce_a), (&public, &nonce_b), &shared);
+    let (sas, key) = sas_and_key(
+        id.as_bytes(),
+        (&pk_a, &nonce_a),
+        (&public, &nonce_b),
+        &shared,
+    );
     // ここから先は、人が判断する時間を見込んで期限を延ばす(登録全体の期限は超えない)。
     // 承認の期限(session_until)は壁時計。ワイヤの IO 期限はその残りを単調時計へ写す
     let session_left = remaining(session_until, SystemTime::now());
-    wire.until =
-        Instant::now() + (APPROVAL_WINDOW + Duration::from_secs(10)).min(session_left);
+    wire.until = Instant::now() + (APPROVAL_WINDOW + Duration::from_secs(10)).min(session_left);
     let probe = wire.socket.try_clone()?;
     let alive = move || {
         let mut byte = [0u8; 1];
         match probe.peek(&mut byte) {
             Ok(0) => false,
             Ok(_) => true,
-            Err(e) => e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted,
+            Err(e) => {
+                e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::Interrupted
+            }
         }
     };
     if !ask(client_name.clone(), sas, peer, &alive)? {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not approved"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not approved",
+        ));
     }
     check_active(stop, session_until)?;
     let mut channel = Channel::handshake(wire, &key, false)?;
-    serve_credential(&mut channel, registry, &client_name, port, stop, session_until)
+    serve_credential(
+        &mut channel,
+        registry,
+        &client_name,
+        port,
+        stop,
+        session_until,
+    )
 }
 
 /// 承認方式の依頼側(Windows・Android)が、確認番号を出した状態で待っている接続。
@@ -584,14 +682,30 @@ impl Pending {
         preserve_existing: bool,
         save: impl FnOnce(&str, SocketAddr) -> io::Result<()>,
     ) -> io::Result<String> {
-        let Pending { socket, cancelled, address, key, .. } = self;
+        let Pending {
+            socket,
+            cancelled,
+            address,
+            key,
+            ..
+        } = self;
         // 承認の期限は壁時計(スリープ中も進み、眠っている間に延命されない)。
         // ワイヤの IO 期限は同じ長さを単調時計で測る(ワイヤは Instant の原則)
         let session_until = SystemTime::now() + APPROVAL_WINDOW + Duration::from_secs(10);
         let io_until = Instant::now() + APPROVAL_WINDOW + Duration::from_secs(10);
-        let wire = Wire::new(socket, &cancelled, io_until)?;
-        let mut channel = Channel::handshake(wire, &key, true)?;
-        client_credential(&mut channel, address, preserve_existing, &cancelled, session_until, save)
+        (|| {
+            let wire = Wire::new(socket, &cancelled, io_until)?;
+            let mut channel = Channel::handshake(wire, &key, true)?;
+            client_credential(
+                &mut channel,
+                address,
+                preserve_existing,
+                &cancelled,
+                session_until,
+                save,
+            )
+        })()
+        .map_err(|e| with_stage(Stage::Approval, e))
     }
 }
 
@@ -601,37 +715,51 @@ pub fn request_approval(
     my_name: &str,
     cancelled: Arc<AtomicBool>,
 ) -> io::Result<Pending> {
-    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)?;
-    let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
+    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)
+        .map_err(|e| with_stage(Stage::Connect, e))?;
+    let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .map_err(|e| with_stage(Stage::Connect, e))?;
     let until = Instant::now() + Duration::from_secs(20);
-    let mut wire = Wire::new(s, &cancelled, until)?;
-    let id = wire.receive()?;
+    let mut wire = Wire::new(s, &cancelled, until).map_err(|e| with_stage(Stage::Invitation, e))?;
+    let id = wire
+        .receive()
+        .map_err(|e| with_stage(Stage::Invitation, e))?;
     if id.len() != 64 || !id.iter().all(u8::is_ascii_hexdigit) {
-        return Err(invalid("unknown invitation"));
+        return Err(with_stage(Stage::Invitation, invalid("unknown invitation")));
     }
-    let secret = random32()?;
-    let public = public_of(&secret);
-    let nonce_a: [u8; 16] = random32()?[..16].try_into().unwrap();
-    let name = safe_name(my_name);
-    let mut msg1 = Vec::from(SAS_MARK);
-    msg1.extend_from_slice(&commitment(&public, &nonce_a));
-    msg1.extend_from_slice(clamp_name_bytes(&name, 64).as_bytes());
-    wire.send(&msg1)?;
-    let msg2 = wire.receive()?;
-    if msg2.len() < 48 || msg2.len() > 48 + 64 {
-        return Err(invalid("invalid approval response"));
-    }
-    let pk_b: [u8; 32] = msg2[..32].try_into().unwrap();
-    let nonce_b: [u8; 16] = msg2[32..48].try_into().unwrap();
-    let server_name = safe_name(&String::from_utf8_lossy(&msg2[48..]));
-    let mut msg3 = Vec::with_capacity(48);
-    msg3.extend_from_slice(&public);
-    msg3.extend_from_slice(&nonce_a);
-    wire.send(&msg3)?;
-    let shared = shared_secret(&secret, &pk_b)?;
-    let (sas, key) = sas_and_key(&id, (&public, &nonce_a), (&pk_b, &nonce_b), &shared);
-    let socket = wire.socket;
-    Ok(Pending { socket, cancelled, address, key, sas, server_name })
+    (|| {
+        let secret = random32()?;
+        let public = public_of(&secret);
+        let nonce_a: [u8; 16] = random32()?[..16].try_into().unwrap();
+        let name = safe_name(my_name);
+        let mut msg1 = Vec::from(SAS_MARK);
+        msg1.extend_from_slice(&commitment(&public, &nonce_a));
+        msg1.extend_from_slice(clamp_name_bytes(&name, 64).as_bytes());
+        wire.send(&msg1)?;
+        let msg2 = wire.receive()?;
+        if msg2.len() < 48 || msg2.len() > 48 + 64 {
+            return Err(invalid("invalid approval response"));
+        }
+        let pk_b: [u8; 32] = msg2[..32].try_into().unwrap();
+        let nonce_b: [u8; 16] = msg2[32..48].try_into().unwrap();
+        let server_name = safe_name(&String::from_utf8_lossy(&msg2[48..]));
+        let mut msg3 = Vec::with_capacity(48);
+        msg3.extend_from_slice(&public);
+        msg3.extend_from_slice(&nonce_a);
+        wire.send(&msg3)?;
+        let shared = shared_secret(&secret, &pk_b)?;
+        let (sas, key) = sas_and_key(&id, (&public, &nonce_a), (&pk_b, &nonce_b), &shared);
+        let socket = wire.socket;
+        Ok(Pending {
+            socket,
+            cancelled: cancelled.clone(),
+            address,
+            key,
+            sas,
+            server_name,
+        })
+    })()
+    .map_err(|e| with_stage(Stage::Exchange, e))
 }
 
 /// The caller persists only after authenticated decryption. A save failure never
@@ -670,28 +798,43 @@ fn enroll_impl(
     preserve_existing: bool,
     save: impl FnOnce(&str, SocketAddr) -> io::Result<()>,
 ) -> io::Result<String> {
-    let code = parse_code(code)?;
-    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)?;
-    let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))?;
+    let code = parse_code(code).map_err(|e| with_stage(Stage::Exchange, e))?;
+    check_active(&cancelled, SystemTime::now() + IO_TIMEOUT)
+        .map_err(|e| with_stage(Stage::Connect, e))?;
+    let s = TcpStream::connect_timeout(&address, Duration::from_secs(3))
+        .map_err(|e| with_stage(Stage::Connect, e))?;
     // ワイヤの IO 期限(Instant)と、この登録試行の期限(壁時計)を分けて持つ
     let io_until = Instant::now() + Duration::from_secs(20);
     let session_until = SystemTime::now() + Duration::from_secs(20);
-    let mut wire = Wire::new(s, &cancelled, io_until)?;
-    let id = wire.receive()?;
+    let mut wire =
+        Wire::new(s, &cancelled, io_until).map_err(|e| with_stage(Stage::Invitation, e))?;
+    let id = wire
+        .receive()
+        .map_err(|e| with_stage(Stage::Invitation, e))?;
     if id.len() != 64 || !id.iter().all(u8::is_ascii_hexdigit) {
-        return Err(invalid("unknown invitation"));
+        return Err(with_stage(Stage::Invitation, invalid("unknown invitation")));
     }
-    let (state, message) = Spake2::<Ed25519Group>::start_a(
-        &Password::new(code.as_bytes()),
-        &Identity::new(b"knit-windows-v1"),
-        &Identity::new(&id),
-    );
-    wire.send(&message)?;
-    let key = state
-        .finish(&wire.receive()?)
-        .map_err(|_| invalid("invalid PAKE message"))?;
-    let mut channel = Channel::handshake(wire, &key, true)?;
-    client_credential(&mut channel, address, preserve_existing, &cancelled, session_until, save)
+    (|| {
+        let (state, message) = Spake2::<Ed25519Group>::start_a(
+            &Password::new(code.as_bytes()),
+            &Identity::new(b"knit-windows-v1"),
+            &Identity::new(&id),
+        );
+        wire.send(&message)?;
+        let key = state
+            .finish(&wire.receive()?)
+            .map_err(|_| invalid("invalid PAKE message"))?;
+        let mut channel = Channel::handshake(wire, &key, true)?;
+        client_credential(
+            &mut channel,
+            address,
+            preserve_existing,
+            &cancelled,
+            session_until,
+            save,
+        )
+    })()
+    .map_err(|e| with_stage(Stage::Exchange, e))
 }
 /// 認証済みの暗号化経路で長期キーを受け取って保存する(6桁方式と承認方式で共通)。
 fn client_credential(
@@ -714,7 +857,8 @@ fn client_credential(
         return Err(invalid("unsupported credential"));
     }
     check_active(cancelled, until)?;
-    save(&token, SocketAddr::new(address.ip(), credential.port))?;
+    save(&token, SocketAddr::new(address.ip(), credential.port))
+        .map_err(|e| with_stage(Stage::Save, e))?;
     // Persistence succeeded: a lost final acknowledgement must not invite an
     // overwrite on retry. The normal authenticated connection completes recovery.
     let _ = channel.send(b"saved");
@@ -934,7 +1078,11 @@ fn discover_at(target: SocketAddr, wait: Duration) -> io::Result<Vec<Candidate>>
 }
 /// discover_at の実体。probe_port は応答者の登録待ち受け(TCP)の確認先で、
 /// 本番は pairing::PORT 固定。テストは任意ポートの招待と合わせる
-fn discover_probe(target: SocketAddr, wait: Duration, probe_port: u16) -> io::Result<Vec<Candidate>> {
+fn discover_probe(
+    target: SocketAddr,
+    wait: Duration,
+    probe_port: u16,
+) -> io::Result<Vec<Candidate>> {
     let s = UdpSocket::bind("0.0.0.0:0")?;
     s.set_broadcast(true)?;
     s.send_to(ASK, target)?;
@@ -1019,7 +1167,10 @@ mod tests {
         );
         // 承認窓も同じ壁時計の計算に乗る
         let approved_at = created + Duration::from_secs(299);
-        assert_eq!(remaining(until, approved_at + APPROVAL_WINDOW), Duration::ZERO);
+        assert_eq!(
+            remaining(until, approved_at + APPROVAL_WINDOW),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -1044,7 +1195,11 @@ mod tests {
         // 向けても、その TCP が閉じていれば候補へ出ない
         let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
         let fake_addr = fake.local_addr().unwrap();
-        let beacon = serde_json::to_vec(&Beacon { version: 1, name: "Knit (Mac)".into() }).unwrap();
+        let beacon = serde_json::to_vec(&Beacon {
+            version: 1,
+            name: "Knit (Mac)".into(),
+        })
+        .unwrap();
         let responder = thread::spawn(move || {
             let mut buf = [0; 128];
             if let Ok((n, from)) = fake.recv_from(&mut buf) {
@@ -1056,16 +1211,19 @@ mod tests {
         // 偽の UDP ポートと同じ番号の TCP が閉じていることを自分で確かめる
         //(同番号を bind して直ぐ閉じれば、誰も listen していない状態を作れる)
         if TcpListener::bind(fake_addr).is_ok() {
-            let found = discover_probe(fake_addr, Duration::from_millis(600), fake_addr.port())
-                .unwrap();
-            assert!(found.is_empty(), "TCP を持たない応答者は候補へ出ない: {found:?}");
+            let found =
+                discover_probe(fake_addr, Duration::from_millis(600), fake_addr.port()).unwrap();
+            assert!(
+                found.is_empty(),
+                "TCP を持たない応答者は候補へ出ない: {found:?}"
+            );
         }
         responder.join().unwrap();
 
         // 本物: 招待(TCP+UDP が同ポート)を立てると同じ探索で候補に載る
         let (invitation, real_addr, _token) = invitation(Duration::from_secs(30));
-        let found = discover_probe(real_addr, Duration::from_millis(600), real_addr.port())
-            .unwrap();
+        let found =
+            discover_probe(real_addr, Duration::from_millis(600), real_addr.port()).unwrap();
         assert_eq!(found.len(), 1, "待ち受けを持つ応答者は候補へ出る");
         assert_eq!(found[0].address, real_addr);
         assert_eq!(found[0].name, beacon_name());
@@ -1155,7 +1313,10 @@ mod tests {
         let beacon = serde_json::to_string(&found).unwrap();
         assert!(!beacon.contains(&i.code));
         let received = enroll(addr, &i.code, |key, peer| {
-            assert!(credentials::parse_key(key).is_ok(), "受け取るのは正規の64桁hex鍵");
+            assert!(
+                credentials::parse_key(key).is_ok(),
+                "受け取るのは正規の64桁hex鍵"
+            );
             assert_eq!(peer.port(), 24900);
             Ok(())
         })
@@ -1167,12 +1328,16 @@ mod tests {
         // 登録後のビーコンにも鍵材料は出ない(表示は匿名ラベルのまま)
         let after = discover_probe(addr, Duration::from_millis(150), addr.port()).unwrap();
         let beacon2 = serde_json::to_string(&after).unwrap();
-        assert!(!beacon2.contains(&tokens[0].1), "導出トークンはビーコンに漏れない");
+        assert!(
+            !beacon2.contains(&tokens[0].1),
+            "導出トークンはビーコンに漏れない"
+        );
         assert!(!beacon2.contains(&received));
         // 通常は 0.3 秒ほどで届く。全テストを並列に走らせるとマシンが混むため
         // 余裕を持たせる(2秒だと手元の並列実行でも落ちることがあった。CI の
         // ランナーはさらに遅い)。届かないこと自体は従来どおり失敗にする
-        let event = i.events
+        let event = i
+            .events
             .recv_timeout(Duration::from_secs(10))
             .expect("登録イベントが届くこと");
         assert!(
@@ -1194,7 +1359,11 @@ mod tests {
         for _ in 0..6 {
             assert!(tcp_port_open(addr, Duration::from_secs(2)));
         }
-        let wrong = if i.code == "000000" { "111111" } else { "000000" };
+        let wrong = if i.code == "000000" {
+            "111111"
+        } else {
+            "000000"
+        };
         assert!(enroll(addr, wrong, |_, _| panic!("wrong code must not save")).is_err());
         // probe 分の AttemptFailed が混ざっていれば最後のイベントが変わる
         let mut last = None;
@@ -1233,24 +1402,44 @@ mod tests {
         // legacy 形式の master(長さも文字種も自由)でも、招待が配るのは
         // master から導いた正規形の端末別トークン(desktop の保存規則を壊さない)
         let master = "Legacy-Key-With-Mixed-CASE-And-Symbols+/==";
-        let registry = std::sync::Arc::new(DeviceRegistry::open(&fresh_dir("legacy"), master).unwrap());
+        let registry =
+            std::sync::Arc::new(DeviceRegistry::open(&fresh_dir("legacy"), master).unwrap());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
-        let invitation = Invitation::bind(address, registry.clone(), 24900, Duration::from_secs(10)).unwrap();
+        let invitation =
+            Invitation::bind(address, registry.clone(), 24900, Duration::from_secs(10)).unwrap();
         // Android の保存経路(enroll_existing_key)でも、受け取った鍵のバイトを
         // 壊さずに保存できる
         let received = enroll_existing_key(address, &invitation.code, |key, peer| {
-            assert!(credentials::parse_key(key).is_ok(), "導出トークンは正規形(バイトを壊さない)");
+            assert!(
+                credentials::parse_key(key).is_ok(),
+                "導出トークンは正規形(バイトを壊さない)"
+            );
             assert_eq!(peer.port(), 24900);
             Ok(())
-        }).unwrap();
+        })
+        .unwrap();
         let tokens = registry.device_tokens();
         assert_eq!(tokens.len(), 1);
-        assert_eq!(received, tokens[0].1, "保存経路を通っても台帳の導出値と同一");
+        assert_eq!(
+            received, tokens[0].1,
+            "保存経路を通っても台帳の導出値と同一"
+        );
         assert_ne!(received, master, "master そのものは渡らない");
-        assert!(matches!(invitation.events.recv_timeout(Duration::from_secs(2)).unwrap(), Event::Registered(_)));
-        for bad in ["123456".into(), "x".repeat(31), "x".repeat(513), format!("{}\n", "x".repeat(32))] {
+        assert!(matches!(
+            invitation
+                .events
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Event::Registered(_)
+        ));
+        for bad in [
+            "123456".into(),
+            "x".repeat(31),
+            "x".repeat(513),
+            format!("{}\n", "x".repeat(32)),
+        ] {
             assert!(credentials::validate_transport_key(&bad).is_err());
         }
     }
@@ -1263,7 +1452,8 @@ mod tests {
             "000000"
         };
         for left in [2, 1, 0] {
-            assert!(enroll(addr, wrong, |_, _| panic!("wrong code must not save")).is_err());
+            let error = enroll(addr, wrong, |_, _| panic!("wrong code must not save")).unwrap_err();
+            assert_eq!(stage_of(&error), Some(Stage::Exchange));
             let event = i.events.recv_timeout(Duration::from_secs(2)).unwrap();
             assert_eq!(
                 event,
@@ -1279,10 +1469,15 @@ mod tests {
     #[test]
     fn storage_failure_never_reports_registration() {
         let (i, addr, _) = invitation(Duration::from_secs(10));
-        assert!(enroll(addr, &i.code, |_, _| Err(io::Error::other(
-            "test storage failure"
-        )))
-        .is_err());
+        let error = enroll(addr, &i.code, |_, _| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test storage failure",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(stage_of(&error), Some(Stage::Save));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(
             i.events.recv_timeout(Duration::from_secs(2)).unwrap(),
             Event::AttemptFailed(2)
@@ -1354,6 +1549,105 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 
+    #[test]
+    fn staged_errors_preserve_kind_and_original_cause() {
+        for stage in [
+            Stage::Connect,
+            Stage::Invitation,
+            Stage::Exchange,
+            Stage::Approval,
+            Stage::Save,
+        ] {
+            let error = with_stage(stage, io::Error::new(io::ErrorKind::TimedOut, "元のエラー"));
+            assert_eq!(stage_of(&error), Some(stage));
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert_eq!(error.to_string(), "元のエラー");
+            assert_eq!(
+                error.get_ref().unwrap().source().unwrap().to_string(),
+                "元のエラー"
+            );
+            let error = with_stage(Stage::Exchange, error);
+            assert_eq!(stage_of(&error), Some(stage));
+        }
+        assert_eq!(stage_of(&io::Error::other("通常のエラー")), None);
+    }
+
+    #[test]
+    fn connection_and_missing_invitation_report_their_stages() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        for approval in [false, true] {
+            let error = if approval {
+                request_approval(address, "PC", Arc::new(AtomicBool::new(false)))
+                    .err()
+                    .unwrap()
+            } else {
+                enroll(address, "123456", |_, _| unreachable!()).unwrap_err()
+            };
+            assert_eq!(stage_of(&error), Some(Stage::Connect));
+            assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        }
+        for approval in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                drop(listener.accept().unwrap());
+            });
+            let error = if approval {
+                request_approval(address, "PC", Arc::new(AtomicBool::new(false)))
+                    .err()
+                    .unwrap()
+            } else {
+                enroll(address, "123456", |_, _| unreachable!()).unwrap_err()
+            };
+            server.join().unwrap();
+            assert_eq!(stage_of(&error), Some(Stage::Invitation));
+        }
+        assert_eq!(stage_of(&io::Error::other("通常のエラー")), None);
+    }
+
+    #[test]
+    fn approval_storage_failure_keeps_save_stage() {
+        let (invitation, address, _) = invitation(Duration::from_secs(30));
+        let client = approval_client(address);
+        let approval = next_approval(&invitation);
+        let pending = client.join().unwrap().unwrap();
+        approval.approve();
+        let error = pending
+            .confirm(false, |_, _| {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "保存失敗"))
+            })
+            .unwrap_err();
+        assert_eq!(stage_of(&error), Some(Stage::Save));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn pairing_hints_follow_stage_and_error_kind() {
+        use io::ErrorKind::*;
+        let cases = [
+            (Some(Stage::Connect), TimedOut, "相手の端末から応答がありません。相手で Knit が起動しているか、IP アドレス、同じネットワークにいるかを確認してください。".to_string()),
+            (Some(Stage::Invitation), InvalidData, "相手の端末で登録画面が開かれていません。相手の設定「接続」から「端末を登録…」を開いてください。".to_string()),
+            (Some(Stage::Exchange), InvalidData, "コードが違うか、期限が切れています。相手の画面に出ている新しいコードでやり直してください。".to_string()),
+            (Some(Stage::Approval), TimedOut, "相手の端末で「許可」が押されませんでした。相手の画面を確認して、もう一度やり直してください。".to_string()),
+            (Some(Stage::Approval), PermissionDenied, "相手の端末で拒否されました。".to_string()),
+            (Some(Stage::Save), PermissionDenied, "登録情報を保存できませんでした。Windowsのユーザーと保存先を確認してください。".to_string()),
+        ];
+        for (stage, kind, expected) in cases {
+            assert_eq!(pairing_hint(stage, kind), expected);
+        }
+        assert_eq!(pairing_hint(None, Other), "登録できませんでした。相手の画面を確認し、期限切れなら新しく開いてやり直してください。");
+        assert_eq!(
+            pairing_hint(None, TimedOut),
+            "相手の端末に接続できません。登録画面・ネットワーク・IPを確認してください。"
+        );
+        assert_eq!(
+            pairing_hint(None, PermissionDenied),
+            "相手の端末で許可されませんでした。もう一度やり直してください。"
+        );
+    }
+
     // ---- 承認方式(6桁を打たず、両方の画面の確認番号を見比べる) ----
     fn approval_client(addr: SocketAddr) -> JoinHandle<io::Result<Pending>> {
         thread::spawn(move || request_approval(addr, "Test PC", Arc::new(AtomicBool::new(false))))
@@ -1409,7 +1703,8 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
             Ok(())
         });
-        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert_eq!(stage_of(&error), Some(Stage::Approval));
         assert!(!saved.load(Ordering::SeqCst), "拒否されたら何も保存しない");
         assert_eq!(
             i.events.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -1423,7 +1718,7 @@ mod tests {
         let client = approval_client(addr);
         let approval = next_approval(&i);
         drop(client.join().unwrap().unwrap()); // 依頼側が確認せずにやめた
-        // 切断を検知して、Mac の確認画面を取り下げる
+                                               // 切断を検知して、Mac の確認画面を取り下げる
         assert_eq!(
             i.events.recv_timeout(Duration::from_secs(5)).unwrap(),
             Event::Withdrawn
@@ -1450,7 +1745,10 @@ mod tests {
         let client = approval_client(addr);
         next_approval(&i).deny();
         drop(client.join().unwrap().unwrap());
-        assert_eq!(i.events.recv_timeout(Duration::from_secs(5)).unwrap(), Event::Locked);
+        assert_eq!(
+            i.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Event::Locked
+        );
     }
 
     #[test]
@@ -1514,7 +1812,10 @@ mod tests {
         let started = Instant::now();
         let event = i.events.recv_timeout(Duration::from_secs(20)).unwrap();
         assert_eq!(event, Event::AttemptFailed(2));
-        assert!(started.elapsed() < Duration::from_secs(15), "待ち受けを長く塞がない");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "待ち受けを長く塞がない"
+        );
     }
 
     #[test]
@@ -1523,7 +1824,9 @@ mod tests {
         for _ in 0..60 {
             let list = number_choices("4821").unwrap();
             assert_eq!(list.len(), 4);
-            assert!(list.iter().all(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit())));
+            assert!(list
+                .iter()
+                .all(|n| n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit())));
             let unique: std::collections::HashSet<_> = list.iter().collect();
             assert_eq!(unique.len(), 4, "候補は重ならない");
             positions.insert(list.iter().position(|n| n == "4821").unwrap());
