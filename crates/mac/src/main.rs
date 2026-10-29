@@ -15,6 +15,8 @@ mod conn;
 mod desktop_settings;
 mod diag;
 mod doctor;
+mod extend;
+mod extend_capture;
 mod file_drag;
 mod files;
 mod gui;
@@ -30,6 +32,7 @@ mod supervise;
 mod tap;
 mod trackpad;
 mod updater;
+mod vdisplay;
 
 // 分割したモジュールの item を crate ルートへ再エクスポートする。
 // 他モジュールの crate:: 参照・use crate::*・テストの use super::* の解決を保つため
@@ -1475,6 +1478,7 @@ fn main() {
     if swept > 0 {
         eprintln!("[bulk] 前回の受信中ファイルの残骸を {swept} 件掃除しました");
     }
+    extend::start(port);
     spawn_role_threads(0);
 
     // 診断モード: 1秒ごとにモード/受信・送信カウント/実カーソル位置を記録。
