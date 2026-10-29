@@ -22,3 +22,4 @@ Knit は MIT ライセンスです。GPL など互換性のないライセンス
 | 仕様書 | アイデアの出どころ(問題の発見元) | 実装者 |
 |---|---|---|
 | [Windows の電力スロットリング解除](cleanroom/2026-10-29-win-power-throttling.md) | TwinDesk issue #16(公開の不具合報告) | TwinDesk のソースを読んでいないエージェント |
+| [Mac のスリープ/一時的な目覚めの扱い](cleanroom/2026-10-29-mac-sleep-gate.md) | Power Nap 中の再接続の空回り(一般に知られた macOS の挙動) | Codex(gpt-6.1-terra)。TwinDesk のソースを読んでいない |

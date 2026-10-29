@@ -22,6 +22,7 @@ mod incoming_drag;
 mod objc;
 mod outgoing;
 mod peers;
+mod power;
 mod screen_settings;
 mod session;
 mod state;
@@ -1228,6 +1229,7 @@ fn main() {
     let _ = TX.set(tx);
     let slot: Arc<Mutex<Option<secure::Writer>>> = Arc::new(Mutex::new(None));
     let _ = STREAM_SLOT.set(slot.clone());
+    power::start();
 
     // 単一の送信スレッド(チャネル→ストリーム差し替え方式)
     std::thread::spawn(move || {
@@ -1255,14 +1257,15 @@ fn main() {
                 // stability-report.sh が「復帰検知→再接続確立」の所要時間を集計できるよう
                 // 計測行を残す(スリープ検知のログ行自体には時刻の数値が無いため)
                 eprintln!(
-                    "[conn-metric] wake unix_ms={} slept_s={}",
+                    "[conn-metric] wake unix_ms={} slept_s={} source=clock",
                     crate::state::wall_ms(),
                     slept.as_secs()
                 );
-                drop_stream(&format!("スリープ復帰を検知({}秒)", slept.as_secs()));
-                BULK_LINK.clear();
-                // クライアントモードの再接続待機を飛ばして、すぐ張り直させる
-                WAKE.notify();
+                if power::clock_wake_needs_reconnect() {
+                    drop_stream(&format!("スリープ復帰を検知({}秒)", slept.as_secs()));
+                    BULK_LINK.clear();
+                    WAKE.notify();
+                }
             }
             match pending.take().map(Ok).unwrap_or_else(|| rx.recv_timeout(Duration::from_millis(200))) {
                 Ok(line) => {
