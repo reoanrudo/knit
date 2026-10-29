@@ -143,7 +143,7 @@ pub(crate) fn session(
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
     reader
         .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(9)));
+        .set_read_timeout(Some(knit_common::heartbeat::WIN_READ_SILENCE));
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
@@ -187,7 +187,7 @@ pub(crate) fn session(
         let running = running.clone();
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(knit_common::heartbeat::WIN_PING_INTERVAL);
                 if tx.send(encode(&Msg::Ping { ts: 0 })).is_err() {
                     break;
                 }
