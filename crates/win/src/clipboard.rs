@@ -392,7 +392,9 @@ pub(crate) fn sync_clipboard_to_mac() {
                 }
                 println!("[clip] win->mac {} bytes", text.len());
                 history_push(&text, "Windows");
-                let _ = tx.send(encode(&Msg::Clip { text }));
+                let ts = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner())
+                    .local_copy(knit_common::clipclock::wall_ms());
+                let _ = tx.send(encode(&Msg::Clip { text, ts: Some(ts) }));
             } else if !text.is_empty() && text.len() > CLIP_MAX_CHARS {
                 // 1MB 超のテキストは Mac へ送れない。黙って落とすと「コピーしたのに
                 // 貼り付けられない」状態になるため、サイズ・文字数を伝える
