@@ -1297,7 +1297,7 @@ fn main() {
                 log_check_at = std::time::Instant::now();
                 rotate_tmp_log();
             }
-            if ping_at.elapsed() >= Duration::from_secs(1) {
+            if ping_at.elapsed() >= knit_common::heartbeat::MAC_PING_INTERVAL {
                 ping_at = std::time::Instant::now();
                 // M03: 操作権の期限。WIN_MODE 中に pong が5秒途絶えたら、切断(15秒)を
                 // 待たずにカーソルを手元へ戻す。この1秒周期はサーバ役・クライアント役の
@@ -1314,7 +1314,9 @@ fn main() {
                 // 15 秒 pong が無ければ実質切断扱いでストリームを外す
                 // (TCP が生きていても相手プロセスが固まった場合を拾う。相手の
                 // 9 秒無通信判定より十分遅くして、ping の間隔揺れで切らないようにする)
-                if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed)) > 15_000 {
+                if now_ms().saturating_sub(LAST_PONG_MS.load(Ordering::Relaxed))
+                    > knit_common::heartbeat::MAC_PONG_SILENCE.as_millis() as u64
+                {
                     drop_stream("pong が 15 秒途絶");
                     continue;
                 }
@@ -2199,6 +2201,51 @@ mod boundary_tests {
         // 下配置: Windows の上端
         assert!(abs_edge_reached(3, 400.0, 0.0, w, h));
         assert!(!abs_edge_reached(3, 400.0, 1.9, w, h));
+    }
+
+    #[test]
+    fn fast_movement_does_not_reach_an_edge_before_the_cursor() {
+        let (w, h) = (1920.0, 1080.0);
+        // 幅 1920px の 30% を超える 600px の移動後も端には届かない。
+        for (dir, x, y, dx, dy) in [
+            (0, 900.0, 500.0, -600.0, 0.0),
+            (1, 1000.0, 500.0, 600.0, 0.0),
+            (2, 200.0, 300.0, 600.0, 600.0),
+            (3, 200.0, 780.0, 600.0, -600.0),
+        ] {
+            assert!(!abs_edge_reached(dir, x + dx, y + dy, w, h));
+        }
+        // 積算位置が端を越えても、実カーソルが手前なら切り替えない。
+        assert!(!boundary_crossed(-600.0, 1.0));
+    }
+
+    #[test]
+    fn abs_edge_requires_the_exact_clamp_boundary() {
+        let (w, h) = (1920.0, 1080.0);
+        for (dir, before, edge) in [
+            (0, (1.0, 500.0), (0.0, 500.0)),
+            (1, (1917.0, 500.0), (1918.0, 500.0)),
+            (2, (900.0, 1077.0), (900.0, 1078.0)),
+            (3, (900.0, 1.0), (900.0, 0.0)),
+        ] {
+            assert!(!abs_edge_reached(dir, before.0, before.1, w, h));
+            assert!(abs_edge_reached(dir, edge.0, edge.1, w, h));
+        }
+    }
+
+    #[test]
+    fn fast_diagonal_near_a_corner_only_reaches_the_configured_edge() {
+        let (w, h) = (1920.0, 1080.0);
+        // 左上付近へ斜めに大きく移動し、左端だけに到達する。
+        let (x, y) = (600.0 - 600.0, 601.0 - 600.0);
+        for dir in 0..4 {
+            assert_eq!(abs_edge_reached(dir, x, y, w, h), dir == 0);
+        }
+        // 右下付近でも、下端だけに到達する。
+        let (x, y) = (1317.0 + 600.0, 478.0 + 600.0);
+        for dir in 0..4 {
+            assert_eq!(abs_edge_reached(dir, x, y, w, h), dir == 2);
+        }
     }
 }
 

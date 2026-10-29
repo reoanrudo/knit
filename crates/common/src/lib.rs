@@ -4,6 +4,7 @@ pub mod persist;
 pub mod diagnose;
 pub mod doctor;
 pub mod drag;
+pub mod heartbeat;
 pub mod hud;
 pub mod notice;
 pub mod history;
