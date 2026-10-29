@@ -143,7 +143,7 @@ pub(crate) fn session(
     // タイムアウトで read がエラーを返し、再接続ループへ制御が戻る(半開対策)
     reader
         .get_ref()
-        .set_read_timeout(Some(Duration::from_secs(9)));
+        .set_read_timeout(Some(knit_common::heartbeat::WIN_READ_SILENCE));
     // 送信の単一ライタ化: 受信ループとクリップ監視スレッドが同一ソケットへ並行
     // write すると行が混線し、Mac 側 decode で黙って捨てられる(pong 欠損→偽切断)。
     // Mac 側と同じ mpsc+単一スレッド構成へ集約する(レビュー Wave1 X2/P0-3)
@@ -187,7 +187,7 @@ pub(crate) fn session(
         let running = running.clone();
         std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_secs(3));
+                std::thread::sleep(knit_common::heartbeat::WIN_PING_INTERVAL);
                 if tx.send(encode(&Msg::Ping { ts: 0 })).is_err() {
                     break;
                 }
@@ -626,7 +626,7 @@ pub(crate) fn session(
                 RETURN_ARMED_W.store(false, Ordering::Relaxed);
                 last_return_notify = Instant::now();
             }
-            Msg::Clip { text } => {
+            Msg::Clip { text, ts } => {
                 if !knit_common::share::allow_clip() {
                     println!("[clip] この端末の設定でクリップボード共有がオフのため受け取りを拒否しました");
                     continue;
@@ -656,6 +656,18 @@ pub(crate) fn session(
                     }
                     continue;
                 }
+                let mut clip_state = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner());
+                let pt = knit_common::clipclock::wall_ms();
+                let expected_seq = clipboard_seq();
+                if knit_common::clipclock::has_pending_local_copy(expected_seq, LAST_SYNC_SEQ.load(Ordering::Relaxed)) {
+                    clip_state.local_copy(pt);
+                }
+                if !clip_state.receive(ts, pt) {
+                    println!("[clip] 古いコピーのため適用しません");
+                    continue;
+                }
+                let accepted = clip_state.latest();
+                drop(clip_state);
                 // Mac の LF を Windows の CRLF へ正規化(メモ帳等で貼り付けた時の
                 // 行送りの乱れを防ぐ。既に CRLF が混ざる場合は壊さない)
                 let text = if text.contains('\r') {
@@ -672,10 +684,15 @@ pub(crate) fn session(
                 std::thread::spawn(move || {
                     let mut ok = false;
                     for wait in [100u64, 200, 400, 700, 1100, 1600] {
+                        let state = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner());
+                        if state.latest() != accepted || clipboard_seq() != expected_seq {
+                            return;
+                        }
                         if clipboard_write_text(&text) {
                             ok = true;
                             break;
                         }
+                        drop(state);
                         std::thread::sleep(Duration::from_millis(wait));
                     }
                     if ok {

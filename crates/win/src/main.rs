@@ -16,6 +16,7 @@ mod dragdrop;
 mod helper;
 mod input;
 mod inputdesk;
+mod power;
 mod session;
 mod state;
 mod tray;
@@ -434,6 +435,8 @@ fn main() {
             }
         }
     };
+    // 早期 return はここまで。常駐に入る前に電力スロットリング解除と優先度の引き上げ(失敗は続行)
+    power::tune_at_startup();
     // 版18: 期限切れ(7日)の再開用部分ファイルを起動時に掃除する
     let purged = knit_common::files::purge_expired_partials(&receive_dir(), 7 * 24 * 3600);
     if purged > 0 {

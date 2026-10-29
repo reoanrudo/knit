@@ -87,7 +87,7 @@ fn main() {
                 if let Some(Msg::Text { text }) = proto::decode(&line) {
                     let mut writer = w.lock().unwrap();
                     if writer
-                        .write_all(proto::encode(&Msg::Clip { text }).as_bytes())
+                        .write_all(proto::encode(&Msg::Clip { text, ts: None }).as_bytes())
                         .and_then(|_| writer.flush())
                         .is_err()
                     {

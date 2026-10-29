@@ -1,9 +1,11 @@
+pub mod clipclock;
 pub mod clock;
 pub mod credentials;
 pub mod persist;
 pub mod diagnose;
 pub mod doctor;
 pub mod drag;
+pub mod heartbeat;
 pub mod hud;
 pub mod notice;
 pub mod history;
@@ -14,6 +16,7 @@ pub mod retry;
 pub mod share;
 pub mod smartguard;
 pub mod update;
+pub mod video;
 pub mod xfer;
 // 共通プロトコル定義(JSON Lines over TCP)
 pub mod envutil;

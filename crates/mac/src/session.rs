@@ -180,7 +180,7 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 eprintln!("[mode] MAC (return)");
                             }
                         }
-                        Msg::Clip { text } => {
+                        Msg::Clip { text, ts } => {
                             if !CLIP_SHARE.load(Ordering::Relaxed) || !knit_common::share::allow_clip() {
                                 continue;
                             }
@@ -200,6 +200,16 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 continue;
                             }
                             {
+                                let mut clip_state = knit_common::clipclock::device_state().lock().unwrap_or_else(|e| e.into_inner());
+                                let pt = knit_common::clipclock::wall_ms();
+                                let count = with_pool(clipboard_change_count);
+                                if knit_common::clipclock::has_pending_local_copy(count, LAST_SYNC_COUNT.load(Ordering::Relaxed)) {
+                                    clip_state.local_copy(pt);
+                                }
+                                if !clip_state.receive(ts, pt) {
+                                    eprintln!("[clip] 古いコピーのため適用しません");
+                                    continue;
+                                }
                                 // Windows の CRLF は Mac 向けに LF へ正規化
                                 let text = if text.contains("\r\n") {
                                     text.replace("\r\n", "\n")
@@ -591,6 +601,11 @@ pub(crate) fn server_thread(
                 continue;
             }
         };
+        if !crate::power::should_connect() {
+            crate::power::log_rejected();
+            drop(stream);
+            continue;
+        }
         eprintln!("[conn] accepted from {peer}");
         // 接続元の制限(既定は LAN・有線直結のみ。Tailscale は KNIT_ALLOW_TS=1、
         // インターネット側は KNIT_ALLOW_ANY=1 で許可)。認証は暗号化ハンドシェイクで行う
@@ -632,6 +647,10 @@ pub(crate) fn server_thread(
                 continue;
             }
         };
+        if !crate::power::should_connect() {
+            crate::power::log_rejected();
+            continue;
+        }
         throttle.success();
         eprintln!(
             "[conn] established: {disp} (id={dev}) 画面 {}x{} モニター: {}",
@@ -659,6 +678,9 @@ pub(crate) fn server_thread(
             {
                 let _change = PEER_CHANGES.lock().unwrap_or_else(|e| e.into_inner());
                 let mut slot = STREAM_SLOT.get().unwrap().lock().unwrap_or_else(|e| e.into_inner());
+                if !crate::power::should_connect() {
+                    return;
+                }
                 let mut entries = PEERS.lock().unwrap_or_else(|e| e.into_inner());
                 let mut active = ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
                 let previous = *active;
@@ -806,6 +828,9 @@ pub(crate) fn client_attempt(s: TcpStream, token: &str, screen_w: f64, screen_h:
             .unwrap()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        if !crate::power::should_connect() {
+            return Err("スリープ中のため接続を閉じます".into());
+        }
         *guard = Some(hw);
         OUTBOUND_GENERATION.fetch_add(1, Ordering::SeqCst);
     }
@@ -848,6 +873,10 @@ pub(crate) fn client_thread(
         if crate::role_generation_stale(generation) {
             eprintln!("[conn] 接続試行を終了しました(役割の切り替え・世代 {generation})");
             return;
+        }
+        if !crate::power::should_connect() {
+            WAKE.sleep(Duration::from_secs(2));
+            continue;
         }
         // 既知候補(KNIT_HOST・保存済みピア)へのダイヤルを LAN 発見と並行に始める:
         // 発見が応答しない環境(Tailscale・AP 隔離・相手が再起動中)では、従来は

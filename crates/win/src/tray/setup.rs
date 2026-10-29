@@ -48,13 +48,21 @@ unsafe fn clear_pending() {
     for c in &CHOICES {
         ShowWindow(c.load(Ordering::Relaxed) as HWND, SW_HIDE);
     }
-    for w in CODE_WIDGETS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for w in CODE_WIDGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         ShowWindow(*w as HWND, SW_SHOW);
     }
     set_text(CONNECT.load(Ordering::Relaxed), "登録する");
 }
 unsafe fn show_choices(list: &[String]) {
-    for w in CODE_WIDGETS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+    for w in CODE_WIDGETS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         ShowWindow(*w as HWND, SW_HIDE);
     }
     for (c, text) in CHOICES.iter().zip(list) {
@@ -125,20 +133,17 @@ unsafe fn search() {
 unsafe fn target_address() -> Result<std::net::SocketAddr, &'static str> {
     let host = text_of(&HOST);
     if !host.trim().is_empty() {
-        return pairing::manual_address(&host).map_err(|_| "IPアドレスを確認してください。例：192.168.1.10");
+        return pairing::manual_address(&host)
+            .map_err(|_| "IPアドレスを確認してください。例：192.168.1.10");
     }
     let selected = SendMessageW(LIST.load(Ordering::Relaxed) as HWND, CB_GETCURSEL, 0, 0);
     let peers = CANDIDATES.lock().unwrap_or_else(|e| e.into_inner());
-    peers
-        .get(selected as usize)
-        .map(|p| p.address)
-        .ok_or("相手側の設定「接続」で「端末を登録…」を開き、再検索してください。IPでも指定できます。")
+    peers.get(selected as usize).map(|p| p.address).ok_or(
+        "相手側の設定「接続」で「端末を登録…」を開き、再検索してください。IPでも指定できます。",
+    )
 }
-fn save_error_message(e: &std::io::Error, save_failed: bool) -> String {
-    if save_failed { "登録情報を保存できませんでした。Windowsのユーザーと保存先を確認してください。".into() }
-    else if matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) { "相手の端末に接続できません。登録画面・ネットワーク・IPを確認してください。".into() }
-    else if e.kind() == std::io::ErrorKind::PermissionDenied { "相手の端末で許可されませんでした。もう一度やり直してください。".into() }
-    else { "登録できませんでした。相手の画面を確認し、期限切れなら新しく開いてやり直してください。".into() }
+fn save_error_message(e: &std::io::Error) -> String {
+    pairing::pairing_hint(pairing::stage_of(e), e.kind()).into()
 }
 /// 承認方式: Mac に「つなぎたい」と伝え、確認番号を受け取る。持ち主が押すまで何も保存しない
 unsafe fn request_approval() {
@@ -163,8 +168,8 @@ unsafe fn request_approval() {
     *EVENTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
     let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into());
     std::thread::spawn(move || {
-        let result = pairing::request_approval(address, &name, cancel)
-            .map_err(|e| save_error_message(&e, false));
+        let result =
+            pairing::request_approval(address, &name, cancel).map_err(|e| save_error_message(&e));
         let _ = tx.send(UiEvent::Approval(result));
     });
 }
@@ -181,14 +186,11 @@ unsafe fn confirm_pending() {
     let (tx, rx) = mpsc::channel();
     *EVENTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
     std::thread::spawn(move || {
-        let mut save_failed = false;
         let result = pending
             .confirm(false, |token, peer| {
-                let result = credentials::save_peer(peer).and_then(|_| credentials::save(token));
-                save_failed = result.is_err();
-                result
+                credentials::save_peer(peer).and_then(|_| credentials::save(token))
             })
-            .map_err(|e| save_error_message(&e, save_failed));
+            .map_err(|e| save_error_message(&e));
         let _ = tx.send(UiEvent::Registered(result));
     });
 }
@@ -232,11 +234,10 @@ unsafe fn connect() {
     let (tx, rx) = mpsc::channel();
     *EVENTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(rx);
     std::thread::spawn(move || {
-        let mut save_failed = false;
         let result = pairing::enroll_cancellable(address, &code, cancel, |token, peer| {
-            let result = credentials::save_peer(peer).and_then(|_| credentials::save(token));
-            save_failed = result.is_err(); result
-        }).map_err(|e| save_error_message(&e, save_failed));
+            credentials::save_peer(peer).and_then(|_| credentials::save(token))
+        })
+        .map_err(|e| save_error_message(&e));
         let _ = tx.send(UiEvent::Registered(result));
     });
 }
@@ -255,7 +256,11 @@ unsafe fn auto_submit() {
     let host = text_of(&HOST);
     let selected = SendMessageW(LIST.load(Ordering::Relaxed) as HWND, CB_GETCURSEL, 0, 0);
     let has_target = !host.trim().is_empty()
-        || (selected >= 0 && !CANDIDATES.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        || (selected >= 0
+            && !CANDIDATES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty());
     if !has_target {
         return;
     }

@@ -90,6 +90,7 @@ fn main() {
         let t = Instant::now();
         let s = encode(black_box(&Msg::Clip {
             text: format!("{text}-enc-{i}"),
+            ts: None,
         }));
         black_box(&s);
         enc.push(t.elapsed().as_nanos());

@@ -21,6 +21,7 @@
     /// 18: 中断したファイル転送の続きから再開する能力(bulk の FILE_BEGIN に
     ///     "offset"/"prefix")。**版ゲートで送らない**(旧側は offset を知らず
     ///     先頭から書くため、offset 付きの送信は resume 対応の相手だけへ)
+    // Clip の時刻は省略可能で旧版は未知フィールドを無視するため版を上げない。
     pub const VERSION: u32 = 18;
     /// 接続を受け入れる最小の相手版。新しいメッセージは未知として無視される
     /// (decode が None を返す)ため、MIN_VERSION 以上なら新旧混在でも通信できる。
@@ -383,7 +384,11 @@
         },
         /// クリップボード同期(プレーンテキスト)
         #[serde(rename = "clip")]
-        Clip { text: String },
+        Clip {
+            text: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            ts: Option<crate::clipclock::ClipStamp>,
+        },
         /// Mac が制御を取り戻した(Windows を離れた)。Windows は押下中の全キー・
         /// ボタン・Alt+Tab を解放する。ホットキー/Mac 内完結の左端復帰/切断など
         /// Windows が自力で検知できない離脱経路のための後片付け合図
