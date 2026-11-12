@@ -26,9 +26,30 @@ pub fn apply_remote_prefs(json: &str) {
     preferences::apply_remote(json);
 }
 mod prefs;
+mod settings_new;
 mod settings_archive;
 pub mod setup;
 pub static UI_PREVIEW: AtomicBool = AtomicBool::new(false);
+
+fn settings_new_selected(preview: bool, flag: bool) -> bool {
+    preview && flag
+}
+
+fn use_settings_new() -> bool {
+    settings_new_selected(UI_PREVIEW.load(Ordering::Relaxed), std::env::args().any(|a| a == "--settings-new"))
+}
+
+#[cfg(test)]
+mod settings_preview_tests {
+    #[test]
+    fn settings_new_requires_preview_and_flag() {
+        assert!(!super::settings_new_selected(false, false));
+        assert!(!super::settings_new_selected(false, true));
+        assert!(!super::settings_new_selected(true, false));
+        assert!(super::settings_new_selected(true, true));
+    }
+}
+
 pub fn restore_preferences() {
     preferences::restore();
 }
@@ -1074,6 +1095,10 @@ unsafe extern "C" fn imp_preview_window_close(_s: ID, _c: SEL, _n: ID) {
 /// 行わず early return する: 表示の復帰は show_prefs 末尾の呼び出しで即座に
 /// 最新化され、最小化からドック経由で戻ったときだけ次の毎秒タイマーが拾う
 fn sync_prefs_state() {
+    // 新設定UI(--settings-new)では旧UIの部品が無いので同期しない
+    if use_settings_new() {
+        return;
+    }
     unsafe {
         let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
         if win.is_null() {
@@ -2935,6 +2960,7 @@ unsafe fn make_target() -> ID {
     let methods: &[(&std::ffi::CStr, usize)] = &[
         (c"sdHotkey:", prefs::hotkey as *const () as usize),
         (c"sdNavigate:", prefs::navigate as *const () as usize),
+        (c"sdNewNavigate:", settings_new::nav as *const () as usize),
         (c"sdLanguage:", prefs::change_language as *const () as usize),
         (c"sdRefinedNoop:", prefs::refined::noop as *const () as usize),
         (c"sdRefinedRole:", prefs::refined::role_changed as *const () as usize),
