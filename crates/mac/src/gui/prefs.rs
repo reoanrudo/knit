@@ -1376,6 +1376,10 @@ pub(super) fn host_field() -> usize {
 }
 
 pub(super) unsafe fn sync() {
+    // 新設定UI(--settings-new)は独自の同期を持つ。旧UIの部品は構築されていないため触らない
+    if use_settings_new() {
+        return;
+    }
     if refined::is_built() {
         refined::sync();
         return;
@@ -1672,6 +1676,9 @@ unsafe fn sync_layout_values() {
 }
 
 pub(super) unsafe fn build(target: ID) -> ID {
+    if use_settings_new() {
+        return super::settings_new::build(target);
+    }
     refined::build(target)
 }
 

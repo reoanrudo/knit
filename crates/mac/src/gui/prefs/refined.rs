@@ -218,21 +218,75 @@ unsafe fn color(v: ID, sidebar: bool) {
         msg0(c, sel(c"CGColor")),
     );
 }
+/// AppKit の意味別素材を使い、外観や透明度の設定への追従を OS に任せる。
+unsafe fn glass(parent: ID, r: NSRect, material: i64) -> ID {
+    let v = msg0(objc_getClass(c"NSVisualEffectView".as_ptr()), sel(c"new"));
+    frame(v, r);
+    msg1_void_i64(v, sel(c"setMaterial:"), material);
+    msg1_void_i64(v, sel(c"setBlendingMode:"), 0);
+    msg1_void_i64(v, sel(c"setState:"), 0);
+    msg1_void_u8(v, sel(c"setWantsLayer:"), 1);
+    msg1_void_id(parent, sel(c"addSubview:"), v);
+    v
+}
+
+/// 半透明のカード。背景のガラスが透ける
+unsafe fn card(parent: ID, x: f64, y: f64, w: f64, h: f64) -> ID {
+    let v = msg0(objc_getClass(c"NSBox".as_ptr()), sel(c"new"));
+    frame(v, NSRect { x, y, w, h });
+    msg1_void_i64(v, sel(c"setBoxType:"), 4);
+    let alpha: unsafe extern "C" fn(ID, SEL, f64) -> ID =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let colors = objc_getClass(c"NSColor".as_ptr());
+    // 背景は背後の素材に任せ、ダーク時もラベルのコントラストを保つ。
+    let fill = msg0(colors, sel(c"clearColor"));
+    msg1_void_id(v, sel(c"setFillColor:"), fill);
+    let border = alpha(
+        msg0(colors, sel(c"separatorColor")),
+        sel(c"colorWithAlphaComponent:"),
+        0.35,
+    );
+    msg1_void_id(v, sel(c"setBorderColor:"), border);
+    let f: unsafe extern "C" fn(ID, SEL, f64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    f(v, sel(c"setBorderWidth:"), 1.0);
+    f(v, sel(c"setCornerRadius:"), 16.0);
+    msg1_void_id(parent, sel(c"addSubview:"), v);
+    v
+}
+
+/// 状態ドット
+unsafe fn dot(parent: ID, x: f64, y: f64, d: f64) {
+    let v = view(parent, NSRect { x, y, w: d, h: d });
+    msg1_void_u8(v, sel(c"setWantsLayer:"), 1);
+    let f: unsafe extern "C" fn(ID, SEL, f64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    f(msg0(v, sel(c"layer")), sel(c"setCornerRadius:"), d / 2.0);
+    let c = msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"systemGreenColor"));
+    msg1_void_id(
+        msg0(v, sel(c"layer")),
+        sel(c"setBackgroundColor:"),
+        msg0(c, sel(c"CGColor")),
+    );
+}
+
+unsafe fn page_title(p: ID, y: f64, title: &str, subtitle: &str, english: &str) {
+    label(p, title, 24.0, y, 520.0, 24.0, false);
+    let description = label(p, subtitle, 24.0, y - 24.0, 780.0, 13.0, true);
+    let localized = localization::language().pick(subtitle, english);
+    for property in [c"setStringValue:", c"setToolTip:"] {
+        msg1_void_id(description, sel(property), nsstring(localized));
+        COPY_BINDINGS.lock().unwrap_or_else(|e| e.into_inner()).push(CopyBinding {
+            view: description as usize,
+            property,
+            japanese: subtitle.into(),
+            english: english.into(),
+        });
+    }
+}
+
 unsafe fn refresh_surface() {
-    let win = object(&WINDOW);
-    if win.is_null() {
-        return;
-    }
-    let appearance = msg0(win, sel(c"effectiveAppearance"));
-    let p = msg0_cstr(msg0(appearance, sel(c"name")), sel(c"UTF8String"));
-    let dark = !p.is_null() && CStr::from_ptr(p).to_string_lossy().contains("Dark");
-    if LAST_THEME.swap(dark as usize, Ordering::Relaxed) == dark as usize {
-        return;
-    }
-    let cv = msg0(win, sel(c"contentView"));
-    color(cv, false);
-    color(object(&SIDEBAR), true);
-    msg1_void_id(win, sel(c"setBackgroundColor:"), surface_color(cv, false));
+    // ガラス(NSVisualEffectView)は外観に自動追従するため手動の色替えはしない
 }
 unsafe fn line(parent: ID, x: f64, y: f64, w: f64) {
     let v = msg0(objc_getClass(c"NSBox".as_ptr()), sel(c"new"));
@@ -378,7 +432,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             localization::set_language(lang);
         }
     }
-    let width = 1040.0;
+    let width = 1100.0;
     let height = 700.0;
     let f: unsafe extern "C" fn(ID, SEL, NSRect, u64, u64, u8) -> ID =
         std::mem::transmute(crate::objc_msgSend as *const () as usize);
@@ -391,7 +445,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             w: width,
             h: height,
         },
-        1 | 2 | 4 | 8,
+        1 | 2 | 4 | 8 | 32768,
         2,
         0,
     );
@@ -402,6 +456,8 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
     msg1_void_id(win, sel(c"setTitle:"), nsstring("Knit"));
     msg1_void_u8(win, sel(c"setReleasedWhenClosed:"), 0);
     msg1_void_u8(win, sel(c"setTitlebarAppearsTransparent:"), 1);
+    msg1_void_i64(win, sel(c"setTitleVisibility:"), 1);
+    msg1_void_u8(win, sel(c"setOpaque:"), 0);
     let size: unsafe extern "C" fn(ID, SEL, crate::CGSize) =
         std::mem::transmute(crate::objc_msgSend as *const () as usize);
     size(
@@ -439,19 +495,30 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
     }
     msg0_void(win, sel(c"center"));
     let cv = msg0(win, sel(c"contentView"));
-    color(cv, false);
-    msg1_void_id(win, sel(c"setBackgroundColor:"), surface_color(cv, false));
-    let sidebar = view(
+    let clear = msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"clearColor"));
+    msg1_void_id(win, sel(c"setBackgroundColor:"), clear);
+    glass(
         cv,
         NSRect {
             x: 0.0,
             y: 0.0,
-            w: 180.0,
+            w: width,
             h: height,
         },
+        // WindowBackground: 設定本文は背後のデスクトップで読みにくくしない。
+        12,
+    );
+    let sidebar = glass(
+        cv,
+        NSRect {
+            x: 0.0,
+            y: 0.0,
+            w: 240.0,
+            h: height,
+        },
+        7,
     );
     SIDEBAR.store(sidebar as usize, Ordering::Relaxed);
-    color(sidebar, true);
     for (i, (title, image)) in [
         ("接続", "link"),
         ("画面配置", "display"),
@@ -469,7 +536,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             NSRect {
                 x: 12.0,
                 y: height - 66.0 - i as f64 * 46.0,
-                w: 156.0,
+                w: 216.0,
                 h: 36.0,
             },
         );
@@ -480,7 +547,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
         msg1_void_i64(b, sel(c"setImagePosition:"), 2);
         NAV[i].store(b as usize, Ordering::Relaxed);
     }
-    let main_x = 180.0;
+    let main_x = 240.0;
     for i in 0..4 {
         let p = make_page(cv, main_x, 68.0, width - main_x, height - 68.0);
         PANELS[i].store(
@@ -493,10 +560,17 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             2 => build_sharing(p),
             _ => build_general(p),
         }
+        // 非反転の文書では最大Yが先頭。長いページも最初に見出しを表示する。
+        let scroll_to: unsafe extern "C" fn(ID, SEL, CGPoint2) =
+            std::mem::transmute(crate::objc_msgSend as *const () as usize);
+        scroll_to(p, sel(c"scrollPoint:"), CGPoint2 {
+            x: 0.0,
+            y: [560.0, 632.0, 1052.0, 910.0][i],
+        });
     }
-    line(cv, 180.0, 66.0, 860.0);
+    line(cv, 240.0, 66.0, 860.0);
     ERROR.store(
-        label(cv, "", 202.0, 21.0, 560.0, 12.0, false) as usize,
+        label(cv, "", 262.0, 21.0, 560.0, 12.0, false) as usize,
         Ordering::Relaxed,
     );
     msg1_void_id(
@@ -510,7 +584,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             "元に戻す",
             c"sdRefinedRevert:",
             NSRect {
-                x: 800.0,
+                x: 860.0,
                 y: 18.0,
                 w: 108.0,
                 h: 32.0,
@@ -524,7 +598,7 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
             "適用",
             c"sdRefinedApply:",
             NSRect {
-                x: 920.0,
+                x: 980.0,
                 y: 18.0,
                 w: 96.0,
                 h: 32.0,
@@ -566,44 +640,23 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
     win
 }
 unsafe fn build_connection(p: ID) {
-    icon(
-        p,
-        "laptopcomputer",
-        "このMac",
-        NSRect {
-            x: 32.0,
-            y: 494.0,
-            w: 32.0,
-            h: 28.0,
-        },
-    );
-    label(p, &crate::hostname_label(), 78.0, 498.0, 420.0, 18.0, false);
-    DIAG_BUTTON.store(
-        command(
-            p,
-            "診断",
-            c"sdDiagnose:",
-            NSRect {
-                x: 720.0,
-                y: 492.0,
-                w: 104.0,
-                h: 32.0,
-            },
-        ) as usize,
-        Ordering::Relaxed,
-    );
+    page_title(p, 514.0, "接続", "このMacと接続中の端末。", "Manage this Mac and connected devices.");
+
+    // 状態カード: 接続中の端末一覧と操作
+    card(p, 24.0, 300.0, 812.0, 196.0);
+    label(p, "接続", 44.0, 464.0, 120.0, 14.0, false);
     RTT.store(
-        label(p, "", 78.0, 470.0, 560.0, 14.0, false) as usize,
+        label(p, "", 470.0, 464.0, 330.0, 12.0, true) as usize,
         Ordering::Relaxed,
     );
     let peer_scroll = msg0(objc_getClass(c"NSScrollView".as_ptr()), sel(c"new"));
     frame(
         peer_scroll,
         NSRect {
-            x: 32.0,
-            y: 228.0,
-            w: 792.0,
-            h: 228.0,
+            x: 40.0,
+            y: 356.0,
+            w: 780.0,
+            h: 92.0,
         },
     );
     msg1_void_u8(peer_scroll, sel(c"setDrawsBackground:"), 0);
@@ -615,29 +668,27 @@ unsafe fn build_connection(p: ID) {
         NSRect {
             x: 0.0,
             y: 0.0,
-            w: 792.0,
-            h: 228.0,
+            w: 780.0,
+            h: 92.0,
         },
     );
     msg1_void_id(peer_scroll, sel(c"setDocumentView:"), peer_doc);
     PEER_LIST.store(peer_doc as usize, Ordering::Relaxed);
     PEER_SCROLL.store(peer_scroll as usize, Ordering::Relaxed);
-    // 接続ページ内診断: peer_scroll と同じ枠に重ねるパネル(初期hidden)。
-    // 結果は set_inline_diag で本文を受け取り、閉じるボタンで一覧へ戻る。
+    // 接続ページ内診断: 一覧の枠に重ねるパネル(初期hidden)
     let diag_panel = msg0(objc_getClass(c"NSView".as_ptr()), sel(c"new"));
     frame(
         diag_panel,
         NSRect {
-            x: 32.0,
-            y: 228.0,
-            w: 792.0,
-            h: 228.0,
+            x: 40.0,
+            y: 356.0,
+            w: 780.0,
+            h: 92.0,
         },
     );
     msg1_void_id(p, sel(c"addSubview:"), diag_panel);
     msg1_void_u8(diag_panel, sel(c"setHidden:"), 1);
     DIAG_PANEL.store(diag_panel as usize, Ordering::Relaxed);
-    // 編集不可・選択可のテキストビュー(text_input と同じ作法でスクロールに載せる)
     let init_frame: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
         std::mem::transmute(crate::objc_msgSend as *const () as usize);
     let diag_text = init_frame(
@@ -646,8 +697,8 @@ unsafe fn build_connection(p: ID) {
         NSRect {
             x: 0.0,
             y: 0.0,
-            w: 792.0,
-            h: 184.0,
+            w: 690.0,
+            h: 62.0,
         },
     );
     msg1_void_u8(diag_text, sel(c"setEditable:"), 0);
@@ -658,9 +709,9 @@ unsafe fn build_connection(p: ID) {
         sel(c"initWithFrame:"),
         NSRect {
             x: 0.0,
-            y: 44.0,
-            w: 792.0,
-            h: 184.0,
+            y: 22.0,
+            w: 690.0,
+            h: 66.0,
         },
     );
     msg1_void_u8(diag_scroll, sel(c"setHasVerticalScroller:"), 1);
@@ -673,10 +724,10 @@ unsafe fn build_connection(p: ID) {
         "閉じる",
         c"sdRefinedDiagClose:",
         NSRect {
-            x: 672.0,
-            y: 4.0,
-            w: 100.0,
-            h: 32.0,
+            x: 700.0,
+            y: 62.0,
+            w: 76.0,
+            h: 24.0,
         },
     );
     command(
@@ -684,45 +735,42 @@ unsafe fn build_connection(p: ID) {
         "端末を追加…",
         c"sdRegistration:",
         NSRect {
-            x: 32.0,
-            y: 184.0,
-            w: 140.0,
-            h: 32.0,
-        },
-    );
-    command(
-        p,
-        "手動接続",
-        c"sdRefinedManual:",
-        NSRect {
-            x: 32.0,
-            y: 132.0,
+            x: 44.0,
+            y: 312.0,
             w: 150.0,
-            h: 32.0,
+            h: 30.0,
         },
     );
-    let manual = view(
-        p,
-        NSRect {
-            x: 32.0,
-            y: 10.0,
-            w: 792.0,
-            h: 110.0,
-        },
+    DIAG_BUTTON.store(
+        command(
+            p,
+            "診断",
+            c"sdDiagnose:",
+            NSRect {
+                x: 724.0,
+                y: 312.0,
+                w: 88.0,
+                h: 30.0,
+            },
+        ) as usize,
+        Ordering::Relaxed,
     );
+
+    // 接続先カード(役割・IP・保存)
+    let manual = card(p, 24.0, 194.0, 812.0, 88.0);
     MANUAL.store(manual as usize, Ordering::Relaxed);
-    msg1_void_u8(manual, sel(c"setHidden:"), 1);
+    label(p, "接続先", 44.0, 250.0, 200.0, 12.0, true);
     HOST_ROLE.store(
         popup(
-            manual,
+            p,
             object(&TARGET),
             &["このMacで待ち受ける", "相手へ接続する"],
             c"sdRefinedRole:",
             NSRect {
-                x: 0.0,
-                y: 70.0,
-                w: 240.0,
-                h: 28.0,
+                x: 44.0,
+                y: 214.0,
+                w: 220.0,
+                h: 26.0,
             },
         ) as usize,
         Ordering::Relaxed,
@@ -734,30 +782,30 @@ unsafe fn build_connection(p: ID) {
     };
     HOST.store(
         text_field(
-            manual,
+            p,
             object(&TARGET),
             None,
             "接続先のIPアドレス",
             "192.168.1.10",
             &host,
             NSRect {
-                x: 0.0,
-                y: 25.0,
-                w: 380.0,
-                h: 28.0,
+                x: 280.0,
+                y: 213.0,
+                w: 300.0,
+                h: 26.0,
             },
         ) as usize,
         Ordering::Relaxed,
     );
     command(
-        manual,
+        p,
         "保存して再接続",
         c"sdRefinedSaveHost:",
         NSRect {
-            x: 400.0,
-            y: 22.0,
-            w: 180.0,
-            h: 32.0,
+            x: 592.0,
+            y: 209.0,
+            w: 200.0,
+            h: 30.0,
         },
     );
     msg1_void_i64(
@@ -765,8 +813,30 @@ unsafe fn build_connection(p: ID) {
         sel(c"selectItemAtIndex:"),
         crate::effective_client_role() as i64,
     );
+
+    // 画面配置カード
+    card(p, 24.0, 96.0, 812.0, 82.0);
+    label(p, "画面配置", 44.0, 140.0, 300.0, 14.0, false);
+
+    let nav = command(
+        p,
+        "画面配置を開く",
+        c"sdNavigate:",
+        NSRect {
+            x: 600.0,
+            y: 122.0,
+            w: 200.0,
+            h: 30.0,
+        },
+    );
+    msg1_void_i64(nav, sel(c"setTag:"), 1);
 }
+
 unsafe fn build_layout(p: ID) {
+    frame(p, NSRect { x: 0.0, y: 0.0, w: 860.0, h: 632.0 });
+    page_title(p, 578.0, "画面配置", "端末の配置とポインターの感度を調整します。", "Arrange devices and adjust pointer sensitivity.");
+    card(p, 24.0, 98.0, 812.0, 398.0);
+    card(p, 24.0, 18.0, 812.0, 64.0);
     command(
         p,
         "画面を識別",
@@ -859,17 +929,20 @@ unsafe fn build_layout(p: ID) {
     );
 }
 unsafe fn build_sharing(p: ID) {
-    label(p, "Windows音声", 32.0, 494.0, 360.0, 22.0, false);
-    label(p, "コピーとファイル", 458.0, 494.0, 370.0, 22.0, false);
-    toggle(p, "Macで再生", 0, 32.0, 434.0, 360.0);
-    label(p, "音量", 32.0, 375.0, 100.0, 14.0, false);
+    frame(p, NSRect { x: 0.0, y: 0.0, w: 860.0, h: 1052.0 });
+    page_title(p, 998.0, "共有", "端末間の音声、コピー、ファイルを設定します。", "Configure audio, clipboard, and file sharing.");
+    card(p, 20.0, 596.0, 816.0, 356.0);
+    card(p, 20.0, 18.0, 816.0, 514.0);
+    label(p, "Windows音声", 32.0, 914.0, 360.0, 22.0, false);
+    toggle(p, "Macで再生", 0, 32.0, 854.0, 780.0);
+    label(p, "音量", 32.0, 795.0, 100.0, 14.0, false);
     GAIN.store(
         range_slider(
             p,
             "Windows音声の音量",
             NSRect {
                 x: 132.0,
-                y: 372.0,
+                y: 792.0,
                 w: 200.0,
                 h: 28.0,
             },
@@ -880,10 +953,10 @@ unsafe fn build_sharing(p: ID) {
         Ordering::Relaxed,
     );
     GAIN_VALUE.store(
-        label(p, "", 337.0, 375.0, 58.0, 13.0, true) as usize,
+        label(p, "", 337.0, 795.0, 58.0, 13.0, true) as usize,
         Ordering::Relaxed,
     );
-    label(p, "出力先", 32.0, 316.0, 100.0, 14.0, false);
+    label(p, "出力先", 32.0, 736.0, 100.0, 14.0, false);
     OUTPUT.store(
         dynamic_copy_scope(|| {
             popup(
@@ -893,7 +966,7 @@ unsafe fn build_sharing(p: ID) {
                 c"sdRefinedOutput:",
                 NSRect {
                     x: 132.0,
-                    y: 312.0,
+                    y: 732.0,
                     w: 260.0,
                     h: 30.0,
                 },
@@ -901,24 +974,25 @@ unsafe fn build_sharing(p: ID) {
         }) as usize,
         Ordering::Relaxed,
     );
-    toggle(p, "Windowsスピーカーを消音", 1, 32.0, 254.0, 360.0);
+    toggle(p, "Windowsスピーカーを消音", 1, 32.0, 674.0, 780.0);
     command(
         p,
         "出力を確認…",
         c"sdRefinedTestOutput:",
         NSRect {
             x: 32.0,
-            y: 194.0,
+            y: 614.0,
             w: 148.0,
             h: 32.0,
         },
     );
-    toggle(p, "コピー", 2, 458.0, 434.0, 366.0);
-    toggle(p, "ファイル", 3, 458.0, 380.0, 366.0);
-    line(p, 458.0, 362.0, 366.0);
-    label(p, "受信フォルダ", 458.0, 316.0, 366.0, 14.0, false);
+    label(p, "コピーとファイル", 32.0, 494.0, 780.0, 22.0, false);
+    toggle(p, "コピー", 2, 32.0, 434.0, 780.0);
+    toggle(p, "ファイル", 3, 32.0, 380.0, 780.0);
+    line(p, 32.0, 362.0, 780.0);
+    label(p, "受信フォルダ", 32.0, 316.0, 366.0, 14.0, false);
     FOLDER.store(
-        label(p, "", 458.0, 276.0, 245.0, 13.0, false) as usize,
+        label(p, "", 32.0, 276.0, 245.0, 13.0, false) as usize,
         Ordering::Relaxed,
     );
     command(
@@ -926,7 +1000,7 @@ unsafe fn build_sharing(p: ID) {
         "変更…",
         c"sdRefinedFolder:",
         NSRect {
-            x: 700.0,
+            x: 274.0,
             y: 270.0,
             w: 72.0,
             h: 30.0,
@@ -937,17 +1011,17 @@ unsafe fn build_sharing(p: ID) {
         "開く",
         c"sdRefinedOpenFolder:",
         NSRect {
-            x: 778.0,
+            x: 352.0,
             y: 270.0,
             w: 48.0,
             h: 30.0,
         },
     );
-    line(p, 458.0, 246.0, 366.0);
-    toggle(p, "受信後にフォルダを開く", 6, 458.0, 214.0, 366.0);
-    label(p, "履歴", 458.0, 196.0, 366.0, 15.0, false);
-    toggle(p, "コピーを保存", 4, 458.0, 150.0, 250.0);
-    label(p, "保存件数", 716.0, 153.0, 100.0, 14.0, false);
+    line(p, 32.0, 246.0, 780.0);
+    toggle(p, "受信後にフォルダを開く", 6, 32.0, 214.0, 780.0);
+    label(p, "履歴", 32.0, 184.0, 366.0, 15.0, false);
+    toggle(p, "コピーを保存", 4, 32.0, 150.0, 780.0);
+    label(p, "保存件数", 32.0, 105.0, 180.0, 14.0, false);
     HISTORY_LIMIT.store(
         popup(
             p,
@@ -955,8 +1029,8 @@ unsafe fn build_sharing(p: ID) {
             &["10件", "50件", "100件", "200件"],
             c"sdRefinedHistoryLimit:",
             NSRect {
-                x: 690.0,
-                y: 148.0,
+                x: 264.0,
+                y: 100.0,
                 w: 126.0,
                 h: 28.0,
             },
@@ -968,8 +1042,8 @@ unsafe fn build_sharing(p: ID) {
         "履歴を消去…",
         c"sdHistoryClear:",
         NSRect {
-            x: 458.0,
-            y: 94.0,
+            x: 32.0,
+            y: 30.0,
             w: 150.0,
             h: 32.0,
         },
@@ -981,7 +1055,7 @@ unsafe fn build_sharing(p: ID) {
         "画像の実体: ~/.config/knit/images(最大 {})",
         crate::human_bytes(knit_common::history::MAX_IMAGE_STORE_BYTES)
     );
-    label(p, &store_note, 458.0, 126.0, 366.0, 12.0, true);
+    label(p, &store_note, 32.0, 76.0, 366.0, 12.0, true);
 }
 unsafe fn build_general(p: ID) {
     // 切替キー・更新の自動確認・キー変換プレビューを増やした分だけ文書を伸ばす
@@ -992,9 +1066,14 @@ unsafe fn build_general(p: ID) {
             x: 0.0,
             y: 0.0,
             w: 860.0,
-            h: 830.0,
+            h: 910.0,
         },
     );
+    page_title(p, 854.0, "その他", "起動、言語、キーを設定します。", "Configure startup, language and keyboard.");
+    card(p, 58.0, 566.0, 726.0, 248.0);
+    card(p, 58.0, 410.0, 726.0, 140.0);
+    card(p, 58.0, 258.0, 726.0, 134.0);
+    card(p, 58.0, 4.0, 726.0, 238.0);
     label(p, "一般", 74.0, 788.0, 700.0, 15.0, false);
     label(p, "言語", 90.0, 742.0, 420.0, 14.0, false);
     LANGUAGE.store(
@@ -1337,19 +1416,19 @@ unsafe fn refresh_devices_inner() {
             parent,
             localization::text("未接続", "Not connected"),
             0.0,
-            166.0,
+            36.0,
             600.0,
             15.0,
             true,
         );
     }
-    let doc_height = (peers.len() as f64 * 72.0 + 12.0).max(228.0);
+    let doc_height = (peers.len() as f64 * 72.0 + 12.0).max(92.0);
     frame(
         parent,
         NSRect {
             x: 0.0,
             y: 0.0,
-            w: 792.0,
+            w: 780.0,
             h: doc_height,
         },
     );
@@ -1415,7 +1494,7 @@ unsafe fn refresh_devices_inner() {
         );
         msg1_void_i64(n, sel(c"setTag:"), i as i64);
         ids.push(p.id.clone());
-        line(parent, 0.0, y - 20.0, 792.0);
+        line(parent, 0.0, y - 20.0, 780.0);
     }
     *PEER_IDS.lock().unwrap_or_else(|e| e.into_inner()) = ids;
     let point: unsafe extern "C" fn(ID, SEL, CGPoint2) =
@@ -1425,7 +1504,7 @@ unsafe fn refresh_devices_inner() {
         sel(c"scrollPoint:"),
         CGPoint2 {
             x: 0.0,
-            y: (doc_height - 228.0).max(0.0),
+            y: (doc_height - 92.0).max(0.0),
         },
     );
 }
