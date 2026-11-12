@@ -26,7 +26,8 @@ pub fn apply_remote_prefs(json: &str) {
     preferences::apply_remote(json);
 }
 mod prefs;
-mod settings_new;
+mod settings_model;
+pub(crate) mod settings_new;
 mod settings_archive;
 pub mod setup;
 pub static UI_PREVIEW: AtomicBool = AtomicBool::new(false);
@@ -2961,6 +2962,9 @@ unsafe fn make_target() -> ID {
         (c"sdHotkey:", prefs::hotkey as *const () as usize),
         (c"sdNavigate:", prefs::navigate as *const () as usize),
         (c"sdNewNavigate:", settings_new::nav as *const () as usize),
+        (c"sdNewToggle:", settings_new::toggle as *const () as usize),
+        (c"sdNewApply:", settings_new::apply as *const () as usize),
+        (c"sdNewRevert:", settings_new::revert as *const () as usize),
         (c"sdLanguage:", prefs::change_language as *const () as usize),
         (c"sdRefinedNoop:", prefs::refined::noop as *const () as usize),
         (c"sdRefinedRole:", prefs::refined::role_changed as *const () as usize),

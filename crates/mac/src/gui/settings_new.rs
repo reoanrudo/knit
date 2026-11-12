@@ -14,6 +14,7 @@
 //! - 余白は 4pt グリッド
 use crate::*;
 use crate::gui::UI_PREVIEW;
+use super::localization;
 use super::{msg0_void, msg1_id_f64, msg1_void_i64, msg1_void_id, msg1_void_u8, msg1_void_sel, sel, NSRect};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -80,6 +81,13 @@ static NAV_BUTTONS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static NAV_ROWS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static NAV_ICONS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
 static NAV_LABELS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+/// 画面のスイッチ(OPT_ORDER と同じ並び)
+static SWITCHES: [AtomicUsize; 7] = [const { AtomicUsize::new(0) }; 7];
+/// フッターのボタン(押せる状態を切り替える)
+static APPLY_BUTTON: AtomicUsize = AtomicUsize::new(0);
+static REVERT_BUTTON: AtomicUsize = AtomicUsize::new(0);
+/// フッターの状態表示
+static STATUS: AtomicUsize = AtomicUsize::new(0);
 
 const PAGES: [&str; 4] = ["接続", "画面配置", "共有", "その他"];
 const ICONS: [&str; 4] = ["link", "display", "square.and.arrow.up", "gearshape"];
@@ -363,15 +371,86 @@ unsafe fn button_at(parent: ID, title: &str, x: f64, y: f64, kind: BtnKind) -> f
     w
 }
 
-unsafe fn switch(parent: ID, on: bool, x: f64, y: f64) -> ID {
+/// 画面のスイッチとモデルの項目の対応
+#[derive(Clone, Copy, PartialEq)]
+enum Opt {
+    ClipShare,
+    ShareFiles,
+    AudioMuted,
+    HistoryEnabled,
+    OpenReceiveFolder,
+    Startup,
+    UpdateCheck,
+}
+
+/// スイッチの並び(モデルと同じ順序)
+const OPT_ORDER: [Opt; 7] = [
+    Opt::ClipShare,
+    Opt::ShareFiles,
+    Opt::AudioMuted,
+    Opt::HistoryEnabled,
+    Opt::OpenReceiveFolder,
+    Opt::Startup,
+    Opt::UpdateCheck,
+];
+
+unsafe fn tag_of(v: ID, n: i64) {
+    let f: unsafe extern "C" fn(ID, SEL, i64) =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    f(v, sel(c"setTag:"), n);
+}
+
+unsafe fn switch(parent: ID, target: ID, on: bool, opt: Opt, x: f64, y: f64) -> ID {
     let s = msg0(objc_getClass(c"NSSwitch".as_ptr()), sel(c"new"));
     frame(s, NSRect { x, y, w: 44.0, h: 28.0 });
-    // 状態はビュー階層に入れてから設定する(先に設定すると、
-    // ウィンドウに載る前の状態が描画へ反映されないことがある)
     msg1_void_id(parent, sel(c"addSubview:"), s);
     msg1_void_i64(s, sel(c"setState:"), if on { 1 } else { 0 });
     msg1_void_i64(s, sel(c"setIntValue:"), if on { 1 } else { 0 });
+    let index = OPT_ORDER.iter().position(|o| *o == opt).unwrap_or(0);
+    SWITCHES[index].store(s as usize, Ordering::Relaxed);
+    msg1_void_id(s, sel(c"setTarget:"), target);
+    msg1_void_sel(s, sel(c"setAction:"), sel(c"sdNewToggle:"));
+    tag_of(s, index as i64);
     s
+}
+
+/// スイッチの現在状態をモデルへ書き戻す(クリック時の経路)
+fn read_switch(index: usize, on: bool) {
+    if index >= OPT_ORDER.len() {
+        return;
+    }
+    let opt = OPT_ORDER[index];
+    crate::gui::settings_model::update(|d| match opt {
+        Opt::ClipShare => d.clip_share = on,
+        Opt::ShareFiles => d.share_files = on,
+        Opt::AudioMuted => d.audio_muted = on,
+        Opt::HistoryEnabled => d.history_enabled = on,
+        Opt::OpenReceiveFolder => d.open_receive_folder = on,
+        Opt::Startup => d.startup = on,
+        Opt::UpdateCheck => d.update_check = on,
+    });
+}
+
+/// 画面のスイッチ表示をモデルへ合わせる
+fn sync_switches() {
+    let d = crate::gui::settings_model::draft();
+    let states = [
+        d.clip_share,
+        d.share_files,
+        d.audio_muted,
+        d.history_enabled,
+        d.open_receive_folder,
+        d.startup,
+        d.update_check,
+    ];
+    for (slot, on) in SWITCHES.iter().zip(states) {
+        let v = slot.load(Ordering::Relaxed) as ID;
+        if !v.is_null() {
+            unsafe {
+                msg1_void_i64(v, sel(c"setState:"), if on { 1 } else { 0 });
+            }
+        }
+    }
 }
 
 unsafe fn slider(parent: ID, value: f64, min: f64, max: f64, x: f64, y: f64, w: f64) -> ID {
@@ -571,12 +650,12 @@ fn center_y(y: f64, h: f64, control_h: f64) -> f64 {
 
 // ---------- 各ページ ----------
 
-unsafe fn build_connection(p: ID) {
+unsafe fn build_connection(p: ID, target: ID) {
     // 端末
     let y = PAGE_BODY;
     let rows = section(p, y, &[84.0], "端末", "この Mac と接続している端末、これから加える端末。");
     // 見出しの右に操作を置く
-    row_buttons_right_of_title(p, y, &[("端末を追加…", BtnKind::Primary), ("診断…", BtnKind::Secondary)]);
+    row_buttons_right_of_title(p, target, y, &[("端末を追加…", BtnKind::Primary, c"sdRegistration:"), ("診断…", BtnKind::Secondary, c"sdDiagnose:")]);
     let ry = rows[0];
     row_plate(p, ry, 84.0);
     icon_view(
@@ -624,20 +703,25 @@ unsafe fn build_connection(p: ID) {
 }
 
 /// カード見出しの右端にボタンを並べる(見出し行に置く操作)
-unsafe fn row_buttons_right_of_title(p: ID, card_y: f64, titles: &[(&str, BtnKind)]) {
+unsafe fn row_buttons_right_of_title(
+    p: ID,
+    target: ID,
+    card_y: f64,
+    buttons: &[(&str, BtnKind, &std::ffi::CStr)],
+) {
     let mut right = CARD_X + CARD_W - CARD_PAD;
-    for (title, kind) in titles.iter().rev() {
+    for (title, kind, action) in buttons.iter().rev() {
         let w = button_width(title);
         right -= w;
-        button(p, title, right, card_y + 11.0, *kind);
+        place_action(p, target, title, right, card_y + 11.0, *kind, action);
         right -= 8.0;
     }
 }
 
-unsafe fn build_displays(p: ID) {
+unsafe fn build_displays(p: ID, target: ID) {
     let y = PAGE_BODY;
     let rows = section(p, y, &[210.0], "画面の並び", "この Mac の画面と、相手の端末の位置。");
-    row_buttons_right_of_title(p, y, &[("画面を識別", BtnKind::Secondary), ("数値で指定…", BtnKind::Secondary)]);
+    row_buttons_right_of_title(p, target, y, &[("画面を識別", BtnKind::Secondary, c"sdRefinedIdentify:"), ("数値で指定…", BtnKind::Secondary, c"sdRefinedRanges:")]);
     let cy = rows[0];
     row_plate(p, cy, 210.0);
     let face = system_color(c"controlBackgroundColor");
@@ -675,37 +759,37 @@ unsafe fn build_displays(p: ID) {
     segmented(p, &["全域", "カスタム"], 0, row_right() - 180.0, center_y(rows[0], 44.0, 26.0), 180.0);
 }
 
-unsafe fn build_sharing(p: ID) {
+unsafe fn build_sharing(p: ID, target: ID) {
     let y = PAGE_BODY;
     let rows = section(p, y, &[52.0], "クリップボード共有", "コピーしたテキストや画像を、もう1台で貼り付けられるようにします。");
     row(p, rows[0], 52.0, "クリップボード共有を有効にする", "どちらかでコピーした内容を、もう一方で貼り付けられます。");
-    switch(p, true, row_right() - 44.0, center_y(rows[0], 52.0, 28.0));
+    switch(p, target, true, Opt::ClipShare, row_right() - 44.0, center_y(rows[0], 52.0, 28.0));
 
     let y = y + card_height(&[52.0]) + CARD_GAP;
     let rows = section(p, y, &[52.0], "ファイル転送", "端末の間でファイルを送受信します。");
     row(p, rows[0], 52.0, "受信フォルダ", "ほかの端末から届いたファイルはここに保存されます。");
     let w = button_width("変更…");
     text_field(p, "~/Downloads/Knit", "", row_right() - w - 8.0 - 210.0, center_y(rows[0], 52.0, 26.0), 210.0);
-    button(p, "変更…", row_right() - w, center_y(rows[0], 52.0, PILL_H), BtnKind::Secondary);
+    place_action(p, target, "変更…", row_right() - w, center_y(rows[0], 52.0, PILL_H), BtnKind::Secondary, c"sdRefinedFolder:");
 
     let y = y + card_height(&[52.0]) + CARD_GAP;
     let rows = section(p, y, &[46.0, 46.0], "音声", "ほかの端末の音声を、この Mac で再生します。");
     row(p, rows[0], 46.0, "音声の再生を許可する", "");
-    switch(p, true, row_right() - 44.0, center_y(rows[0], 46.0, 28.0));
+    switch(p, target, true, Opt::AudioMuted, row_right() - 44.0, center_y(rows[0], 46.0, 28.0));
     row(p, rows[1], 46.0, "出力先", "");
     popup(p, &["内蔵スピーカー", "AirPods Pro"], 0, row_right() - 260.0, center_y(rows[1], 46.0, 26.0), 260.0);
 
     let y = y + card_height(&[46.0, 46.0]) + CARD_GAP;
     let rows = section(p, y, &[44.0], "クリップボード履歴", "最近コピーした内容を残し、あとから復元できるようにします。");
     row(p, rows[0], 44.0, "履歴に残す", "");
-    switch(p, true, row_right() - 44.0, center_y(rows[0], 44.0, 28.0));
+    switch(p, target, true, Opt::HistoryEnabled, row_right() - 44.0, center_y(rows[0], 44.0, 28.0));
 }
 
-unsafe fn build_general(p: ID) {
+unsafe fn build_general(p: ID, target: ID) {
     let y = PAGE_BODY;
     let rows = section(p, y, &[52.0], "ログイン時に開く", "この Mac にログインしたとき、Knit を自動で起動します。");
     row(p, rows[0], 52.0, "ログイン時に開く", "バックグラウンドで自動的に起動します。");
-    switch(p, true, row_right() - 44.0, center_y(rows[0], 52.0, 28.0));
+    switch(p, target, true, Opt::Startup, row_right() - 44.0, center_y(rows[0], 52.0, 28.0));
 
     let y = y + card_height(&[52.0]) + CARD_GAP;
     let rows = section(p, y, &[44.0], "言語", "Knit の画面で使う言語を選びます。");
@@ -725,15 +809,15 @@ unsafe fn build_general(p: ID) {
     let rows = section(p, y, &[44.0], "メンテナンス", "設定の控え、ログ、初期化。");
     row(p, rows[0], 44.0, "", "");
     let mut x = CARD_X + CARD_PAD + 12.0;
-    for (title, kind) in [
-        ("設定を書き出す…", BtnKind::Secondary),
-        ("設定を読み込む…", BtnKind::Secondary),
-        ("ログ", BtnKind::Secondary),
-        ("登録を初期化…", BtnKind::Destructive),
-        ("設定を初期化…", BtnKind::Destructive),
+    for (title, kind, action) in [
+        ("設定を書き出す…", BtnKind::Secondary, c"sdRefinedExport:"),
+        ("設定を読み込む…", BtnKind::Secondary, c"sdRefinedImport:"),
+        ("ログ", BtnKind::Secondary, c"sdOpenLog:"),
+        ("登録を初期化…", BtnKind::Destructive, c"sdResetRegistration:"),
+        ("設定を初期化…", BtnKind::Destructive, c"sdResetSettings:"),
     ] {
         let w = button_width(title);
-        button(p, title, x, center_y(rows[0], 44.0, PILL_H), kind);
+        place_action(p, target, title, x, center_y(rows[0], 44.0, PILL_H), kind, action);
         x += w + 8.0;
     }
 }
@@ -751,6 +835,167 @@ fn page_height(page: usize) -> f64 {
         y += card_height(rows) + CARD_GAP;
     }
     y - CARD_GAP + PAGE_BOTTOM
+}
+// ---------- 操作のハンドラ(モデルへの配線) ----------
+
+/// スイッチが切り替わった。画面の値をそのままモデルへ写す
+pub(in crate::gui) unsafe extern "C" fn toggle(_s: ID, _c: SEL, sender: ID) {
+    let index = crate::msg0_isize(sender, sel(c"tag")).max(0) as usize;
+    let on = crate::msg0_isize(sender, sel(c"state")) == 1;
+    read_switch(index, on);
+    update_footer();
+}
+
+/// 「適用」。保存先へ書き込み、結果をフッターに出す
+pub(in crate::gui) unsafe extern "C" fn apply(_s: ID, _c: SEL, _sender: ID) {
+    match crate::gui::settings_model::apply() {
+        Ok(values) => {
+            if values.language != localization::language() {
+                localization::set_language(values.language);
+            }
+            sync_switches();
+            disable_footer();
+            set_status("保存しました");
+        }
+        Err(e) => {
+            sync_switches();
+            update_footer();
+            set_status(&format!("保存できませんでした: {e}"));
+        }
+    }
+}
+
+/// 「元に戻す」。下書きを捨てて保存済みの値に戻す
+pub(in crate::gui) unsafe extern "C" fn revert(_s: ID, _c: SEL, _sender: ID) {
+    crate::gui::settings_model::discard();
+    sync_switches();
+    disable_footer();
+    set_status("");
+}
+
+unsafe fn set_status(text: &str) {
+    let v = STATUS.load(Ordering::Relaxed) as ID;
+    if !v.is_null() {
+        msg1_void_id(v, sel(c"setStringValue:"), nsstring(text));
+    }
+}
+
+/// 未保存の変更に応じてフッターのボタンを有効/無効にする
+unsafe fn update_footer() {
+    let dirty = crate::gui::settings_model::is_dirty();
+    for slot in [&APPLY_BUTTON, &REVERT_BUTTON] {
+        let b = slot.load(Ordering::Relaxed) as ID;
+        if !b.is_null() {
+            msg1_void_u8(b, sel(c"setEnabled:"), dirty as u8);
+        }
+    }
+}
+
+/// 保存直後は未保存の変更が無いのでフッターを無効に戻す
+unsafe fn disable_footer() {
+    for slot in [&APPLY_BUTTON, &REVERT_BUTTON] {
+        let b = slot.load(Ordering::Relaxed) as ID;
+        if !b.is_null() {
+            msg1_void_u8(b, sel(c"setEnabled:"), 0);
+        }
+    }
+}
+
+/// 幅を測ってアクション付きボタンを置く(最後に追加したビューを掴む)
+unsafe fn place_action(
+    parent: ID,
+    target: ID,
+    title: &str,
+    x: f64,
+    y: f64,
+    kind: BtnKind,
+    action: &std::ffi::CStr,
+) -> ID {
+    let (_, _w) = button(parent, title, x, y, kind);
+    let subviews = msg0(parent, sel(c"subviews"));
+    let count = crate::msg0_isize(subviews, sel(c"count"));
+    if count <= 0 {
+        return std::ptr::null_mut();
+    }
+    let f: unsafe extern "C" fn(ID, SEL, isize) -> ID =
+        std::mem::transmute(crate::objc_msgSend as *const () as usize);
+    let b = f(subviews, sel(c"objectAtIndex:"), count - 1);
+    msg1_void_id(b, sel(c"setTarget:"), target);
+    msg1_void_sel(b, sel(c"setAction:"), sel(action));
+    b
+}
+// ---------- 自己テスト(配線を GUI 操作なしで確かめる) ----------
+
+/// `--settings-new --selftest` で実行する。クリックに頼らず、
+/// スイッチ操作と同じ経路を通して配線と安全柵を検証する。
+pub(crate) unsafe fn selftest() -> bool {
+    let mut ok = true;
+
+    // 1. 初期状態は未編集
+    crate::gui::settings_model::discard();
+    report(&mut ok, "初期状態は未編集", !crate::gui::settings_model::is_dirty());
+
+    // 2. スイッチ操作と同じ経路で値が変わる
+    let before = crate::gui::settings_model::draft();
+    read_switch(0, !before.clip_share);
+    report(&mut ok, "スイッチ操作で下書きが変わる", crate::gui::settings_model::is_dirty());
+    report(
+        &mut ok,
+        "変更がモデルへ届く",
+        crate::gui::settings_model::draft().clip_share != before.clip_share,
+    );
+
+    // 3. 元に戻すと値も未編集状態も戻る
+    revert(std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut());
+    report(&mut ok, "元に戻すと未編集へ戻る", !crate::gui::settings_model::is_dirty());
+    report(
+        &mut ok,
+        "元に戻すと値も戻る",
+        crate::gui::settings_model::draft().clip_share == before.clip_share,
+    );
+
+    // 4. 対応表とスイッチの数が一致している
+    report(&mut ok, "スイッチの対応表が7件", OPT_ORDER.len() == SWITCHES.len());
+
+    // 5. プレビュー中は実ファイルを書き換えない
+    let dir = knit_common::envutil::config_dir();
+    let prefs_path = dir.as_ref().map(|d| d.join("preferences.json"));
+    let desktop_path = dir.as_ref().map(|d| d.join("desktop-settings.json"));
+    let stamp = |p: &Option<std::path::PathBuf>| {
+        p.as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+    };
+    let prefs_before = stamp(&prefs_path);
+    let desktop_before = stamp(&desktop_path);
+    read_switch(0, !before.clip_share);
+    report(&mut ok, "プレビュー中の適用は成功を返す", crate::gui::settings_model::apply().is_ok());
+    report(
+        &mut ok,
+        "プレビュー中は下書きを破棄する",
+        !crate::gui::settings_model::is_dirty(),
+    );
+    report(
+        &mut ok,
+        "プレビュー中は設定ファイルを書き換えない",
+        stamp(&prefs_path) == prefs_before && stamp(&desktop_path) == desktop_before,
+    );
+    let restored = crate::gui::settings_model::discard();
+
+    println!(
+        "[selftest] {} (clip_share: {} -> {})",
+        if ok { "ALL PASS" } else { "FAILED" },
+        before.clip_share,
+        restored.clip_share
+    );
+    ok
+}
+
+fn report(ok: &mut bool, name: &str, passed: bool) {
+    println!("[selftest] {} {}", if passed { "PASS" } else { "FAIL" }, name);
+    if !passed {
+        *ok = false;
+    }
 }
 // ---------- ウィンドウ ----------
 
@@ -983,9 +1228,14 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
     let revert_w = button_width("元に戻す");
     let mut fx = W - GUTTER - apply_w;
     let by = (FOOTER_H - PILL_H) / 2.0;
-    button_at(cv, "適用", fx, by, BtnKind::Primary);
+    let apply_button = place_action(cv, target, "適用", fx, by, BtnKind::Primary, c"sdNewApply:");
+    APPLY_BUTTON.store(apply_button as usize, Ordering::Relaxed);
     fx -= revert_w + 8.0;
-    button_at(cv, "元に戻す", fx, by, BtnKind::Secondary);
+    let revert_button =
+        place_action(cv, target, "元に戻す", fx, by, BtnKind::Secondary, c"sdNewRevert:");
+    REVERT_BUTTON.store(revert_button as usize, Ordering::Relaxed);
+    let status = label(cv, "", PAGE_X + GUTTER, by + 9.0, 300.0, F_NOTE, false, true);
+    STATUS.store(status as usize, Ordering::Relaxed);
 
     let current = page_arg();
     for i in 0..4 {
@@ -995,13 +1245,17 @@ pub(in crate::gui) unsafe fn build(target: ID) -> ID {
         label(doc, PAGES[i], PAGE_TEXT_X, PAGE_TOP, 560.0, F_TITLE, true, false);
         label(doc, SUBTITLES[i], PAGE_TEXT_X, PAGE_HEAD_SUB, 700.0, F_SUBTITLE, false, true);
         match i {
-            0 => build_connection(doc),
-            1 => build_displays(doc),
-            2 => build_sharing(doc),
-            _ => build_general(doc),
+            0 => build_connection(doc, target),
+            1 => build_displays(doc, target),
+            2 => build_sharing(doc, target),
+            _ => build_general(doc, target),
         }
         msg1_void_u8(scroll, sel(c"setHidden:"), (i != current) as u8);
     }
+
+    // 画面の状態を保存済みの値へ合わせる(既定値の直書きを避ける)
+    sync_switches();
+    disable_footer();
 
     if UI_PREVIEW.load(Ordering::Relaxed) {
         // 非アクティブのままだと NSVisualEffectView が灰色で描かれ、デザインと

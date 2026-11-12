@@ -595,7 +595,7 @@ pub fn send_msg_reported(msg: &Msg) -> bool {
 }
 /// 表示用のリリースバージョン(設定ウィンドウ等)
 pub const VERSION_STR: &str = env!("CARGO_PKG_VERSION");
-const BUILD_ID: &str = "build-20261016-132547-200c41b";
+const BUILD_ID: &str = "build-20261028-160758-467725a";
 
 /// ロックを取得できない場合は起動しない。保持する File は main の寿命まで生きる。
 fn acquire_instance_lock() -> std::io::Result<std::fs::File> {
@@ -941,6 +941,12 @@ fn main() {
     }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
+        // 設定画面の配線を GUI 操作なしで確かめる(--settings-new --selftest)
+        #[cfg(debug_assertions)]
+        if args.iter().any(|a| a == "--selftest") {
+            let ok = unsafe { gui::settings_new::selftest() };
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         // プレビューでも「操作する端末」が複数台のときの見た目を確認できるように、
         // ダミーの端末を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
         PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
