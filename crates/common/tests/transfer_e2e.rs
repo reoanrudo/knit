@@ -197,3 +197,90 @@ fn explicit_cancel_discards_the_partial_over_real_secure_link() {
     assert!(!dst.join("big.bin").exists(), "中止した実体は公開しない");
     STOP.store(true, Ordering::Relaxed);
 }
+
+/// 逆方向構成の本質的な経路: 待受側が受理した 1 つの bulk 接続を双方向に**同時に**
+/// 使っても両方向の転送が完了する。接続側は 10 秒毎に keepalive を送るため、
+/// 待受側の応答(reply_keepalive)が送信中のロック待ちで受信ループを止める旧回帰
+/// (逆方向のデータが吸われなくなり相手の書き込みタイムアウトで転送が死ぬ)が
+/// 再発するとこの試験の完了が止まる。実アプリと同じ connect_loop + link.send で
+/// 駆動し、60 秒の完了期限で回帰を壁にする
+#[test]
+fn one_link_simultaneous_bidirectional_transfer_completes_both_ways() {
+    let _serial = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let temp_a = Temp::new("simul-a");
+    let temp_b = Temp::new("simul-b");
+    let dst_a = temp_a.0.join("received");
+    let dst_b = temp_b.0.join("received");
+    let ep_a = endpoint(&dst_a); // 接続しに行く側(逆方向の Mac=クライアント役相当)
+    let ep_b = endpoint(&dst_b); // 待受側(逆方向の Windows=サーバ役相当)
+    let port_b = free_port();
+    start_server(ep_b, port_b);
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port_b));
+    std::thread::spawn(move || {
+        bulk::connect_loop(ep_a, || Some(addr), || true, || STOP.load(Ordering::Relaxed))
+    });
+    wait_until(
+        "受理した 1 接続で双方の link が確立",
+        || ep_a.link.is_up() && ep_b.link.is_up(),
+    );
+
+    // 8MiB(32 チャンク)。進捗を 500ms/chunk で引き伸ばし計約 16 秒: 接続側の
+    // keepalive(10 秒周期)が相手側の送信中に確実に発生する窓を作る
+    let data_a: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 251) as u8 ^ 0x5a).collect();
+    let data_b: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 249) as u8 ^ 0xa5).collect();
+    let src_a = temp_a.0.join("a-to-b.bin");
+    let src_b = temp_b.0.join("b-to-a.bin");
+    std::fs::write(&src_a, &data_a).unwrap();
+    std::fs::write(&src_b, &data_b).unwrap();
+
+    let slow_send = |ep: &'static bulk::Endpoint, src: std::path::PathBuf| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ep.link.send(|w| {
+                bulk::send_files_with_progress(w, std::slice::from_ref(&src), false, |_, _| {
+                    std::thread::sleep(Duration::from_millis(500));
+                })
+            }));
+        });
+        rx
+    };
+    let rx_ab = slow_send(ep_a, src_a.clone());
+    let rx_ba = slow_send(ep_b, src_b.clone());
+
+    let report_ab = rx_ab
+        .recv_timeout(Duration::from_secs(60))
+        .expect("A→B が 60 秒以内に完了しない(逆方向の停滞回帰の疑い)")
+        .expect("A→B の送信が成功する");
+    let report_ba = rx_ba
+        .recv_timeout(Duration::from_secs(60))
+        .expect("B→A が 60 秒以内に完了しない(逆方向の停滞回帰の疑い)")
+        .expect("B→A の送信が成功する");
+    assert_eq!(report_ab.sent, 1);
+    assert_eq!(report_ba.sent, 1);
+
+    wait_until(
+        "A→B の実体が公開される",
+        || {
+            std::fs::metadata(dst_b.join("a-to-b.bin"))
+                .map(|m| m.len() == data_a.len() as u64)
+                .unwrap_or(false)
+        },
+    );
+    wait_until(
+        "B→A の実体が公開される",
+        || {
+            std::fs::metadata(dst_a.join("b-to-a.bin"))
+                .map(|m| m.len() == data_b.len() as u64)
+                .unwrap_or(false)
+        },
+    );
+    assert_eq!(std::fs::read(dst_b.join("a-to-b.bin")).unwrap(), data_a, "A→B の内容");
+    assert_eq!(std::fs::read(dst_a.join("b-to-a.bin")).unwrap(), data_b, "B→A の内容");
+    assert_eq!(partial_count(&dst_a), 0, "A 側に部分ファイルが残らない");
+    assert_eq!(partial_count(&dst_b), 0, "B 側に部分ファイルが残らない");
+    assert!(
+        ep_a.link.is_up() && ep_b.link.is_up(),
+        "同時双方向転送の後も 1 接続の経路は生きている"
+    );
+    STOP.store(true, Ordering::Relaxed);
+}

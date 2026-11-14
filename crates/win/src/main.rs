@@ -499,18 +499,16 @@ fn main() {
     updater::start_background();
     dragdrop::edge::start();
 
-    // 音声転送(Windows→Mac)。クライアントモードの接続先へ送る
-    // (サーバモードは KNIT_AUDIO_HOST で明示指定した時のみ)
+    // 音声転送(Windows→Mac)。既定は本線の接続先(複数経路のうち繋がったもの)へ
+    // 追従する。サーバモード(逆方向)でも受理した相手(Mac)のアドレスへ追従する
+    // ため KNIT_AUDIO_HOST の指定は不要(接続先を明示上書きしたいときの口として残す)
     if knit_common::envutil::get("KNIT_AUDIO").as_deref() != Some("0") && knit_common::share::allow_audio() {
-        // 既定は本線の接続先(複数経路のうち繋がったもの)へ追従する
-        match (knit_common::envutil::get("KNIT_AUDIO_HOST"), role_server) {
-            // 音声は本線ポートからの差分 +1(24900→24901)
-            (Some(h), _) => audio::start(Some(h), token.clone(), port + 1),
-            (None, false) => audio::start(None, token.clone(), port + 1),
-            (None, true) => {
-                println!("[audio] サーバモードで音声先未指定のため無効(KNIT_AUDIO_HOST で指定可)")
-            }
-        }
+        // 音声は本線ポートからの差分 +1(24900→24901)
+        audio::start(
+            knit_common::envutil::get("KNIT_AUDIO_HOST"),
+            token.clone(),
+            port + 1,
+        );
     }
 
     let bulk_ep: &'static bulk::Endpoint = BULK.get_or_init(|| bulk::Endpoint {
