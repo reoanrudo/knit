@@ -58,11 +58,12 @@ Windows のコード署名(SmartScreen 対応)には別途証明書の購入と 
 
 ## 4. Windows へのインストール
 
-1. `win-dist/` 一式(knit-win.exe・app.ico・install.bat・run_knit.bat・run_knit.vbs・.env)を
-   `C:\Users\<user>\knit` へコピー
+1. `win-dist/` 一式(knit-win.exe・WebView2Loader.dll・app.ico・install.bat・run_knit.bat・run_knit.vbs・.env)を
+   `C:\Users\<user>\knit` へコピー(WebView2Loader.dll は設定画面の表示に必要)
 2. install.bat を**管理者として実行**(スタートアップ登録のため。以降の起動に管理者権限は不要)
-3. **タスクトレイ(通知領域)にアイコンが常駐する**。左クリックでステータスウィンドウ
-   (状態/ビルド/音声の表示と「ログを開く」「音声 ON/OFF」「終了」)、右クリックでメニュー
+3. **タスクトレイ(通知領域)にアイコンが常駐する**。右クリックの「設定を開く…」で
+   設定画面(Mac と同じ `ui/app.html` を WebView2 で表示)が開く。表示には Microsoft Edge
+   WebView2 ランタイムを使う(Windows 11 と更新済みの Windows 10 には同梱)
 
 - ログオン時に自動起動(schtasks `knit` / ONLOGON)
 - **自動復帰ウォッチ**(schtasks `knit_watch` / 毎分): 何らかの理由で落ちても
