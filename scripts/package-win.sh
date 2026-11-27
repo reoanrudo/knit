@@ -13,6 +13,12 @@ echo '[package-win] building...'
 cargo build --locked --release -p knit-win --target x86_64-pc-windows-gnu
 mkdir -p "$OUT"
 cp target/x86_64-pc-windows-gnu/release/knit-win.exe "$OUT/"
+# 設定画面は WebView2 で ui/app.html を表示する。exe は WebView2Loader.dll を
+# 動的リンクするため、同じフォルダへ必ず同梱する(無いと起動時に読み込みで止まる)。
+# 実体は webview2-com-sys のビルドが OUT_DIR へ複製したものを使う(版ずれを避ける)
+LOADER=$(find target/x86_64-pc-windows-gnu/release/build -path '*webview2-com-sys*/out/x64/WebView2Loader.dll' 2>/dev/null | head -1)
+[ -n "$LOADER" ] || { echo '[package-win] WebView2Loader.dll が見つかりません' >&2; exit 1; }
+cp "$LOADER" "$OUT/WebView2Loader.dll"
 cp win-dist/install.bat win-dist/uninstall.bat win-dist/run_knit.bat win-dist/run_knit.vbs win-dist/README-win.txt win-dist/app.ico "$OUT/"
 cp LICENSE "$OUT/LICENSE.txt"
 python3 - "$OUT" "$VER" <<'PY'

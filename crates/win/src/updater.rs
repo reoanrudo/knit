@@ -44,6 +44,18 @@ fn set_state(s: State) {
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = s;
 }
 
+/// 設定画面(WebView2)向けの更新状態。
+/// (状態, 新しい版, 理由, 自動更新が使えるか) を返す
+pub(crate) fn ui_state() -> (&'static str, String, String, bool) {
+    let enabled = !trusted_keys().is_empty();
+    match state() {
+        State::Idle => ("idle", String::new(), String::new(), enabled),
+        State::Checking => ("checking", String::new(), String::new(), enabled),
+        State::Available(version, _) => ("available", version, String::new(), enabled),
+        State::Installing => ("installing", String::new(), String::new(), enabled),
+    }
+}
+
 /// トレイメニューの表示。状態に応じて変わる
 pub fn menu_title() -> String {
     match state() {

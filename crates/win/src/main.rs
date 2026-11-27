@@ -23,6 +23,8 @@ mod session;
 mod state;
 mod tray;
 mod updater;
+// 設定画面(WebView2)。ui/app.html を表示する
+mod webui;
 mod xfer;
 
 use knit_common::bulk;

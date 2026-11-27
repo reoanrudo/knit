@@ -13,6 +13,11 @@ pub(crate) use preferences::{
 };
 pub mod setup;
 static UI_PREVIEW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// プレビュー起動かどうかの読み取り(状態を変えずに参照する)
+pub(crate) fn preview_mode() -> bool {
+    UI_PREVIEW.load(Ordering::Relaxed)
+}
+/// プレビュー起動(この関数自体がトレイのメッセージループへ入る)
 pub fn preview() {
     UI_PREVIEW.store(true, Ordering::Relaxed);
     unsafe {
@@ -225,21 +230,21 @@ unsafe extern "system" {
 }
 
 const MENU_EXTEND: u32 = 1091;
-const MENU_QUIT: u32 = 1001;
+pub(crate) const MENU_QUIT: u32 = 1001;
 const MENU_STATUS: u32 = 1002;
 const MENU_AUDIO: u32 = 1003;
-const MENU_OPENLOG: u32 = 1004;
-const MENU_RESTART: u32 = 1005;
+pub(crate) const MENU_OPENLOG: u32 = 1004;
+pub(crate) const MENU_RESTART: u32 = 1005;
 const MENU_SAVEHOST: u32 = 1006;
 const MENU_BACKMAC: u32 = 1007;
-const MENU_OPENFOLDER: u32 = 1008;
+pub(crate) const MENU_OPENFOLDER: u32 = 1008;
 const MENU_DIAGNOSE: u32 = 1017;
 const MENU_OPENSETDIR: u32 = 1018;
 /// 「その他」ページの「すべての設定を初期化…」(Mac 側の同名ボタンと対)
-const MENU_RESETSETTINGS: u32 = 1019;
+pub(crate) const MENU_RESETSETTINGS: u32 = 1019;
 /// 「その他」ページの「すべての登録を初期化…」(Mac 側の同名ボタンと対。
 /// 接続キーを削除して初回登録へ戻す)
-const MENU_RESETREG: u32 = 1021;
+pub(crate) const MENU_RESETREG: u32 = 1021;
 /// 「その他」ページの「ロック解除の連動」トグル(チェックボックス)
 const MENU_UNLOCK_SYNC: u32 = 1022;
 /// 「その他」ページの「ロック解除の連動」のパスワード保存ボタン
@@ -360,7 +365,7 @@ fn set_text(h: usize, s: &str) {
 /// 未登録の間は呼び出しのたびに見に行くが、未登録ならファイル自体が無く
 /// すぐ返るため負荷にならない
 static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-fn registered() -> bool {
+pub(crate) fn registered() -> bool {
     if REGISTERED.load(Ordering::Relaxed) {
         return true;
     }
@@ -497,6 +502,7 @@ unsafe extern "system" fn tray_wndproc(
         WM_TIMER => {
             update_tip();
             update_labels();
+            crate::webui::tick();
             0
         }
         WM_WTSSESSION_CHANGE2 => {
@@ -610,7 +616,7 @@ pub(crate) fn apply_peer_role(peer_is_host: bool) {
 /// 自分を終了して、すぐ起こし直す。終了だけだと毎分の自動復帰タスクが起こすまで
 /// 最長 1 分アプリが消えたままになる。古いプロセスが抜ける(単一起動の排他が空く)のを
 /// 少し待ってから、導入済みの起動タスク(knit_run)を走らせる
-fn restart_self() -> ! {
+pub(crate) fn restart_self() -> ! {
     use std::os::windows::process::CommandExt;
     // 自発的切替と相手からの切替要求の両方から呼ばれるため、二重進入で
     // 起動タスクを二重発火させないよう1回だけ通す
@@ -625,6 +631,152 @@ fn restart_self() -> ! {
         .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
         .spawn();
     std::process::exit(0);
+}
+
+
+// ---------- 設定画面(WebView2)から使う入口 ----------
+
+/// メニュー項目と同じ処理を、メニューを開かずに実行する(設定画面のボタン用)
+pub(crate) fn post_menu(id: u32) {
+    unsafe {
+        let hwnd = TRAY_HWND.load(Ordering::Relaxed) as HWND;
+        if !hwnd.is_null() {
+            let _ = PostMessageW(hwnd, WM_COMMAND, id as usize, 0);
+        }
+    }
+}
+
+/// 表示用: いま使っている接続先(環境変数 KNIT_HOST があればそちらが優先)
+pub(crate) fn host_text() -> String {
+    if let Some(v) = knit_common::envutil::get("KNIT_HOST") {
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    HOST_NOW
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 役割カードの注記(設定画面の Connection ページ)
+pub(crate) fn role_note() -> String {
+    settings_ui::role_note_text()
+}
+
+/// 接続の経路ラベル(設定画面の Connection ページ)
+pub(crate) fn route_label() -> Option<&'static str> {
+    settings_ui::route_label()
+}
+
+/// 設定(preferences.json)の保存。失敗は画面のトーストへ返す
+pub(crate) fn save_preferences() -> Result<String, String> {
+    preferences::save().map_err(|e| {
+        eprintln!("[prefs] save failed: {e}");
+        format!("設定を保存できません: {e}")
+    })?;
+    unsafe { update_labels() };
+    Ok(String::new())
+}
+
+/// ロック解除のパスワードを DPAPI で保護して保存する(空欄は消去)
+pub(crate) fn set_unlock_secret(text: &str) -> Result<String, String> {
+    preferences::protect_and_set_unlock_secret(text)
+        .map_err(|e| format!("パスワードを保存できません: {e}"))?;
+    preferences::save().map_err(|e| format!("パスワードは保護しましたが保存できません: {e}"))?;
+    unsafe { update_labels() };
+    Ok(if text.is_empty() {
+        "パスワードを消去しました(次回から Enter のみ送ります)".into()
+    } else {
+        "パスワードを保存しました(このPC内に暗号化保存)".into()
+    })
+}
+
+/// 接続先を .env へ保存して再起動する。空欄は指定を消して自動発見へ戻す。
+/// 戻った時点で再起動しているため、成功時のメッセージが画面へ届くことはない
+pub(crate) fn save_host(host: &str) -> Result<String, String> {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return Ok("プレビューのため実行しません".to_string());
+    }
+    if let Err(bad) = knit_common::connect::validate_host_input(host) {
+        return Err(format!(
+            "192.168.1.23の形式で入力してください({bad}はIPアドレスとして読めません)"
+        ));
+    }
+    if let Err(e) = save_host_to_env(host) {
+        eprintln!("[prefs] host save failed: {e}");
+        return Err("アプリのフォルダへの書込み権限を確認してください".into());
+    }
+    let mut message = if host.is_empty() {
+        "接続先の指定を外しました(自動発見へ戻します)。Knitを再起動します".to_string()
+    } else {
+        format!("接続先を {host} に保存しました。Knitを再起動します")
+    };
+    if std::env::var("KNIT_HOST").map(|v| !v.is_empty()).unwrap_or(false) {
+        message.push_str("。なお環境変数 KNIT_HOST が設定されているため、そちらが優先されます");
+    }
+    notify("Knit", &message);
+    crate::audio::speaker_disconnect();
+    crate::release_all_input();
+    restart_self()
+}
+
+/// 役割(このPCがホストか)を切り替えて再起動する。
+/// 相手にも反対の役割を送り、適用の確認(RoleAck)を待ってから再起動する
+/// (双方が同じ役割のまま沈黙するのを防ぐ)
+pub(crate) fn switch_role(host: bool) {
+    if UI_PREVIEW.load(Ordering::Relaxed) {
+        return;
+    }
+    if role_env_fixed() {
+        notify(
+            "Knit",
+            "環境変数 KNIT_ROLE=server で役割を固定しています。切り替えるには .env の KNIT_ROLE の指定を外して再起動してください",
+        );
+        unsafe { update_labels() };
+        return;
+    }
+    if host == HOST_MODE.load(Ordering::Relaxed) {
+        unsafe { update_labels() };
+        return;
+    }
+    preferences::set_host_mode(host);
+    if let Err(e) = preferences::save() {
+        eprintln!("[prefs] save failed: {e}");
+    }
+    notify(
+        "Knit",
+        if host {
+            "このPCをホスト(待受側)に切り替えました。Knitを再起動します"
+        } else {
+            "このPCを接続側に戻しました。Knitを再起動します"
+        },
+    );
+    // この処理はウィンドウプロシージャ(メッセージループ)から呼ばれるため、
+    // 最大2秒の待ちをここで行うと描画・トレイ操作が固まる。別スレッドで待つ
+    ROLE_ACK.store(false, Ordering::Relaxed);
+    settings_ui::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
+    crate::state::send_main_msg(&knit_common::proto::Msg::Role { host });
+    crate::audio::speaker_disconnect();
+    crate::release_all_input();
+    std::thread::spawn(|| {
+        if wait_role_ack(std::time::Duration::from_millis(2000)) {
+            println!("[role] 相手の適用を確認しました");
+            settings_ui::ROLE_NOTE_KIND.store(3, Ordering::Relaxed);
+        } else {
+            println!("[role] 相手の適用確認が取れないため時間経過で再起動します");
+            settings_ui::ROLE_NOTE_KIND.store(4, Ordering::Relaxed);
+        }
+        restart_self();
+    });
+}
+
+/// 通知してから再起動する(設定画面の「つなぎ直す」)
+pub(crate) fn restart(message: &str) -> ! {
+    notify("Knit", message);
+    crate::audio::speaker_disconnect();
+    crate::release_all_input();
+    restart_self()
 }
 
 unsafe fn handle_command(id: u32) {
@@ -934,62 +1086,8 @@ unsafe fn handle_command(id: u32) {
             );
         }
         MENU_SAVEHOST => {
-            // サーバー(Mac)アドレスを .env へ保存して再起動(自動復帰が起こす)。
-            // 空欄は KNIT_HOST 行を消して LAN 自動発見へ戻す(Mac 側と同じ挙動)
-            let hwnd = EDIT_HOST.load(Ordering::Relaxed) as HWND;
-            if !hwnd.is_null() {
-                extern "system" {
-                    fn GetWindowTextW(hwnd: HWND, buf: *mut u16, max: i32) -> i32;
-                    fn GetWindowTextLengthW(hwnd: HWND) -> i32;
-                }
-                let len = GetWindowTextLengthW(hwnd);
-                let mut buf = vec![0u16; len as usize + 1];
-                GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
-                let text = String::from_utf16_lossy(&buf[..len.max(0) as usize]);
-                let host = text.trim().to_string();
-                if UI_PREVIEW.load(Ordering::Relaxed) {
-                    return;
-                }
-                // 形式の確認(Mac 側 imp_save_host と同じ基準の共通関数):
-                // 各要素が IP アドレスとして書けているか。不正なら通知して保存しない
-                if let Err(bad) = knit_common::connect::validate_host_input(&host) {
-                    eprintln!("[prefs] host save rejected: {bad}");
-                    notify(
-                        "接続先を保存できません",
-                        &format!("192.168.1.23の形式で入力してください({bad}はIPアドレスとして読めません)"),
-                    );
-                    return;
-                }
-                if let Err(e) = save_host_to_env(&host) {
-                    eprintln!("[prefs] host save failed: {e}");
-                    notify(
-                        "接続先を保存できません",
-                        "アプリのフォルダへの書込み権限を確認してください。",
-                    );
-                    return;
-                }
-                // 保存先(.env)より優先される指定(起動時の環境変数)があるときは
-                // 保存が効かないため、上書き方法を併せて案内する(Mac 側と同じ)
-                let mut message = if host.is_empty() {
-                    "接続先の指定を外しました(自動発見へ戻します)。Knitを再起動します".to_string()
-                } else {
-                    format!("接続先を {host} に保存しました。Knitを再起動します")
-                };
-                if std::env::var("KNIT_HOST").map(|v| !v.is_empty()).unwrap_or(false) {
-                    message.push_str("。なお環境変数 KNIT_HOST が設定されているため、そちらが優先されます");
-                }
-                eprintln!(
-                    "[tray] サーバーを {} へ変更し再起動します",
-                    if host.is_empty() { "(自動発見)" } else { host.as_str() }
-                );
-                notify("Knit", &message);
-                // 接続中ミュートの状態を復帰させてから終わる(ミュート恒久化の防止)。
-                // 終了だけだと毎分の自動復帰タスクが起こすまで最長 1 分消えたままに
-                // なるため、restart_self で即座に起こし直す(MENU_RESTART と同じ)
-                crate::audio::speaker_disconnect();
-                crate::release_all_input();
-                restart_self();
-            }
+            // 保存は設定画面(WebView2)の入力欄から save_host を呼ぶ経路に一本化した。
+            // ここへ来るのはメニュー相当の ID を直接送られた場合だけなので何もしない
         }
         MENU_MAC_CLIP | MENU_MAC_FILES | MENU_MAC_HISTORY | MENU_MAC_AUDIO | MENU_MAC_SPK => {
             let key = match id {
@@ -1033,64 +1131,12 @@ unsafe fn handle_command(id: u32) {
             update_labels();
         }
         MENU_HOSTMODE | MENU_ROLE_CLIENT | MENU_ROLE_HOST => {
-            // 接続の方向は起動時に決まるため、切り替えたら再起動して即反映する
-            if UI_PREVIEW.load(Ordering::Relaxed) {
-                return;
-            }
-            // 環境変数 KNIT_ROLE=server で固定中は GUI から切り替えられない
-            if role_env_fixed() {
-                notify(
-                    "Knit",
-                    "環境変数 KNIT_ROLE=server で役割を固定しています。切り替えるには .env の KNIT_ROLE の指定を外して再起動してください",
-                );
-                update_labels();
-                return;
-            }
-            let want = match id {
+            let host = match id {
                 MENU_ROLE_HOST => true,
                 MENU_ROLE_CLIENT => false,
                 _ => !HOST_MODE.load(Ordering::Relaxed),
             };
-            if want == HOST_MODE.load(Ordering::Relaxed) {
-                update_labels(); // すでにその役割。選択表示だけ合わせ直す
-                return;
-            }
-            preferences::set_host_mode(want);
-            let next = want;
-            if let Err(e) = preferences::save() {
-                eprintln!("[prefs] save failed: {e}");
-            }
-            notify(
-                "Knit",
-                if next {
-                    "このPCをホスト(待受側)に切り替えました。Knitを再起動します"
-                } else {
-                    "このPCを接続側に戻しました。Knitを再起動します"
-                },
-            );
-            // 相手(Mac)にも反対の役割へ合わせさせる(双方が待ち受け/双方が接続側になり、
-            // つながらなくなるのを防ぐ)。版 15 以降の相手は適用済みの RoleAck を返す
-            // ので、それを確認してから再起動する(行き損ねで双方が同役割のまま沈黙するのを
-            // 防ぐ)。旧版は応答しないため時間経過で再起動する。
-            // この処理はウィンドウプロシージャ(メッセージループ)から呼ばれるため、
-            // 最大2秒の待ちをここで行うと描画・トレイ操作が固まる。別スレッドで待つ
-            ROLE_ACK.store(false, Ordering::Relaxed);
-            // 切替の進行を設定画面の注記行へ出す(確認待ち→確認済み/タイムアウト。
-            // sync() がこの状態を文言へ反映する。Mac 側と同じ仕組み)
-            settings_ui::ROLE_NOTE_KIND.store(2, Ordering::Relaxed);
-            crate::state::send_main_msg(&knit_common::proto::Msg::Role { host: next });
-            crate::audio::speaker_disconnect();
-            crate::release_all_input();
-            std::thread::spawn(|| {
-                if wait_role_ack(std::time::Duration::from_millis(2000)) {
-                    println!("[role] 相手の適用を確認しました");
-                    settings_ui::ROLE_NOTE_KIND.store(3, Ordering::Relaxed);
-                } else {
-                    println!("[role] 相手の適用確認が取れないため時間経過で再起動します");
-                    settings_ui::ROLE_NOTE_KIND.store(4, Ordering::Relaxed);
-                }
-                restart_self();
-            });
+            switch_role(host);
         }
         MENU_UPDATE => crate::updater::on_click(),
         MENU_INPUT_HELPER => {
@@ -1443,7 +1489,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// ステータスウィンドウ(アプリ本体の画面)を開く。トレイ左クリック/メニューから
 unsafe fn open_status_window() {
-    settings_ui::build();
+    crate::webui::show();
 }
 
 /// ラベル類の定期更新(WM_TIMER から)。状態行は Mac の設定「接続」と同じ文言形式

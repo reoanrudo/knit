@@ -6,7 +6,11 @@ edition = "2021"
 [dependencies]
 knit-common = { path = "../common" }
 serde_json = { workspace = true }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant"] }
+# 設定画面は Mac と同じ HTML(ui/app.html)を WebView2 で表示する。COM の
+# 作成・イベント購読・スクリプト実行は webview2-com、その土台の Win32 型は
+# windows(0.62 系で版を揃える)から取る
+webview2-com = "0.39"
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_Ole", "Win32_System_Variant", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
 
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

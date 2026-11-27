@@ -1,8 +1,10 @@
-//! Windows 設定画面。Mac 側(gui/prefs.rs)と同じ 5 ページ構成(接続・画面配置・切替・
-//! 共有・その他)・同じ文言で構築し、上部タブで切り替える。Mac に UI が無い調整
-//! (スクロール・タブレット操作)はここにも置かない(env と設定ファイルが担う)。
-//! 接続先のIP入力と「保存して再接続」は Mac と同じ導線で、IP アドレス指定での
-//! 直接接続をこの画面から完結させる。
+//! 設定画面のうち、**画面を作らない側**の部品(状態行の文言・経路ラベル・
+//! ロック解除のパスワード欄の読み取りなど)。設定画面そのものは WebView2 版
+//! (crate::webui。ui/app.html を共有)へ置き換えたため、ここに残るネイティブ
+//! ウィンドウの構築・描画コードはもう呼ばれない。削除は差分を分けて行う
+//! (呼び出し側の tray.rs に残るメニュー処理と同じコミットで消すと、
+//! レビューで変更の意図が追えなくなるため)。
+#![allow(dead_code)]
 use super::*;
 use std::sync::Mutex;
 use windows_sys::Win32::Graphics::Gdi::InvalidateRect;
@@ -211,7 +213,7 @@ pub(super) fn connection_state_text(
 }
 
 /// 役割カードの注記行の文言(ROLE_NOTE_KIND の状態から。Mac 側と同じ文言)
-fn role_note_text() -> String {
+pub(super) fn role_note_text() -> String {
     match ROLE_NOTE_KIND.load(Ordering::Relaxed) {
         1 => "環境変数 KNIT_ROLE で役割を固定中のため、ここでは切り替えられません".into(),
         2 => "切り替えを相手へ送りました。相手の適用を確認しています…".into(),

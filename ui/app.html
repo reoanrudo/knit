@@ -355,7 +355,9 @@ const SIDE_NAME=['右','左','上','下','右上','右下','左上','左下'];
 const me=()=>isMac?'このMac':'このPC';
 
 /* ---------- nav ---------- */
-const PAGES=[['gen','General','gear','gray'],['conn','Connection','link','green'],['share','Sharing','clip','blue'],['notify','Notifications','bell','red'],['diag','Diagnostics','shield','indigo'],['upd','Updates','release','orange']];
+const PAGES_ALL=[['gen','General','gear','gray'],['conn','Connection','link','green'],['share','Sharing','clip','blue'],['notify','Notifications','bell','red'],['diag','Diagnostics','shield','indigo'],['upd','Updates','release','orange']];
+/* Windows 版は通知の種類別設定を持たないため Notifications を出さない */
+const PAGES=isMac?PAGES_ALL:PAGES_ALL.filter(p=>p[0]!=='notify');
 function renderNav(){
   $('#snav').innerHTML='<span class="navsel" id="navsel"></span>'+PAGES.map(p=>`<button type="button" data-page="${p[0]}"${page===p[0]?' aria-current="page"':''}>${tile(p[2],p[3])}${p[1]}</button>`).join('');
   moveNav(true);
@@ -477,7 +479,79 @@ function pgNotify(){
     row({ic:['bell','red'],t:'macOS の通知設定',n:'表示スタイル、集中モード中の扱い、音は macOS 側で決めます。',c:btn('openNotify','Open…','sm')}),
     row({ic:['bell','gray'],t:'テスト通知',n:'実際の見え方を確かめます。',c:btn('testNotify','Send Test','sm')})]);
 }
-const PG={gen:pgGen,conn:pgConn,share:pgShare,notify:pgNotify,diag:pgDiag,upd:pgUpd};
+
+/* ---------- Windows pages ----------
+   Windows は受け取る側なので、Mac 固有の項目(切替キー・通知の種類・音声の出力先・
+   アクセシビリティ許可)は出さない。画面の位置だけは Windows 側の設定。 */
+const SIDE_NAME_W=['右','左','上','下'];
+function winLink(){
+  const c=S.conn,peers=S.peers||[],ap=peers.find(p=>p.active)||peers[0];
+  return `<section class="sec"><div class="grp"><div class="linkcard"><div class="dv">${devSvg('win')}<b>${me()}</b><span>${esc(S.myName||'')}</span></div>${strands(c.connected?'<span data-live="rtt">'+(c.rtt||'—')+'</span> ms':'未接続',!c.connected)}<div class="dv">${devSvg('mac')}<b>${esc(ap?ap.label:'相手')}</b><span>${esc(ap?ap.ip:'')}</span></div></div>
+    <div class="stats"><div><b>${esc(c.status||'')}</b><span>${esc(c.route||'')}</span></div>${c.connected?`<div><b><span data-live="rtt">${c.rtt||'—'}</span> ms</b><span>Latency</span></div>`:''}</div></div></section>`;
+}
+function winGen(){
+  return head('General','この PC の基本情報と、起動のしかたです。')+
+  sec('Startup',[row({ic:['power','green'],t:'スタートアップ',n:'install.bat がタスク スケジューラへ登録します。以降は PC の起動時に常駐します。',c:'<span class="chip info">install.bat</span>'})])+
+  sec('Switching',[row({ic:['key','gray'],t:'切替キー',n:'キーは Mac 側で決めます。Windows 側は受け取って操作するだけです。',c:'<span class="chip off">Mac 側の設定</span>'})])+
+  sec('Language',[row({ic:['globe','blue'],t:'言語',n:'Windows 版は日本語のみです。',c:'<span class="chip info">日本語</span>'})]);
+}
+function winConn(){
+  const c=S.conn,peers=S.peers||[];
+  const prow=peers.map(p=>row({ic:['dev','green'],t:esc(p.label),n:esc(p.ip),c:'<span class="chip ok"><i></i>Active</span>'}));
+  const peersSec=peers.length?sec('Peer',prow):sec('Peer',[row({ic:['dev','gray'],t:'まだ相手がつながっていません',n:'Mac 側の設定「Connection」の「端末を登録…」で、この PC を登録してください。',c:'<span class="chip off">Not paired</span>'})]);
+  const role=c.role==='client';
+  const side=String(Number(S.win&&S.win.side||0));
+  const sides=SIDE_NAME_W.map((n,i)=>[String(i),n]);
+  const route=sec('Route',[
+    row({ic:['role','indigo'],t:'このPCの役割',n:c.roleNote?esc(c.roleNote):(c.roleLocked?'環境変数で固定されています。':(role?'相手のPCへ接続しに行きます。':'相手のPCからの接続を待ちます。')),c:`<span class="sides" role="group" aria-label="役割"><button type="button" data-role="host" aria-pressed="${!role}"${c.roleLocked?' disabled':''}>Host</button><button type="button" data-role="client" aria-pressed="${role}"${c.roleLocked?' disabled':''}>Client</button></span>`}),
+    row({ic:['side','gray'],t:'このPCの画面の位置',n:'Mac の画面から見て、この PC がどこにあるか。越える辺が決まります。',c:sel('win_side',sides,side,'画面の位置')}),
+    row({ic:['net','gray'],t:'相手のアドレス',n:'空欄なら同じネットワークを自動で探します。Tailscale などではIPアドレスを入れます。保存すると Knit を再起動します。',stack:true,c:`<div style="display:flex;gap:8px;width:100%"><input class="inp" id="hostIn" value="${esc(c.host||'')}" placeholder="例: 100.84.0.2" aria-label="相手のアドレス" autocomplete="off" spellcheck="false">${btn('saveHost','Save & Reconnect','sm')}</div>${c.hostError?`<span class="rn" style="color:var(--bad);margin:0">${esc(c.hostError)}</span>`:''}`}),
+    row({ic:['dev','gray'],t:`${me()}のアドレス`,n:'Mac 側で入力するときに使います。',stack:true,c:`<div class="addrs">${(S.addrs||[]).map(a=>`<div class="addr"><code>${esc(a)}</code>${btn('copy:'+a,'Copy','sm')}</div>`).join('')||'<span class="rn">取得できませんでした</span>'}</div>`})
+  ],'IPアドレスは相手を探すためだけに使います。接続の許可には、登録した接続キーを使います。');
+  const reg=sec('Pairing',[
+    row({ic:['unlink','red'],t:'すべての登録を初期化',n:'接続キーを作り直します。登録したすべての PC が、つながらなくなります。',c:btn('resetReg','Reset…','d sm')})]);
+  return head('Connection','つないでいる相手と、画面の位置です。')+winLink()+peersSec+route+reg;
+}
+function winShare(){
+  const s=S.settings,cap=S.caps||{};
+  const capNote=c=>cap[c]===false?'KNIT_SHARE で無効になっています。':'';
+  return head('Sharing','端末のあいだで渡すものを選びます。')+
+  sec('Clipboard',[
+    row({ic:['clip','blue'],t:'コピーを相手と共有',n:capNote('clip')||'テキストと画像。画面を移るときに相手のクリップボードへ渡します。',c:sw('clip_share',s.clip_share,'コピーを相手と共有',cap.clip===false)}),
+    row({ic:['hist','indigo'],t:'履歴をすべて消す',n:'この PC に残っている、行き来したコピーの履歴を消します。',c:btn('historyClear','Clear…','d sm')})])+
+  sec('Files',[
+    row({ic:['file','blue'],t:'ファイルを共有',n:capNote('files')||'コピーしたファイルや、画面の端まで運んだファイルを相手へ渡します。',c:sw('share_files',s.share_files,'ファイルを共有',cap.files===false)}),
+    row({ic:['folder','blue'],t:'受信フォルダ',n:'相手から届いたファイルの置き場所です(Windows 版は固定)。',stack:true,c:`<div style="display:flex;gap:8px;align-items:center;width:100%"><code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.receive_folder)}</code>${btn('openFolder','Show','sm')}</div>`})])+
+  sec('Audio',[
+    row({ic:['speaker','orange'],t:'このPCの音声を相手側で再生',n:capNote('audio')||'この PC で鳴っている音を、相手側で聞けるようにします。',c:sw('audio_on',s.audio_on,'このPCの音声を相手側で再生',cap.audio===false)}),
+    row({ic:['mute','gray'],t:'相手のスピーカーを消音',n:'この PC で鳴らしている間、相手側では鳴らしません。',c:sw('spk_mute',s.spk_mute,'相手のスピーカーを消音')})]);
+}
+function winDiag(){
+  const d=S.diag||{},w=S.win||{};
+  const body=d.running?'<div class="inl"><div style="display:flex;gap:8px;align-items:center"><span class="spin"></span><span class="rn" style="margin:0">Checking…</span></div></div>':(diagText?`<div class="inl"><pre>${esc(diagText)}</pre></div>`:'');
+  return head('Diagnostics','つながりを確かめ、この PC の解除の連動を決めます。')+
+  `<section class="sec"><h3>Diagnostics</h3><div class="grp">${row({ic:['pulse','indigo'],t:'つながりを確かめる',n:'待ち受け、相手への到達、認証、遅延を順に確かめます。',c:btn('diag',d.running?'Checking…':'Run','sm',d.running?' disabled':'')})}${body}${row({ic:['doc','gray'],t:'ログ',n:'入力した文字、パスワード、接続キーは記録していません。',c:btn('log','Open…','sm')})}</div></section>`+
+  sec('Lock Sync',[
+    row({ic:['shield','indigo'],t:'Mac のロック解除に合わせてこの PC も解除する',n:'操作補助(UAC・管理者アプリの操作)の導入が必要です。',c:sw('unlock_sync',w.unlockSync,'ロック解除の連動')}),
+    row({ic:['key','gray'],t:'解除のパスワード',n:w.unlockSecretSet?'保存済みです。変えるときだけ入力してください。':'未設定です(Enter のみ送ります)。',stack:true,c:`<div style="display:flex;gap:8px;width:100%"><input class="inp" id="unlockIn" type="password" placeholder="Windows のサインイン パスワード" autocomplete="off" aria-label="解除のパスワード">${btn('unlockSave','Save','sm')}</div>`}),
+  ],'パスワードはこの PC 内に暗号化して保存します。');
+}
+function winUpd(){
+  const u=S.update||{};let card='';
+  if(u.state==='checking')card=`<div class="uh">${appIc}<div class="tt"><b>新しい版を確認しています…</b><span class="rn">送るのは版・OS・チャンネルだけです。</span></div><span class="spin"></span></div>`;
+  else if(u.state==='available')card=`<div class="uh">${appIc}<div class="tt"><b>Knit ${esc(u.version)} があります</b><span class="rn">いまは ${esc(S.version)}。署名と中身を確かめてから入れ替え、起動しなければ前の版に戻します。設定と登録には触れません。</span></div>${btn('update','Update Now','p sm')}</div>`;
+  else if(u.state==='installing')card=`<div class="uh">${appIc}<div class="tt"><b>更新を準備しています…</b><span class="rn">終わると Knit が自動で再起動します。</span></div><span class="spin"></span></div>`;
+  else card=`<div class="uh">${appIc}<div class="tt"><b>Knit ${esc(S.version)}</b><span class="rn">${u.enabled===false?'更新の署名鍵が未登録のため、この版では自動更新を使えません。':'新しい版があるかを確かめます(起動時と6時間ごとに自動でも確認します)。'}</span></div>${btn('update','Check Now','sm')}</div>`;
+  return head('Updates','新しい版への更新と、保守のための道具です。')+
+  `<section class="sec"><div class="grp"><div class="updcard">${card}</div></div></section>`+
+  sec('Maintenance',[
+    row({ic:['redo','gray'],t:'Knit を再起動',n:'相手とのつながりは数秒で戻ります。',c:btn('restart','Restart','sm')}),
+    row({ic:['unlink','red'],t:'すべての登録を初期化',n:'接続キーを作り直します。登録したすべての PC が、つながらなくなります。',c:btn('resetReg','Reset…','d sm')}),
+    row({ic:['gear','red'],t:'すべての設定を初期化',n:'登録はそのままで、設定だけをはじめの状態に戻します。',c:btn('resetAll','Reset…','d sm')}),
+    row({ic:['quit','gray'],t:'Knit を終了',c:btn('quit','Quit','sm')})])+
+  sec('About',[row({ic:['release','blue'],t:'Version',c:`<code>${esc(S.version)}</code>`})]);
+}
+const PG=isMac?{gen:pgGen,conn:pgConn,share:pgShare,notify:pgNotify,diag:pgDiag,upd:pgUpd}:{gen:winGen,conn:winConn,share:winShare,diag:winDiag,upd:winUpd};
 function renderAll(enter){renderNav();renderPage(enter)}
 /* WebKit scrolls range inputs into view after a re-render. Hold the intended position for a
    moment unless the user is the one scrolling. */
@@ -664,10 +738,12 @@ document.addEventListener('click',e=>{
   if(cmd==='saveHost'){post('saveHost',{text:($('#hostIn')||{}).value||''});return}
   if(cmd==='sensReset'){post('sens',{peer:arg,value:1});return}
   if(cmd==='diag'){diagText=null;post('diag');return}
+  if(cmd==='unlockSave'){const i=$('#unlockIn');post('unlock',{text:(i||{}).value||''},ok=>{if(ok&&i)i.value=''});return}
+  if(cmd==='historyClear'){if(confirm('クリップボードの履歴すべてを消します。元に戻せません。よろしいですか?'))post('historyClear');return}
   post(cmd,arg!=null?{peer:arg}:{});
 });
 document.addEventListener('change',e=>{
-  const s=e.target.closest('[data-sel]');if(s){const k=s.dataset.sel,v=(k==='hotkey'||k==='history_limit')?Number(s.value):s.value;post('set',{key:k,value:v});s.blur();return}
+  const s=e.target.closest('[data-sel]');if(s){const k=s.dataset.sel,v=(k==='hotkey'||k==='history_limit'||k==='win_side')?Number(s.value):s.value;post('set',{key:k,value:v});s.blur();return}
   const gn=e.target.closest('[data-gain]');if(gn){post('set',{key:'audio_gain',value:Number(gn.value)/100});return}
   const r=e.target.closest('[data-sens]');if(r){post('sens',{peer:r.dataset.sens,value:Number(r.value)})}
 });

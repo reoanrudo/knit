@@ -3,6 +3,8 @@ REM knit installer: deploy + startup task + start now
 set DIR=%USERPROFILE%\knit
 mkdir %DIR% 2>nul
 copy /Y %~dp0knit-win.exe %DIR%\knit-win.exe
+REM 設定画面(WebView2)のローダー。exe と同じフォルダに必要
+copy /Y %~dp0WebView2Loader.dll %DIR%\WebView2Loader.dll
 copy /Y %~dp0run_knit.bat %DIR%\run_knit.bat
 copy /Y %~dp0run_knit.vbs %DIR%\run_knit.vbs
 REM 共有トークン(同梱されていれば配布。無いと knit-win 起動が fatal 停止する)
