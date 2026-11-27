@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Knit Setup</title>
+<!--
+  First-run setup and pairing (modal window). Steps: welcome -> permission -> connect -> finish.
+  The app (Rust) owns the pairing invitation and pushes knit.state(json) every 250 ms when it changes.
+  Copy: headers, buttons and chips in English; explanations in Japanese.
+-->
+<style>
+:root{--accent:#007aff;--on-accent:#fff;--accent-soft:rgba(0,122,255,.12);--label:#1d1d1f;--sub:#6e6e73;--ter:#a1a1a6;
+  --grp:rgba(255,255,255,.75);--grp-line:rgba(0,0,0,.08);--ctl:rgba(118,118,128,.12);--ctl-h:rgba(118,118,128,.2);--w-solid:#fbfbfd;--field-line:rgba(0,0,0,.12);
+  --track:rgba(118,118,128,.22);--sw-off:rgba(118,118,128,.24);--ok:#1f8f3c;--ok-dot:#34c759;--ok-bg:rgba(52,199,89,.15);--warn:#b25e00;--warn-bg:rgba(255,159,10,.16);--bad:#d70015;--bad-bg:rgba(255,59,48,.12);
+  --ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hiragino Sans",system-ui,sans-serif;--disp:-apple-system,BlinkMacSystemFont,"SF Pro Display","Hiragino Sans",system-ui,sans-serif;
+  --spring:cubic-bezier(.34,1.45,.64,1);color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--accent:#0a84ff;--accent-soft:rgba(10,132,255,.22);--label:#f5f5f7;--sub:#a1a1a6;--ter:#6e6e73;--grp:rgba(255,255,255,.07);--grp-line:rgba(255,255,255,.09);
+  --ctl:rgba(118,118,128,.26);--ctl-h:rgba(118,118,128,.36);--w-solid:#2a2a2d;--field-line:rgba(255,255,255,.13);--track:rgba(118,118,128,.34);--sw-off:rgba(118,118,128,.36);
+  --ok:#4cd964;--ok-bg:rgba(48,209,88,.16);--warn:#ffb340;--warn-bg:rgba(255,159,10,.18);--bad:#ff6961;--bad-bg:rgba(255,69,58,.18)}}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{font:13px/1.5 var(--ui);color:var(--label);background:transparent;-webkit-font-smoothing:antialiased;overflow:hidden;-webkit-user-select:none;user-select:none;cursor:default;display:flex;flex-direction:column}
+button{font:inherit;color:inherit}:focus{outline:none}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.steps{display:flex;gap:6px;justify-content:center;padding:18px 0 0}
+.steps i{height:5px;width:24px;border-radius:3px;background:var(--track);transition:background .3s,width .35s var(--spring)}
+.steps i.on{background:var(--accent);width:40px}.steps i.done{background:var(--accent);opacity:.45}
+main{flex:1;padding:16px 44px 0;display:flex;flex-direction:column;align-items:center;text-align:center;gap:14px;overflow:auto}
+main.enter{animation:enter .4s cubic-bezier(.2,.8,.2,1)}@keyframes enter{from{opacity:0;transform:translateY(8px)}}
+h1{margin:6px 0 0;font:700 24px/1.2 var(--disp);letter-spacing:-.01em}
+.lead{margin:0;color:var(--sub);font-size:13.5px;max-width:46ch}
+footer{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:14px 20px 18px}
+footer .r{display:flex;gap:8px;margin-left:auto}
+.btn{height:30px;padding:0 16px;border-radius:999px;border:0;background:var(--ctl);font-size:13px;font-weight:500;white-space:nowrap;transition:background .15s,transform .15s}
+.btn:hover{background:var(--ctl-h)}.btn:active{transform:scale(.97)}
+.btn.p{background:var(--accent);color:var(--on-accent)}.btn.p:hover{filter:brightness(1.08)}
+.btn.q{background:transparent;color:var(--accent);padding:0 8px}.btn.lg{height:36px;padding:0 22px;font-size:14px}
+.btn:disabled{opacity:.4}
+.chip{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
+.chip i{width:7px;height:7px;border-radius:50%;background:currentColor}
+.chip.ok{background:var(--ok-bg);color:var(--ok)}.chip.warn{background:var(--warn-bg);color:var(--warn)}.chip.bad{background:var(--bad-bg);color:var(--bad)}
+.card{width:100%;max-width:520px;text-align:left;background:var(--grp);border-radius:14px;box-shadow:inset 0 0 0 .5px var(--grp-line);padding:14px 16px;display:flex;flex-direction:column;gap:10px}
+.row{display:flex;align-items:center;gap:12px}.row .t{flex:1;min-width:0}.row b{font-size:13.5px}.rn{font-size:11.5px;color:var(--sub);line-height:1.45}
+.ri{flex:none;width:28px;height:28px;border-radius:7px;display:grid;place-items:center;color:#fff;background:linear-gradient(180deg,#3d97ff,#0a7cff)}
+.ri svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.sw{flex:none;position:relative;width:42px;height:24px;border-radius:999px;border:0;background:var(--sw-off);padding:0;transition:background .2s}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.22);transition:translate .36s var(--spring)}
+.sw[aria-checked="true"]{background:var(--accent)}.sw[aria-checked="true"]::after{translate:18px 0}
+.hero{display:grid;grid-template-columns:auto minmax(80px,200px) auto;align-items:center;gap:6px;margin-top:4px}
+.dev{display:flex;flex-direction:column;align-items:center;gap:6px;width:110px}.dev svg{width:80px;height:62px;filter:drop-shadow(0 8px 14px rgba(0,0,0,.18))}.dev b{font-size:12.5px}
+.strand{position:relative;height:60px}.strand svg{position:absolute;inset:0;width:100%;height:100%;-webkit-mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent)}
+.flow{animation:flow 1.8s linear infinite}@keyframes flow{to{transform:translateX(-40px)}}
+.need{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+.need span{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--sub);padding:6px 12px;border-radius:999px;background:var(--ctl)}
+.code{display:flex;gap:6px;justify-content:center}
+.code span{width:44px;height:54px;border-radius:11px;display:grid;place-items:center;font:700 28px/1 var(--disp);font-variant-numeric:tabular-nums;background:var(--w-solid);box-shadow:0 0 0 .5px var(--field-line),0 2px 0 var(--field-line)}
+.code .gap{width:10px;background:none;box-shadow:none}
+.code.sas span{width:56px;height:70px;font-size:38px;color:var(--accent)}
+.scan{display:flex;align-items:center;gap:10px;color:var(--sub);font-size:13px;justify-content:center}
+.spin{width:15px;height:15px;border-radius:50%;border:2px solid var(--track);border-top-color:var(--accent);animation:spin .8s linear infinite;flex:none}@keyframes spin{to{transform:rotate(360deg)}}
+code{font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace;-webkit-user-select:all;user-select:all}
+.addrs{display:flex;gap:8px;flex-wrap:wrap}
+.addrs span{display:inline-flex;gap:8px;align-items:center;padding:4px 10px;border-radius:8px;background:var(--ctl)}
+.msg{font-size:12.5px;color:var(--warn)}
+.done svg{width:76px;height:76px}.done circle{fill:var(--ok-bg);stroke:var(--ok-dot);stroke-width:3}
+.done path{fill:none;stroke:var(--ok-dot);stroke-width:5;stroke-linecap:round;stroke-linejoin:round;stroke-dasharray:60;stroke-dashoffset:60;animation:draw .6s .15s ease forwards}@keyframes draw{to{stroke-dashoffset:0}}
+kbd{font:600 11.5px/1 var(--ui);display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 6px;border-radius:6px;background:var(--w-solid);box-shadow:0 0 0 .5px var(--field-line),0 1.5px 0 var(--field-line)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="steps" id="steps" aria-hidden="true"></div>
+<main id="main"></main>
+<footer id="foot"></footer>
+<script>
+/*KNIT_BOOT*/
+(function(){
+'use strict';
+const BOOT=window.KNIT_BOOT||{mode:'first',preview:true};
+const $=s=>document.querySelector(s),esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let seq=0;
+function post(cmd,args={}){const msg=JSON.stringify(Object.assign({id:++seq,cmd},args));try{if(window.webkit&&webkit.messageHandlers.knit){webkit.messageHandlers.knit.postMessage(msg);return}}catch(e){}demo(cmd,args)}
+const STEPS={first:['welcome','perm','pair','finish'],pair:['pair'],perm:['perm']}[BOOT.mode]||['welcome','perm','pair','finish'];
+let step=0,S=null;
+window.knit={state(s){const prev=S;S=s;if(!prev){render(true);return}
+  if(STEPS[step]==='perm'&&s.ax&&!prev.ax){render(false);setTimeout(()=>{if(STEPS[step]==='perm')next()},900);return}
+  render(false)}};
+const G={access:'<circle cx="12" cy="4.5" r="1.8"/><path d="M5 8.5l7 1.5 7-1.5M12 10v4.5M12 14.5l-3 6M12 14.5l3 6"/>',power:'<path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/>',home:'<path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1z"/>',check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>'};
+const gl=k=>`<svg viewBox="0 0 24 24" aria-hidden="true">${G[k]}</svg>`;
+const ri=(g,c)=>`<span class="ri" style="${c?`background:${c}`:''}">${gl(g)}</span>`;
+const btn=(a,l,c='')=>`<button type="button" class="btn ${c}" data-act="${a}">${l}</button>`;
+function dev(k){return k==='mac'?'<svg viewBox="0 0 84 66"><rect x="12" y="6" width="60" height="40" rx="4" fill="#16171b"/><rect x="15" y="9" width="54" height="34" rx="1.5" fill="url(#gm)"/><path d="M4 50h76l-4 6H8z" fill="#b9bdc6"/><defs><linearGradient id="gm" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4f46e5"/><stop offset="1" stop-color="#f97316"/></linearGradient></defs></svg>'
+  :'<svg viewBox="0 0 84 66"><rect x="6" y="4" width="72" height="44" rx="3.5" fill="#16171b"/><rect x="9" y="7" width="66" height="38" rx="1.5" fill="url(#gw)"/><rect x="38" y="48" width="8" height="9" fill="#8e939c"/><rect x="28" y="57" width="28" height="4" rx="2" fill="#a3a8b1"/><defs><linearGradient id="gw" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1d5fe0"/><stop offset="1" stop-color="#9cc0f5"/></linearGradient></defs></svg>'}
+function strands(){let a='',b='';for(let x=-40;x<=360;x+=4){const s=Math.sin(x/40*Math.PI*2);a+=(x===-40?'M':'L')+x+' '+(32+11*s).toFixed(1);b+=(x===-40?'M':'L')+x+' '+(32-11*s).toFixed(1)}
+  return `<div class="strand"><svg viewBox="0 0 320 64" preserveAspectRatio="none"><g class="flow"><path d="${b}" fill="none" stroke="#a26bff" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity=".75"/><path d="${a}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke"/></g></svg></div>`}
+const digits=(s,cls='')=>`<div class="code ${cls}" aria-label="${esc(s)}">${[...String(s)].map(c=>c===' '?'<span class="gap"></span>':`<span>${esc(c)}</span>`).join('')}</div>`;
+const mmss=s=>`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+
+function vWelcome(){return `<div class="hero"><div class="dev">${dev('mac')}<b>このMac</b></div>${strands()}<div class="dev">${dev('win')}<b>となりのPC</b></div></div>
+  <h1>ひとつのキーボードとマウスで、<br>2台のPCを。</h1><p class="lead">画面の端までカーソルを動かすと、となりのPCをそのまま操作できます。準備は数分で終わります。</p>
+  <div class="need"><span>✓ 両方のPCに Knit を入れる</span><span>✓ 同じネットワーク（または Tailscale）につなぐ</span></div>`}
+function vPerm(){return `<h1>Accessibility</h1><p class="lead">キーボードとマウスの入力を読み取り、相手のPCへ送るために使います。Knit が求める権限はこれだけです。入力した文字や画面の内容は保存しません。</p>
+  <div class="card"><div class="row">${ri('access')}<div class="t"><b>Accessibility</b><div class="rn">${S.ax?'許可されています。':'システム設定で Knit をオンにします。許可を確かめると自動で次へ進みます。'}</div></div>${S.ax?'<span class="chip ok"><i></i>Granted</span>':btn('openAx','Open System Settings','p')}</div></div>`}
+function vPair(){
+  const p=S.pair||{};
+  if(p.phase==='confirm'){const r=p.request||{};return `<h1>Pair with ${esc(r.name)}?</h1><p class="lead">相手が名乗った名前です（アドレス <code>${esc(r.addr)}</code>）。心当たりのある端末なら、相手の画面でこの番号を選んでもらい、「Allow」を押してください。</p>${digits(r.sas,'sas')}`}
+  if(p.phase==='done')return `<div class="done"><svg viewBox="0 0 84 84"><circle cx="42" cy="42" r="38"/><path d="M26 43l11 11 21-23"/></svg></div><h1>Paired</h1><p class="lead">${esc(p.peer||'相手の端末')} を登録しました。次からは、2台を起動するだけで自動でつながります。</p>`;
+  if(p.phase==='ended')return `<h1>Pairing ended</h1><p class="lead">${esc(p.message||'')}</p>`;
+  if(p.phase!=='wait')return `<h1>Connect</h1><div class="scan"><span class="spin"></span>準備しています…</div>`;
+  return `<h1>Connect</h1><p class="lead">相手のPCで Knit を開くと、このMacを自動で見つけます。要求が届くと、ここに確認の番号が出ます。</p>
+  <div class="scan"><span class="spin"></span>Waiting for the other device…</div>
+  <div class="card"><div class="row"><div class="t"><b>自動で見つからないとき</b><div class="rn">相手のPCで、このMacのアドレスと手入力コードを入れます（Tailscale や別のネットワークでも使えます）。</div></div></div>
+    <div class="addrs">${(S.addrs||[]).map(a=>`<span><code>${esc(a)}</code></span>`).join('')}</div>
+    ${digits(p.code||'')}<div class="rn" style="text-align:center">Expires in ${mmss(p.remain||0)}</div></div>
+  ${p.message?`<div class="msg">${esc(p.message)}</div>`:''}`}
+function vFinish(){return `<h1>Almost done</h1><p class="lead">最後に、起動のしかたを決めます。画面の並びは、つながったあとに Settings の Connection で整えられます。</p>
+  <div class="card"><div class="row">${ri('power','linear-gradient(180deg,#5ee07a,#30c759)')}<div class="t"><b>PCの起動時に Knit を開く</b><div class="rn">ログイン項目に登録します。あとから外せます。</div></div><button type="button" class="sw" role="switch" aria-checked="${!!S.startup}" data-act="startup" aria-label="PCの起動時に Knit を開く"></button></div>
+  <div class="row">${ri('home','linear-gradient(180deg,#ff7a70,#ff453a)')}<div class="t"><b>手元に戻すには</b><div class="rn">切替キーか、メニューバーの Knit の「Macに戻る」。</div></div><kbd>${esc(S.hotkey||'F13')}</kbd></div></div>`}
+const VIEWS={welcome:vWelcome,perm:vPerm,pair:vPair,finish:vFinish};
+function foot(){const k=STEPS[step],p=(S.pair||{});const back=step>0&&k!=='pair'?btn('back','Back','q'):'<span></span>';
+  if(k==='welcome')return back+`<div class="r">${btn('next','Get Started','p lg')}</div>`;
+  if(k==='perm')return back+`<div class="r">${S.ax?'':btn('later','Later','q')}${btn('next','Continue','p',)}</div>`.replace('data-act="next"',S.ax?'data-act="next"':'data-act="next" disabled');
+  if(k==='pair'){
+    if(p.phase==='confirm')return `<span></span><div class="r">${btn('deny','Deny')}${btn('allow','Allow','p')}</div>`;
+    if(p.phase==='done')return `<span></span><div class="r">${btn(STEPS.length>step+1?'next':'finish',STEPS.length>step+1?'Continue':'Done','p')}</div>`;
+    if(p.phase==='ended')return `${btn('close','Close','q')}<div class="r">${btn('newCode','New Code','p')}</div>`;
+    return `${btn(BOOT.mode==='first'?'skipPair':'close',BOOT.mode==='first'?'Pair later':'Close','q')}<div class="r"></div>`}
+  return back+`<div class="r">${btn('finish','Done','p lg')}</div>`}
+function render(enter){if(!S)return;const k=STEPS[step];
+  $('#steps').innerHTML=STEPS.length>1?STEPS.map((_,i)=>`<i class="${i<step?'done':i===step?'on':''}"></i>`).join(''):'';
+  const m=$('#main');m.innerHTML=VIEWS[k]();m.classList.remove('enter');if(enter){void m.offsetWidth;m.classList.add('enter')}
+  $('#foot').innerHTML=foot();
+  const d=document.querySelector('[data-act="deny"]');if(d)d.focus();}
+function next(){if(step<STEPS.length-1){step++;if(STEPS[step]==='pair')post('pairStart');render(true)}}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b||b.disabled)return;const a=b.dataset.act;
+  if(a==='next')return next();
+  if(a==='back'){step=Math.max(0,step-1);render(true);return}
+  if(a==='skipPair'){step=STEPS.indexOf('finish');post('pairStop');render(true);return}
+  if(a==='startup'){const v=b.getAttribute('aria-checked')!=='true';b.setAttribute('aria-checked',String(v));post('startup',{value:v});return}
+  post(a)});
+document.addEventListener('keydown',e=>{if(e.key==='Escape'&&(S&&S.pair&&S.pair.phase==='confirm')){e.preventDefault();post('deny')}});
+document.addEventListener('contextmenu',e=>{if(!e.target.closest('code'))e.preventDefault()});
+if(STEPS[0]==='pair')post('pairStart');
+/* demo when opened in a plain browser */
+let D={mode:BOOT.mode,preview:true,ax:false,startup:true,hotkey:'F13',addrs:['192.168.1.20','100.84.0.1'],pair:{phase:'idle'}};
+function demo(cmd){setTimeout(()=>{
+  if(cmd==='ready')return window.knit.state(Object.assign({},D));
+  if(cmd==='openAx'){D.ax=true}
+  if(cmd==='pairStart'){D.pair={phase:'wait',code:'315 904',remain:300,message:''};setTimeout(()=>{D.pair={phase:'confirm',request:{name:'HACHIMAN-PC',addr:'192.168.1.42',sas:'4829'}};window.knit.state(JSON.parse(JSON.stringify(D)))},2500)}
+  if(cmd==='allow'){D.pair={phase:'done',peer:'HACHIMAN-PC'}}
+  if(cmd==='deny'||cmd==='newCode'){D.pair={phase:'wait',code:'622 018',remain:300,message:cmd==='deny'?'要求を拒否しました。':''}}
+  if(cmd==='startup'){}
+  window.knit.state(JSON.parse(JSON.stringify(D)))},60)}
+post('ready');
+})();
+</script>
+</body>
+</html>

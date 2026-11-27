@@ -104,6 +104,12 @@ pub(crate) static DIAG_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomi
 /// 手動の「アップデートを確認…」メニューはこの設定の影響を受けない。
 /// updater の自動確認ループが毎周回読むため、適用すると次回の確認から反映される
 pub(crate) static UPDATE_CHECK: AtomicBool = AtomicBool::new(true);
+/// Notification categories the user can silence (Settings > Notifications).
+/// Problems (errors, refusals, things that need action) are always shown.
+pub(crate) static NOTIFY_TRANSFER: AtomicBool = AtomicBool::new(true);
+pub(crate) static NOTIFY_CLIPBOARD: AtomicBool = AtomicBool::new(true);
+pub(crate) static NOTIFY_CONNECTION: AtomicBool = AtomicBool::new(true);
+pub(crate) static NOTIFY_UPDATE: AtomicBool = AtomicBool::new(true);
 pub(crate) static DIAG_WARP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_MODE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static DIAG_SCROLL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

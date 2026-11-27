@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Knit</title>
+<!--
+  Menu bar popover. Shows one state and the one action that fits it.
+  The app pushes knit.state(json) while the popover is open; the classic menu stays behind "More…".
+-->
+<style>
+:root{--accent:#007aff;--on-accent:#fff;--accent-soft:rgba(0,122,255,.12);--label:#1d1d1f;--sub:#6e6e73;--ter:#a1a1a6;
+  --grp:rgba(255,255,255,.6);--grp-line:rgba(0,0,0,.08);--ctl:rgba(118,118,128,.12);--ctl-h:rgba(118,118,128,.2);--w-solid:#fbfbfd;--field-line:rgba(0,0,0,.12);--sw-off:rgba(118,118,128,.24);
+  --ok:#1f8f3c;--ok-dot:#34c759;--ok-bg:rgba(52,199,89,.15);--warn:#b25e00;--warn-dot:#ff9f0a;--warn-bg:rgba(255,159,10,.16);--bad:#d70015;--bad-dot:#ff3b30;--bad-bg:rgba(255,59,48,.12);
+  --ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hiragino Sans",system-ui,sans-serif;--spring:cubic-bezier(.34,1.45,.64,1);color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--accent:#0a84ff;--accent-soft:rgba(10,132,255,.22);--label:#f5f5f7;--sub:#a1a1a6;--ter:#6e6e73;--grp:rgba(255,255,255,.07);--grp-line:rgba(255,255,255,.09);
+  --ctl:rgba(118,118,128,.26);--ctl-h:rgba(118,118,128,.36);--w-solid:#2a2a2d;--field-line:rgba(255,255,255,.13);--sw-off:rgba(118,118,128,.36);
+  --ok:#4cd964;--ok-bg:rgba(48,209,88,.16);--warn:#ffb340;--warn-bg:rgba(255,159,10,.18);--bad:#ff6961;--bad-bg:rgba(255,69,58,.18)}}
+*{box-sizing:border-box}html,body{margin:0}
+body{font:13px/1.45 var(--ui);color:var(--label);background:transparent;-webkit-font-smoothing:antialiased;-webkit-user-select:none;user-select:none;cursor:default}
+button{font:inherit;color:inherit}:focus{outline:none}:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#root{padding:14px;display:flex;flex-direction:column;gap:12px}
+.head{display:flex;justify-content:space-between;align-items:center}.head b{font-size:13px}.head span{font-size:11.5px;color:var(--sub)}
+.pair{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:4px}
+.dv{display:flex;flex-direction:column;align-items:center;gap:3px;width:82px;text-align:center}.dv svg{width:48px;height:38px}
+.dv span{font-size:11px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:82px}
+.strand{position:relative;height:42px}.strand svg{position:absolute;inset:0;width:100%;height:100%;-webkit-mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent)}
+.flow{animation:flow 1.8s linear infinite}@keyframes flow{to{transform:translateX(-40px)}}
+.strand.cut svg{opacity:.4}.strand.cut path{stroke-dasharray:3 6}.strand.cut .flow{animation-play-state:paused}
+.pill{position:absolute;left:50%;top:50%;translate:-50% -50%;padding:2px 9px;border-radius:999px;background:var(--w-solid);font:600 11px/1.4 var(--ui);font-variant-numeric:tabular-nums;box-shadow:0 0 0 .5px var(--grp-line)}
+.state{border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:8px;background:var(--grp);box-shadow:inset 0 0 0 .5px var(--grp-line)}
+.state .t{display:flex;align-items:center;gap:8px;font-weight:650;font-size:13.5px}
+.state .t i{width:9px;height:9px;border-radius:50%;flex:none}
+.state p{margin:0;font-size:12px;color:var(--sub)}
+.state .acts{display:flex;gap:8px;flex-wrap:wrap}
+.ok .t i{background:var(--ok-dot);box-shadow:0 0 0 4px var(--ok-bg)}.info .t i{background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+.warn .t i{background:var(--warn-dot);box-shadow:0 0 0 4px var(--warn-bg)}.bad .t i{background:var(--bad-dot);box-shadow:0 0 0 4px var(--bad-bg)}.off .t i{background:var(--ter)}
+.btn{height:26px;padding:0 12px;border-radius:999px;border:0;background:var(--ctl);font-size:12.5px;font-weight:500;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;transition:background .15s,transform .15s}
+.btn:hover{background:var(--ctl-h)}.btn:active{transform:scale(.97)}.btn.p{background:var(--accent);color:var(--on-accent)}.btn.p:hover{filter:brightness(1.08)}
+.btn.q{background:transparent;color:var(--accent);padding:0 6px}.btn.q:hover{background:var(--accent-soft)}
+.prow{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:0 4px;font-size:12.5px}
+kbd{font:600 11px/1 var(--ui);display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;border-radius:5px;background:var(--w-solid);box-shadow:0 0 0 .5px var(--field-line),0 1.5px 0 var(--field-line)}
+.btn kbd{background:rgba(255,255,255,.25);box-shadow:none;color:inherit}
+.sw{flex:none;position:relative;width:36px;height:21px;border-radius:999px;border:0;background:var(--sw-off);padding:0;transition:background .2s}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:17px;height:17px;border-radius:50%;background:#fff;box-shadow:0 2px 4px rgba(0,0,0,.22);transition:translate .34s var(--spring)}
+.sw[aria-checked="true"]{background:var(--accent)}.sw[aria-checked="true"]::after{translate:15px 0}
+.upd{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:10px;background:var(--accent-soft);font-size:12px}.upd span{flex:1}
+.foot{display:flex;justify-content:space-between;border-top:1px solid var(--grp-line);padding-top:8px}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+/*KNIT_BOOT*/
+(function(){
+'use strict';
+const $=s=>document.querySelector(s),esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let seq=0;
+function post(cmd,args={}){const msg=JSON.stringify(Object.assign({id:++seq,cmd},args));try{if(window.webkit&&webkit.messageHandlers.knit){webkit.messageHandlers.knit.postMessage(msg);return}}catch(e){}demo(cmd,args)}
+let S=null,lastSig='';
+window.knit={state(s){S=s;const sig=JSON.stringify(Object.assign({},s,{rtt:0}));if(sig!==lastSig){lastSig=sig;render()}else{const r=$('[data-rtt]');if(r)r.textContent=s.rtt||'—'}},result(){}};
+const btn=(a,l,c='')=>`<button type="button" class="btn ${c}" data-act="${a}">${l}</button>`;
+const dv=k=>k==='mac'?'<svg viewBox="0 0 84 66"><rect x="12" y="6" width="60" height="40" rx="4" fill="#16171b"/><rect x="15" y="9" width="54" height="34" rx="1.5" fill="#6a3bd2"/><path d="M4 50h76l-4 6H8z" fill="#b9bdc6"/></svg>'
+  :'<svg viewBox="0 0 84 66"><rect x="6" y="4" width="72" height="44" rx="3.5" fill="#16171b"/><rect x="9" y="7" width="66" height="38" rx="1.5" fill="#1d5fe0"/><rect x="38" y="48" width="8" height="9" fill="#8e939c"/><rect x="28" y="57" width="28" height="4" rx="2" fill="#a3a8b1"/></svg>';
+function strands(pill,cut){let a='',b='';for(let x=-40;x<=360;x+=4){const s=Math.sin(x/40*Math.PI*2);a+=(x===-40?'M':'L')+x+' '+(32+11*s).toFixed(1);b+=(x===-40?'M':'L')+x+' '+(32-11*s).toFixed(1)}
+  return `<div class="strand${cut?' cut':''}"><svg viewBox="0 0 320 64" preserveAspectRatio="none"><g class="flow"><path d="${b}" fill="none" stroke="#a26bff" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity=".75"/><path d="${a}" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke"/></g></svg><span class="pill">${pill}</span></div>`}
+function stateCard(){
+  const p=esc(S.peer||'相手'),hk=`<kbd>${esc(S.hotkey)}</kbd>`;
+  if(!S.ax)return `<div class="state bad"><div class="t"><i></i>Accessibility is off</div><p>許可が外れているため、相手を操作できません。許可すると自動で再開します。</p><div class="acts">${btn('openAx','Open System Settings','p')}</div></div>`;
+  if(!S.paired)return `<div class="state off"><div class="t"><i></i>Not paired</div><p>もう一台のPCを登録すると、ここからすぐ使えます。</p><div class="acts">${btn('pair','Pair a Device…','p')}</div></div>`;
+  if(S.controlling)return `<div class="state info"><div class="t"><i></i>Controlling ${p}</div><p>キーボードとマウスの入力は ${p} に届いています。</p><div class="acts">${btn('goHome','Return to Mac','p')} ${hk}</div></div>`;
+  if(S.connected)return `<div class="state ok"><div class="t"><i></i>Connected to ${p}</div><p>${S.edge?'画面の端へ動かすか、':''}切替キーで ${p} を操作できます。</p><div class="acts">${btn('goPeer','Go to '+p+' '+hk,'p')}</div></div>`;
+  return `<div class="state warn"><div class="t"><i></i>Searching for ${p}</div><p>${esc(S.retry||'相手のPCがスリープしていないか、Knit が動いているか確かめてください。')}押していたキーはすべて離しています。</p><div class="acts">${btn('diag','Diagnose','p')}${btn('settings:conn','Connection…')}</div></div>`;
+}
+function render(){
+  if(!S)return;
+  const upd=S.update?`<div class="upd"><span>Knit ${esc(S.update)} is available</span>${btn('update','Update','p')}</div>`:'';
+  $('#root').innerHTML=`<div class="head"><b>Knit</b><span>${esc(S.route||'')}</span></div>
+  <div class="pair"><div class="dv">${dv('mac')}<span>${esc(S.me||'このMac')}</span></div>${strands(S.connected?'<span data-rtt>'+(S.rtt||'—')+'</span> ms':(S.paired?'offline':'—'),!S.connected)}<div class="dv">${dv('win')}<span>${esc(S.peer||'—')}</span></div></div>
+  ${stateCard()}${upd}
+  <div class="prow"><span>Hotkey</span><kbd>${esc(S.hotkey)}</kbd></div>
+  <div class="prow"><span>画面の端で切り替える</span><button type="button" class="sw" role="switch" aria-checked="${!!S.edge}" data-act="edge" aria-label="画面の端で切り替える"></button></div>
+  <div class="foot">${btn('settings','Settings…','q')}${btn('menu','More…','q')}${btn('quit','Quit','q')}</div>`;
+  post('size',{h:Math.ceil(document.documentElement.scrollHeight)});
+}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;const a=b.dataset.act;
+  if(a==='edge'){const v=b.getAttribute('aria-checked')!=='true';b.setAttribute('aria-checked',String(v));post('edge',{value:v});return}
+  const i=a.indexOf(':');post(i<0?a:a.slice(0,i),i<0?{}:{page:a.slice(i+1)})});
+document.addEventListener('contextmenu',e=>e.preventDefault());
+let D={me:'MacBook Pro',peer:'HACHIMAN-PC',paired:true,connected:true,controlling:false,ax:true,rtt:4,route:'LAN',hotkey:'F13',edge:true,update:'0.27.0'};
+function demo(cmd,args){setTimeout(()=>{if(cmd==='goPeer')D.controlling=true;if(cmd==='goHome')D.controlling=false;if(cmd==='edge')D.edge=args.value;if(cmd==='ready'||cmd==='goPeer'||cmd==='goHome'||cmd==='edge')window.knit.state(Object.assign({},D))},40)}
+post('ready');
+})();
+</script>
+</body>
+</html>

@@ -36,6 +36,19 @@ fn set_state(s: State) {
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = s;
 }
 
+/// 設定画面(webui)向けの状態: (種別, 新しい版, 失敗の理由, 署名鍵が登録済みか)。
+/// 種別は idle / checking / available / installing / failed
+pub fn ui_state() -> (&'static str, Option<String>, Option<String>, bool) {
+    let enabled = !trusted_keys().is_empty();
+    match state() {
+        State::Idle => ("idle", None, None, enabled),
+        State::Checking => ("checking", None, None, enabled),
+        State::Available { version, .. } => ("available", Some(version), None, enabled),
+        State::Installing => ("installing", None, None, enabled),
+        State::Failed(reason) => ("failed", None, Some(reason), enabled),
+    }
+}
+
 /// メニュー項目の表示。状態に応じて変わる
 pub fn menu_title() -> String {
     menu_title_with_reason().0
@@ -299,7 +312,7 @@ pub fn on_click() {
             std::thread::spawn(|| {
                 match check() {
                     Ok(Some(a)) => {
-                        crate::notify("Knit", &available_text(&a.version));
+                        crate::notify_as(crate::Notice::Update, "Knit", &available_text(&a.version));
                         set_state(State::Available { version: a.version, artifact: a.artifact });
                     }
                     Ok(None) => {
@@ -462,7 +475,7 @@ pub fn start_background() {
                     let mut n = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
                     if *n != a.version {
                         *n = a.version.clone();
-                        crate::notify("Knit", &available_text(&a.version));
+                        crate::notify_as(crate::Notice::Update, "Knit", &available_text(&a.version));
                     }
                     if matches!(state(), State::Idle | State::Failed(_)) {
                         set_state(State::Available { version: a.version, artifact: a.artifact });

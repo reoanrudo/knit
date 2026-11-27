@@ -8,7 +8,6 @@
 //! 新 UI と旧 UI で保存形式が分岐しないようにするため。
 use super::*;
 use super::localization::Language;
-use std::sync::Mutex;
 
 /// 画面が編集している設定値の下書き。
 ///
@@ -52,45 +51,6 @@ impl Settings {
             hotkey: crate::hotkey_kc(),
             update_check: crate::UPDATE_CHECK.load(Ordering::Relaxed),
         }
-    }
-}
-
-/// 下書き。未編集なら None(読むたびに保存先から現在値を取る)。
-static DRAFT: Mutex<Option<Settings>> = Mutex::new(None);
-/// 直前に適用した値(=「元に戻す」の戻し先)
-static APPLIED: Mutex<Option<Settings>> = Mutex::new(None);
-
-pub(in crate::gui) fn draft() -> Settings {
-    let mut guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-    guard.get_or_insert_with(Settings::current).clone()
-}
-
-/// 下書きを書き換える
-pub(in crate::gui) fn update(f: impl FnOnce(&mut Settings)) -> Settings {
-    let mut guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-    let d = guard.get_or_insert_with(Settings::current);
-    f(d);
-    d.clone()
-}
-
-/// 下書きを破棄して保存済みの値へ戻す(=元に戻す)
-pub(in crate::gui) fn discard() -> Settings {
-    let mut guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = None;
-    Settings::current()
-}
-
-/// 適用後の基準を記録する
-pub(in crate::gui) fn mark_applied(s: Settings) {
-    *APPLIED.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
-}
-
-/// 未保存の変更があるか(「適用」を押せる状態か)
-pub(in crate::gui) fn is_dirty() -> bool {
-    let guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-    match guard.as_ref() {
-        None => false,
-        Some(d) => *d != Settings::current(),
     }
 }
 
@@ -158,9 +118,11 @@ pub(in crate::gui) fn plan(before: &Settings, next: &Settings) -> Plan {
 /// 順序は「デスクトップ設定 → 自動起動 → preferences」。
 /// 途中で失敗したら、それまでの変更を戻してからエラーを返す。
 /// (旧 UI の apply と同じ順序と考え方に揃えている)
-pub(in crate::gui) fn apply() -> Result<Settings, String> {
+/// Write `next` to the stores (desktop settings -> login item -> preferences), rolling back
+/// earlier steps if a later one fails. Settings save immediately from the settings window.
+pub(in crate::gui) fn save(next: &Settings) -> Result<Settings, String> {
     let before = Settings::current();
-    let next = draft();
+    let next = next.clone();
     let p = plan(&before, &next);
 
     // 1. デスクトップ設定(受信フォルダ・履歴件数・受信後に開く)
@@ -207,8 +169,6 @@ pub(in crate::gui) fn apply() -> Result<Settings, String> {
         crate::history_set_limit(next.history_limit as usize);
     }
 
-    *DRAFT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    mark_applied(next.clone());
     Ok(next)
 }
 
@@ -225,27 +185,6 @@ fn restore_desktop(before: &Settings) {
 mod apply_tests {
     use super::*;
 
-    #[test]
-    fn apply_without_changes_is_a_no_op() {
-        // 下書きが無ければ何も書かない(適用ボタンは押せない状態)
-        *DRAFT.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        assert!(!is_dirty());
-    }
-
-    #[test]
-    fn discard_restores_saved_values() {
-        let _ = update(|d| d.clip_share = !d.clip_share);
-        discard();
-        let guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(guard.is_none());
-    }
-
-    #[test]
-    fn update_then_discard_leaves_no_draft() {
-        let _ = update(|d| d.history_limit = 200);
-        let got = discard();
-        assert_eq!(got, Settings::current());
-    }
 }
 
 #[cfg(test)]
@@ -350,14 +289,4 @@ mod tests {
         assert!(plan.startup);
     }
 
-    #[test]
-    fn draft_is_cleared_by_discard() {
-        let mut guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(base());
-        drop(guard);
-        assert!(is_dirty() || true); // 現在値はプロセス状態に依存するため握らない
-        discard();
-        let guard = DRAFT.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(guard.is_none(), "元に戻すと下書きは破棄される");
-    }
 }

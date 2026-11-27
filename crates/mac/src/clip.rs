@@ -834,7 +834,8 @@ fn smart_secret_notify(detail: &str) {
     if now.saturating_sub(SMART_SECRET_NOTIFY_MS.swap(now, Ordering::Relaxed)) < 60_000 {
         return;
     }
-    notify(
+    crate::notify_as(
+        crate::Notice::Clipboard,
         "Knit",
         &format!("クリップボードに機密の可能性があるため {detail}、履歴にも載せません(KNIT_SMART_SECRET=0 で無効化)"),
     );
@@ -848,7 +849,8 @@ fn big_text_notify(text: &str) {
     if now.saturating_sub(BIG_TEXT_NOTIFY_MS.swap(now, Ordering::Relaxed)) < 60_000 {
         return;
     }
-    notify(
+    crate::notify_as(
+        crate::Notice::Clipboard,
         "Knit",
         &knit_common::history::too_large_clip_message(text),
     );

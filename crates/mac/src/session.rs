@@ -192,7 +192,8 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                     .saturating_sub(BIG_CLIP_NOTIFY_MS.swap(now, Ordering::Relaxed))
                                     >= 60_000
                                 {
-                                    notify(
+                                    crate::notify_as(
+                                        crate::Notice::Clipboard,
                                         "Knit",
                                         &knit_common::history::too_large_clip_message(&text),
                                     );
@@ -252,7 +253,8 @@ pub(crate) fn session_receive_loop(reader: &mut std::io::BufReader<secure::Reade
                                 *degrade = next;
                                 drop(degrade);
                                 if guide {
-                                    notify(
+                                    crate::notify_as(
+                                        crate::Notice::Connection,
                                         "Knit",
                                         "遅延が続いています(80ms超)。Wi-Fiの場合は有線直結を検討してください。経路は設定「接続」で確認できます",
                                     );

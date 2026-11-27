@@ -4,7 +4,7 @@
 // 呼び出し規約: このモジュールの全関数はメインスレッドから呼ぶこと
 // (start() は main() の末尾、IMP は AppKit のイベント配信=メインRunLoop)。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::{msg0, msg0_cstr, nsstring, objc_getClass};
@@ -27,29 +27,12 @@ pub fn apply_remote_prefs(json: &str) {
 }
 mod prefs;
 mod settings_model;
-pub(crate) mod settings_new;
 mod settings_archive;
+mod webui;
+mod websetup;
+mod webtray;
 pub mod setup;
 pub static UI_PREVIEW: AtomicBool = AtomicBool::new(false);
-
-fn settings_new_selected(preview: bool, flag: bool) -> bool {
-    preview && flag
-}
-
-fn use_settings_new() -> bool {
-    settings_new_selected(UI_PREVIEW.load(Ordering::Relaxed), std::env::args().any(|a| a == "--settings-new"))
-}
-
-#[cfg(test)]
-mod settings_preview_tests {
-    #[test]
-    fn settings_new_requires_preview_and_flag() {
-        assert!(!super::settings_new_selected(false, false));
-        assert!(!super::settings_new_selected(false, true));
-        assert!(!super::settings_new_selected(true, false));
-        assert!(super::settings_new_selected(true, true));
-    }
-}
 
 pub fn restore_preferences() {
     preferences::restore();
@@ -218,14 +201,7 @@ fn state_title_set_now(menu_open: bool) -> bool {
     !menu_open
 }
 
-// ---------- 設定ウィンドウ(メニュー「設定…」で開く) ----------
-static PREFS_WIN: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_AUDIO: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_CMD: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_CLIP: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_FILES: AtomicUsize = AtomicUsize::new(0);
-static PREFS_CHK_HISTORY: AtomicUsize = AtomicUsize::new(0);
-static PREFS_STATE: AtomicUsize = AtomicUsize::new(0);
+// ---------- settings window (opened from the menu's Settings…) ----------
 /// 起動直後に設定ウィンドウを開く(--show-prefs。1 秒タイマーの初回で処理)
 pub static SHOW_AT_START: AtomicBool = AtomicBool::new(false);
 
@@ -297,20 +273,6 @@ unsafe fn confirm_alert(title: &str, body: &str, buttons: &[&str]) -> isize {
         msg1_void_i64(app, sel(c"setActivationPolicy:"), 1);
     }
     result
-}
-
-/// NSButton を破壊的操作の見た目へ(macOS 12+: 赤文字で通常ボタンと区別させる。
-/// API が無い古い OS では何もせず通常ボタンとして機能する=レイアウト側の
-/// 間隔確保だけでも区別は保たれる)
-unsafe fn mark_destructive(button: ID) {
-    if button.is_null() {
-        return;
-    }
-    let responds: unsafe extern "C" fn(ID, SEL, SEL) -> u8 =
-        std::mem::transmute(crate::objc_msgSend as *const () as usize);
-    if responds(button, sel(c"respondsToSelector:"), sel(c"setHasDestructiveAction:")) != 0 {
-        msg1_void_u8(button, sel(c"setHasDestructiveAction:"), 1);
-    }
 }
 
 /// 「履歴をすべて消す…」の確認文。実際に消える件数を入れる(取り消せない操作の
@@ -390,21 +352,11 @@ unsafe extern "C" fn imp_restart(_s: ID, _c: SEL, _n: ID) {
 /// 設定「接続」の「保存して再接続」: ~/.config/knit/env の KNIT_HOST 行を書き換えて
 /// 再起動する(接続先は起動時に決まるため。Windows 側の .env 書き換えと同じ流れ)。
 /// 空欄なら行を消して LAN からの自動発見へ戻す
-unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
+unsafe fn save_host_text(text: &str) -> Result<String, String> {
     if UI_PREVIEW.load(Ordering::Relaxed) {
-        return;
+        return Ok(String::new());
     }
-    let field = prefs::host_field() as ID;
-    if field.is_null() {
-        return;
-    }
-    let obj = msg0(field, sel(c"stringValue"));
-    let utf8 = crate::msg0_cstr(obj, sel(c"UTF8String"));
-    let text = if utf8.is_null() {
-        String::new()
-    } else {
-        std::ffi::CStr::from_ptr(utf8).to_string_lossy().trim().to_string()
-    };
+    let text = text.to_string();
     // 形式の確認: カンマ区切りの各要素が IP アドレス(IPv4/IPv6)として書けているか。
     // ホスト名は Knit の接続先指定では使わないため、入力ミスをここで止める。
     // 判定は Windows 側(MENU_SAVEHOST)と共通の knit_common::connect::validate_host_input。
@@ -417,13 +369,13 @@ unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
         prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
         crate::notify("Knit", &message);
         eprintln!("[prefs] 接続先の形式が不正のため保存しません: {bad}");
-        return;
+        return Err(message);
     }
     let Some(dir) = knit_common::envutil::config_dir() else {
         let message = "ホームが取得できず接続先を保存できませんでした".to_string();
         prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
         crate::notify("Knit", &message);
-        return;
+        return Err(message);
     };
     let path = dir.join("env");
     // Windows 側(save_host_to_env)と同じ安全策: 失敗したら通知して元のまま続ける。
@@ -433,7 +385,7 @@ unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
         prefs::set_save_error(prefs::SaveErrorSource::Host, message.clone());
         crate::notify("Knit", &message);
         eprintln!("[prefs] 接続先の保存に失敗: {e}");
-        return;
+        return Err(message);
     }
     prefs::clear_save_error(prefs::SaveErrorSource::Host);
     let message = if text.is_empty() {
@@ -450,6 +402,7 @@ unsafe extern "C" fn imp_save_host(_s: ID, _c: SEL, _n: ID) {
     };
     crate::notify("Knit", &message);
     restart_now();
+    Ok(message)
 }
 
 /// 再起動のためのシェル文字列。1 秒待って(古いプロセスが終わり二重起動のロックが
@@ -738,7 +691,6 @@ unsafe extern "C" fn imp_side(_s: ID, _c: SEL, sender: ID) {
             std::mem::transmute(crate::objc_msgSend as *const () as usize);
         let idx = get(sender, sel(c"indexOfSelectedItem"));
         crate::set_side(idx.clamp(0, 7) as u8);
-        *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
     }
     preferences::save();
 }
@@ -780,10 +732,7 @@ unsafe extern "C" fn imp_rotate_side(_s: ID, _c: SEL, _n: ID) {
 /// 配置エディタ(独立ウィンドウ)を開く
 /// 配置エディタ(独立ウィンドウ)を開く(メニュー IMP と起動直後の両方から呼ぶ)
 pub fn show_layout() {
-    show_prefs();
-    unsafe {
-        prefs::select_page(1);
-    }
+    show_prefs_page(Some("conn"));
 }
 
 unsafe extern "C" fn imp_show_layout(_s: ID, _c: SEL, _n: ID) {
@@ -963,7 +912,8 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {    // accessory �
                 // 未接続で 1 件も始まらない場合も残りを確実に戻す(表示が残らないように)
                 crate::android::PUSH_REMAINING.store(0, Ordering::Relaxed);
                 match r {
-                    Some(n) => crate::notify(
+                    Some(n) => crate::notify_as(
+                        crate::Notice::Transfer,
                         "Knit",
                         &format!("タブレットの Download へ {n} 件を保存しました"),
                     ),
@@ -980,31 +930,12 @@ unsafe extern "C" fn imp_send_file(_s: ID, _c: SEL, _n: ID) {    // accessory �
         }
     }
 }
-/// 設定ウィンドウを開く(初回のみ生成。以降は同一ウィンドウを前面化)。
-/// メニューの IMP と起動直後(--show-prefs)の両方から呼ぶ
-/// NSException の内容を abort 前にログへ(objc が unwind 前に呼ぶ)
-unsafe extern "C" fn uncaught_exc_handler(exc: ID) {
-    unsafe {
-        let name = msg0_cstr(msg0(exc, sel(c"name")), sel(c"UTF8String"));
-        let reason = msg0_cstr(msg0(exc, sel(c"reason")), sel(c"UTF8String"));
-        eprintln!(
-            "[prefs] NSException name={:?} reason={:?}",
-            if name.is_null() {
-                None
-            } else {
-                std::ffi::CStr::from_ptr(name).to_str().ok()
-            },
-            if reason.is_null() {
-                None
-            } else {
-                std::ffi::CStr::from_ptr(reason).to_str().ok()
-            },
-        );
-    }
+pub fn show_prefs() {
+    show_prefs_page(None);
 }
 
-pub fn show_prefs() {
-    eprintln!("[prefs] enter");
+/// 設定画面(WKWebView)を開く。page は gen / conn / diag / upd
+fn show_prefs_page(page: Option<&str>) {
     // スクロール方向は起動時の macOS 設定(自然スクロール)のスナップショットで
     // 決まる。起動中にシステム設定で切り替えた場合も入力の向きへ反映させるため、
     // 設定画面を開くタイミングで再取得する(defaults read はサブプロセス呼び出しな
@@ -1018,54 +949,7 @@ pub fn show_prefs() {
             );
         }
     }
-    unsafe {
-        let app = msg0(
-            objc_getClass(c"NSApplication".as_ptr()),
-            sel(c"sharedApplication"),
-        );
-        if !app.is_null() {
-            // メニューバー常駐型は非アクティブなので明示的に前面化する
-            msg1_void_u8(app, sel(c"activateIgnoringOtherApps:"), 1);
-        }
-        extern "C" {
-            fn NSSetUncaughtExceptionHandler(h: Option<unsafe extern "C" fn(ID)>);
-        }
-        NSSetUncaughtExceptionHandler(Some(uncaught_exc_handler));
-        eprintln!("[prefs] activated");
-        let existing = PREFS_WIN.load(Ordering::Relaxed) as ID;
-        if existing.is_null() {
-            let target = GUI_TARGET.load(Ordering::Relaxed) as ID;
-            let win = make_prefs_window(target);
-            if win.is_null() {
-                eprintln!("[gui] 設定ウィンドウの生成に失敗");
-                return;
-            }
-            if UI_PREVIEW.load(Ordering::Relaxed) {
-                msg1_void_id(win, sel(c"setDelegate:"), target);
-            }
-            PREFS_WIN.store(win as usize, Ordering::Relaxed);
-        }
-        let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
-        // 最小化中は makeKeyAndOrderFront だけでは戻らない(未最小化なら無害)
-        msg1_void_id(win, sel(c"deminiaturize:"), std::ptr::null_mut());
-        // 開くときは必ず「接続」タブから(「その他」などのまま閉じた状態を
-        // 引き継がない)。プレビュー(--preview-page)は build が選んだページを優先する
-        if !UI_PREVIEW.load(Ordering::Relaxed) {
-            prefs::select_page(0);
-        }
-        msg1_void_id(win, sel(c"makeKeyAndOrderFront:"), std::ptr::null_mut());
-        msg0_void(win, sel(c"orderFrontRegardless"));
-        // macOS 14 以降は activateIgnoringOtherApps: だけだと前面化されないことがある。
-        // ウィンドウを出した後に新 API(activate)でもう一度要求する
-        if !app.is_null() {
-            let responds: unsafe extern "C" fn(ID, SEL, SEL) -> u8 =
-                std::mem::transmute(crate::objc_msgSend as *const () as usize);
-            if responds(app, sel(c"respondsToSelector:"), sel(c"activate")) != 0 {
-                msg0_void(app, sel(c"activate"));
-            }
-        }
-        sync_prefs_state();
-    }
+    webui::show(page);
 }
 
 unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
@@ -1076,1014 +960,20 @@ unsafe extern "C" fn imp_show_prefs(_s: ID, _c: SEL, _n: ID) {
 /// setReleasedWhenClosed:0 のため隠れるだけで破棄されず、次回の show_prefs で
 /// 同じウィンドウ(入力欄の値もそのまま)が戻る
 unsafe extern "C" fn imp_close_prefs(_s: ID, _c: SEL, _n: ID) {
-    let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
-    if !win.is_null() {
-        msg1_void_id(win, sel(c"performClose:"), std::ptr::null_mut());
-    }
+    webui::close();
 }
 
-/// プレビューは閉じた後に常駐させない。本番窓の delegate には設定しない。
-unsafe extern "C" fn imp_preview_window_close(_s: ID, _c: SEL, _n: ID) {
-    if UI_PREVIEW.load(Ordering::Relaxed) {
-        eprintln!("[ui-check] PASS: preview window closed; process exits without a status item");
-        crate::clip::flush_image_store();
-        std::process::exit(0);
-    }
-}
 
 /// チェックボックスの見た目を本体の状態(static)へ同期する(1秒タイマーから)。
 /// 設定ウィンドウが表示されていない間は毎秒の全書き換え(50 メッセージ超/秒)を
 /// 行わず early return する: 表示の復帰は show_prefs 末尾の呼び出しで即座に
 /// 最新化され、最小化からドック経由で戻ったときだけ次の毎秒タイマーが拾う
 fn sync_prefs_state() {
-    // 新設定UI(--settings-new)では旧UIの部品が無いので同期しない
-    if use_settings_new() {
-        return;
-    }
-    unsafe {
-        let win = PREFS_WIN.load(Ordering::Relaxed) as ID;
-        if win.is_null() {
-            return;
-        }
-        let is_visible: unsafe extern "C" fn(ID, SEL) -> u8 =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        if is_visible(win, sel(c"isVisible")) == 0 {
-            return;
-        }
-        prefs::sync();
-        if prefs::refined::is_built() { return; }
-        let set = |slot: &AtomicUsize, on: bool| {
-            let b = slot.load(Ordering::Relaxed) as ID;
-            if !b.is_null() {
-                msg1_void_u8(b, sel(c"setState:"), on as u8);
-            }
-        };
-        set(
-            &PREFS_CHK_AUDIO,
-            !crate::audio::MUTED.load(Ordering::Relaxed) && knit_common::share::env_cap().audio,
-        );
-        set(&PREFS_CHK_CMD, crate::CMD_ALT.load(Ordering::Relaxed));
-        set(
-            &PREFS_CHK_CLIP,
-            crate::CLIP_SHARE.load(Ordering::Relaxed) && knit_common::share::env_cap().clip,
-        );
-        set(&PREFS_CHK_FILES, knit_common::share::allow_files());
-        set(
-            &PREFS_CHK_HISTORY,
-            crate::LOCAL_HISTORY.load(Ordering::Relaxed) && knit_common::share::env_cap().clip,
-        );
-    }
+    webui::tick();
+    webtray::tick();
 }
 
-// ---------- モニター配置エディタ(Mac の「ディスプレイ配置」相当) ----------
-// 灰色=Mac、青=Windows の矩形を描き、Windows 側をドラッグして物理配置を再現する。
-// ドロップ時に「接する辺+辺に沿った接続範囲」を算出して SIDE/LAY_RANGE へ反映
-const LAY_VW: f64 = 560.0;
-const LAY_VH: f64 = 320.0;
 
-/// Mac/Win 両グループの実ピクセルサイズ(外接。hello の monitors から算出)
-fn lay_px() -> ((f64, f64), (f64, f64)) {
-    let ((_, msz), (_, wsz)) = (mac_group(), win_group());
-    (msz, wsz)
-}
-
-/// モニター群を正規化する: 原点を (0,0) に寄せ、y を上向き(View 座標)へ反転。
-/// 矩形 (x, y, w, h)
-type Rect = (f64, f64, f64, f64);
-/// 矩形リストと外接サイズ
-type RectGroup = (Vec<Rect>, (f64, f64));
-
-/// 戻り値は (矩形リスト, 外接サイズ)
-fn normalize_monitors(list: &[Rect]) -> RectGroup {
-    if list.is_empty() {
-        return (Vec::new(), (1.0, 1.0));
-    }
-    let min_x = list.iter().map(|m| m.0).fold(f64::MAX, f64::min);
-    let max_x = list.iter().map(|m| m.0 + m.2).fold(f64::MIN, f64::max);
-    let min_y = list.iter().map(|m| m.1).fold(f64::MAX, f64::min);
-    let max_y = list.iter().map(|m| m.1 + m.3).fold(f64::MIN, f64::max);
-    let w = (max_x - min_x).max(1.0);
-    let h = (max_y - min_y).max(1.0);
-    let rects = list
-        .iter()
-        .map(|m| (m.0 - min_x, max_y - (m.1 + m.3), m.2.max(1.0), m.3.max(1.0)))
-        .collect();
-    (rects, (w, h))
-}
-
-/// Mac 側の全モニター(内蔵+外部。実座標の相対配置を保つ)。
-/// 並びは mac_displays() と同じ(メイン先頭)なので、番号で矩形を引ける
-fn mac_group() -> RectGroup {
-    let list: Vec<Rect> = crate::mac_displays()
-        .iter()
-        .map(|d| (d.x, d.y, d.w, d.h))
-        .collect();
-    normalize_monitors(&list)
-}
-
-// 描画・ドラッグ判定で同じ寸法を使う。通信のscreen/monitorsは書き換えない。
-fn peer_group(p: &crate::PeerEntry) -> RectGroup {
-    let list: Vec<Rect> = p.monitors.iter().map(|m| (m.x as f64,m.y as f64,m.w as f64,m.h as f64)).collect();
-    let (mut rects, mut size) = if list.is_empty() { normalize_monitors(&[(0.0,0.0,p.screen.0,p.screen.1)]) } else { normalize_monitors(&list) };
-    if p.id.starts_with("android-") {
-        let d = unsafe { crate::CGMainDisplayID() };
-        let mac = unsafe { crate::CGDisplayBounds(d) };
-        let mm = unsafe { crate::CGDisplayScreenSize(d) };
-        let display = crate::android::display::layout_size(size, crate::android::display::get(&p.id), (mac.size.w,mac.size.h),(mm.w,mm.h));
-        let factor = display.0 / size.0;
-        for r in &mut rects { *r = (r.0*factor,r.1*factor,r.2*factor,r.3*factor); }
-        size = display;
-    }
-    (rects,size)
-}
-
-fn win_group() -> RectGroup {
-    let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = peers.get(act) { return peer_group(p); }
-    let (w,h) = *crate::WIN_SCREEN.lock().unwrap_or_else(|e| e.into_inner());
-    normalize_monitors(&[(0.0,0.0,w,h)])
-}
-
-/// 共通縮尺: 両モニターを横並び + 縦に収める(重ならず両方必ず見える)
-fn lay_scale() -> f64 {
-    let ((mw, mh), (ww, wh)) = lay_px();
-    let by_w = (LAY_VW - 80.0) / (mw + 2.0 * ww).max(1.0);
-    let by_h = (LAY_VH - 40.0) / (mh + 2.0 * wh).max(1.0);
-    by_w.min(by_h)
-}
-
-/// Windows 矩形のサイズ(実際の大きさ比・共通縮尺)
-fn lay_win_size() -> (f64, f64) {
-    let (_, (ww, wh)) = lay_px();
-    let sc = lay_scale();
-    (ww * sc, wh * sc)
-}
-static LAY_WIN: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0)); // Win 矩形中心(0=既定=Macの右隣)
-
-/// side(0-7)に対応する接続先ブロックの中心位置。Mac 側矩形 base の外側に置く。
-/// 斜め(4-7)は基の辺(右/左)の上下半分の中心(接続範囲 LAY_RANGE の上半分/
-/// 下半分と一致させる)。ここが 4 方向しか対応していないと、斜めへドロップ
-/// しても表示が常に右へ戻り「移動できない」ように見える
-fn lay_side_center(side: u8, base: &NSRect, w: f64, h: f64) -> (f64, f64) {
-    let cy = base.y + base.h / 2.0;
-    let cx = base.x + base.w / 2.0;
-    let right_x = base.x + base.w + 8.0 + w / 2.0;
-    let left_x = base.x - 8.0 - w / 2.0;
-    let upper_y = base.y + base.h * 0.75; // 斜めの上半分の中心
-    let lower_y = base.y + base.h * 0.25; // 斜めの下半分の中心
-    match side {
-        1 => (left_x, cy),
-        2 => (cx, base.y + base.h + 8.0 + h / 2.0),
-        3 => (cx, base.y - 8.0 - h / 2.0),
-        4 => (right_x, upper_y), // 右上
-        5 => (right_x, lower_y), // 右下
-        6 => (left_x, upper_y),  // 左上
-        7 => (left_x, lower_y),  // 左下
-        _ => (right_x, cy),
-    }
-}
-
-/// 相手矩形の中心(未設定ならアクティブ端末の side/モニターから既定位置を計算)
-fn lay_win_center() -> (f64, f64) {
-    let c = *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner());
-    if c.0 <= 0.0 {
-        // アクティブ端末の設定(存在すれば)を使う。モニター指定ならその矩形の外側
-        let (side, mi) = {
-            let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
-            let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-            match peers.get(act) {
-                Some(p) => (p.side, p.edge_monitor),
-                // 未接続時の全体設定。斜め(4-7)もそのまま使う
-                None => (crate::SIDE.load(Ordering::Relaxed).min(7), None),
-            }
-        };
-        let sc = lay_scale();
-        let (rects, _) = mac_group();
-        let (mox, moy) = lay_mac_origin();
-        let base = match mi.and_then(|i| rects.get(i)) {
-            Some((x, y, w, h)) => NSRect {
-                x: mox + x * sc,
-                y: moy + y * sc,
-                w: w * sc,
-                h: h * sc,
-            },
-            None => lay_mac_rect(),
-        };
-        let (ww, wh) = lay_win_size();
-        return lay_side_center(side, &base, ww, wh);
-    }
-    c
-}
-static LAY_GRAB: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
-static LAY_DRAG: AtomicBool = AtomicBool::new(false);
-/// ドラッグ中の端末(PEERS の添字。usize::MAX = なし)
-static LAY_DRAG_IDX: AtomicUsize = AtomicUsize::new(usize::MAX);
-/// mouseDown の位置(クリック判定=ドラッグ量 4px 未満の mouseUp に使う)。
-/// 端末を掴んでいない時は f64::NAN を入れて判定が常に偽になるようにする
-static LAY_DOWN_POS: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((f64::NAN, f64::NAN));
-/// 占有済みの辺へドロップした時の警告表示の期限(単調時計 ms。0=無効)。
-/// 毎秒の再描画(refresh_status → prefs::sync)で自然に消えるため戻し処理は不要
-static LAY_WARN_UNTIL: AtomicU64 = AtomicU64::new(0);
-/// 警告表示の対象の基の辺(0=右/1=左/2=上/3=下)
-static LAY_WARN_DIR: AtomicU8 = std::sync::atomic::AtomicU8::new(255);
-/// 非アクティブ端末をドラッグ中の中心(アクティブ用の LAY_WIN とは別に持つ)
-static LAY_DRAG_CENTER: std::sync::Mutex<(f64, f64)> = std::sync::Mutex::new((0.0, 0.0));
-
-fn lay_mac_rect() -> NSRect {
-    let ((_, (mw, mh)), _) = (mac_group(), win_group());
-    let sc = lay_scale();
-    let (ox, oy) = lay_mac_origin();
-    NSRect {
-        x: ox,
-        y: oy,
-        w: mw * sc,
-        h: mh * sc,
-    }
-}
-
-/// side(0=右/1=左/2=上/3=下/4=右上/5=右下/6=左上/7=左下)の配置セルの矩形。
-/// Mac の外接矩形を 1 セルとして、その周囲 8 マスに置く(Deskflow の
-/// 「セルにドラッグして置く」にあたる見せ方。斜めも置ける)
-unsafe fn lay_cell_rect(mac: &NSRect, side: u8) -> NSRect {
-    let (dx, dy) = match side {
-        1 => (-1.0, 0.0),
-        2 => (0.0, 1.0),
-        3 => (0.0, -1.0),
-        4 => (1.0, 1.0),
-        5 => (1.0, -1.0),
-        6 => (-1.0, 1.0),
-        7 => (-1.0, -1.0),
-        _ => (1.0, 0.0),
-    };
-    NSRect {
-        x: mac.x + dx * mac.w,
-        y: mac.y + dy * mac.h,
-        w: mac.w,
-        h: mac.h,
-    }
-}
-
-/// 点から最も近い配置セルの side を返す。Mac 自身の上は None(置けない)
-unsafe fn lay_cell_for_point(mac: &NSRect, p: (f64, f64)) -> Option<u8> {
-    let mcx = mac.x + mac.w / 2.0;
-    let mcy = mac.y + mac.h / 2.0;
-    let dx = p.0 - mcx;
-    let dy = p.1 - mcy;
-    if dx.abs() < mac.w / 2.0 && dy.abs() < mac.h / 2.0 {
-        return None;
-    }
-    let a = (dy).atan2(dx).to_degrees();
-    let side = if a >= -22.5 && a < 22.5 {
-        0 // 右
-    } else if a >= 22.5 && a < 67.5 {
-        4 // 右上
-    } else if a >= 67.5 && a < 112.5 {
-        2 // 上
-    } else if a >= 112.5 && a < 157.5 {
-        6 // 左上
-    } else if a >= -67.5 && a < -22.5 {
-        5 // 右下
-    } else if a >= -112.5 && a < -67.5 {
-        3 // 下
-    } else if a >= -157.5 && a < -112.5 {
-        7 // 左下
-    } else {
-        1 // 左
-    };
-    Some(side)
-}
-
-/// Mac グループ(外接)の描画原点(中央寄せ)
-fn lay_mac_origin() -> (f64, f64) {
-    let ((_, (mw, mh)), _) = (mac_group(), win_group());
-    let sc = lay_scale();
-    ((LAY_VW - mw * sc) / 2.0, (LAY_VH - mh * sc) / 2.0)
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct CGPoint2 {
-    x: f64,
-    y: f64,
-}
-
-unsafe fn lay_point_in_view(_self: ID, ev: ID) -> CGPoint2 {
-    unsafe {
-        let loc: unsafe extern "C" fn(ID, SEL) -> CGPoint2 =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        let conv: unsafe extern "C" fn(ID, SEL, CGPoint2, ID) -> CGPoint2 =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        let p = loc(ev, sel(c"locationInWindow"));
-        conv(
-            _self,
-            sel(c"convertPoint:fromView:"),
-            p,
-            std::ptr::null_mut(),
-        )
-    }
-}
-
-/// 描画: CoreGraphics で直接塗る(graphicsPort 経由)
-/// 配置エディタに表示する 1 端末分の情報(描画とドラッグ判定の共通ソース)
-struct LayPeer {
-    idx: usize,
-    /// 端末識別子(hello の id。クリック選択で使う。未接続プレースホルダは空)
-    id: String,
-    name: String,
-    rects: Vec<Rect>,
-    size: (f64, f64),
-    /// rects と同じ並びのモニター名(取れない時は空)
-    names: Vec<String>,
-    active: bool,
-    dragging: bool,
-    center: (f64, f64),
-}
-
-/// sizeWithAttributes: の戻り値(NSSize と同じ並び)
-#[repr(C)]
-struct CGSize2 {
-    w: f64,
-    h: f64,
-}
-
-/// 全端末の表示位置を計算する。ドラッグ中の端末はその中心、アクティブ端末は
-/// 自由位置(LAY_WIN)、それ以外は割り当てた辺の外側に置く
-fn lay_peers() -> Vec<LayPeer> {
-    let sc = lay_scale();
-    let (mrects, _) = mac_group();
-    let (mox, moy) = lay_mac_origin();
-    let m = lay_mac_rect();
-    let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-    let drag_idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
-    let drag_center = *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner());
-    let peers: Vec<(String, String, u8, Option<usize>, (Vec<Rect>, (f64, f64)), Vec<String>)> = {
-        let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
-        peers
-            .iter()
-            .map(|p| {
-                (
-                    p.id.clone(),
-                    // 下の名前ラベルは「表示名 (IP)」: エイリアス優先・同じ
-                    // コンピュータ名の複数台を IP で区別できる形式
-                    crate::conn::peer_display_label(
-                        p.alias.as_deref(),
-                        &p.name,
-                        &p.ip.to_string(),
-                    ),
-                    p.side,
-                    p.edge_monitor,
-                    peer_group(p),
-                    p.monitors.iter().map(|m| m.name.clone()).collect(),
-                )
-            })
-            .collect()
-    };
-    let mut out = Vec::new();
-    for (i, (id, name, side, edge_monitor, (rects, size), names)) in peers.into_iter().enumerate() {
-        let active = i == act;
-        let dragging = i == drag_idx;
-        let (w, h) = (size.0 * sc, size.1 * sc);
-        let (cx, cy) = if dragging {
-            if active {
-                *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner())
-            } else {
-                drag_center
-            }
-        } else if active {
-            lay_win_center()
-        } else {
-            // 割り当てた辺の外側(モニター指定があればそのモニターの外側)。
-            // 斜め(4-7)も含めて lay_side_center が 8 方向の位置を出す
-            let base = match edge_monitor.and_then(|mi| mrects.get(mi)) {
-                Some((x, y, bw, bh)) => NSRect {
-                    x: mox + x * sc,
-                    y: moy + y * sc,
-                    w: bw * sc,
-                    h: bh * sc,
-                },
-                None => m,
-            };
-            lay_side_center(side, &base, w, h)
-        };
-        out.push(LayPeer {
-            idx: i,
-            id,
-            name,
-            rects,
-            size,
-            names,
-            active,
-            dragging,
-            center: (cx, cy),
-        });
-    }
-    if out.is_empty() {
-        // 未接続でも操作対象のプレースホルダ 1 台を表示する(従来と同じ)
-        let (rects, size) = win_group();
-        out.push(LayPeer {
-            idx: usize::MAX,
-            id: String::new(),
-            name: localization::text("接続先", "Other device").to_string(),
-            rects,
-            size,
-            names: Vec::new(),
-            active: true,
-            dragging: false,
-            center: lay_win_center(),
-        });
-    }
-    out
-}
-
-/// キャンバスへ文字を描く(現在の CoreGraphics コンテキストに NSString で載せる)
-/// モニター名を矩形の幅に収まる文字数へ切り詰める(全角は約 1 文字=size 幅)
-fn lay_fit(name: &str, width: f64, size: f64) -> String {
-    let max = ((width - 6.0) / (size * 0.62)).floor().max(1.0) as usize;
-    if name.chars().count() <= max {
-        return name.to_string();
-    }
-    let mut t: String = name.chars().take(max.saturating_sub(1)).collect();
-    t.push('…');
-    t
-}
-
-unsafe fn lay_text(s: &str, cx: f64, y: f64, size: f64, light: bool) {
-    unsafe {
-        let obj = crate::nsstring(s);
-        if obj.is_null() {
-            return;
-        }
-        let font = msg1_id_f64(
-            objc_getClass(c"NSFont".as_ptr()),
-            sel(c"systemFontOfSize:"),
-            size,
-        );
-        let color = msg0(objc_getClass(c"NSColor".as_ptr()), sel(if light { c"whiteColor" } else { c"labelColor" }));
-        let dict = msg0(
-            objc_getClass(c"NSMutableDictionary".as_ptr()),
-            sel(c"dictionary"),
-        );
-        msg2_void_id_id(dict, sel(c"setObject:forKey:"), font, crate::nsstring("NSFont"));
-        msg2_void_id_id(dict, sel(c"setObject:forKey:"), color, crate::nsstring("NSColor"));
-        let sz: CGSize2 = {
-            let f: unsafe extern "C" fn(ID, SEL, ID) -> CGSize2 =
-                std::mem::transmute(crate::objc_msgSend as *const () as usize);
-            f(obj, sel(c"sizeWithAttributes:"), dict)
-        };
-        let f: unsafe extern "C" fn(ID, SEL, CGPoint2, ID) =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        f(
-            obj,
-            sel(c"drawAtPoint:withAttributes:"),
-            CGPoint2 {
-                x: cx - sz.w / 2.0,
-                y,
-            },
-            dict,
-        );
-    }
-}
-
-unsafe extern "C" fn lay_draw(_self: ID, _cmd: SEL, _r: NSRect) {
-    unsafe {
-        let ctx_cls = objc_getClass(c"NSGraphicsContext".as_ptr());
-        let cur = msg0(ctx_cls, sel(c"currentContext"));
-        if cur.is_null() {
-            return;
-        }
-        let port = msg0(cur, sel(c"graphicsPort"));
-        if port.is_null() {
-            return;
-        }
-        extern "C" {
-            fn CGContextSetRGBFillColor(c: *mut core::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
-            fn CGContextFillRect(c: *mut core::ffi::c_void, r: NSRect);
-            fn CGContextSetRGBStrokeColor(
-                c: *mut core::ffi::c_void,
-                r: f64,
-                g: f64,
-                b: f64,
-                a: f64,
-            );
-            fn CGContextSetLineWidth(c: *mut core::ffi::c_void, w: f64);
-            fn CGContextStrokeRect(c: *mut core::ffi::c_void, r: NSRect);
-        }
-        let ctx = port;
-        // 背景
-        msg0_void(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"controlBackgroundColor")), sel(c"setFill"));
-        CGContextFillRect(
-            ctx,
-            NSRect {
-                x: 0.0,
-                y: 0.0,
-                w: LAY_VW,
-                h: LAY_VH,
-            },
-        );
-        // グリッド(Deskflow 風の薄い方眼。1px 矩形で描く)
-        msg0_void(msg1_id_f64(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"separatorColor")), sel(c"colorWithAlphaComponent:"), 0.24), sel(c"setFill"));
-        let mut gx = 40.0;
-        while gx < LAY_VW {
-            CGContextFillRect(
-                ctx,
-                NSRect {
-                    x: gx,
-                    y: 0.0,
-                    w: 1.0,
-                    h: LAY_VH,
-                },
-            );
-            gx += 40.0;
-        }
-        let mut gy = 40.0;
-        while gy < LAY_VH {
-            CGContextFillRect(
-                ctx,
-                NSRect {
-                    x: 0.0,
-                    y: gy,
-                    w: LAY_VW,
-                    h: 1.0,
-                },
-            );
-            gy += 40.0;
-        }
-        // 配置セル(Deskflow 式): Mac を中央に周囲 8 マス。ドラッグ中は
-        // ドロップ候補のセルを薄く塗って、置き場所が一目で分かるようにする
-        {
-            let m = lay_mac_rect();
-            let drag = LAY_DRAG.load(Ordering::Relaxed);
-            let hover = if drag {
-                let idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
-                let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-                let p = if idx == usize::MAX || idx == act {
-                    lay_win_center()
-                } else {
-                    *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner())
-                };
-                lay_cell_for_point(&m, p)
-            } else {
-                None
-            };
-            // 同じ辺(斜めは基の辺へ集約)を 2 台以上が使っているセルは警告色の
-            // 枠で見せる: 重複配置は黙って受け入れられ 2 台が重なって描かれる
-            // ため、どちらかが辺に入れず気づけない
-            let occupied: Vec<u8> = crate::PEERS
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .iter()
-                .map(|p| crate::base_dir(p.side))
-                .collect();
-            // 占有済みの辺へのドロップ直後の告知(約1.5秒の薄赤フラッシュ。
-            // 毎秒の再描画タイマーがあるため期限が切れれば自然に戻る)
-            let warn_dir = LAY_WARN_DIR.load(Ordering::Relaxed);
-            let warn_active = crate::now_ms() < LAY_WARN_UNTIL.load(Ordering::Relaxed);
-            for s in 0u8..8 {
-                let r = lay_cell_rect(&m, s);
-                let d = crate::base_dir(s);
-                if warn_active && d == warn_dir {
-                    CGContextSetRGBFillColor(ctx, 0.92, 0.28, 0.24, 0.20);
-                    CGContextFillRect(ctx, r);
-                }
-                if Some(s) == hover {
-                    CGContextSetRGBFillColor(ctx, 0.36, 0.47, 0.88, 0.14);
-                    CGContextFillRect(ctx, r);
-                }
-                if occupied.iter().filter(|&&od| od == d).count() >= 2 {
-                    CGContextSetRGBStrokeColor(ctx, 0.88, 0.46, 0.16, 1.0);
-                    CGContextSetLineWidth(ctx, 2.0);
-                } else {
-                    msg0_void(msg1_id_f64(msg0(objc_getClass(c"NSColor".as_ptr()), sel(c"separatorColor")), sel(c"colorWithAlphaComponent:"), 0.65), sel(c"setStroke"));
-                    CGContextSetLineWidth(ctx, 1.0);
-                }
-                CGContextStrokeRect(ctx, r);
-            }
-        }
-        // Mac(灰+白枠): 全モニターを実配置のまま描く。内蔵(メイン)は濃い灰で区別
-        let sc = lay_scale();
-        let (macs, _) = mac_group();
-        let (mox, moy) = lay_mac_origin();
-        let (main_w, main_h) = {
-            let g = crate::geo();
-            (g.main_w, g.main_h)
-        };
-        let mac_names: Vec<String> = crate::mac_displays().into_iter().map(|d| d.name).collect();
-        for (i, (x, y, w, h)) in macs.iter().enumerate() {
-            let r = NSRect {
-                x: mox + x * sc,
-                y: moy + y * sc,
-                w: w * sc,
-                h: h * sc,
-            };
-            let is_main = (w - main_w).abs() < 1.0 && (h - main_h).abs() < 1.0;
-            if is_main {
-                CGContextSetRGBFillColor(ctx, 0.42, 0.46, 0.56, 1.0);
-            } else {
-                CGContextSetRGBFillColor(ctx, 0.62, 0.66, 0.74, 1.0);
-            }
-            CGContextFillRect(ctx, r);
-            CGContextSetRGBStrokeColor(ctx, 1.0, 1.0, 1.0, 0.9);
-            CGContextSetLineWidth(ctx, 1.5);
-            CGContextStrokeRect(ctx, r);
-            let label = match mac_names.get(i).filter(|n| !n.is_empty()) {
-                Some(n) => n.clone(),
-                None => format!("{}{}", localization::text("モニター", "Display "), i + 1),
-            };
-            lay_text(&lay_fit(&label, r.w, 10.0), r.x + r.w / 2.0, r.y + r.h / 2.0 - 6.0, 10.0, is_main);
-        }
-        // ドラッグ中の端末が Mac の外接矩形の上(セルの外)にあるとき: ドロップで
-        // 「全画面の端(モニター指定なし)」へ戻ることを示す薄緑のオーバーレイ。
-        // モニター描画の後へ重ねないと下の fill に隠れるため、この位置で描く。
-        // 未接続プレースホルダ(usize::MAX)は戻す先のモニター指定がそもそも
-        // 無いため対象外(表示だけ出て何も起きないのを避ける)
-        if LAY_DRAG.load(Ordering::Relaxed)
-            && LAY_DRAG_IDX.load(Ordering::Relaxed) != usize::MAX
-        {
-            let m = lay_mac_rect();
-            let idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
-            let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-            let p = if idx == usize::MAX || idx == act {
-                lay_win_center()
-            } else {
-                *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner())
-            };
-            if lay_cell_for_point(&m, p).is_none() {
-                CGContextSetRGBFillColor(ctx, 0.30, 0.65, 0.40, 0.18);
-                CGContextFillRect(ctx, m);
-                CGContextSetRGBStrokeColor(ctx, 0.22, 0.58, 0.34, 1.0);
-                CGContextSetLineWidth(ctx, 2.0);
-                CGContextStrokeRect(ctx, m);
-            }
-        }
-        // 接続先: 全端末のモニター群を実配置のまま描く。アクティブな端末は青、
-        // それ以外は薄い青。どの端末もドラッグで配置を変えられ、名前を下に表示する
-        let peers = lay_peers();
-        // ドラッグ中の端末は最前面に描く
-        let mut order: Vec<&LayPeer> = peers.iter().filter(|p| !p.dragging).collect();
-        order.extend(peers.iter().filter(|p| p.dragging));
-        for lp in order {
-            let (cx, cy) = lp.center;
-            let (sw, sh) = (lp.size.0 * sc, lp.size.1 * sc);
-            let (ox, oy) = (cx - sw / 2.0, cy - sh / 2.0);
-            if lp.active || lp.dragging {
-                CGContextSetRGBFillColor(ctx, 0.32, 0.38, 0.82, 1.0);
-            } else {
-                CGContextSetRGBFillColor(ctx, 0.62, 0.70, 0.90, 1.0);
-            }
-            for (i, (x, y, w, h)) in lp.rects.iter().enumerate() {
-                let r = NSRect {
-                    x: ox + x * sc,
-                    y: oy + y * sc,
-                    w: w * sc,
-                    h: h * sc,
-                };
-                CGContextFillRect(ctx, r);
-                let label = match lp.names.get(i).filter(|n| !n.is_empty()) {
-                    Some(n) => n.clone(),
-                    None => format!("{}{}", localization::text("モニター", "Display "), i + 1),
-                };
-                lay_text(
-                    &lay_fit(&label, r.w, 10.0),
-                    r.x + r.w / 2.0,
-                    r.y + r.h / 2.0 - 6.0,
-                    10.0,
-                    lp.active || lp.dragging,
-                );
-            }
-            // 端末名(Deskflow 風に矩形の下へ)。名前+IP で長くなるため幅に収まるよう切り詰める
-            lay_text(
-                &lay_fit(&lp.name, LAY_VW, 11.0),
-                cx,
-                (oy - 15.0).max(2.0),
-                11.0,
-                false,
-            );
-        }
-        // Mac 側の名前(実機のホスト名。配置は固定)
-        {
-            let m = lay_mac_rect();
-            lay_text(
-                &crate::hostname_label(),
-                m.x + m.w / 2.0,
-                (m.y - 15.0).max(2.0),
-                11.0,
-                false,
-            );
-        }
-    }
-}
-
-unsafe extern "C" fn lay_down(_self: ID, _cmd: SEL, ev: ID) {
-    unsafe {
-        let p = lay_point_in_view(_self, ev);
-        // 全端末を対象に、押した位置にある矩形を探してドラッグを開始する
-        let sc = lay_scale();
-        let blocks: Vec<LayPeer> = lay_peers();
-        let mut hit: Option<(usize, (f64, f64))> = None;
-        for lp in &blocks {
-            let (cx, cy) = lp.center;
-            let (sw, sh) = (lp.size.0 * sc, lp.size.1 * sc);
-            // 当たり判定は描画矩形より少し広く取る(縮尺後のブロックは小さいため)
-            let inside = p.x >= cx - sw / 2.0 - 12.0
-                && p.x <= cx + sw / 2.0 + 12.0
-                && p.y >= cy - sh / 2.0 - 12.0
-                && p.y <= cy + sh / 2.0 + 12.0;
-            if inside {
-                hit = Some((lp.idx, (cx, cy)));
-                break;
-            }
-        }
-        eprintln!(
-            "[lay] down ({:.0},{:.0}) hit={:?} blocks={}",
-            p.x,
-            p.y,
-            hit.map(|(i, _)| i),
-            blocks
-                .iter()
-                .map(|lp| format!(
-                    "{}@({:.0},{:.0})",
-                    lp.name, lp.center.0, lp.center.1
-                ))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-        if let Some((idx, (cx, cy))) = hit {
-            let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-            if idx == usize::MAX || idx == act {
-                // アクティブ端末(と未接続プレースホルダ)は LAY_WIN を自由位置に使う
-                *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (cx, cy);
-            } else {
-                *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()) = (cx, cy);
-            }
-            LAY_DRAG_IDX.store(idx, Ordering::Relaxed);
-            LAY_DRAG.store(true, Ordering::Relaxed);
-            *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner()) = (p.x - cx, p.y - cy);
-            // クリック判定のため押下位置を覚える(移動量が僅かなら選択扱いにする)
-            *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (p.x, p.y);
-        } else {
-            *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (f64::NAN, f64::NAN);
-        }
-    }
-}
-
-unsafe extern "C" fn lay_dragged(_self: ID, _cmd: SEL, ev: ID) {
-    unsafe {
-        if !LAY_DRAG.load(Ordering::Relaxed) {
-            return;
-        }
-        let p = lay_point_in_view(_self, ev);
-        let g = *LAY_GRAB.lock().unwrap_or_else(|e| e.into_inner());
-        let idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
-        let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-        let sc = lay_scale();
-        let (ww, wh) = lay_peers()
-            .iter()
-            .find(|lp| lp.idx == idx)
-            .map(|lp| (lp.size.0 * sc, lp.size.1 * sc))
-            .unwrap_or_else(lay_win_size);
-        // 端末がキャンバスより大きくても clamp が panic しないよう下限で丸める
-        let minx = ww / 2.0 + 2.0;
-        let maxx = (LAY_VW - ww / 2.0 - 2.0).max(minx);
-        let miny = wh / 2.0 + 2.0;
-        let maxy = (LAY_VH - wh / 2.0 - 2.0).max(miny);
-        let nx = (p.x - g.0).clamp(minx, maxx);
-        let ny = (p.y - g.1).clamp(miny, maxy);
-        if idx == usize::MAX || idx == act {
-            *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
-        } else {
-            *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()) = (nx, ny);
-        }
-        let snd: unsafe extern "C" fn(ID, SEL, u8) =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        snd(_self, sel(c"setNeedsDisplay:"), 1);
-    }
-}
-
-/// ドロップ: ドラッグ中の端末について、最も近い Mac モニターとその辺を
-/// 「画面の位置」として設定し、表示を計算位置へスナップし直す。
-/// Mac の外接矩形の上(セルの外)へ置いた場合はモニター指定を外して
-/// 「全画面の端」へ戻す(旧JSON・環境変数経由でしか戻せなかった問題の解消)。
-/// ドラッグ量が僅か(4px 未満)の mouseUp はクリックとみなし、その端末を
-/// 操作対象へ選択する(接続ページのポップアップと同じ経路)
-unsafe extern "C" fn lay_up(_self: ID, _cmd: SEL, ev: ID) {
-    unsafe {
-        if !LAY_DRAG.swap(false, Ordering::Relaxed) {
-            return;
-        }
-        let idx = LAY_DRAG_IDX.load(Ordering::Relaxed);
-        LAY_DRAG_IDX.store(usize::MAX, Ordering::Relaxed);
-        // ドロップ位置(いま操作している端末の中心)から、最も近い Mac モニターと
-        // その辺を決めて、その端末の「画面の位置」として設定する
-        let sc = lay_scale();
-        let (rects, _) = mac_group();
-        let (mox, moy) = lay_mac_origin();
-        let act = *crate::ACTIVE_PEER.lock().unwrap_or_else(|e| e.into_inner());
-        let active_drag = idx == usize::MAX || idx == act;
-        let (wc0, _ww, _wh) = if active_drag {
-            (lay_win_center(), lay_win_size().0, lay_win_size().1)
-        } else {
-            let (sw, sh) = lay_peers()
-                .iter()
-                .find(|lp| lp.idx == idx)
-                .map(|lp| (lp.size.0 * sc, lp.size.1 * sc))
-                .unwrap_or((60.0, 40.0));
-            (
-                *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()),
-                sw,
-                sh,
-            )
-        };
-        // クリック判定: 押下からほぼ動いていなければ配置は変えず、その端末を
-        // 操作対象へ選ぶ。activate_peer_by_id は writer の一時不在を待ち得るが
-        // 接続ページのポップアップ(imp_peer_activate)と同じメインスレッド経路
-        let down = *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner());
-        let up = lay_point_in_view(_self, ev);
-        let clicked = (up.x - down.0).abs() < 4.0
-            && (up.y - down.1).abs() < 4.0
-            && down.0.is_finite()
-            && down.1.is_finite();
-        *LAY_DOWN_POS.lock().unwrap_or_else(|e| e.into_inner()) = (f64::NAN, f64::NAN);
-        if clicked {
-            let id = lay_peers()
-                .iter()
-                .find(|lp| lp.idx == idx)
-                .map(|lp| lp.id.clone())
-                .unwrap_or_default();
-            if !id.is_empty() && !UI_PREVIEW.load(Ordering::Relaxed) {
-                crate::activate_peer_by_id(&id, "配置エディタ");
-                refresh_status();
-            }
-            // 選択だけなので設定保存は不要。位置リセットと再描画だけ行う
-            *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
-            *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
-            let snd: unsafe extern "C" fn(ID, SEL, u8) =
-                std::mem::transmute(crate::objc_msgSend as *const () as usize);
-            snd(_self, sel(c"setNeedsDisplay:"), 1);
-            return;
-        }
-        // ドロップ位置から最寄りの Mac モニター(edge 指定)と、8 方向セルの
-        // side(Deskflow 式。斜めも置ける)を決める
-        let mac_rect = lay_mac_rect();
-        let mut best: Option<(usize, f64)> = None;
-        for (mi, (x, y, w, h)) in rects.iter().enumerate() {
-            let (mx, my, mw, mh) = (mox + x * sc, moy + y * sc, w * sc, h * sc);
-            let (mcx, mcy) = (mx + mw / 2.0, my + mh / 2.0);
-            let (dx, dy) = (wc0.0 - mcx, wc0.1 - mcy);
-            let dist = (dx * dx + dy * dy).sqrt();
-            if best.as_ref().map(|(_, d)| dist < *d).unwrap_or(true) {
-                best = Some((mi, dist));
-            }
-        }
-        if let Some((mi, _)) = best {
-            let target = if active_drag { act } else { idx };
-            match lay_cell_for_point(&mac_rect, wc0) {
-                Some(side) => {
-                    // 占有済みの辺(斜めは基の辺)へのドロップは重複配置になる。
-                    // 設定自体は受け入れる(従来どおり)が、セルを一瞬赤く
-                    // フラッシュして重複が起きたことを見せる
-                    let dir = crate::base_dir(side);
-                    let dup = {
-                        let peers = crate::PEERS.lock().unwrap_or_else(|e| e.into_inner());
-                        peers
-                            .iter()
-                            .enumerate()
-                            .any(|(i, p)| i != target && crate::base_dir(p.side) == dir)
-                    };
-                    if dup && target != usize::MAX {
-                        LAY_WARN_UNTIL
-                            .store(crate::now_ms() + 1500, Ordering::Relaxed);
-                        LAY_WARN_DIR.store(dir, Ordering::Relaxed);
-                        eprintln!("[lay] 警告: {}の辺は既に他の端末が使っています(重複配置)", crate::side_label(dir));
-                    }
-                    if target != usize::MAX {
-                        crate::set_peer_side(target, side, Some(mi));
-                        eprintln!(
-                            "[lay] 配置を更新: モニター{} の{}",
-                            mi + 1,
-                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
-                        );
-                    } else {
-                        // 未接続(プレースホルダを動かした)。全体設定 SIDE へ反映し、
-                        // 次に繋がる端末の位置になる。ここで反映しないとドロップが
-                        // 常に捨てられ「動かせない」ように見える
-                        crate::set_side(side);
-                        eprintln!(
-                            "[lay] 配置を更新(未接続のため全体設定へ): {}",
-                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][side.min(7) as usize]
-                        );
-                        // 保存済みの端末は接続時にその配置が優先されるため、この
-                        // 変更が「次に繋がる端末」へ反映されないことがある。
-                        // 気づかないまま設定が捨てられたように見えるのを防ぐ案内
-                        if crate::has_saved_peer_sides() {
-                            crate::notify(
-                                "Knit",
-                                "保存済みの端末は各端末の設定が優先されるため、この位置は次回の接続では使われないことがあります",
-                            );
-                        }
-                    }
-                }
-                None => {
-                    // Mac の外接矩形の上(どのセルにも置かない)へドロップ:
-                    // モニター指定を外して「全画面の端」へ戻す。辺は現在の値を
-                    // 維持する(意図は「モニター指定の解除」のため)
-                    if target != usize::MAX {
-                        let current = crate::PEERS
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(target)
-                            .map(|p| p.side)
-                            .unwrap_or(0);
-                        crate::set_peer_side(target, current, None);
-                        eprintln!(
-                            "[lay] 配置を更新: 全画面の{}(モニター指定なし)",
-                            ["右", "左", "上", "下", "右上", "右下", "左上", "左下"][current.min(7) as usize]
-                        );
-                    } else {
-                        eprintln!("[lay] 未接続のため、Mac の上へのドロップは無視します(全体設定にモニター指定はありません)");
-                    }
-                }
-            }
-        }
-        // 表示位置は保存せず、設定(side/モニター)から計算し直した位置へスナップする
-        *LAY_WIN.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
-        *LAY_DRAG_CENTER.lock().unwrap_or_else(|e| e.into_inner()) = (0.0, 0.0);
-        let snd: unsafe extern "C" fn(ID, SEL, u8) =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        snd(_self, sel(c"setNeedsDisplay:"), 1);
-        // 接続範囲(斜め=辺の半分)は set_peer_side が選択端末分を設定済み。
-        // ここで全域へ戻すと斜め配置の「辺の半分だけ接続」が効かなくなるため上書きしない
-    }
-    preferences::save();
-    // 設定ページの現在値表示(モニター名+辺の一覧)もドロップ結果へ揃える
-    prefs::redraw_layout();
-}
-/// 配置エディタの NSView サブクラスを登録して生成(初回のみ)
-unsafe fn make_layout_view(target_frame_host: ID) -> ID {
-    unsafe {
-        let _ = target_frame_host;
-        static CLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let cls = *CLS.get_or_init(|| {
-            let super_cls = objc_getClass(c"NSView".as_ptr());
-            if super_cls.is_null() {
-                return 0usize;
-            }
-            let cls = objc_allocateClassPair(super_cls, c"TSLayView".as_ptr(), 0);
-            if cls.is_null() {
-                return 0usize;
-            }
-            let ok1 = class_addMethod(
-                cls,
-                sel(c"drawRect:"),
-                lay_draw as *const () as usize,
-                c"v@:{CGRect={CGPoint=dd}{CGSize=dd}}".as_ptr(),
-            );
-            let ok2 = class_addMethod(
-                cls,
-                sel(c"mouseDown:"),
-                lay_down as *const () as usize,
-                c"v@:@".as_ptr(),
-            );
-            let ok3 = class_addMethod(
-                cls,
-                sel(c"mouseDragged:"),
-                lay_dragged as *const () as usize,
-                c"v@:@".as_ptr(),
-            );
-            let ok4 = class_addMethod(
-                cls,
-                sel(c"mouseUp:"),
-                lay_up as *const () as usize,
-                c"v@:@".as_ptr(),
-            );
-            if ok1 == 0 || ok2 == 0 || ok3 == 0 || ok4 == 0 {
-                return 0usize;
-            }
-            objc_registerClassPair(cls);
-            cls as usize
-        });
-        if cls == 0 {
-            return std::ptr::null_mut();
-        }
-        let init: unsafe extern "C" fn(ID, SEL, NSRect) -> ID =
-            std::mem::transmute(crate::objc_msgSend as *const () as usize);
-        init(
-            msg0(cls as ID, sel(c"alloc")),
-            sel(c"initWithFrame:"),
-            NSRect {
-                x: 0.0,
-                y: 0.0,
-                w: LAY_VW,
-                h: LAY_VH,
-            },
-        )
-    }
-}
-
-/// OSネイティブの4分類設定画面を構築する。
-unsafe fn make_prefs_window(target: ID) -> ID {
-    prefs::build(target)
-}
 
 /// 「Knitを終了」の確認文。転送中だけ Some を返し、転送していない通常の終了には
 /// 確認を出さない(メニューバー常駐アプリのため、普段の終了に摩擦を足さない)。
@@ -2406,10 +1296,8 @@ fn refresh_status() {
             if let Some(text) = g.take() {
                 if text == "__RUNNING__" {
                     *g = Some(text);
-                } else if prefs::refined::refined_window_visible() {
-                    // 設定画面が見えていれば接続ページ内のパネルへ出す
-                    prefs::refined::set_inline_diag(&text);
-                } else {
+                } else if !webui::show_diag(&text) {
+                    // 設定画面が見えていれば「権限と診断」ページへ出す。見えていなければ警告で出す
                     show_diag_alert(&text);
                 }
             }
@@ -2959,46 +1847,6 @@ unsafe fn make_target() -> ID {
     //IMP は (self, _cmd, sender) の v@:@ 型
     let types = c"v@:@".as_ptr();
     let methods: &[(&std::ffi::CStr, usize)] = &[
-        (c"sdHotkey:", prefs::hotkey as *const () as usize),
-        (c"sdNavigate:", prefs::navigate as *const () as usize),
-        (c"sdNewNavigate:", settings_new::nav as *const () as usize),
-        (c"sdNewToggle:", settings_new::toggle as *const () as usize),
-        (c"sdNewApply:", settings_new::apply as *const () as usize),
-        (c"sdNewRevert:", settings_new::revert as *const () as usize),
-        (c"sdLanguage:", prefs::change_language as *const () as usize),
-        (c"sdRefinedNoop:", prefs::refined::noop as *const () as usize),
-        (c"sdRefinedRole:", prefs::refined::role_changed as *const () as usize),
-        (c"sdRefinedSaveHost:", prefs::refined::save_host as *const () as usize),
-        (c"sdRefinedChanged:", prefs::refined::changed as *const () as usize),
-        (c"sdRefinedToggle:", prefs::refined::toggle_changed as *const () as usize),
-        (c"sdRefinedGain:", prefs::refined::gain_changed as *const () as usize),
-        (c"sdRefinedSensitivity:", prefs::refined::sensitivity_changed as *const () as usize),
-        (c"sdRefinedSensitivityReset:", prefs::refined::sensitivity_reset as *const () as usize),
-        (c"sdRefinedOutput:", prefs::refined::output_changed as *const () as usize),
-        (c"sdRefinedRevert:", prefs::refined::revert as *const () as usize),
-        (c"sdRefinedApply:", prefs::refined::apply as *const () as usize),
-        (c"sdRefinedManual:", prefs::refined::manual as *const () as usize),
-        (c"sdRefinedIdentify:", prefs::refined::identify as *const () as usize),
-        (c"sdRefinedRanges:", prefs::refined::ranges as *const () as usize),
-        (c"sdRefinedReconnect:", prefs::refined::reconnect as *const () as usize),
-        (c"sdRefinedFolder:", prefs::refined::folder as *const () as usize),
-        (c"sdRefinedOpenFolder:", prefs::refined::open_folder as *const () as usize),
-        (c"sdRefinedExport:", prefs::refined::export as *const () as usize),
-        (c"sdRefinedImport:", prefs::refined::import as *const () as usize),
-        (c"sdRefinedLog:", prefs::refined::log as *const () as usize),
-        (c"sdRefinedRestart:", prefs::refined::restart as *const () as usize),
-        (c"sdRefinedReset:", prefs::refined::reset as *const () as usize),
-        (c"sdRefinedTestOutput:", prefs::refined::test_output as *const () as usize),
-        (c"sdRefinedDiagClose:", prefs::refined::diag_close as *const () as usize),
-        (c"sdRefinedHistoryLimit:", prefs::refined::history_limit_changed as *const () as usize),
-        (c"sdRefinedHotkey:", prefs::refined::hotkey_changed as *const () as usize),
-        (c"sdRefinedRename:", prefs::refined::rename_peer as *const () as usize),
-        (
-            c"sdSwitchDelay:",
-            prefs::switch_delay as *const () as usize,
-        ),
-        (c"sdReturnMac:", prefs::return_mac as *const () as usize),
-        (c"sdEnterPeer:", prefs::enter_peer as *const () as usize),
         (c"menuWillOpen:", prefs::peer_menu_open as *const () as usize),
         (c"menuDidClose:", prefs::peer_menu_close as *const () as usize),
         (
@@ -3026,11 +1874,9 @@ unsafe fn make_target() -> ID {
         (c"sdRevokeDevice:", imp_revoke_device as *const () as usize),
         (c"sdRefuseLegacy:", imp_refuse_legacy as *const () as usize),
         (c"sdRestart:", imp_restart as *const () as usize),
-        (c"sdSaveHost:", imp_save_host as *const () as usize),
         (c"sdCheckUpdate:", imp_check_update as *const () as usize),
         (c"sdDiagnose:", imp_diag as *const () as usize),
         (c"sdAudio:", imp_audio_toggle as *const () as usize),
-        (c"sdAudioGain:", prefs::audio_gain as *const () as usize),
         (c"sdCmdMap:", imp_cmd_map as *const () as usize),
         (c"sdVol:", imp_vol as *const () as usize),
         (c"sdSendFile:", imp_send_file as *const () as usize),
@@ -3041,7 +1887,6 @@ unsafe fn make_target() -> ID {
         (c"sdTabletText:", text_input::show as *const () as usize),
         (c"sdShowPrefs:", imp_show_prefs as *const () as usize),
         (c"sdClosePrefs:", imp_close_prefs as *const () as usize),
-        (c"windowWillClose:", imp_preview_window_close as *const () as usize),
         (c"sdSide:", imp_side as *const () as usize),
         (c"sdClipShare:", imp_clip_share as *const () as usize),
         (c"sdFileShare:", imp_file_share as *const () as usize),
@@ -3117,6 +1962,18 @@ pub fn start() -> bool {
 
         // 設定プレビューは NSStatusItem を作らず、入力監視タイマーも動かさない。
         if UI_PREVIEW.load(Ordering::Relaxed) {
+            // --preview-tray: a bare status item so the real popover can be checked
+            if std::env::args().any(|a| a == "--preview-tray") {
+                let sb = msg0(objc_getClass(c"NSStatusBar".as_ptr()), sel(c"systemStatusBar"));
+                let item = msg1_id_f64(sb, sel(c"statusItemWithLength:"), -1.0);
+                let button = msg0(item, sel(c"button"));
+                let icon = make_menu_icon();
+                if !button.is_null() && !icon.is_null() {
+                    msg1_void_id(button, sel(c"setImage:"), icon);
+                }
+                let menu = msg0(objc_getClass(c"NSMenu".as_ptr()), sel(c"new"));
+                webtray::attach(item, menu);
+            }
             let timer = msg5_timer(
                 objc_getClass(c"NSTimer".as_ptr()),
                 sel(c"scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
@@ -3346,7 +2203,8 @@ pub fn start() -> bool {
         if !icon.is_null() {
             msg1_void_id(button, sel(c"setImage:"), icon);
         }
-        msg1_void_id(item, sel(c"setMenu:"), menu);
+        // Left click: popover (webtray). Right/control/option click: this classic menu
+        webtray::attach(item, menu);
 
         // 毎秒の状態反映。メニュー追跡中も止まらないよう common modes へ登録する
         let timer = msg5_timer(
@@ -3614,44 +2472,6 @@ mod role_confirm_hook_tests {
     }
 }
 
-#[cfg(test)]
-mod lay_side_center_tests {
-    use super::{lay_side_center, NSRect};
-
-    fn base() -> NSRect {
-        NSRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }
-    }
-
-    #[test]
-    fn eight_sides_get_distinct_positions() {
-        let b = base();
-        let pos = |s: u8| lay_side_center(s, &b, 40.0, 40.0);
-        // 4 方向の基本位置
-        assert_eq!(pos(0), (128.0, 50.0)); // 右
-        assert_eq!(pos(1), (-28.0, 50.0)); // 左
-        assert_eq!(pos(2), (50.0, 128.0)); // 上
-        assert_eq!(pos(3), (50.0, -28.0)); // 下
-        // 斜めは基の辺の上下半分の中心(ここが右扱いだと「斜めに置けない」回帰)
-        assert_eq!(pos(4), (128.0, 75.0)); // 右上
-        assert_eq!(pos(5), (128.0, 25.0)); // 右下
-        assert_eq!(pos(6), (-28.0, 75.0)); // 左上
-        assert_eq!(pos(7), (-28.0, 25.0)); // 左下
-    }
-
-    #[test]
-    fn every_side_is_visibly_distinct() {
-        let b = base();
-        let mut seen: Vec<(f64, f64)> = Vec::new();
-        for s in 0u8..8 {
-            let p = lay_side_center(s, &b, 40.0, 40.0);
-            assert!(
-                seen.iter().all(|q| (q.0 - p.0).abs() > 1.0 || (q.1 - p.1).abs() > 1.0),
-                "side {s} が他と同じ位置: {p:?}"
-            );
-            seen.push(p);
-        }
-    }
-}
 
 /// メニューバー状態行(status_line_text)の並びと条件の回帰防止:
 /// ・未登録(!manual && !paired)には「再試行まで N秒」「見つけられない」を出さない

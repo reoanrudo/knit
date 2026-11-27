@@ -77,6 +77,11 @@ pub(super) fn snapshot() -> Value {
         // 更新の自動確認(手動確認は常に可能。この Mac のみの設定のため
         // 遠隔適用の許可リストには含めない)
         "update_check": crate::UPDATE_CHECK.load(Ordering::Relaxed),
+        // Notification categories (this Mac only, not remotely writable)
+        "notify_transfer": crate::NOTIFY_TRANSFER.load(Ordering::Relaxed),
+        "notify_clipboard": crate::NOTIFY_CLIPBOARD.load(Ordering::Relaxed),
+        "notify_connection": crate::NOTIFY_CONNECTION.load(Ordering::Relaxed),
+        "notify_update": crate::NOTIFY_UPDATE.load(Ordering::Relaxed),
         // 環境変数・envファイルで固定されているキー(設定が効かない原因の見える化)。
         // apply は知らないキーを無視するため、読み込み側でそのまま戻しても無害
         "env_overrides": override_keys()
@@ -315,7 +320,8 @@ pub(super) fn validate_patch(patch: &Value) -> Result<(), String> {
         match key.as_str() {
             "clip_share" | "share_files" | "local_history" | "audio_muted" | "spk_mute"
             | "cmd_alt" | "android_pinch" | "android_navigation" | "diag_log" | "hotkey_only"
-            | "scroll_flip" | "scroll_compat" | "client_role" | "update_check" => {
+            | "scroll_flip" | "scroll_compat" | "client_role" | "update_check"
+            | "notify_transfer" | "notify_clipboard" | "notify_connection" | "notify_update" => {
                 if !v.is_boolean() {
                     return Err(format!("{key}: 真偽値が必要です"));
                 }
@@ -461,6 +467,10 @@ fn apply(v: &Value) {
     boolean("diag_log", &crate::DIAG_ENABLED);
     // 更新の自動確認(自分の端末の設定のため遠隔適用の許可リストには入れない)
     boolean("update_check", &crate::UPDATE_CHECK);
+    boolean("notify_transfer", &crate::NOTIFY_TRANSFER);
+    boolean("notify_clipboard", &crate::NOTIFY_CLIPBOARD);
+    boolean("notify_connection", &crate::NOTIFY_CONNECTION);
+    boolean("notify_update", &crate::NOTIFY_UPDATE);
     if let Some(n) = v["side"].as_u64().filter(|n| *n <= 7) {
         crate::set_side(n as u8);
     }

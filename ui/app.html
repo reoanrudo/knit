@@ -1,0 +1,706 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Knit 設定</title>
+<!--
+  Knit settings window (WKWebView on Mac, WebView2 on Windows).
+  Renders and takes input only; the app (Rust) reads and writes values.
+  - app -> page: knit.state(json) / knit.result(id, ok, message) / knit.diag(text)
+  - page -> app: post(cmd, args) (Mac: webkit.messageHandlers.knit, Windows: chrome.webview)
+  Loads nothing from the network (system fonts only).
+  Copy: navigation, headers, buttons and status chips in English; explanations in Japanese.
+-->
+<style>
+:root{
+  --accent:#007aff; --on-accent:#fff; --accent-soft:rgba(0,122,255,.12);
+  --pane:rgba(251,251,253,.96); --side:transparent; --grp:rgba(255,255,255,.82); --grp-line:rgba(0,0,0,.08);
+  --label:#1d1d1f; --sub:#6e6e73; --ter:#a1a1a6;
+  --ctl:rgba(118,118,128,.12); --ctl-h:rgba(118,118,128,.2); --ctl-bd:transparent;
+  --field:#fff; --field-line:rgba(0,0,0,.12); --w-solid:#fbfbfd; --glass:rgba(255,255,255,.7);
+  --sw-off:rgba(118,118,128,.24); --sw-bd:transparent; --knob-c:#fff; --track:rgba(118,118,128,.22);
+  --ok:#1f8f3c; --ok-dot:#34c759; --ok-bg:rgba(52,199,89,.15);
+  --warn:#b25e00; --warn-dot:#ff9f0a; --warn-bg:rgba(255,159,10,.16);
+  --bad:#d70015; --bad-dot:#ff3b30; --bad-bg:rgba(255,59,48,.12);
+  --tile-blue:#0a84ff; --tile-green:#30c759; --tile-gray:#8e8e93; --tile-orange:#ff9f0a; --tile-indigo:#5e5ce6; --tile-red:#ff453a;
+  --peer:#2fb8a6;
+  --ui:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hiragino Sans","Hiragino Kaku Gothic ProN",system-ui,sans-serif;
+  --disp:-apple-system,BlinkMacSystemFont,"SF Pro Display","Hiragino Sans",system-ui,sans-serif;
+  --r-grp:12px; --r-ctl:999px; --r-field:7px;
+  --sw-w:42px; --sw-h:24px; --knob:20px; --knob-i:1px;
+  --side-w:220px; --side-top:52px;
+  --spring:cubic-bezier(.34,1.45,.64,1);
+  color-scheme:light dark;
+}
+@media (prefers-color-scheme:dark){:root{
+  --accent:#0a84ff; --accent-soft:rgba(10,132,255,.22);
+  --pane:rgba(30,30,33,.96); --grp:rgba(255,255,255,.06); --grp-line:rgba(255,255,255,.09);
+  --label:#f5f5f7; --sub:#a1a1a6; --ter:#6e6e73;
+  --ctl:rgba(118,118,128,.26); --ctl-h:rgba(118,118,128,.36);
+  --field:rgba(0,0,0,.25); --field-line:rgba(255,255,255,.13); --w-solid:#2a2a2d; --glass:rgba(40,40,46,.75);
+  --sw-off:rgba(118,118,128,.36); --track:rgba(118,118,128,.34);
+  --ok:#4cd964; --ok-bg:rgba(48,209,88,.16); --warn:#ffb340; --warn-bg:rgba(255,159,10,.18); --bad:#ff6961; --bad-bg:rgba(255,69,58,.18);
+}}
+/* Windows (WebView2): same content, Fluent look */
+html[data-os="win"]{
+  --accent:#005fb8; --accent-soft:rgba(0,95,184,.09);
+  --pane:#f9f9f9; --side:#f3f3f3; --grp:#fbfbfb; --grp-line:rgba(0,0,0,.07);
+  --label:#1b1b1b; --sub:#5d5d5d; --ter:#8a8a8a;
+  --ctl:#fdfdfd; --ctl-h:#f6f6f6; --ctl-bd:rgba(0,0,0,.1); --field:#fff; --field-line:rgba(0,0,0,.14); --w-solid:#fff;
+  --sw-off:rgba(0,0,0,.03); --sw-bd:#858585; --knob-c:#5d5d5d; --track:rgba(0,0,0,.28);
+  --ok:#0f7b0f; --ok-dot:#0f7b0f; --ok-bg:#dff6dd; --warn:#9d5d00; --warn-dot:#9d5d00; --warn-bg:#fff4ce; --bad:#c42b1c; --bad-dot:#c42b1c; --bad-bg:#fde7e9;
+  --ui:"Segoe UI Variable Text","Segoe UI","Yu Gothic UI","Meiryo UI",sans-serif;
+  --disp:"Segoe UI Variable Display","Segoe UI","Yu Gothic UI",sans-serif;
+  --r-grp:6px; --r-ctl:4px; --r-field:4px; --sw-w:40px; --sw-h:20px; --knob:12px; --knob-i:3px; --side-w:250px; --side-top:12px;
+}
+@media (prefers-color-scheme:dark){html[data-os="win"]{
+  --accent:#60cdff; --on-accent:#00243b; --accent-soft:rgba(96,205,255,.12);
+  --pane:#202020; --side:#202020; --grp:#2b2b2b; --grp-line:rgba(0,0,0,.3);
+  --label:#fff; --sub:#c5c5c5; --ter:#9a9a9a; --ctl:#2d2d2d; --ctl-h:#323232; --ctl-bd:rgba(255,255,255,.09);
+  --field:#2d2d2d; --field-line:rgba(255,255,255,.14); --w-solid:#2b2b2b;
+  --sw-off:rgba(0,0,0,.1); --sw-bd:#a0a0a0; --knob-c:#d0d0d0; --track:rgba(255,255,255,.3);
+  --ok:#6ccb5f; --ok-dot:#6ccb5f; --ok-bg:#393d1b; --warn:#fce100; --warn-dot:#fce100; --warn-bg:#433519; --bad:#ff99a4; --bad-dot:#ff99a4; --bad-bg:#442726;
+}}
+
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:13px/1.5 var(--ui);color:var(--label);background:transparent;-webkit-font-smoothing:antialiased;overflow:hidden;-webkit-user-select:none;user-select:none;cursor:default}
+html[data-os="win"] body{background:var(--side)}
+button,input,select{font:inherit;color:inherit}
+input{-webkit-user-select:text;user-select:text}
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.app{display:grid;grid-template-columns:var(--side-w) minmax(0,1fr);height:100%}
+
+/* ---- sidebar (on Mac the NSVisualEffectView behind shows through) ---- */
+.side{background:var(--side);padding:var(--side-top) 10px 12px;display:flex;flex-direction:column;gap:2px;min-height:0}
+.who{display:none;align-items:center;gap:12px;padding:8px 8px 16px}
+html[data-os="win"] .who{display:flex}
+.who b{display:block;font-size:13.5px}
+.who span{font-size:11.5px;color:var(--sub)}
+.snav{position:relative;display:flex;flex-direction:column;gap:2px}
+.navsel{position:absolute;left:0;top:0;border-radius:8px;background:var(--accent);transition:transform .42s var(--spring),height .3s,width .3s;pointer-events:none}
+html[data-os="win"] .navsel{background:var(--ctl-h);border-radius:4px}
+html[data-os="win"] .navsel::before{content:"";position:absolute;left:0;top:50%;width:3px;height:16px;margin-top:-8px;border-radius:2px;background:var(--accent)}
+.snav button{position:relative;z-index:1;display:flex;align-items:center;gap:10px;height:32px;padding:0 8px;border:0;background:transparent;border-radius:8px;font-size:13px;text-align:left;transition:color .2s}
+.snav button[aria-current="page"]{color:#fff}
+html[data-os="win"] .snav button{height:36px;font-size:14px}
+html[data-os="win"] .snav button[aria-current="page"]{color:var(--label)}
+.sfoot{margin-top:auto;display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--sub);padding:8px}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--ter);flex:none;position:relative}
+.dot.on{background:var(--ok-dot)}
+.dot.on::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:2px solid var(--ok-dot);opacity:0;animation:ring 2.4s ease-out infinite}
+@keyframes ring{0%{transform:scale(.5);opacity:.7}100%{transform:scale(1.6);opacity:0}}
+
+/* ---- pane ---- */
+.pane{background:var(--pane);min-height:0;position:relative;box-shadow:-.5px 0 0 var(--grp-line)}
+.scroll{position:absolute;inset:0;overflow-y:auto;padding:30px 30px 40px;display:flex;flex-direction:column;gap:20px}
+.scroll.enter>*{animation:enter .38s cubic-bezier(.2,.8,.2,1) backwards}
+.scroll.enter>*:nth-child(2){animation-delay:.03s}.scroll.enter>*:nth-child(3){animation-delay:.06s}.scroll.enter>*:nth-child(4){animation-delay:.09s}
+@keyframes enter{from{opacity:0;transform:translateY(8px)}}
+.scroll>header h1{margin:0;font:700 24px/1.2 var(--disp);letter-spacing:-.01em}
+html[data-os="win"] .scroll>header h1{font-weight:600;font-size:28px}
+.scroll>header p{margin:4px 0 0;color:var(--sub)}
+.preview{display:inline-flex;margin-left:8px;vertical-align:middle}
+
+/* ---- controls ---- */
+.btn{height:28px;padding:0 14px;border-radius:var(--r-ctl);border:1px solid var(--ctl-bd);background:var(--ctl);color:var(--label);font-size:13px;font-weight:500;white-space:nowrap;display:inline-flex;align-items:center;gap:6px;transition:background .15s,transform .15s}
+.btn:hover:not(:disabled){background:var(--ctl-h)}
+.btn:active:not(:disabled){transform:scale(.97)}
+.btn.p{background:var(--accent);color:var(--on-accent);border-color:transparent}
+.btn.p:hover:not(:disabled){background:var(--accent);filter:brightness(1.08)}
+.btn.d{color:var(--bad)}
+.btn.sm{height:26px;padding:0 12px;font-size:12.5px}
+.btn:disabled{opacity:.42}
+html[data-os="win"] .btn{box-shadow:inset 0 -1px 0 rgba(0,0,0,.08)}
+.sw{flex:none;position:relative;width:var(--sw-w);height:var(--sw-h);border-radius:999px;border:1px solid var(--sw-bd);background:var(--sw-off);padding:0;transition:background .2s,border-color .2s}
+.sw::after{content:"";position:absolute;top:50%;left:var(--knob-i);width:var(--knob);height:var(--knob);margin-top:calc(var(--knob) / -2);border-radius:999px;background:var(--knob-c);box-shadow:0 2px 5px rgba(0,0,0,.22);transition:translate .36s var(--spring),width .2s}
+.sw[aria-checked="true"]{background:var(--accent);border-color:var(--accent)}
+.sw[aria-checked="true"]::after{translate:calc(var(--sw-w) - var(--knob) - 2 * var(--knob-i) - 2px) 0}
+html[data-os="mac"] .sw:active::after{width:calc(var(--knob) + 6px)}
+html[data-os="mac"] .sw[aria-checked="true"]:active::after{translate:calc(var(--sw-w) - var(--knob) - 6px - 2 * var(--knob-i) - 2px) 0}
+html[data-os="win"] .sw::after{box-shadow:none}
+html[data-os="win"] .sw[aria-checked="true"]::after{background:var(--on-accent)}
+.sw:disabled{opacity:.45}
+.sel{position:relative;display:inline-flex;align-items:center}
+.sel select{appearance:none;-webkit-appearance:none;height:26px;padding:0 28px 0 12px;border-radius:var(--r-ctl);border:1px solid var(--ctl-bd);background:var(--ctl);font-size:13px;color:var(--label);min-width:120px}
+html[data-os="win"] .sel select{background:var(--field);border-color:var(--field-line)}
+.sel svg{position:absolute;right:9px;width:11px;height:11px;stroke:var(--sub);fill:none;stroke-width:2.2;pointer-events:none;stroke-linecap:round;stroke-linejoin:round}
+.inp{height:28px;border-radius:var(--r-field);border:1px solid var(--field-line);background:var(--field);padding:0 10px;font-size:13px;min-width:0;width:100%;color:var(--label)}
+.num{width:64px;text-align:right;font-variant-numeric:tabular-nums}
+.rg{appearance:none;-webkit-appearance:none;height:4px;border-radius:2px;flex:1;min-width:80px;margin:0;background:linear-gradient(var(--accent),var(--accent)) 0 0/var(--p,50%) 100% no-repeat,var(--track)}
+.rg::-webkit-slider-thumb{-webkit-appearance:none;width:24px;height:16px;border-radius:8px;background:#fff;box-shadow:0 0 0 .5px rgba(0,0,0,.14),0 2px 6px rgba(0,0,0,.24)}
+html[data-os="win"] .rg::-webkit-slider-thumb{width:20px;height:20px;border-radius:50%;background:radial-gradient(circle,var(--accent) 0 5px,var(--w-solid) 5.5px);box-shadow:0 0 0 1px rgba(0,0,0,.12)}
+.chip{display:inline-flex;align-items:center;gap:6px;height:22px;padding:0 9px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap}
+.chip i{width:7px;height:7px;border-radius:50%;background:currentColor}
+.chip.ok{background:var(--ok-bg);color:var(--ok)}.chip.warn{background:var(--warn-bg);color:var(--warn)}.chip.bad{background:var(--bad-bg);color:var(--bad)}.chip.off{background:var(--ctl);color:var(--sub)}.chip.info{background:var(--accent-soft);color:var(--accent)}
+kbd{font:600 11.5px/1 var(--ui);display:inline-flex;align-items:center;justify-content:center;min-width:22px;height:22px;padding:0 6px;border-radius:6px;background:var(--w-solid);box-shadow:0 0 0 .5px var(--field-line),0 1.5px 0 var(--field-line)}
+.spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--track);border-top-color:var(--accent);animation:spin .8s linear infinite;flex:none}
+@keyframes spin{to{transform:rotate(360deg)}}
+code{font:600 12.5px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;-webkit-user-select:all;user-select:all}
+
+/* ---- grouped rows ---- */
+.sec{display:flex;flex-direction:column;gap:7px}
+.sec>h3{margin:0 0 0 12px;font-size:13px;font-weight:650}
+.sec>.fn{margin:0 12px;font-size:11.5px;color:var(--sub)}
+.grp{background:var(--grp);border-radius:var(--r-grp);box-shadow:inset 0 0 0 .5px var(--grp-line);display:flex;flex-direction:column}
+.row{display:flex;align-items:center;gap:12px;min-height:44px;padding:9px 14px;position:relative}
+.row+.row::before{content:"";position:absolute;top:0;right:14px;left:var(--sl,14px);height:1px;background:var(--grp-line)}
+.row.hi{--sl:52px}
+.ri{flex:none;width:26px;height:26px;border-radius:7px;display:grid;place-items:center;color:#fff;background:linear-gradient(180deg,color-mix(in srgb,var(--tc) 78%,#fff),var(--tc))}
+.ri svg{width:16px;height:16px;stroke:currentColor;fill:none;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+.rt{flex:1;min-width:0}
+.rl{font-size:13px}
+.rn{font-size:11.5px;color:var(--sub);line-height:1.45;margin-top:1px}
+.rc{flex:none;display:flex;align-items:center;gap:8px;max-width:64%;flex-wrap:wrap;justify-content:flex-end}
+.row.stack{flex-wrap:wrap}
+.row.stack .rc{flex-basis:100%;max-width:none;justify-content:flex-start;padding-left:38px}
+.row.stack:not(.hi) .rc{padding-left:0}
+html[data-os="win"] .grp{background:none;box-shadow:none;gap:3px}
+html[data-os="win"] .grp>.row{background:var(--grp);border-radius:var(--r-grp);box-shadow:inset 0 0 0 1px var(--grp-line);min-height:62px;padding:12px 16px}
+html[data-os="win"] .row+.row::before{display:none}
+html[data-os="win"] .ri{background:none;color:var(--label);width:22px}
+html[data-os="win"] .ri svg{width:20px;height:20px;stroke-width:1.5}
+.empty{padding:22px 18px;display:flex;flex-direction:column;align-items:center;gap:10px;text-align:center;color:var(--sub)}
+.inl{padding:0 14px 12px 52px;display:flex;flex-direction:column;gap:8px}
+.inl pre{margin:0;white-space:pre-wrap;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--label);background:var(--ctl);border-radius:8px;padding:10px 12px;-webkit-user-select:text;user-select:text;max-height:260px;overflow:auto}
+.sides{display:inline-flex;background:var(--ctl);border-radius:var(--r-ctl);padding:2px;gap:2px}
+.sides button{border:0;background:transparent;border-radius:var(--r-ctl);padding:3px 12px;font-size:12.5px;color:var(--label)}
+.sides button[aria-pressed="true"]{background:var(--w-solid);box-shadow:0 1px 3px rgba(0,0,0,.16)}
+.sides button:disabled{opacity:.5}
+.addrs{display:flex;flex-direction:column;gap:6px;width:100%}
+.addr{display:flex;align-items:center;gap:10px;font-size:12.5px}
+.addr span{color:var(--sub);min-width:40px}
+.addr code{flex:1}
+
+/* ---- link card ---- */
+.linkcard{display:grid;grid-template-columns:auto 1fr auto;gap:6px;align-items:center;padding:16px 18px}
+.dv{display:flex;flex-direction:column;align-items:center;gap:4px;width:116px;text-align:center}
+.dv svg{width:62px;height:48px;filter:drop-shadow(0 6px 10px rgba(0,0,0,.16))}
+.dv b{font-size:12.5px;max-width:116px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dv span{font-size:11px;color:var(--sub)}
+.strand{position:relative;height:60px;min-width:70px}
+.strand svg{position:absolute;inset:0;width:100%;height:100%;-webkit-mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent);mask-image:linear-gradient(90deg,transparent,#000 14%,#000 86%,transparent)}
+.flow{animation:flow 1.8s linear infinite}
+@keyframes flow{to{transform:translateX(-40px)}}
+.strand.cut svg{opacity:.4}.strand.cut path{stroke-dasharray:3 6}.strand.cut .flow{animation-play-state:paused}
+.pill{position:absolute;left:50%;top:50%;translate:-50% -50%;padding:4px 11px;border-radius:999px;background:var(--glass);font:600 12px/1.3 var(--ui);white-space:nowrap;font-variant-numeric:tabular-nums;box-shadow:inset 0 0 0 .5px var(--grp-line),0 4px 14px rgba(0,0,0,.1)}
+.stats{display:flex;gap:22px;padding:0 18px 14px;flex-wrap:wrap;align-items:flex-end}
+.stats div{display:flex;flex-direction:column}
+.stats b{font:650 19px/1.1 var(--disp);font-variant-numeric:tabular-nums}
+.stats span{font-size:11px;color:var(--sub)}
+.spark{flex:1;min-width:140px;height:40px}
+
+/* ---- arrangement ---- */
+.arrwrap{display:flex;flex-direction:column;gap:10px}
+.arrbar{display:flex;justify-content:space-between;align-items:center;gap:8px 14px;flex-wrap:wrap}
+.legend{display:flex;gap:6px 14px;flex-wrap:wrap;font-size:11.5px;color:var(--sub);align-items:center}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.lg-me,.lg-pe{width:9px;height:9px;border-radius:50%}.lg-me{background:var(--accent)}.lg-pe{background:var(--peer)}
+.lg-pass{width:18px;height:4px;border-radius:2px;background:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.lg-h{width:11px;height:11px;border-radius:50%;border:2.5px solid var(--accent);background:var(--w-solid)}
+.lg-block{width:18px;border-top:2px dashed var(--ter)}
+.arr{position:relative;border-radius:12px;background-color:var(--grp);box-shadow:inset 0 0 0 .5px var(--grp-line);overflow:hidden;background-image:radial-gradient(var(--grp-line) 1.2px,transparent 1.2px);background-size:18px 18px}
+html[data-os="win"] .arr{border-radius:6px}
+.arr svg{display:block;width:100%;height:280px;touch-action:none;transition:height .35s cubic-bezier(.2,.8,.2,1)}
+.arr .hint{position:absolute;right:10px;top:8px;font-size:11px;color:var(--sub);background:var(--glass);padding:3px 9px;border-radius:999px;pointer-events:none}
+.arr .grpg{cursor:grab;outline:none}
+.arr.dragging .grpg{cursor:grabbing}
+.arr .rh{outline:none;cursor:grab}
+.arr .rh:focus-visible circle.k,.arr .rh:hover circle.k{stroke-width:4.5px}
+.arr .grpg:focus-visible .ring{opacity:1}
+.arr .ring{opacity:0;transition:opacity .2s}.arr .ring.on{opacity:1}
+.arr .settle{transition:transform .45s var(--spring)}
+.arr .idn{transform-box:fill-box;transform-origin:center;animation:idpop .55s var(--spring)}
+@keyframes idpop{from{transform:scale(.2);opacity:0}}
+.edges{display:flex;flex-wrap:wrap;gap:6px}
+.edge{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;background:var(--accent-soft);color:var(--accent);font-size:12px;font-weight:500}
+.edge i{width:14px;height:3px;border-radius:2px;background:currentColor;position:relative}
+.edge i::before,.edge i::after{content:"";position:absolute;top:-2px;width:7px;height:7px;border-radius:50%;background:currentColor}
+.edge i::before{left:-3px}.edge i::after{right:-3px}
+.edge.note{background:var(--ctl);color:var(--sub)}.edge.warn{background:var(--warn-bg);color:var(--warn)}
+
+.bannerwrap{padding:22px;display:grid;place-items:center;background:linear-gradient(135deg,color-mix(in srgb,var(--accent) 18%,transparent),transparent 60%),radial-gradient(var(--grp-line) 1px,transparent 1px);background-size:auto,16px 16px;border-radius:var(--r-grp)}
+.banner{width:min(100%,360px);display:flex;gap:12px;align-items:flex-start;padding:12px 14px;border-radius:16px;background:var(--glass);box-shadow:0 10px 30px rgba(0,0,0,.16),inset 0 0 0 .5px var(--grp-line);-webkit-backdrop-filter:blur(30px);backdrop-filter:blur(30px);animation:enter .35s cubic-bezier(.2,.8,.2,1)}
+html[data-os="win"] .banner{border-radius:8px}
+.banner .bh{display:flex;justify-content:space-between;gap:10px;font-size:12.5px}.banner .bh span{color:var(--sub);font-size:11.5px}
+.banner .bb{font-size:12.5px;line-height:1.45;margin-top:2px}
+.row[id^="nt-"]{cursor:pointer}
+/* ---- update ---- */
+.updcard{padding:18px;display:flex;flex-direction:column;gap:12px}
+.uh{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.uh .tt{flex:1;min-width:180px}
+.uh .tt b{display:block;font:650 15px/1.3 var(--disp)}
+.appic{width:46px;height:46px;flex:none;filter:drop-shadow(0 6px 12px rgba(0,0,0,.16))}
+
+.toast{position:fixed;left:calc(var(--side-w) + (100% - var(--side-w)) / 2);bottom:18px;translate:-50% 12px;padding:8px 16px;border-radius:999px;background:var(--glass);color:var(--label);font-size:13px;font-weight:500;box-shadow:0 8px 24px rgba(0,0,0,.18),inset 0 0 0 .5px var(--grp-line);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);opacity:0;pointer-events:none;transition:opacity .25s,translate .35s var(--spring);z-index:9;max-width:70%;text-align:center}
+.toast.on{opacity:1;translate:-50% 0}
+.toast.err{color:var(--bad)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side">
+    <div class="who" id="who"></div>
+    <nav class="snav" id="snav" aria-label="設定"><span class="navsel" id="navsel"></span></nav>
+    <div class="sfoot" id="sfoot"></div>
+  </aside>
+  <main class="pane"><div class="scroll" id="scroll"></div></main>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+</div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+  <linearGradient id="wp-mac" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#23185f"/><stop offset=".35" stop-color="#6a3bd2"/><stop offset=".68" stop-color="#e2467e"/><stop offset="1" stop-color="#ffb46a"/></linearGradient>
+  <radialGradient id="wp-mac-h" cx=".25" cy=".15" r=".7"><stop offset="0" stop-color="#ffd9f0" stop-opacity=".55"/><stop offset="1" stop-color="#ffd9f0" stop-opacity="0"/></radialGradient>
+  <radialGradient id="wp-win" cx=".5" cy=".64" r=".78"><stop offset="0" stop-color="#bfe0ff"/><stop offset=".18" stop-color="#4c8dff"/><stop offset=".5" stop-color="#1546c4"/><stop offset="1" stop-color="#071a52"/></radialGradient>
+  <radialGradient id="wp-win-h" cx=".5" cy=".62" r=".34"><stop offset="0" stop-color="#fff" stop-opacity=".55"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></radialGradient>
+  <linearGradient id="gloss" x1="0" y1="0" x2=".7" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".2"/><stop offset=".42" stop-color="#fff" stop-opacity="0"/></linearGradient>
+</defs></svg>
+<script>
+/*KNIT_BOOT*/
+(function(){
+'use strict';
+const BOOT=window.KNIT_BOOT||{os:'mac',preview:true,version:'0.26.0',demo:true};
+const OS=BOOT.os==='win'?'win':'mac';
+document.documentElement.dataset.os=OS;
+const isMac=OS==='mac';
+const $=(s,r=document)=>r.querySelector(s),$$=(s,r=document)=>[...r.querySelectorAll(s)];
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* ---------- bridge ---------- */
+let seq=0;const pending=new Map();
+function post(cmd,args={},onDone){
+  const id=++seq;if(onDone)pending.set(id,onDone);
+  const msg=JSON.stringify(Object.assign({id,cmd},args));
+  try{
+    if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.knit){window.webkit.messageHandlers.knit.postMessage(msg);return id}
+    if(window.chrome&&window.chrome.webview){window.chrome.webview.postMessage(msg);return id}
+  }catch(e){}
+  demoHandle(id,cmd,args);return id;
+}
+let S=null,page=BOOT.page||'gen',busyUntil=0,pendingRender=false,diagText=null,lastSig='';
+window.knit={
+  state(s){const first=!S,sig=JSON.stringify(Object.assign({},s,{conn:Object.assign({},s.conn,{rtt:0})}));S=s;live();
+    if(first){lastSig=sig;renderAll(true);return}
+    if(sig===lastSig)return;lastSig=sig;
+    if(isBusy()){pendingRender=true;return}renderPage(false)},
+  result(id,ok,msg){const f=pending.get(id);pending.delete(id);if(msg)toast(msg,!ok);if(f)f(ok,msg)},
+  diag(text){diagText=text;if(page==='diag')renderPage(false)}
+};
+function isBusy(){const a=document.activeElement;return adrag||Date.now()<busyUntil||(a&&(a.tagName==='INPUT'||a.tagName==='SELECT'))}
+setInterval(()=>{if(pendingRender&&!isBusy()){pendingRender=false;renderPage(false)}},400);
+function toast(m,err){const t=$('#toast');t.textContent=m;t.classList.toggle('err',!!err);t.classList.add('on');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('on'),2600)}
+
+/* ---------- glyphs & builders ---------- */
+const G={
+ link:'<path d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1"/><path d="M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/>',
+ gear:'<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+ shield:'<path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
+ access:'<circle cx="12" cy="4.5" r="1.8"/><path d="M5 8.5l7 1.5 7-1.5M12 10v4.5M12 14.5l-3 6M12 14.5l3 6"/>',
+ power:'<path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/>',
+ key:'<rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10"/>',
+ home:'<path d="M4 11l8-7 8 7v8a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1z"/>',
+ globe:'<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.5 2.6 3.7 5.4 3.7 8.5s-1.2 5.9-3.7 8.5c-2.5-2.6-3.7-5.4-3.7-8.5S9.5 6.1 12 3.5z"/>',
+ dev:'<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M9 20h6M12 16v4"/>',
+ side:'<rect x="3" y="7" width="8" height="10" rx="1.5"/><rect x="13" y="7" width="8" height="10" rx="1.5"/>',
+ plus:'<path d="M12 5v14M5 12h14"/>',
+ unlink:'<path d="M9 15l-1.5 1.5a3.5 3.5 0 0 1-5-5L4 10M15 9l1.5-1.5a3.5 3.5 0 0 1 5 5L20 14M8 4l1 3M16 20l-1-3M4 8l3 1M20 16l-3-1"/>',
+ net:'<path d="M12 20h.01M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 14 0M2 9.4a15 15 0 0 1 20 0"/>',
+ pulse:'<path d="M3 12h4l2-5 4 10 2-5h6"/>',
+ doc:'<path d="M7 3h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M9 8h6M9 12h6M9 16h3"/>',
+ release:'<path d="M12 3v10M8 9l4 4 4-4"/><path d="M5 17h14v3H5z"/>',
+ redo:'<path d="M3 12a9 9 0 0 1 15.3-6.4L21 8"/><path d="M21 3v5h-5"/>',
+ archive:'<rect x="3" y="4" width="18" height="5" rx="1.5"/><path d="M5 9v9a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/>',
+ ptr:'<path d="M5 3l14 7-6 2-2 6z"/>',
+ check:'<path d="M5 12.5l4.5 4.5L19 7.5"/>',
+ updown:'<path d="M8 9l4-4 4 4M8 15l4 4 4-4"/>',
+ down:'<path d="M6 9l6 6 6-6"/>',
+ role:'<path d="M7 7h10l-3-3M17 17H7l3 3"/>',
+ quit:'<path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10"/>',
+ clip:'<rect x="6" y="4" width="12" height="17" rx="2"/><path d="M9 4V3h6v1M9 10h6M9 14h4"/>',
+ hist:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/>',
+ stack:'<rect x="4" y="4" width="16" height="5" rx="1.5"/><rect x="4" y="10.5" width="16" height="5" rx="1.5"/><path d="M6 19h12"/>',
+ file:'<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/>',
+ folder:'<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+ open:'<path d="M14 4h6v6M20 4l-9 9"/><path d="M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
+ speaker:'<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+ out:'<path d="M4 15v-3a8 8 0 0 1 16 0v3"/><rect x="3" y="14" width="4" height="6" rx="1.5"/><rect x="17" y="14" width="4" height="6" rx="1.5"/>',
+ mute:'<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M17 9l5 6M22 9l-5 6"/>',
+ bell:'<path d="M6 16V11a6 6 0 0 1 12 0v5l1.5 2h-15z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
+ warn:'<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17h.01"/>',
+ wifi:'<path d="M12 20h.01M8.5 16.4a5 5 0 0 1 7 0M5 12.9a10 10 0 0 1 14 0"/>'
+};
+const gl=k=>`<svg viewBox="0 0 24 24" aria-hidden="true">${G[k]}</svg>`;
+const tile=(g,c)=>`<span class="ri" style="--tc:var(--tile-${c})">${gl(g)}</span>`;
+const sw=(key,on,label,dis)=>`<button type="button" class="sw" role="switch" aria-checked="${!!on}" aria-label="${esc(label)}" data-set="${key}"${dis?' disabled':''}></button>`;
+const sel=(key,opts,val,label,dis)=>`<span class="sel"><select data-sel="${key}" aria-label="${esc(label)}"${dis?' disabled':''}>${opts.map(o=>`<option value="${esc(o[0])}"${String(o[0])===String(val)?' selected':''}>${esc(o[1])}</option>`).join('')}</select>${gl(isMac?'updown':'down')}</span>`;
+const btn=(act,label,cls='',extra='')=>`<button type="button" class="btn${cls?' '+cls:''}" data-act="${act}"${extra}>${label}</button>`;
+function row(o){return `<div class="row${o.ic?' hi':''}${o.stack?' stack':''}"${o.id?` id="${o.id}"`:''}>${o.ic?tile(o.ic[0],o.ic[1]):''}<div class="rt"><div class="rl">${o.t}</div>${o.n?`<div class="rn">${o.n}</div>`:''}</div>${o.c?`<div class="rc">${o.c}</div>`:''}</div>${o.after||''}`}
+const sec=(h,rows,fn)=>`<section class="sec">${h?`<h3>${h}</h3>`:''}<div class="grp">${rows.join('')}</div>${fn?`<p class="fn">${fn}</p>`:''}</section>`;
+let gid=0;
+function devSvg(kind){
+  const g={mac:['#4f46e5','#f97316'],win:['#1d5fe0','#9cc0f5']}[kind]||['#16a085','#2d7bd8'];const id='dg'+(gid++);
+  const grad=`<defs><linearGradient id="${id}" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${g[0]}"/><stop offset="1" stop-color="${g[1]}"/></linearGradient></defs>`;
+  if(kind==='mac')return `<svg viewBox="0 0 84 66" aria-hidden="true">${grad}<rect x="12" y="6" width="60" height="40" rx="4" fill="#16171b"/><rect x="15" y="9" width="54" height="34" rx="1.5" fill="url(#${id})"/><path d="M4 50h76l-4 6H8z" fill="#b9bdc6"/></svg>`;
+  return `<svg viewBox="0 0 84 66" aria-hidden="true">${grad}<rect x="6" y="4" width="72" height="44" rx="3.5" fill="#16171b"/><rect x="9" y="7" width="66" height="38" rx="1.5" fill="url(#${id})"/><rect x="38" y="48" width="8" height="9" fill="#8e939c"/><rect x="28" y="57" width="28" height="4" rx="2" fill="#a3a8b1"/></svg>`;
+}
+function strands(pill,cut){
+  let a='',b='';for(let x=-40;x<=360;x+=4){const s=Math.sin(x/40*Math.PI*2);a+=(x===-40?'M':'L')+x+' '+(32+11*s).toFixed(1);b+=(x===-40?'M':'L')+x+' '+(32-11*s).toFixed(1)}
+  const id='sg'+(gid++);
+  return `<div class="strand${cut?' cut':''}"><svg viewBox="0 0 320 64" preserveAspectRatio="none" aria-hidden="true"><defs><linearGradient id="${id}a" x1="0" x2="1"><stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="#36c9b6"/></linearGradient><linearGradient id="${id}b" x1="0" x2="1"><stop offset="0" stop-color="#a26bff"/><stop offset="1" stop-color="var(--accent)"/></linearGradient></defs><g class="flow"><path d="${b}" fill="none" stroke="url(#${id}b)" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke" opacity=".75"/><path d="${a}" fill="none" stroke="url(#${id}a)" stroke-width="3" stroke-linecap="round" vector-effect="non-scaling-stroke"/></g></svg>${pill?`<span class="pill">${pill}</span>`:''}</div>`;
+}
+const SIDE_NAME=['右','左','上','下','右上','右下','左上','左下'];
+const me=()=>isMac?'このMac':'このPC';
+
+/* ---------- nav ---------- */
+const PAGES=[['gen','General','gear','gray'],['conn','Connection','link','green'],['share','Sharing','clip','blue'],['notify','Notifications','bell','red'],['diag','Diagnostics','shield','indigo'],['upd','Updates','release','orange']];
+function renderNav(){
+  $('#snav').innerHTML='<span class="navsel" id="navsel"></span>'+PAGES.map(p=>`<button type="button" data-page="${p[0]}"${page===p[0]?' aria-current="page"':''}>${tile(p[2],p[3])}${p[1]}</button>`).join('');
+  moveNav(true);
+}
+function moveNav(instant){const b=$(`#snav [data-page="${page}"]`),s=$('#navsel');if(!b||!s)return;if(instant)s.style.transition='none';s.style.transform=`translate(${b.offsetLeft}px,${b.offsetTop}px)`;s.style.width=b.offsetWidth+'px';s.style.height=b.offsetHeight+'px';if(instant){s.offsetWidth;s.style.transition=''}}
+function goPage(p){if(p===page)return;page=p;$$('#snav [data-page]').forEach(b=>b.dataset.page===p?b.setAttribute('aria-current','page'):b.removeAttribute('aria-current'));moveNav(false);renderPage(true)}
+
+/* ---------- live values ---------- */
+const rtts=[];
+function live(){
+  if(!S)return;const c=S.conn||{};
+  if(c.connected&&c.rtt>0){rtts.push(c.rtt);if(rtts.length>60)rtts.shift()}
+  $$('[data-live="rtt"]').forEach(e=>e.textContent=c.connected&&c.rtt>0?c.rtt:'—');
+  const sp=$('[data-live="spark"]');if(sp)sp.innerHTML=spark();
+  const f=$('#sfoot');if(f){const ap=(S.peers||[]).find(p=>p.active)||(S.peers||[])[0];f.innerHTML=c.connected?`<span class="dot on"></span><span>${esc(ap?ap.label:'相手')} · <span data-live="rtt">${c.rtt||'—'}</span> ms</span>`:`<span class="dot"></span><span>${esc(c.status||'未接続')}</span>`}
+}
+function spark(){
+  if(rtts.length<2)return '';const W=300,H=40,n=rtts.length,mx=Math.max(14,...rtts),X=i=>i/(n-1)*W,Y=v=>H-3-v/mx*(H-8);
+  const pts=rtts.map((v,i)=>X(i).toFixed(1)+','+Y(v).toFixed(1)).join(' ');
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="直近の遅延"><polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="1.8" vector-effect="non-scaling-stroke" stroke-linejoin="round"/></svg>`;
+}
+
+/* ---------- pages ---------- */
+const head=(h,p)=>`<header><h1>${h}${BOOT.preview?' <span class="chip warn preview">Preview · 保存しません</span>':''}</h1><p>${p}</p>${S&&S.saveError?`<p class="chip bad" style="height:auto;padding:6px 12px;margin-top:10px;white-space:normal"><i></i>${esc(S.saveError)}</p>`:''}</header>`;
+function pgGen(){
+  const s=S.settings,hk=[[97,'F6'],[100,'F8'],[105,'F13'],[54,isMac?'右 ⌘':'右 Ctrl']];
+  if(!hk.some(h=>h[0]===s.hotkey))hk.push([s.hotkey,`キーコード ${s.hotkey}`]);
+  return head('General','起動と、相手へ移る方法を決めます。')+
+  sec('Startup',[row({ic:['power','green'],t:'PCの起動時に Knit を開く',n:isMac?'ログイン項目に登録します。':'スタートアップ アプリに登録します。',c:sw('startup',s.startup,'PCの起動時に Knit を開く')})])+
+  sec('Switching',[
+    row({ic:['key','gray'],t:'Hotkey',n:s.locked.hotkey?'環境変数で固定されているため、ここでは変えられません。':'押すたびに、手元と相手を行き来します。画面の端へ動かしても移れます。',c:sel('hotkey',hk,s.hotkey,'切替キー',s.locked.hotkey)}),
+    row({ic:['home','red'],t:'手元に戻す',n:`切替キーのほか、${isMac?'メニューバー':'トレイ'}の Knit から「${isMac?'Macに戻る':'このPCに戻る'}」でも戻れます。`,c:`<kbd>${esc(hk.find(h=>h[0]===s.hotkey)[1])}</kbd>`})])+
+  sec('Language',[row({ic:['globe','blue'],t:'メニューと通知の言語',n:'設定画面の言葉は変わりません。',c:sel('ui_language',[['ja','日本語'],['en','English']],s.language,'言語',s.locked.ui_language)})]);
+}
+function pgConn(){
+  const c=S.conn,peers=S.peers||[],ap=peers.find(p=>p.active)||peers[0];
+  const avg=rtts.length?Math.round(rtts.reduce((a,b)=>a+b,0)/rtts.length):0,mx=rtts.length?Math.max(...rtts):0;
+  const link=`<section class="sec"><div class="grp"><div class="linkcard"><div class="dv">${devSvg(OS)}<b>${me()}</b><span>${esc(S.myName||'')}</span></div>${strands(c.connected?'<span data-live="rtt">'+(c.rtt||'—')+'</span> ms':'未接続',!c.connected)}<div class="dv">${devSvg(isMac?'win':'mac')}<b>${esc(ap?ap.label:'相手')}</b><span>${esc(ap?ap.ip:'')}</span></div></div>
+    <div class="stats"><div><b>${esc(c.status||'')}</b><span>${esc(c.route||'')}</span></div>${c.connected?`<div><b><span data-live="rtt">${c.rtt||'—'}</span> ms</b><span>Latency</span></div><div><b>${avg||'—'} ms</b><span>Average</span></div><div><b>${mx||'—'} ms</b><span>Peak</span></div><div style="flex:1;min-width:140px" data-live="spark">${spark()}</div>`:''}</div></div></section>`;
+  const prow=peers.map(p=>row({ic:['dev',p.active?'green':'gray'],t:esc(p.label)+(p.alias?` <span class="chip off">${esc(p.name)}</span>`:''),n:`${esc(p.ip)}${p.ver?` · 版 ${p.ver}`:''}`,
+    c:(p.active?'<span class="chip ok"><i></i>Active</span>':'<span class="chip off">Standby</span>')+btn('rename:'+p.id,'Rename…','sm')+btn('reconnect:'+p.id,'Reconnect','sm'),
+    after:renaming===p.id?`<div class="inl"><div style="display:flex;gap:8px"><input class="inp" id="aliasIn" value="${esc(p.alias||p.name)}" aria-label="表示名" maxlength="40">${btn('renameOk:'+p.id,'Save','p sm')}${btn('renameCancel','Cancel','sm')}</div><span class="rn" style="margin:0">空欄にするとコンピュータ名に戻ります。</span></div>`:''}));
+  const peersSec=peers.length?sec('Peers',prow):sec('Peers',[`<div class="empty">${devSvg(isMac?'win':'mac')}<div>まだ相手がつながっていません。</div>${btn('pair','Pair a device…','p sm')}</div>`]);
+  const arr=peers.length?`<section class="sec"><h3>Screen Layout</h3>${arrPanel()}</section>`:'';
+  const role=c.role==='client';
+  const route=sec('Route',[
+    row({ic:['role','indigo'],t:'このPCの役割',n:c.roleNote?esc(c.roleNote):(c.roleLocked?'環境変数で固定されています。':(role?'相手のPCへ接続しに行きます。':'相手のPCからの接続を待ちます。')),c:`<span class="sides" role="group" aria-label="役割"><button type="button" data-role="host" aria-pressed="${!role}"${c.roleLocked?' disabled':''}>Host</button><button type="button" data-role="client" aria-pressed="${role}"${c.roleLocked?' disabled':''}>Client</button></span>`}),
+    row({ic:['net','gray'],t:'相手のアドレス',n:'空欄なら同じネットワークを自動で探します。Tailscale などではIPアドレスを入れます。カンマで区切ると順に試します。保存すると Knit を再起動します。',stack:true,c:`<div style="display:flex;gap:8px;width:100%"><input class="inp" id="hostIn" value="${esc(c.host||'')}" placeholder="例: 100.84.0.2" aria-label="相手のアドレス" autocomplete="off" spellcheck="false">${btn('saveHost','Save & Reconnect','sm')}</div>${c.hostError?`<span class="rn" style="color:var(--bad);margin:0">${esc(c.hostError)}</span>`:''}`}),
+    row({ic:['dev','gray'],t:`${me()}のアドレス`,n:'相手のPCで入力するときに使います。',stack:true,c:`<div class="addrs">${(S.addrs||[]).map(a=>`<div class="addr"><code>${esc(a)}</code>${btn('copy:'+a,'Copy','sm')}</div>`).join('')||'<span class="rn">取得できませんでした</span>'}</div>`})
+  ],'IPアドレスは相手を探すためだけに使います。接続の許可には、登録した接続キーを使います。');
+  const reg=sec('Pairing',[
+    row({ic:['plus','blue'],t:'端末を登録',n:'新しいPCをつなぐときに使います。',c:btn('pair','Pair…','sm')}),
+    row({ic:['unlink','red'],t:'すべての登録を初期化',n:'接続キーを作り直します。登録したすべてのPCが、つながらなくなります。',c:btn('resetReg','Reset…','d sm')})]);
+  return head('Connection','つないでいる相手と、画面の並びです。')+link+peersSec+arr+route+reg;
+}
+function pgDiag(){
+  const p=S.perm||{},d=S.diag||{};
+  const ax=row({ic:['access','blue'],t:'Accessibility',n:'キーボードとマウスの入力を読み取り、相手へ送るために使います。Knit が求める権限はこれだけです。',c:p.ax?'<span class="chip ok"><i></i>Granted</span>'+btn('openAx','Open…','sm'):'<span class="chip bad"><i></i>Not granted</span>'+btn('openAx','システム設定を開く','p sm')});
+  const diagBody=d.running?`<div class="inl"><div style="display:flex;gap:8px;align-items:center"><span class="spin"></span><span class="rn" style="margin:0">Checking…</span></div></div>`:(diagText?`<div class="inl"><pre>${esc(diagText)}</pre></div>`:'');
+  return head('Diagnostics','Knit が使っている許可と、つながりを確かめる道具です。')+
+  (isMac?sec('Permissions',[ax]):'')+
+  `<section class="sec"><h3>Diagnostics</h3><div class="grp">${row({ic:['pulse','indigo'],t:'つながりを確かめる',n:'待ち受け、相手への到達、認証、遅延を順に確かめます。',c:btn('diag',d.running?'Checking…':'Run','sm',d.running?' disabled':'')})}${diagBody}${row({ic:['doc','gray'],t:'Logs',n:'入力した文字、パスワード、接続キーは記録していません。',c:btn('log','Export…','sm')})}</div></section>`;
+}
+const appIc=`<svg class="appic" viewBox="0 0 48 48" aria-hidden="true"><defs><linearGradient id="aig" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3b8bff"/><stop offset="1" stop-color="#5b3cf0"/></linearGradient></defs><rect width="48" height="48" rx="12" fill="url(#aig)"/><path d="M9 18c5.5 0 9.5 12 15 12s9.5-12 15-12" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M9 30c5.5 0 9.5-12 15-12s9.5 12 15 12" fill="none" stroke="#fff" stroke-opacity=".6" stroke-width="3.6" stroke-linecap="round"/></svg>`;
+function pgUpd(){
+  const u=S.update||{};let card='';
+  if(u.state==='checking')card=`<div class="uh">${appIc}<div class="tt"><b>新しい版を確認しています…</b><span class="rn">送るのは版・OS・チャンネルだけです。</span></div><span class="spin"></span></div>`;
+  else if(u.state==='available')card=`<div class="uh">${appIc}<div class="tt"><b>Knit ${esc(u.version)} があります</b><span class="rn">いまは ${esc(S.version)}。署名と中身を確かめてから入れ替え、起動しなければ前の版に戻します。設定と登録には触れません。</span></div>${btn('update','Update Now','p sm')}</div>`;
+  else if(u.state==='installing')card=`<div class="uh">${appIc}<div class="tt"><b>更新を準備しています…</b><span class="rn">終わると Knit が自動で再起動します。</span></div><span class="spin"></span></div>`;
+  else if(u.state==='failed')card=`<div class="uh">${appIc}<div class="tt"><b>更新を確認できませんでした</b><span class="rn">${esc(u.reason||'')}</span></div>${btn('update','Try Again','sm')}</div>`;
+  else card=`<div class="uh">${appIc}<div class="tt"><b>Knit ${esc(S.version)}</b><span class="rn">${u.enabled===false?'更新の署名鍵が未登録のため、この版では自動更新を使えません。':'新しい版があるかを確かめます。'}</span></div>${btn('update','Check Now','sm')}</div>`;
+  return head('Updates','新しい版への更新と、保守のための道具です。')+
+  `<section class="sec"><div class="grp"><div class="updcard">${card}</div></div></section>`+
+  sec('Automatic Updates',[row({ic:['redo','orange'],t:'自動で確認する',n:'起動したときと6時間ごとに確認し、知らせるだけです。勝手に入れ替えません。',c:sw('update_check',S.settings.update_check,'自動で確認する',S.settings.locked.update_check)})])+
+  sec('Maintenance',[
+    row({ic:['archive','blue'],t:'設定の書き出しと読み込み',n:'一般の設定と、相手ごとの感度・範囲を含みます。接続キーと権限は含みません。',c:btn('export','Export…','sm')+btn('import','Import…','sm')}),
+    row({ic:['redo','gray'],t:'Knit を再起動',n:'相手とのつながりは数秒で戻ります。',c:btn('restart','Restart','sm')}),
+    row({ic:['gear','red'],t:'すべての設定を初期化',n:'登録はそのままで、設定だけをはじめの状態に戻します。',c:btn('resetAll','Reset…','d sm')}),
+    row({ic:['quit','gray'],t:'Knit を終了',c:btn('quit','Quit','sm')})])+
+  sec('About',[row({ic:['release','blue'],t:'Version',c:`<code>${esc(S.version)}</code>`})]);
+}
+function pgShare(){
+  const s=S.settings,cap=S.caps||{},L=s.locked||{};
+  const lockNote=(k,env)=>L[k]?`${env} で固定されています。`:'';
+  const capNote=c=>cap[c]===false?'KNIT_SHARE で無効になっています。':'';
+  const outs=[['','System Default'],...(S.outputs||[])];
+  if(s.audio_output_uid&&!outs.some(o=>o[0]===s.audio_output_uid))outs.push([s.audio_output_uid,'見つからない出力（再生を止めています）']);
+  const gain=Math.round((s.audio_gain||1)*100);
+  return head('Sharing','端末のあいだで渡すものを選びます。')+
+  sec('Clipboard',[
+    row({ic:['clip','blue'],t:'コピーを相手と共有',n:capNote('clip')||lockNote('clip_share','KNIT_CLIP')||'テキストと画像。画面を移るときに相手のクリップボードへ渡します。',c:sw('clip_share',s.clip_share,'コピーを相手と共有',cap.clip===false||L.clip_share)}),
+    row({ic:['hist','indigo'],t:`${me()}のコピーも履歴に残す`,n:lockNote('history_enabled','KNIT_LOCAL_HISTORY')||'あとからメニューの History で、別の端末へ貼り付けられます。',c:sw('history_enabled',s.history_enabled,'コピーを履歴に残す',L.history_enabled)}),
+    row({ic:['stack','indigo'],t:'History の保存件数',n:'超えた分は古いものから消えます。',c:sel('history_limit',[[10,'10'],[50,'50'],[100,'100'],[200,'200']],s.history_limit,'保存件数')})])+
+  sec('Files',[
+    row({ic:['file','blue'],t:'ファイルを共有',n:capNote('files')||'コピーしたファイルや、画面の端まで運んだファイルを相手へ渡します。',c:sw('share_files',s.share_files,'ファイルを共有',cap.files===false)}),
+    row({ic:['folder','blue'],t:'受信フォルダ',n:S.receiveRestart?'変更は Knit の再起動後に切り替わります。':'相手から届いたファイルの置き場所です。',stack:true,c:`<div style="display:flex;gap:8px;align-items:center;width:100%"><code style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(s.receive_folder)}</code>${btn('folder','Change…','sm')}${btn('openFolder','Show','sm')}</div>`}),
+    row({ic:['open','gray'],t:'受け取ったらフォルダを開く',c:sw('open_receive_folder',s.open_receive_folder,'受け取ったらフォルダを開く')})])+
+  sec('Audio',[
+    row({ic:['speaker','orange'],t:'相手の音声をこのMacで再生',n:capNote('audio')||lockNote('audio_on','KNIT_AUDIO')||(S.outputStatus?esc(S.outputStatus):'相手のPCで鳴っている音を、ここで聞けます。'),c:sw('audio_on',s.audio_on,'相手の音声を再生',cap.audio===false||L.audio_on)}),
+    row({ic:['speaker','orange'],t:'Volume',stack:true,c:`<input type="range" class="rg" min="0" max="200" step="5" value="${gain}" data-gain style="--p:${gain/2}%" aria-label="音量"${L.audio_gain||!s.audio_on?' disabled':''}><code data-out="gain" style="min-width:44px;text-align:right">${gain}%</code>`}),
+    row({ic:['out','orange'],t:'Output',n:'選んだ出力が見つからなくなると、再生を止めます。既定のスピーカーには切り替えません。',c:sel('audio_output_uid',outs,s.audio_output_uid||'','出力先',!s.audio_on)}),
+    row({ic:['mute','gray'],t:'相手のスピーカーを消音',n:lockNote('spk_mute','KNIT_MUTE_SPK')||'このMacで鳴らしている間、相手側では鳴らしません。',c:sw('spk_mute',s.spk_mute,'相手のスピーカーを消音',L.spk_mute)})]);
+}
+const NOTICES=[
+  ['transfer','file','blue','ファイル転送','大きなファイルを送る前と、送り終えたとき。','3 件（12.4 MB）を HACHIMAN-PC へ送信しました'],
+  ['clipboard','clip','indigo','クリップボード','大きすぎる・機密の可能性があるコピーを送らなかったとき。','クリップボードに機密の可能性があるため送らず、履歴にも載せません'],
+  ['connection','wifi','green','接続の品質','遅延が続いて、つなぎ方を見直したほうがよいとき。','遅延が続いています（80ms超）。Wi-Fiの場合は有線直結を検討してください'],
+  ['update','release','orange','アップデート','新しい版が出たとき。','Knit 0.27.0 に更新できます'],
+];
+let noticeSample=NOTICES[0];
+function banner(n){return `<div class="banner" aria-hidden="true"><svg class="appic" viewBox="0 0 48 48" style="width:34px;height:34px"><rect width="48" height="48" rx="11" fill="#3b6bff"/><path d="M9 18c5.5 0 9.5 12 15 12s9.5-12 15-12" fill="none" stroke="#fff" stroke-width="3.6" stroke-linecap="round"/><path d="M9 30c5.5 0 9.5-12 15-12s9.5 12 15 12" fill="none" stroke="#fff" stroke-opacity=".6" stroke-width="3.6" stroke-linecap="round"/></svg><div><div class="bh"><b>Knit</b><span>now</span></div><div class="bb">${esc(n[5])}</div></div></div>`}
+function pgNotify(){
+  const s=S.settings;
+  return head('Notifications','知らせてほしいことだけを選びます。問題が起きたときの通知は止められません。')+
+  `<section class="sec"><h3>Preview</h3><div class="grp"><div class="bannerwrap" id="bannerwrap">${banner(noticeSample)}</div></div><p class="fn">行を選ぶと、その通知の見え方がここに出ます。文面は例です。</p></section>`+
+  sec('Categories',[...NOTICES.map(n=>row({ic:[n[1],n[2]],t:n[3],n:n[4],c:sw('notify_'+n[0],s['notify_'+n[0]],n[3]),id:'nt-'+n[0]})),
+    row({ic:['warn','red'],t:'問題が起きたとき',n:'接続できない、保存できない、許可が外れたなど、対応が必要なとき。',c:'<span class="chip info">Always on</span>',id:'nt-problem'})])+
+  sec('System',[
+    row({ic:['bell','red'],t:'macOS の通知設定',n:'表示スタイル、集中モード中の扱い、音は macOS 側で決めます。',c:btn('openNotify','Open…','sm')}),
+    row({ic:['bell','gray'],t:'テスト通知',n:'実際の見え方を確かめます。',c:btn('testNotify','Send Test','sm')})]);
+}
+const PG={gen:pgGen,conn:pgConn,share:pgShare,notify:pgNotify,diag:pgDiag,upd:pgUpd};
+function renderAll(enter){renderNav();renderPage(enter)}
+/* WebKit scrolls range inputs into view after a re-render. Hold the intended position for a
+   moment unless the user is the one scrolling. */
+let pin=null,userScrollAt=0;
+['wheel','pointerdown','keydown','touchstart'].forEach(t=>addEventListener(t,()=>{userScrollAt=Date.now()},{capture:true,passive:true}));
+function pinScroll(y){pin={y,until:Date.now()+900}}
+document.addEventListener('scroll',e=>{if(e.target.id!=='scroll'||!pin)return;if(Date.now()>pin.until||Date.now()-userScrollAt<1000){pin=null;return}if(e.target.scrollTop!==pin.y)e.target.scrollTop=pin.y},true);
+function renderPage(enter){
+  if(!S)return;const sc=$('#scroll'),y=sc.scrollTop;
+  sc.classList.remove('enter');sc.innerHTML=PG[page]();
+  if(enter){sc.scrollTop=0;void sc.offsetWidth;sc.classList.add('enter')}else sc.scrollTop=y;
+  pinScroll(enter?0:y);
+  const w=$('#who');if(w)w.innerHTML=`${devSvg(OS)}<div><b>${esc(S.myName||'')}</b><span>Knit ${esc(S.version)}</span></div>`;
+  live();
+  const el=$('#arr');if(el){el._vb=null;drawArr(el)}
+  const ai=$('#aliasIn');if(ai&&renaming){ai.focus();ai.select()}
+}
+
+/* ======================= arrangement ======================= */
+/* My screens stay as the OS arranges them. Each peer moves as one group; the longest touching edge
+   becomes the passable edge sent to the app (side, which monitor, source/target ranges). */
+let SELP=null,RNG={},IDN=false;
+function mineS(){return (S.displays||[]).map((d,i)=>({id:'m'+i,idx:i,name:d.name||('ディスプレイ '+(i+1)),x:d.x,y:d.y,w:d.w,h:d.h,main:!!d.main,own:true,kind:OS}))}
+const hit=(a,b)=>a.x<b.x+b.w-.5&&b.x<a.x+a.w-.5&&a.y<b.y+b.h-.5&&b.y<a.y+a.h-.5;
+const bbox=R=>({x:Math.min(...R.map(r=>r.x)),y:Math.min(...R.map(r=>r.y)),x2:Math.max(...R.map(r=>r.x+r.w)),y2:Math.max(...R.map(r=>r.y+r.h))});
+function shared(a,b){const e=.5,r=Math.abs(a.x+a.w-b.x)<e,l=Math.abs(b.x+b.w-a.x)<e;
+  if(r||l){const x=r?b.x:a.x,y1=Math.max(a.y,b.y),y2=Math.min(a.y+a.h,b.y+b.h);if(y2-y1>e)return{x1:x,y1,x2:x,y2,side:r?0:1,len:y2-y1}}
+  const bt=Math.abs(a.y+a.h-b.y)<e,tp=Math.abs(b.y+b.h-a.y)<e;
+  if(bt||tp){const y=bt?b.y:a.y,x1=Math.max(a.x,b.x),x2=Math.min(a.x+a.w,b.x+b.w);if(x2-x1>e)return{x1,y1:y,x2,y2:y,side:bt?3:2,len:x2-x1}}return null}
+let GROUPS=[];
+function relOf(p){const mons=(p.monitors&&p.monitors.length)?p.monitors:[{x:0,y:0,w:p.screen[0]||1920,h:p.screen[1]||1080,name:''}];
+  const x0=Math.min(...mons.map(m=>m.x)),y0=Math.min(...mons.map(m=>m.y));
+  return mons.map((m,j)=>({id:p.id+'#'+j,name:m.name||(mons.length>1?`モニター ${j+1}`:p.label),w:m.w,h:m.h,rx:m.x-x0,ry:m.y-y0,main:j===0,own:false,kind:isMac?'win':'mac'}))}
+function place(p,rel,M){
+  const W=Math.max(...rel.map(r=>r.rx+r.w)),H=Math.max(...rel.map(r=>r.ry+r.h));
+  const A=p.monitor!=null&&M[p.monitor]?M[p.monitor]:(()=>{const b=bbox(M);return{x:b.x,y:b.y,w:b.x2-b.x,h:b.y2-b.y}})();
+  const side=[0,1,2,3,0,0,1,1][p.side]??0,[s0]=p.source||[0,1],[t0]=p.target||[0,1];
+  if(side===0)return{x:A.x+A.w,y:A.y+s0*A.h-t0*H};if(side===1)return{x:A.x-W,y:A.y+s0*A.h-t0*H};
+  if(side===2)return{x:A.x+s0*A.w-t0*W,y:A.y-H};return{x:A.x+s0*A.w-t0*W,y:A.y+A.h};
+}
+function buildGroups(){
+  const M=mineS(),old=Object.fromEntries(GROUPS.map(g=>[g.id,g]));
+  GROUPS=(S.peers||[]).map(p=>{const rel=relOf(p),pos=place(p,rel,M),o=old[p.id];return{id:p.id,label:p.label,rel,x:pos.x,y:pos.y,sens:p.sens,stamp:JSON.stringify([p.side,p.monitor,p.source,p.target,p.monitors,p.screen])}});
+  GROUPS.forEach(g=>{const others=othersFor(g);if(g.rel.some(q=>others.some(o=>hit({x:g.x+q.rx,y:g.y+q.ry,w:q.w,h:q.h},o)))||!crossEdges(g).length){const s=snapSet(g.rel,others,g.x,g.y,(x,y)=>touchesMine(g,x,y));if(s){g.x=s.x;g.y=s.y}}});
+  if(!SELP||!GROUPS.some(g=>g.id===SELP))SELP=GROUPS[0]&&GROUPS[0].id;
+}
+const scr=(g,x=g.x,y=g.y)=>g.rel.map(q=>({...q,x:x+q.rx,y:y+q.ry}));
+function othersFor(g){return [...mineS(),...GROUPS.filter(o=>o.id!==g.id).flatMap(o=>scr(o))]}
+function crossEdgesAt(g,x,y){const out=[];for(const A of mineS())for(const B of scr(g,x,y)){const e=shared(A,B);if(e)out.push({...e,a:A,b:B})}return out}
+const crossEdges=g=>crossEdgesAt(g,g.x,g.y);
+const touchesMine=(g,x,y)=>crossEdgesAt(g,x,y).length>0;
+const bestEdge=g=>crossEdges(g).sort((p,q)=>q.len-p.len)[0]||null;
+function snapSet(set,others,gx,gy,ok){
+  const MAG=140;let best=null;
+  const consider=(x,y)=>{if(set.some(q=>others.some(o=>hit({x:x+q.rx,y:y+q.ry,w:q.w,h:q.h},o))))return;if(ok&&!ok(x,y))return;const d=Math.hypot(x-gx,y-gy);if(!best||d<best.d)best={x,y,d}};
+  for(const A of others)for(const B of set){
+    const mo=Math.min(240,Math.min(A.h,B.h)*.25),mx=Math.min(240,Math.min(A.w,B.w)*.25);
+    for(const sd of [0,1]){const x=sd===0?A.x+A.w-B.rx:A.x-B.rx-B.w,lo=A.y-B.ry-B.h+mo,hi=A.y+A.h-B.ry-mo;if(lo>hi)continue;let y=Math.max(lo,Math.min(hi,gy));
+      for(const t of [A.y-B.ry,A.y+A.h-B.ry-B.h,A.y+A.h/2-B.ry-B.h/2])if(Math.abs(y-t)<MAG&&t>=lo&&t<=hi){y=t;break}consider(x,y)}
+    for(const sd of [3,2]){const y=sd===3?A.y+A.h-B.ry:A.y-B.ry-B.h,lo=A.x-B.rx-B.w+mx,hi=A.x+A.w-B.rx-mx;if(lo>hi)continue;let x=Math.max(lo,Math.min(hi,gx));
+      for(const t of [A.x-B.rx,A.x+A.w-B.rx-B.w,A.x+A.w/2-B.rx-B.w/2])if(Math.abs(x-t)<MAG&&t>=lo&&t<=hi){x=t;break}consider(x,y)}
+  }
+  return best?{x:best.x,y:best.y}:null;
+}
+function fitVB(){const all=[...mineS(),...GROUPS.flatMap(g=>scr(g))];const b=bbox(all),w=b.x2-b.x,h=b.y2-b.y,p=Math.max(w,h)*.13;return{x:b.x-p,y:b.y-p*1.45,w:w+2*p,h:h+2.6*p}}
+function setVB(el,vb,animate){const svg=$('svg',el),from=el._vb;el._vb=vb;
+  if(!animate||!from||reduce){svg.setAttribute('viewBox',`${vb.x} ${vb.y} ${vb.w} ${vb.h}`);return}
+  const t0=performance.now(),step=t=>{const k=Math.min(1,(t-t0)/420),e=1-Math.pow(1-k,3);svg.setAttribute('viewBox',['x','y','w','h'].map(n=>from[n]+(vb[n]-from[n])*e).join(' '));if(k<1)requestAnimationFrame(step)};requestAnimationFrame(step)}
+const tw=s=>[...String(s)].reduce((n,c)=>n+(c.charCodeAt(0)>255?1:.6),0);
+function scrSvg(q,fs,o={}){
+  const bz=Math.max(fs*.16,Math.min(q.w,q.h)*.022),r=fs*.42,ix=q.x+bz,iy=q.y+bz,iw=q.w-2*bz,ih=q.h-2*bz;let h='';
+  h+=`<rect x="${q.x}" y="${q.y+fs*(o.lift?.7:.32)}" width="${q.w}" height="${q.h}" rx="${r}" filter="url(#bl)" style="fill:#000;opacity:${o.lift?.38:.24}"/>`;
+  h+=`<rect x="${q.x}" y="${q.y}" width="${q.w}" height="${q.h}" rx="${r}" style="fill:#0d0e11"/>`;
+  h+=`<rect x="${ix}" y="${iy}" width="${iw}" height="${ih}" rx="${r*.55}" fill="url(#wp-${q.kind})"/><rect x="${ix}" y="${iy}" width="${iw}" height="${ih}" rx="${r*.55}" fill="url(#wp-${q.kind}-h)"/>`;
+  if(q.main){if(q.kind==='mac')h+=`<rect x="${ix}" y="${iy}" width="${iw}" height="${ih*.045}" style="fill:rgba(255,255,255,.32)"/>`;
+    else{const th=ih*.07,cx=ix+iw/2;h+=`<rect x="${ix}" y="${iy+ih-th}" width="${iw}" height="${th}" style="fill:rgba(14,18,32,.55)"/>`+[-1.5,-.5,.5,1.5].map(k=>`<rect x="${cx+k*th*.9-th*.3}" y="${iy+ih-th*.8}" width="${th*.6}" height="${th*.6}" rx="${th*.12}" style="fill:rgba(255,255,255,${k===-1.5?.85:.5})"/>`).join('')}}
+  h+=`<rect x="${ix}" y="${iy}" width="${iw}" height="${ih}" rx="${r*.55}" fill="url(#gloss)"/>`;
+  const line2=`${q.w} × ${q.h}`,need2=Math.max(tw(q.name),tw(line2)*.8)+2.2,need1=tw(q.name)+2.2;
+  let lf=Math.min(fs*.66,iw*.9/need2),two=ih>lf*4.4;if(!two||lf<fs*.4){two=false;lf=Math.min(fs*.66,iw*.9/need1)}
+  const pad=lf*.6,cw=lf*(two?need2:need1),chh=two?lf*2.7:lf*1.7,cx=ix+pad*.7,cy=iy+ih-chh-pad*.7;
+  h+=`<rect x="${cx}" y="${cy}" width="${cw}" height="${chh}" rx="${lf*.45}" style="fill:rgba(8,10,18,.46)"/><circle cx="${cx+pad*.95}" cy="${cy+lf*.86}" r="${lf*.26}" style="fill:${q.own?'var(--accent)':'var(--peer)'}"/>`;
+  h+=`<text x="${cx+pad*.95+lf*.55}" y="${cy+lf*1.2}" font-size="${lf}" font-weight="650" style="fill:#fff">${esc(q.name)}</text>`;
+  if(two)h+=`<text x="${cx+pad*.95+lf*.55}" y="${cy+lf*2.25}" font-size="${lf*.78}" style="fill:rgba(255,255,255,.78)">${esc(line2)}</text>`;
+  if(IDN&&o.num){const rr=Math.min(iw,ih)*.2;h+=`<g class="idn"><circle cx="${ix+iw/2}" cy="${iy+ih/2}" r="${rr}" style="fill:rgba(0,0,0,.5);stroke:rgba(255,255,255,.85)" stroke-width="2.5" vector-effect="non-scaling-stroke"/><text x="${ix+iw/2}" y="${iy+ih/2+rr*.38}" text-anchor="middle" font-size="${rr*1.1}" font-weight="700" style="fill:#fff">${o.num}</text></g>`}
+  return h;
+}
+const P=(e,t)=>({x:e.x1+(e.x2-e.x1)*t,y:e.y1+(e.y2-e.y1)*t});
+function tag(x,y,txt,fs,o={}){
+  const hh=fs*1.42,hw=fs*(o.grip?1.75:1.15)+fs*.6*tw(txt),hy=y-fs*.45-hh,cy=hy+hh/2;
+  const dots=o.grip?[-.3,0,.3].map(dy=>[.52,.8].map(dx=>`<circle cx="${x+fs*dx}" cy="${cy+fs*dy}" r="${fs*.075}" style="fill:var(--sub)"/>`).join('')).join(''):'';
+  return `<rect x="${x}" y="${hy}" width="${hw}" height="${hh}" rx="${hh/2}" stroke-width="1" vector-effect="non-scaling-stroke" style="fill:var(--glass);stroke:var(--grp-line)"/>${dots}<circle cx="${x+fs*(o.grip?1.35:.62)}" cy="${cy}" r="${fs*.2}" style="fill:${o.color}"/><text x="${x+fs*(o.grip?1.7:.98)}" y="${cy+fs*.3}" font-size="${fs*.84}" font-weight="650" style="fill:var(--label)">${esc(txt)}</text>`;
+}
+function guides(G,fs,others){let h='';const seen=new Set();
+  for(const g of G)for(const o of others){
+    for(const [a,b] of [[g.y,o.y],[g.y+g.h,o.y+o.h],[g.y+g.h/2,o.y+o.h/2]])if(Math.abs(a-b)<.5&&!seen.has('h'+a)){seen.add('h'+a);h+=`<line x1="${Math.min(g.x,o.x)-fs*.6}" y1="${a}" x2="${Math.max(g.x+g.w,o.x+o.w)+fs*.6}" y2="${a}" stroke-width="1.5" stroke-dasharray="6 4" vector-effect="non-scaling-stroke" style="stroke:#ff375f"/>`}
+    for(const [a,b] of [[g.x,o.x],[g.x+g.w,o.x+o.w],[g.x+g.w/2,o.x+o.w/2]])if(Math.abs(a-b)<.5&&!seen.has('v'+a)){seen.add('v'+a);h+=`<line x1="${a}" y1="${Math.min(g.y,o.y)-fs*.6}" x2="${a}" y2="${Math.max(g.y+g.h,o.y+o.h)+fs*.6}" stroke-width="1.5" stroke-dasharray="6 4" vector-effect="non-scaling-stroke" style="stroke:#ff375f"/>`}}
+  return h}
+function drawArr(el,opt={}){
+  if(!el)return;if(!opt.drag){const t=fitVB(),sv=$('svg',el),W=sv.clientWidth||560;sv.style.height=Math.round(Math.max(230,Math.min(380,W*t.h/t.w)))+'px';setVB(el,t,!!opt.animate)}
+  const vb=el._vb,fs=vb.w/40,M=mineS();let num=0;
+  let h=`<defs><filter id="bl" x="-30%" y="-30%" width="160%" height="170%"><feGaussianBlur stdDeviation="${fs*.38}"/></filter></defs>`;
+  M.forEach(q=>{num++;h+=scrSvg(q,fs,{num})});
+  const mb=bbox(M);h+=tag(mb.x,mb.y,me(),fs,{color:'var(--accent)'});
+  GROUPS.forEach(g=>{
+    const drag=opt.drag&&opt.drag.id===g.id,gx=drag?g.x+opt.drag.dx:g.x,gy=drag?g.y+opt.drag.dy:g.y;
+    if(drag){const s=snapSet(g.rel,othersFor(g),gx,gy,(x,y)=>touchesMine(g,x,y));if(s){const ghost=scr(g,s.x,s.y);h+=ghost.map(q=>`<rect x="${q.x}" y="${q.y}" width="${q.w}" height="${q.h}" rx="${fs*.42}" stroke-width="2" stroke-dasharray="7 5" vector-effect="non-scaling-stroke" style="fill:var(--accent-soft);stroke:var(--accent)"/>`).join('')+guides(ghost,fs,othersFor(g));const be=crossEdgesAt(g,s.x,s.y).sort((p,q)=>q.len-p.len)[0];if(be)h+=`<line x1="${be.x1}" y1="${be.y1}" x2="${be.x2}" y2="${be.y2}" stroke-width="5" stroke-linecap="round" vector-effect="non-scaling-stroke" style="stroke:var(--accent);opacity:.55"/>`}}
+    const SS=scr(g,gx,gy),pb=bbox(SS),sel=SELP===g.id;
+    h+=`<g class="grpg${drag?'':''}" data-g="${esc(g.id)}" tabindex="0" role="button" aria-pressed="${sel}" aria-label="${esc(g.label)} の画面。ドラッグか矢印キーで動かせます"${drag?' style="opacity:.9"':''}>`+SS.map(q=>{if(!drag)num++;return scrSvg(q,fs,{lift:drag,num:drag?0:num})}).join('')+
+      `<rect class="ring${sel&&!drag?' on':''}" x="${pb.x-fs*.25}" y="${pb.y-fs*.25}" width="${pb.x2-pb.x+fs*.5}" height="${pb.y2-pb.y+fs*.5}" rx="${fs*.6}" fill="none" stroke-width="3" vector-effect="non-scaling-stroke" style="stroke:var(--accent)"/>`+tag(pb.x,pb.y,g.label,fs,{grip:true,color:'var(--peer)'})+`</g>`;
+  });
+  if(!opt.drag)GROUPS.forEach(g=>{
+    crossEdges(g).forEach(e=>{h+=`<line x1="${e.x1}" y1="${e.y1}" x2="${e.x2}" y2="${e.y2}" stroke-width="2" stroke-dasharray="4 5" vector-effect="non-scaling-stroke" style="stroke:var(--ter)"/>`});
+    const e=bestEdge(g);if(!e)return;const [r0,r1]=RNG[g.id]||[0,1],a=P(e,r0),b=P(e,r1),vert=e.x1===e.x2;
+    h+=`<line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke-width="16" stroke-linecap="round" vector-effect="non-scaling-stroke" style="stroke:var(--accent);opacity:.18"/><line x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke-width="5" stroke-linecap="round" vector-effect="non-scaling-stroke" style="stroke:var(--accent)"/>`;
+    [[a,0,r0],[b,1,r1]].forEach(([pt,end,v])=>{h+=`<g class="rh" data-g="${esc(g.id)}" data-end="${end}" tabindex="0" role="slider" aria-label="${esc(g.label)} へ通れる区間の${end?'終わり':'始まり'}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(v*100)}" style="cursor:${vert?'ns-resize':'ew-resize'}"><circle cx="${pt.x}" cy="${pt.y}" r="${fs*.7}" style="fill:transparent"/><circle class="k" cx="${pt.x}" cy="${pt.y}" r="${fs*.34}" stroke-width="3" vector-effect="non-scaling-stroke" style="fill:var(--w-solid);stroke:var(--accent)"/></g>`});
+  });
+  $('svg',el).innerHTML=h;
+  if(opt.settle){const g=$(`.grpg[data-g="${CSS.escape(opt.settle.id)}"]`,el);if(g){g.style.transform=`translate(${opt.settle.dx}px,${opt.settle.dy}px)`;g.getBoundingClientRect();g.classList.add('settle');g.style.transform=''}}
+  const l=$('#edges');if(l&&!opt.drag)l.innerHTML=edgeList();
+}
+function edgeList(){
+  return GROUPS.map(g=>{const E=crossEdges(g),e=bestEdge(g);if(!e)return `<span class="edge warn">${esc(g.label)} がこのPCの画面に触れていません</span>`;
+    const full=e.side<2?e.a.h:e.a.w,[r0,r1]=RNG[g.id]||[0,1],pc=Math.round(e.len*(r1-r0)/full*100);
+    let s=`<span class="edge"><i></i>${esc(e.a.name)} の${SIDE_NAME[e.side]}端 → ${esc(g.label)} · 通れる ${pc}%</span>`;
+    if(E.length>1)s+=`<span class="edge note">ほかに触れている辺は通れません（相手ごとに通れる辺は1本です）</span>`;return s}).join('');
+}
+function arrPanel(){
+  const g=GROUPS.find(x=>x.id===SELP),p=(S.peers||[]).find(x=>x.id===SELP),sens=p?p.sens:1;
+  return `<div class="arrwrap"><div class="arrbar"><div class="legend"><span><i class="lg-me"></i>${me()}</span><span><i class="lg-pe"></i>相手</span><span><i class="lg-pass"></i>通れる区間</span><span><i class="lg-h"></i>端点で狭める</span><span><i class="lg-block"></i>触れているが通れない</span></div><div>${btn('identify','Identify','sm')}</div></div>
+  <div class="arr" id="arr"><svg aria-label="画面の並び"></svg><span class="hint">Drag to move · snaps to edges</span></div><div class="edges" id="edges" aria-live="polite"></div>
+  ${g?`<div class="grp">${row({ic:['ptr','orange'],t:`${esc(g.label)} での速さ`,n:'相手の画面でのポインタの速さです。0.2〜3.0、標準は 1.0。',stack:true,c:`<span class="rn" style="margin:0">遅い</span><input type="range" class="rg" min="0.2" max="3" step="0.1" value="${sens}" data-sens="${esc(g.id)}" style="--p:${(sens-.2)/2.8*100}%" aria-label="速さ"><span class="rn" style="margin:0">速い</span><code data-out="sens" style="min-width:30px;text-align:right">${Number(sens).toFixed(1)}</code>${btn('sensReset:'+g.id,'Default','sm')}`})}</div>`:''}</div>`;
+}
+function sendLayout(g){
+  const e=bestEdge(g);if(!e){toast('相手の画面を、このPCの画面に付けてください',true);return}
+  const vert=e.side<2,A=e.a,lenA=vert?A.h:A.w,a0=vert?A.y:A.x,pb=bbox(scr(g)),lenP=vert?pb.y2-pb.y:pb.x2-pb.x,p0=vert?pb.y:pb.x;
+  const s0=vert?e.y1:e.x1,s1=vert?e.y2:e.x2,[r0,r1]=RNG[g.id]||[0,1],c0=s0+(s1-s0)*r0,c1=s0+(s1-s0)*r1;
+  const cl=v=>Math.max(0,Math.min(1,v));
+  post('layout',{peer:g.id,side:e.side,monitor:A.idx,source:[cl((c0-a0)/lenA),cl((c1-a0)/lenA)],target:[cl((c0-p0)/lenP),cl((c1-p0)/lenP)]},ok=>{if(ok)toast('並びを保存しました')});
+}
+const toWorld=(svg,e)=>{const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;return pt.matrixTransform(svg.getScreenCTM().inverse())};
+let adrag=null;
+document.addEventListener('pointerdown',e=>{
+  const rh=e.target.closest('#arr .rh');
+  if(rh){adrag={kind:'range',el:$('#arr'),svg:$('#arr svg'),id:rh.dataset.g,end:+rh.dataset.end,moved:false};e.preventDefault();return}
+  const t=e.target.closest('#arr .grpg');if(!t)return;
+  const el=$('#arr'),svg=$('svg',el),p=toWorld(svg,e);adrag={kind:'move',el,svg,id:t.dataset.g,sx:p.x,sy:p.y,moved:false};el.classList.add('dragging');e.preventDefault();
+});
+addEventListener('pointermove',e=>{if(!adrag)return;const p=toWorld(adrag.svg,e),g=GROUPS.find(x=>x.id===adrag.id);if(!g)return;
+  if(adrag.kind==='range'){const ed=bestEdge(g);if(!ed)return;const vert=ed.x1===ed.x2,t=vert?(p.y-ed.y1)/(ed.y2-ed.y1):(p.x-ed.x1)/(ed.x2-ed.x1),r=[...(RNG[g.id]||[0,1])],c=Math.max(0,Math.min(1,t));if(adrag.end===0)r[0]=Math.min(c,r[1]-.1);else r[1]=Math.max(c,r[0]+.1);RNG[g.id]=r;adrag.moved=true;drawArr(adrag.el);return}
+  const dx=p.x-adrag.sx,dy=p.y-adrag.sy;if(!adrag.moved&&Math.hypot(dx,dy)<adrag.el._vb.w/200)return;adrag.moved=true;drawArr(adrag.el,{drag:{id:g.id,dx,dy}})});
+addEventListener('pointerup',e=>{if(!adrag)return;const d=adrag;adrag=null;d.el.classList.remove('dragging');const g=GROUPS.find(x=>x.id===d.id);busyUntil=Date.now()+1500;
+  if(!g){drawArr(d.el);return}
+  if(d.kind==='range'){drawArr(d.el);if(d.moved)sendLayout(g);return}
+  if(!d.moved){if(SELP!==g.id){SELP=g.id;renderPage(false)}else drawArr(d.el);return}
+  const p=toWorld(d.svg,e),gx=g.x+p.x-d.sx,gy=g.y+p.y-d.sy,s=snapSet(g.rel,othersFor(g),gx,gy,(x,y)=>touchesMine(g,x,y));
+  if(!s){drawArr(d.el);toast('そこには置けません',true);return}
+  g.x=s.x;g.y=s.y;delete RNG[g.id];SELP=g.id;drawArr(d.el,{animate:true,settle:{id:g.id,dx:gx-s.x,dy:gy-s.y}});sendLayout(g);
+});
+document.addEventListener('keydown',e=>{
+  const rh=e.target.closest&&e.target.closest('#arr .rh');
+  if(rh){const g=GROUPS.find(x=>x.id===rh.dataset.g),ed=g&&bestEdge(g);if(!ed)return;const vert=ed.x1===ed.x2,d=vert?({ArrowDown:.05,ArrowUp:-.05}[e.key]||0):({ArrowRight:.05,ArrowLeft:-.05}[e.key]||0);if(!d)return;e.preventDefault();
+    const end=+rh.dataset.end,r=[...(RNG[g.id]||[0,1])];if(end===0)r[0]=Math.max(0,Math.min(r[0]+d,r[1]-.1));else r[1]=Math.min(1,Math.max(r[1]+d,r[0]+.1));RNG[g.id]=r;drawArr($('#arr'));sendLayout(g);const n=$(`#arr .rh[data-g="${CSS.escape(g.id)}"][data-end="${end}"]`);if(n)n.focus();return}
+  const t=e.target.closest&&e.target.closest('#arr .grpg');if(!t)return;const g=GROUPS.find(x=>x.id===t.dataset.g);if(!g)return;
+  if(e.key==='Enter'||e.key===' '){e.preventDefault();SELP=g.id;renderPage(false);return}
+  const dir={ArrowRight:[1,0],ArrowLeft:[-1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[e.key];if(!dir)return;e.preventDefault();
+  for(let k=1;k<=14;k++){const s=snapSet(g.rel,othersFor(g),g.x+dir[0]*180*k,g.y+dir[1]*180*k,(x,y)=>touchesMine(g,x,y));if(s&&(Math.abs(s.x-g.x)>1||Math.abs(s.y-g.y)>1)){g.x=s.x;g.y=s.y;delete RNG[g.id];SELP=g.id;drawArr($('#arr'),{animate:true});sendLayout(g);break}}
+  const f=$(`#arr .grpg[data-g="${CSS.escape(g.id)}"]`);if(f)f.focus();
+});
+
+/* ---------- events ---------- */
+let renaming=null;
+document.addEventListener('click',e=>{
+  const pg=e.target.closest('[data-page]');if(pg){goPage(pg.dataset.page);return}
+  const nt=e.target.closest('.row[id^="nt-"]');if(nt&&!e.target.closest('[data-set]')){const k=nt.id.slice(3),n=NOTICES.find(x=>x[0]===k)||['problem','warn','red','','','受信フォルダを開けませんでした。フォルダが残っているか確かめてください'];noticeSample=n;const w=$('#bannerwrap');if(w)w.innerHTML=banner(n);return}
+  const s=e.target.closest('[data-set]');
+  if(s&&!s.disabled){const k=s.dataset.set,v=s.getAttribute('aria-checked')!=='true';s.setAttribute('aria-checked',String(v));busyUntil=Date.now()+1200;post('set',{key:k,value:v},ok=>{if(!ok)s.setAttribute('aria-checked',String(!v))});return}
+  const rl=e.target.closest('[data-role]');if(rl&&!rl.disabled){post('role',{client:rl.dataset.role==='client'});return}
+  const b=e.target.closest('[data-act]');if(!b||b.disabled)return;const a=b.dataset.act,arg=a.includes(':')?a.slice(a.indexOf(':')+1):null,cmd=a.split(':')[0];
+  if(cmd==='identify'){IDN=true;drawArr($('#arr'));setTimeout(()=>{IDN=false;drawArr($('#arr'))},2600);return}
+  if(cmd==='rename'){renaming=arg;renderPage(false);return}
+  if(cmd==='renameCancel'){renaming=null;renderPage(false);return}
+  if(cmd==='renameOk'){const v=($('#aliasIn')||{}).value||'';post('rename',{peer:arg,name:v.trim()},ok=>{if(ok){renaming=null;renderPage(false)}});return}
+  if(cmd==='copy'){try{navigator.clipboard.writeText(arg).then(()=>toast(`${arg} をコピーしました`),()=>post('copy',{text:arg}))}catch(_){post('copy',{text:arg})}return}
+  if(cmd==='saveHost'){post('saveHost',{text:($('#hostIn')||{}).value||''});return}
+  if(cmd==='sensReset'){post('sens',{peer:arg,value:1});return}
+  if(cmd==='diag'){diagText=null;post('diag');return}
+  post(cmd,arg!=null?{peer:arg}:{});
+});
+document.addEventListener('change',e=>{
+  const s=e.target.closest('[data-sel]');if(s){const k=s.dataset.sel,v=(k==='hotkey'||k==='history_limit')?Number(s.value):s.value;post('set',{key:k,value:v});s.blur();return}
+  const gn=e.target.closest('[data-gain]');if(gn){post('set',{key:'audio_gain',value:Number(gn.value)/100});return}
+  const r=e.target.closest('[data-sens]');if(r){post('sens',{peer:r.dataset.sens,value:Number(r.value)})}
+});
+document.addEventListener('input',e=>{const gn=e.target.closest('[data-gain]');if(gn){gn.style.setProperty('--p',(gn.value/2)+'%');const o=$('[data-out="gain"]');if(o)o.textContent=gn.value+'%';busyUntil=Date.now()+1500;return}const r=e.target.closest('[data-sens]');if(r){r.style.setProperty('--p',((r.value-.2)/2.8*100)+'%');const o=$('[data-out="sens"]');if(o)o.textContent=Number(r.value).toFixed(1);busyUntil=Date.now()+1500}});
+document.addEventListener('keydown',e=>{if(e.target.id==='hostIn'&&e.key==='Enter'){e.preventDefault();post('saveHost',{text:e.target.value})}if(e.target.id==='aliasIn'){if(e.key==='Enter'){e.preventDefault();$('[data-act^="renameOk"]').click()}if(e.key==='Escape'){renaming=null;renderPage(false)}}});
+document.addEventListener('contextmenu',e=>{if(!e.target.closest('input,pre,code'))e.preventDefault()});
+addEventListener('resize',()=>{moveNav(true);const el=$('#arr');if(el){el._vb=null;drawArr(el)}});
+
+/* Rebuild the layout when topology changes (peer connect/disconnect, monitors plugged in or out) */
+const _state=window.knit.state;let lastTopo='';
+window.knit.state=function(s){const topo=JSON.stringify([s.displays,(s.peers||[]).map(p=>[p.id,p.side,p.monitor,p.source,p.target,p.monitors,p.screen])]);if(topo!==lastTopo&&!adrag){lastTopo=topo;const tmp=S;S=s;buildGroups();S=tmp}_state(s)};
+
+/* ---------- demo data when opened in a plain browser (outside the app) ---------- */
+function demoState(){return{os:OS,preview:true,version:BOOT.version||'0.26.0',myName:'MacBook Pro',
+  settings:{startup:true,hotkey:105,language:'ja',update_check:true,clip_share:true,share_files:true,history_enabled:true,history_limit:50,receive_folder:'/Users/you/Downloads/Knit',open_receive_folder:false,audio_on:true,audio_gain:1,audio_output_uid:'',spk_mute:true,notify_transfer:true,notify_clipboard:true,notify_connection:true,notify_update:true,locked:{}},
+  caps:{clip:true,files:true,audio:true},outputs:[['bi','MacBook Pro のスピーカー'],['ap','AirPods Pro']],outputStatus:null,receiveRestart:false,
+  perm:{ax:true},conn:{connected:true,rtt:4,route:'LAN 直結',status:'接続中',role:'host',roleLocked:false,host:''},
+  addrs:['192.168.1.20','100.84.0.1'],
+  displays:[{x:0,y:0,w:1512,h:982,main:true,name:'内蔵ディスプレイ'},{x:1512,y:-458,w:2560,h:1440,main:false,name:'Studio Display'}],
+  peers:[{id:'pc1',name:'HACHIMAN-PC',alias:'',label:'HACHIMAN-PC',ip:'192.168.1.42',active:true,ver:13,side:0,monitor:1,source:[0,.75],target:[0,1],sens:1,screen:[1920,1080],monitors:[{x:0,y:0,w:1920,h:1080,name:'モニター 1'},{x:1920,y:-420,w:1080,h:1920,name:'モニター 2'}]}],
+  update:{state:'idle',enabled:false},diag:{running:false}}}
+function demoHandle(id,cmd,args){
+  setTimeout(()=>{
+    if(cmd==='ready'){window.knit.state(demoState());return}
+    if(cmd==='set'){S.settings[args.key==='ui_language'?'language':args.key]=args.value;window.knit.result(id,true,'保存しました（見本）');return}
+    if(cmd==='layout'){const p=S.peers.find(x=>x.id===args.peer);Object.assign(p,{side:args.side,monitor:args.monitor,source:args.source,target:args.target});window.knit.result(id,true,'');return}
+    if(cmd==='sens'){S.peers.find(x=>x.id===args.peer).sens=args.value;window.knit.result(id,true,'');renderPage(false);return}
+    if(cmd==='diag'){S.diag.running=true;renderPage(false);setTimeout(()=>{S.diag.running=false;window.knit.diag('待ち受け: OK\n相手に届く: OK (192.168.1.42)\n認証: OK\n遅延: 4 ms');},1200);return}
+    window.knit.result(id,true,'見本のため実行しません');
+  },60);
+}
+post('ready');
+})();
+</script>
+</body>
+</html>

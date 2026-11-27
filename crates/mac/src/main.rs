@@ -96,6 +96,31 @@ fn notify(title: &str, body: &str) {
     });
 }
 
+/// Silenceable notification categories. Anything else goes through `notify` and is always shown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Notice {
+    Transfer,
+    Clipboard,
+    Connection,
+    Update,
+}
+
+pub(crate) fn notice_enabled(kind: Notice) -> bool {
+    match kind {
+        Notice::Transfer => NOTIFY_TRANSFER.load(Ordering::Relaxed),
+        Notice::Clipboard => NOTIFY_CLIPBOARD.load(Ordering::Relaxed),
+        Notice::Connection => NOTIFY_CONNECTION.load(Ordering::Relaxed),
+        Notice::Update => NOTIFY_UPDATE.load(Ordering::Relaxed),
+    }
+}
+
+/// Post a notification of a category the user may have turned off.
+pub(crate) fn notify_as(kind: Notice, title: &str, body: &str) {
+    if notice_enabled(kind) {
+        notify(title, body);
+    }
+}
+
 /// バイト数を通知・表示用に整形する(2048→"2 KB"、3_500_000→"3.3 MB")
 pub fn human_bytes(n: u64) -> String {
     if n >= 1024 * 1024 * 1024 {
@@ -941,12 +966,6 @@ fn main() {
     }
     if args.iter().any(|a| a == "--preview-ui") {
         gui::UI_PREVIEW.store(true, Ordering::Relaxed);
-        // 設定画面の配線を GUI 操作なしで確かめる(--settings-new --selftest)
-        #[cfg(debug_assertions)]
-        if args.iter().any(|a| a == "--selftest") {
-            let ok = unsafe { gui::settings_new::selftest() };
-            std::process::exit(if ok { 0 } else { 1 });
-        }
         // プレビューでも「操作する端末」が複数台のときの見た目を確認できるように、
         // ダミーの端末を必ず1台登録しておく(--preview-tablet で更にタブレットが増える)
         PEERS.lock().unwrap_or_else(|e|e.into_inner()).push(PeerEntry {
@@ -966,7 +985,10 @@ fn main() {
             *ACTIVE_PEER.lock().unwrap_or_else(|e|e.into_inner()) = 1; // タブレットを見ている想定
         }
         if gui::start() {
-            gui::SHOW_AT_START.store(true, Ordering::Relaxed);
+            // --preview-tray checks the menu bar popover alone (the settings window would close it)
+            if !args.iter().any(|a| a == "--preview-tray") {
+                gui::SHOW_AT_START.store(true, Ordering::Relaxed);
+            }
             unsafe { gui::run_app() };
         }
         return;

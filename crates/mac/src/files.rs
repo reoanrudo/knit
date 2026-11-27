@@ -112,7 +112,8 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
         // 送る前に確認する手がかりにする(小さい転送で通知を増やさない閾値)
         if total >= 1024 * 1024 * 1024 {
             let peer = crate::active_peer_label();
-            notify(
+            crate::notify_as(
+                crate::Notice::Transfer,
                 "Knit",
                 &format!(
                     "{} 件・合計 {} を {peer} へ送信します(相手の保存先 Downloads/Knitの空き容量をご確認ください)",
@@ -208,7 +209,8 @@ pub fn send_files_to_win(paths: Vec<std::path::PathBuf>) -> SendFilesOutcome {
                                 accepted == n && rejected == 0 && !scope
                             });
                         if !clean {
-                            notify(
+                            crate::notify_as(
+                                crate::Notice::Transfer,
                                 "Knit",
                                 &format!(
                                     "{n} 件({})を {peer} へ送信しました({:.1}MB/s・Ctrl+V で貼り付け){skip_note}",
